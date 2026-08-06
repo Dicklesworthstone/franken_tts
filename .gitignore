@@ -17,3 +17,7 @@ Cargo.lock.orig
 
 # Truth-pack snapshots: hashes are committed (docs/truth-pack/MANIFEST.sha256), bytes are not.
 docs/truth-pack/snapshots/
+
+# Python bytecode from the verification harnesses
+__pycache__/
+*.pyc

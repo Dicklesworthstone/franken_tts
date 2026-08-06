@@ -1,0 +1,255 @@
+#  franken_tts listening protocol — the pre-registered margins file.
+#
+#  This file is POLICY, not configuration. It is the single place where the smallest effect
+#  size of interest and the equivalence margin for each metric family are declared, and it is
+#  read by `run_panel.py analyze` so the numbers in docs/CONFORMANCE_AND_LISTENING.md and the
+#  numbers a gate actually enforces cannot drift apart.
+#
+#  Amending any margin requires a Listening Protocol Owner sign-off recorded in the
+#  amendment log at the bottom of docs/CONFORMANCE_AND_LISTENING.md, and invalidates every
+#  verdict produced under the previous `policy_version`.
+#
+#  Bead: frankentts-v-listening-25m
+
+schema_version = "1.0.0"
+policy_version = "2026-08-06.1"
+
+#  PROVISIONAL until the Phase -1A/-1B calibration pilot supplies real between-listener SDs
+#  (see docs/CONFORMANCE_AND_LISTENING.md "Calibration status"). Provisional margins may gate
+#  exploratory levers; they may NOT gate a release until frozen.
+calibration_status = "PROVISIONAL"
+freeze_gate = "Phase 2 entry (first shipping quantization gate)"
+
+#  The named human accountable for the power analysis, the margin values, and every
+#  amendment. Role is bound to a person, never to "the team".
+[owner]
+role = "Listening Protocol Owner (LPO)"
+name = "jemanuel"
+responsibilities = [
+  "approves the power analysis before any panel is recruited",
+  "signs off every margin amendment and bumps policy_version",
+  "holds the sealed trials.key.json until analysis is run",
+  "declares a verdict INVALID rather than re-running a panel that missed its power target",
+]
+
+[statistics]
+alpha = 0.05          # one-sided alpha per TOST bound; equivalently a 90% CI
+power = 0.80          # target power at a true effect of zero
+#  Both cluster analyses must clear independently. by_listener guards against a persuasive
+#  minority of listeners; by_speaker guards against a single easy voice carrying the panel.
+cluster_analyses = ["by_listener", "by_speaker"]
+
+[design]
+panel_size_post_screen = 24    # minimum listeners surviving screening
+recruit_target = 32            # recruit allowance for ~25% screening loss
+trials_per_listener_per_family = 24
+catch_trials_per_listener = 6
+min_speakers = 8
+min_texts = 12
+min_languages = 2
+min_objective_utterances = 200
+
+[screening]
+catch_min_correct_rate = 0.85
+hidden_ref_min_score = 90.0
+hidden_ref_max_violation_rate = 0.15
+anchor_max_score = 60.0
+anchor_max_violation_rate = 0.15
+
+# --------------------------------------------------------------------------------------
+#  Metric families
+# --------------------------------------------------------------------------------------
+#  `center` is the value that means "no difference": 0.5 for a two-alternative forced choice,
+#  0.0 for a paired difference. `margin` is the equivalence bound == the smallest effect size
+#  of interest. Anything smaller than the margin is declared, in advance, to be a difference
+#  we do not care about.
+#
+#  Every family's [families.X.tail] block configures the AF-2 tail gate. The tail statistic is
+#  CVaR over per-unit values, compared against a SIGN-FLIP PERMUTATION NULL rather than an
+#  absolute floor. Rationale, recorded here because it is easy to get wrong: an absolute floor
+#  such as "the worst 10% of cells must still poll >= 0.40" is dominated by sampling noise at
+#  realistic cell sizes (6 trials per cell gives a per-cell rate SD near 0.20), so it would
+#  fire on noise and be silenced by widening. Calibrating against the null makes the gate
+#  measure excess tail risk, which is what AF-2 is actually for.
+
+[families.identity_abx]
+label = "Speaker identity (2AFC vs natural reference)"
+bit = "identity_equivalence"
+source = "panel"
+kind = "identity_abx"
+test = "equivalence"
+center = 0.5
+margin = 0.075
+sesoi_rationale = """A 7.5-point shift in forced-choice identity preference is the smallest
+difference the project is willing to call real. Below it we accept the systems as
+identity-equivalent; we do not treat a null result as proof."""
+[families.identity_abx.tail]
+alpha = 0.10           # CVaR over the worst 10% of units
+tail = "lower"         # bad is low: the candidate loses the forced choice
+unit = "cell"          # speaker x text x language x regime
+min_obs_per_unit = 4
+max_dropped_unit_fraction = 0.20
+null_permutations = 999
+null_quantile = 0.05
+slack = 0.03           # observed CVaR may sit at most 0.03 below the null 5th percentile
+min_items_per_axis = 8
+
+[families.naturalness_mushra]
+label = "Naturalness (MUSHRA-style, paired difference)"
+bit = "naturalness_equivalence"
+source = "panel"
+kind = "mushra"
+test = "equivalence"
+center = 0.0
+margin = 5.0
+sesoi_rationale = """5 MUSHRA points is the smallest naturalness change worth a release
+decision. Between-listener SD of the paired difference runs ~8 points, implying ~22 listeners
+at 80% power."""
+[families.naturalness_mushra.tail]
+alpha = 0.10
+tail = "lower"
+unit = "cell"
+min_obs_per_unit = 4
+max_dropped_unit_fraction = 0.20
+null_permutations = 999
+null_quantile = 0.05
+slack = 3.0            # MUSHRA points below the null 5th-percentile CVaR
+min_items_per_axis = 8
+
+#  Objective families run CI-nightly (Tier 0). They screen; they never substitute for a panel
+#  on a lossy lever. Values are paired per utterance (candidate - incumbent).
+[families.wer]
+label = "Word error rate (external ASR verifier, paired)"
+bit = "intelligibility_noninferiority"
+source = "objective"
+metric = "wer"
+test = "non_inferiority"
+center = 0.0
+margin = 0.005         # absolute; +0.5 percentage points
+worse_is = "higher"
+cluster_analyses = ["by_speaker", "by_text"]
+sesoi_rationale = """Half a point of absolute WER is the intelligibility regression floor.
+Paired per-utterance differences have SD ~0.02, implying ~100 utterances; the design requires
+200."""
+[families.wer.tail]
+alpha = 0.10
+tail = "upper"
+unit = "item"
+min_obs_per_unit = 1
+max_dropped_unit_fraction = 0.20
+null_permutations = 999
+null_quantile = 0.95
+slack = 0.01
+min_items_per_axis = 12
+
+[families.word_errors_structural]
+label = "Repeated / skipped word rate (paired)"
+bit = "intelligibility_noninferiority"
+source = "objective"
+metric = "repeat_skip_rate"
+test = "non_inferiority"
+center = 0.0
+margin = 0.003
+worse_is = "higher"
+cluster_analyses = ["by_speaker", "by_text"]
+sesoi_rationale = "Structural failures are more damaging than substitution errors; the margin is tighter than WER."
+[families.word_errors_structural.tail]
+alpha = 0.10
+tail = "upper"
+unit = "item"
+min_obs_per_unit = 1
+max_dropped_unit_fraction = 0.20
+null_permutations = 999
+null_quantile = 0.95
+slack = 0.008
+min_items_per_axis = 12
+
+#  Long-form drift is the plan section 2.8 gate: the metric is the candidate's late-window
+#  minus early-window quality decline, differenced against the incumbent's own decline, so a
+#  model that is uniformly slightly worse does not fail this gate — only one that degrades
+#  faster over the utterance does.
+[families.longform_drift]
+label = "Long-form drift (late-window minus early-window decline, paired)"
+bit = "longform_drift"
+source = "objective"
+metric = "longform_drift"
+test = "non_inferiority"
+center = 0.0
+margin = 0.05
+worse_is = "higher"
+cluster_analyses = ["by_speaker", "by_text"]
+sesoi_rationale = """The 12Hz checkpoint is known to be weaker than 25Hz on long speech
+(plan section 2.8). This gate bounds ADDITIONAL drift introduced by our own levers."""
+[families.longform_drift.tail]
+alpha = 0.10
+tail = "upper"
+unit = "item"
+min_obs_per_unit = 1
+max_dropped_unit_fraction = 0.20
+null_permutations = 999
+null_quantile = 0.95
+slack = 0.06
+min_items_per_axis = 8
+
+# --------------------------------------------------------------------------------------
+#  Protocol instances
+# --------------------------------------------------------------------------------------
+#  One protocol, several instances. Each names which families it requires and whether human
+#  panels are mandatory. `objective_only = true` marks a Tier-0 screening instance whose pass
+#  is explicitly NOT sufficient for a lossy lever.
+
+[instances.ci_nightly]
+label = "Tier 0 nightly objective screen"
+families = ["wer", "word_errors_structural", "longform_drift"]
+objective_only = true
+blocks_release = false
+note = "Screening only. A pass here never authorizes shipping a lossy lever."
+
+[instances.quant_gate]
+label = "Quantization gate (codec Q8, Q8 text embedding, Q4 MTP depth waterfall, AF-1 allocation)"
+families = ["identity_abx", "naturalness_mushra", "wer", "word_errors_structural", "longform_drift"]
+objective_only = false
+blocks_release = true
+consumers = [
+  "frankentts-p2-codec-q8-3vw",
+  "frankentts-k-q4-mtp-lnp",
+  "frankentts-p2-int8-talker-micro-upg",
+]
+
+[instances.bakeoff_gate_a]
+label = "Bakeoff Gate A — upstream quality (official implementations only)"
+families = ["identity_abx", "naturalness_mushra", "wer", "longform_drift"]
+objective_only = false
+blocks_release = false
+consumers = ["frankentts-bake-corpus-48h"]
+note = """Gate A is a quality-floor decision, not an equivalence claim: Pocket is eliminated
+as primary if identity falls outside the equivalence band on the LOW side (a FAIL_DIFFERENT
+against Qwen). INSUFFICIENT_POWER keeps Pocket alive and demands more data."""
+
+[instances.enrollment_audition]
+label = "Voice compiler audition benchmark (AF-4 segment discovery, multi-reference)"
+families = ["identity_abx", "naturalness_mushra"]
+objective_only = false
+blocks_release = false
+consumers = ["frankentts-p4-segment-discovery-qjc", "frankentts-p4-enrollment-en6"]
+note = """Selection must BEAT whole-file enrollment, so this instance reads the equivalence
+result as a floor only: the pass condition is (not FAIL_DIFFERENT on the low side) AND a
+one-sided superiority result reported separately by the enrollment bead."""
+
+[instances.surgery_canary]
+label = "Phase 5 surgery canaries (adaptive depth, early exit, AF-1 allocation)"
+families = ["identity_abx", "naturalness_mushra", "wer"]
+objective_only = false
+blocks_release = true
+required_axes = ["sibilants", "breaths", "noisy_reference"]
+consumers = ["frankentts-p5-surgery-00e"]
+note = "The generic battery is insufficient; the surgery-specific axes above must be populated."
+
+[instances.release]
+label = "Release ship gate"
+families = ["identity_abx", "naturalness_mushra", "wer", "word_errors_structural", "longform_drift"]
+objective_only = false
+blocks_release = true
+required_axes = ["noisy_reference", "sibilants", "breaths", "code_switching", "numbers", "long_form"]
+consumers = ["frankentts-v-af2-tailrisk-0oy"]
+note = "AF-2's CVaR bound is a named bit here (tail_cvar_bound), not advisory commentary."
