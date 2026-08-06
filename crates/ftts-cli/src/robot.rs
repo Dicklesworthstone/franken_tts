@@ -495,6 +495,12 @@ pub const EVENTS: &[EventSpec] = &[
                 summary: "text-transformation mode",
             },
             FieldSpec {
+                name: "normalization_trace_requested",
+                ty: "bool",
+                required: true,
+                summary: "whether an emitted normalization trace was asked for",
+            },
+            FieldSpec {
                 name: "seed",
                 ty: "u64|null",
                 required: true,

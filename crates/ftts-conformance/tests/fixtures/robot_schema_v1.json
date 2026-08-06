@@ -486,6 +486,12 @@
           "type": "string"
         },
         {
+          "name": "normalization_trace_requested",
+          "required": true,
+          "summary": "whether an emitted normalization trace was asked for",
+          "type": "bool"
+        },
+        {
           "name": "seed",
           "required": true,
           "summary": "sampler seed",

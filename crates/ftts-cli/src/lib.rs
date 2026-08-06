@@ -581,22 +581,7 @@ fn resolve_model(explicit: Option<&Path>, environment: &Environment) -> Result<S
             .map(|path| path.display().to_string());
     }
 
-    let mut searched = environment
-        .value("FTTS_MODEL_DIR")
-        .map(std::env::split_paths)
-        .map(|paths| {
-            paths
-                .map(|path| path.join(MODEL_BASENAME))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if let Some(cache_home) = std::env::var_os("HOME") {
-        searched.push(
-            PathBuf::from(cache_home)
-                .join(".cache/franken_tts/models")
-                .join(MODEL_BASENAME),
-        );
-    }
+    let searched = model_search_paths(environment);
     if let Some(path) = searched.iter().find(|path| path.is_file()) {
         return Ok(path.display().to_string());
     }
@@ -668,31 +653,67 @@ fn run_robot(
     environment: &Environment,
     stdout: &mut dyn Write,
 ) -> Result<(), FttsError> {
+    // Every object below is built from `robot::EventType`, so the discriminator and
+    // schema_version cannot be forgotten, and the frozen contract test in ftts-conformance
+    // fails if any of these stops matching the catalogue.
     let event = match command {
-        RobotCommand::Schema => json!({
-            "schema_version": ROBOT_SCHEMA_VERSION,
-            "event": "robot_schema",
-            "event_types": ["run_start", "stage", "frame", "audio_chunk", "health", "run_complete", "run_error"],
-            "stdout_contract": "one JSON object per line unless `say --stream raw` owns stdout for PCM",
-            "raw_stream_contract": "PCM on stdout; robot events on stderr",
-            "environment_variables": ["FTTS_MODEL_DIR", "FTTS_THREADS", "FTTS_PROFILE", "FTTS_PACKET_FRAMES", "FTTS_MATH_MODE", "FTTS_QUANT", "FTTS_FORCE_ARCH", "FTTS_NUMA", "FTTS_STAGE_BUDGET_*_MS"],
-            "exit_codes": exit_codes_json(),
-        }),
-        RobotCommand::Health => json!({
-            "schema_version": ROBOT_SCHEMA_VERSION,
-            "event": "health",
-            "status": "phase0_skeleton",
-            "model_loaded": false,
-            "stateless_default": true,
-            "recommended_command": "ftts say --check --model PATH TEXT",
-        }),
-        RobotCommand::Backends => json!({
-            "schema_version": ROBOT_SCHEMA_VERSION,
-            "event": "backends",
-            "available": ["scalar-placeholder"],
-            "dispatched": null,
-            "force_arch": environment.value("FTTS_FORCE_ARCH"),
-        }),
+        RobotCommand::Schema => robot::schema_document(robot::DOCUMENTED_ENVIRONMENT),
+        RobotCommand::Health => {
+            let searched = model_search_paths(environment);
+            let found = searched.iter().find(|path| looks_like_model_artifact(path));
+            let mut object = robot::EventType::Health.event();
+            object.insert("status".to_owned(), json!("phase0_skeleton"));
+            object.insert("model_loaded".to_owned(), json!(false));
+            // Presence is a magic-bytes header sniff, never a tensor load: `robot health` must
+            // stay cheap enough for an agent to call it on every invocation.
+            object.insert("model_present".to_owned(), json!(found.is_some()));
+            object.insert(
+                "model_path".to_owned(),
+                json!(found.map(|path| path.display().to_string())),
+            );
+            object.insert(
+                "model_dir".to_owned(),
+                json!(environment.value("FTTS_MODEL_DIR")),
+            );
+            // Every directory consulted, so a resolution failure is actionable rather than a
+            // bare "not found".
+            object.insert(
+                "searched".to_owned(),
+                json!(
+                    searched
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                ),
+            );
+            object.insert("stateless_default".to_owned(), json!(true));
+            object.insert(
+                "threads".to_owned(),
+                json!(
+                    environment
+                        .value("FTTS_THREADS")
+                        .and_then(|value| value.parse::<u64>().ok())
+                ),
+            );
+            object.insert(
+                "recommended_command".to_owned(),
+                json!("ftts say --check --model PATH TEXT"),
+            );
+            Value::Object(object)
+        }
+        RobotCommand::Backends => {
+            let mut object = robot::EventType::Backends.event();
+            object.insert("available".to_owned(), json!(["scalar-placeholder"]));
+            object.insert("dispatched".to_owned(), Value::Null);
+            object.insert("isa_features".to_owned(), json!(detected_isa_features()));
+            object.insert("kernel_plan".to_owned(), Value::Null);
+            object.insert("pool_sizing".to_owned(), Value::Null);
+            object.insert(
+                "force_arch".to_owned(),
+                json!(environment.value("FTTS_FORCE_ARCH")),
+            );
+            Value::Object(object)
+        }
         RobotCommand::Selftest => json!({
             "schema_version": ROBOT_SCHEMA_VERSION,
             "event": "selftest",
@@ -701,6 +722,79 @@ fn run_robot(
         }),
     };
     write_json_line(stdout, &event)
+}
+
+/// Every path the model resolver consults, in order.
+///
+/// Shared by `robot health` and the resolution error so the two can never disagree about what
+/// was searched — a "not found" that lists different directories than `health` reports is worse
+/// than no list at all.
+fn model_search_paths(environment: &Environment) -> Vec<PathBuf> {
+    let mut searched = environment
+        .value("FTTS_MODEL_DIR")
+        .map(std::env::split_paths)
+        .map(|paths| {
+            paths
+                .map(|path| path.join(MODEL_BASENAME))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME") {
+        searched.push(
+            PathBuf::from(home)
+                .join(".cache/franken_tts/models")
+                .join(MODEL_BASENAME),
+        );
+    }
+    searched
+}
+
+/// A cheap header sniff: is there a plausible `.fttsq` artifact at this path?
+///
+/// Reads the magic bytes only. Deliberately never opens the tensor data — `robot health` is
+/// meant to be callable on every agent invocation, and a multi-gigabyte read would make it a
+/// thing agents avoid calling, which defeats the point.
+fn looks_like_model_artifact(path: &Path) -> bool {
+    use std::io::Read as _;
+
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 5];
+    file.read_exact(&mut magic).is_ok() && &magic == b"FTTSQ"
+}
+
+/// ISA features detected at runtime, for `robot backends`.
+///
+/// Reported as a plain list so an agent can see what the dispatcher had available; the kernel
+/// tiers themselves land with the Phase-3 engines.
+fn detected_isa_features() -> Vec<&'static str> {
+    let mut features = Vec::new();
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            features.push("neon");
+        }
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            features.push("dotprod");
+        }
+        if std::arch::is_aarch64_feature_detected!("i8mm") {
+            features.push("i8mm");
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            features.push("avx2");
+        }
+        if std::arch::is_x86_feature_detected!("avxvnni") {
+            features.push("avx-vnni");
+        }
+        if std::arch::is_x86_feature_detected!("avx512vnni") {
+            features.push("avx512-vnni");
+        }
+    }
+    features
 }
 
 fn run_doctor(
