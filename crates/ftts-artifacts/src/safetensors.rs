@@ -264,12 +264,11 @@ impl SafetensorsIndex {
             });
         }
         // `header_len` is now <= 64 MiB, so this cast is lossless on every target we build for.
-        let header_len_usize = usize::try_from(header_len).map_err(|_| {
-            WeightsError::HeaderLengthOutOfRange {
+        let header_len_usize =
+            usize::try_from(header_len).map_err(|_| WeightsError::HeaderLengthOutOfRange {
                 declared: header_len,
                 available: bytes.len(),
-            }
-        })?;
+            })?;
         let payload_begin =
             8usize
                 .checked_add(header_len_usize)
@@ -284,11 +283,10 @@ impl SafetensorsIndex {
             });
         };
 
-        let parsed: Value = serde_json::from_slice(header_bytes).map_err(|error| {
-            WeightsError::HeaderNotJson {
+        let parsed: Value =
+            serde_json::from_slice(header_bytes).map_err(|error| WeightsError::HeaderNotJson {
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
         let Value::Object(directory) = parsed else {
             return Err(WeightsError::HeaderNotObject);
         };
@@ -382,13 +380,12 @@ fn parse_entry(
             detail: "entry is not a JSON object".to_owned(),
         })?;
 
-    let raw_dtype = object
-        .get("dtype")
-        .and_then(Value::as_str)
-        .ok_or_else(|| WeightsError::MalformedEntry {
+    let raw_dtype = object.get("dtype").and_then(Value::as_str).ok_or_else(|| {
+        WeightsError::MalformedEntry {
             name: name.to_owned(),
             detail: "missing string field `dtype`".to_owned(),
-        })?;
+        }
+    })?;
     let dtype = Dtype::parse(raw_dtype).ok_or_else(|| WeightsError::UnsupportedDtype {
         name: name.to_owned(),
         raw: raw_dtype.to_owned(),
@@ -769,10 +766,7 @@ mod tests {
         let mut buffer = u64::MAX.to_le_bytes().to_vec();
         buffer.extend_from_slice(b"{}");
         let error = SafetensorsIndex::parse(&buffer).expect_err("must refuse");
-        assert!(matches!(
-            error,
-            WeightsError::HeaderLengthOutOfRange { .. }
-        ));
+        assert!(matches!(error, WeightsError::HeaderLengthOutOfRange { .. }));
     }
 
     #[test]
@@ -780,10 +774,7 @@ mod tests {
         let mut buffer = 4096u64.to_le_bytes().to_vec();
         buffer.extend_from_slice(b"{}");
         let error = SafetensorsIndex::parse(&buffer).expect_err("must refuse");
-        assert!(matches!(
-            error,
-            WeightsError::HeaderLengthOutOfRange { .. }
-        ));
+        assert!(matches!(error, WeightsError::HeaderLengthOutOfRange { .. }));
     }
 
     #[test]

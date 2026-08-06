@@ -15,9 +15,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Superseded PR pushes are worth cancelling; superseded MAIN pushes are not. With several
+# agents committing to main at once, cancel-in-progress there means the gate result is never
+# actually observed — every run gets killed by the next commit. Observed 2026-08-06: 8
+# consecutive main runs cancelled, one queued 10h, and not one job ever executed its steps.
+# A gate whose result nobody ever sees is not a gate.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
