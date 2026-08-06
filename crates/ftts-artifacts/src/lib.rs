@@ -3,6 +3,7 @@
 //! Safe readers and writers for FrankenTTS artifacts.
 
 pub mod census;
+pub mod converter;
 pub mod fttsq;
 pub mod safetensors;
 pub mod sha256;
