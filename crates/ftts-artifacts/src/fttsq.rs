@@ -399,6 +399,18 @@ pub enum FttsqError {
     /// Apache-2.0 §4 attaches to every artifact we publish; an artifact without the notice must not
     /// be readable, or the obligation becomes advisory in practice.
     LicenseNoticeMissing,
+    /// A filesystem operation failed.
+    ///
+    /// Carries the rendered message rather than [`std::io::Error`] so this enum stays `Clone` and
+    /// `PartialEq` — properties the tests and the fuzz target rely on.
+    Io {
+        /// What was being attempted.
+        operation: String,
+        /// The path involved.
+        path: String,
+        /// The OS error text.
+        detail: String,
+    },
 }
 
 impl fmt::Display for FttsqError {
@@ -472,6 +484,11 @@ impl fmt::Display for FttsqError {
                 "artifact carries no license_notice; Apache-2.0 §4 requires it on every published \
                  artifact, so an artifact without one is refused rather than silently accepted",
             ),
+            Self::Io {
+                operation,
+                path,
+                detail,
+            } => write!(f, "{operation} failed for `{path}`: {detail}"),
         }
     }
 }
@@ -1167,6 +1184,63 @@ impl FttsqWriter {
         Ok(out)
     }
 
+    /// Serializes and writes the artifact to `path` **atomically**.
+    ///
+    /// Writes to a temporary file beside the destination, fsyncs it, then renames over the target.
+    /// A reader therefore observes either the previous artifact or the complete new one, never a
+    /// half-written prefix — which matters because a truncated `.fttsq` is exactly the shape that
+    /// digest verification would report as *corruption* rather than as an interrupted write.
+    ///
+    /// The temporary lives in the destination's own directory so the rename stays within one
+    /// filesystem; `rename` across mount points is not atomic and would silently degrade to a copy.
+    /// On failure the temporary is removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FttsqError::Io`] naming the operation and path, or whatever
+    /// [`FttsqWriter::finish`] rejects.
+    pub fn write_to_path(self, path: &std::path::Path) -> Result<(), FttsqError> {
+        use std::io::Write as _;
+
+        let bytes = self.finish()?;
+
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        // Unique per process so two concurrent converters cannot collide on the temporary.
+        let file_name = path.file_name().map_or_else(
+            || std::ffi::OsString::from("artifact.fttsq"),
+            std::ffi::OsStr::to_os_string,
+        );
+        let mut temp_name = file_name;
+        temp_name.push(format!(".tmp.{}", std::process::id()));
+        let temp_path = parent.join(temp_name);
+
+        let io =
+            |operation: &str, target: &std::path::Path, error: &std::io::Error| FttsqError::Io {
+                operation: operation.to_owned(),
+                path: target.display().to_string(),
+                detail: error.to_string(),
+            };
+
+        // Any failure past this point must not leave the temporary behind.
+        let result = (|| -> Result<(), FttsqError> {
+            let mut file = std::fs::File::create(&temp_path)
+                .map_err(|error| io("create", &temp_path, &error))?;
+            file.write_all(&bytes)
+                .map_err(|error| io("write", &temp_path, &error))?;
+            // fsync before rename: without it the rename can land while the data is still in the
+            // page cache, so a crash leaves a correctly-named file full of zeros.
+            file.sync_all()
+                .map_err(|error| io("fsync", &temp_path, &error))?;
+            drop(file);
+            std::fs::rename(&temp_path, path).map_err(|error| io("rename", path, &error))
+        })();
+
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result
+    }
+
     fn directory_json(&self, payload_start: u64) -> Value {
         let mut cursor = payload_start;
         let sections: Vec<Value> = self
@@ -1543,6 +1617,63 @@ mod tests {
         assert_eq!(
             FttsqReader::open(&bytes).expect_err("must refuse a missing notice"),
             FttsqError::LicenseNoticeMissing
+        );
+    }
+
+    #[test]
+    fn write_to_path_lands_a_complete_readable_artifact_and_leaves_no_temporary() {
+        let dir = std::env::temp_dir().join(format!("ftts-fttsq-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("model.fttsq");
+
+        FttsqWriter::new("qwen3-tts-12hz-0.6b-base", "d".repeat(64))
+            .license_notice(NOTICE)
+            .section("m", AccessClass::HotRecurrentMicrodecoder, vec![3_u8; 128])
+            .tensor(TensorEntry {
+                name: "m.w".to_owned(),
+                section: "m".to_owned(),
+                dtype: StoredDtype::Q8,
+                shape: vec![128],
+                offset: 0,
+                length: 128,
+                scales: None,
+            })
+            .write_to_path(&path)
+            .expect("artifact is writable");
+
+        let bytes = std::fs::read(&path).expect("artifact is readable");
+        let reader = FttsqReader::open(&bytes).expect("what landed on disk must verify");
+        assert_eq!(
+            reader.tensor_bytes("m.w", &bytes).expect("resolves"),
+            &vec![3_u8; 128][..]
+        );
+
+        // The temporary must not survive a successful write.
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir is listable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(strays.is_empty(), "temporary files left behind: {strays:?}");
+
+        std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    #[test]
+    fn write_to_path_refuses_before_touching_the_filesystem_when_the_notice_is_missing() {
+        let dir = std::env::temp_dir().join(format!("ftts-fttsq-refuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("model.fttsq");
+
+        let error = FttsqWriter::new("qwen3-tts-12hz-0.6b-base", "e".repeat(64))
+            .section("m", AccessClass::Metadata, vec![1, 2, 3])
+            .write_to_path(&path)
+            .expect_err("a notice-less artifact must never reach disk");
+        assert_eq!(error, FttsqError::LicenseNoticeMissing);
+        assert!(
+            !path.exists(),
+            "a refused artifact must not leave a file behind"
         );
     }
 
