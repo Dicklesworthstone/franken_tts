@@ -5,6 +5,7 @@
 
 use std::fmt;
 
+use crate::fttsq::{FttsqError, FttsqStreamingWriter};
 use crate::safetensors::TensorView;
 
 /// Largest input width accepted by the bounded Q8 matrix-row adapter.
@@ -14,6 +15,14 @@ use crate::safetensors::TensorView;
 /// new checkpoint or a malformed external input with a wider row must be given an explicit tiling
 /// policy rather than turning one "row" into an unbounded allocation.
 pub const MAX_Q8_OUTPUT_CHANNEL_WIDTH: usize = 65_536;
+
+/// Largest number of Q8 output channels whose scales one conversion section may retain.
+///
+/// The pinned checkpoint's widest matrix is the 151,936-row text embedding, whose scale tail is
+/// 607,744 bytes. This cap leaves room for a future similarly sized tensor but fixes the tail at
+/// one MiB: a converter cannot quietly turn a malicious outer dimension into an unbounded scale
+/// allocation while it waits to append that tail after the Q8 payload.
+pub const MAX_Q8_OUTPUT_CHANNELS: usize = 262_144;
 
 /// Failure while quantizing one output channel.
 #[derive(Clone, Debug, PartialEq)]
@@ -160,6 +169,198 @@ where
     }
 }
 
+/// Failure while writing canonical Q8 values and their scale tail into one `.fttsq` section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Q8SectionSinkError {
+    /// The conversion plan would require a scale tail larger than the bounded contract permits.
+    OutputChannelCountTooLarge {
+        /// Number of matrix output channels.
+        rows: usize,
+        /// Maximum number of rows whose scales this sink can retain.
+        limit: usize,
+    },
+    /// A caller bypassed the matrix adapter and supplied an unbounded Q8 row directly.
+    OutputChannelTooWide {
+        /// Number of values in the attempted row.
+        width: usize,
+        /// Maximum row width accepted by the shared adapter.
+        limit: usize,
+    },
+    /// The shared matrix adapter did not present rows in the source's physical order.
+    RowOutOfOrder {
+        /// Row index the sink expected next.
+        expected: usize,
+        /// Row index the adapter supplied.
+        actual: usize,
+    },
+    /// The caller tried to finalize before every planned row supplied a scale.
+    Incomplete {
+        /// Rows the section metadata declared.
+        expected: usize,
+        /// Rows actually received.
+        written: usize,
+    },
+    /// Writing the values or scale tail into the artifact stream failed.
+    Artifact(FttsqError),
+}
+
+impl fmt::Display for Q8SectionSinkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutputChannelCountTooLarge { rows, limit } => write!(
+                f,
+                "Q8 matrix has {rows} output channels, exceeding the bounded scale-tail limit {limit}"
+            ),
+            Self::OutputChannelTooWide { width, limit } => write!(
+                f,
+                "Q8 section row width {width} exceeds the bounded row limit {limit}"
+            ),
+            Self::RowOutOfOrder { expected, actual } => write!(
+                f,
+                "Q8 section expected source row {expected}, received row {actual}"
+            ),
+            Self::Incomplete { expected, written } => write!(
+                f,
+                "Q8 section needs {expected} scales but received {written}"
+            ),
+            Self::Artifact(error) => write!(f, "cannot write Q8 section: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for Q8SectionSinkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Artifact(error) => Some(error),
+            Self::OutputChannelCountTooLarge { .. }
+            | Self::OutputChannelTooWide { .. }
+            | Self::RowOutOfOrder { .. }
+            | Self::Incomplete { .. } => None,
+        }
+    }
+}
+
+/// A bounded bridge from canonical Q8 matrix rows into one streaming `.fttsq` section.
+///
+/// `.fttsq` keeps the Q8 tensor contiguous, followed by the contiguous F32 scale tensor that its
+/// directory names. The sink therefore streams every Q8 row immediately, retaining only the scale
+/// tail (at most one MiB for the pinned inventory) until the values have completed. It also keeps
+/// one byte-per-row scratch buffer for the signed-to-wire byte conversion, so the total working
+/// set remains bounded by the row adapter's 320 KiB plus at most 64 KiB of value bytes and one MiB
+/// of scales — never by the full matrix size.
+pub struct Q8SectionSink<'a, W> {
+    writer: &'a mut FttsqStreamingWriter<W>,
+    section: String,
+    expected_rows: usize,
+    next_row: usize,
+    value_bytes: Vec<u8>,
+    scale_bytes: Vec<u8>,
+}
+
+impl<'a, W: std::io::Write + std::io::Seek> Q8SectionSink<'a, W> {
+    /// Starts writing one Q8 matrix section with a fixed number of output channels.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Q8SectionSinkError::OutputChannelCountTooLarge`] before allocating when the
+    /// planned F32 scale tail exceeds this adapter's one-MiB memory ceiling.
+    pub fn new(
+        writer: &'a mut FttsqStreamingWriter<W>,
+        section: impl Into<String>,
+        expected_rows: usize,
+    ) -> Result<Self, Q8SectionSinkError> {
+        if expected_rows > MAX_Q8_OUTPUT_CHANNELS {
+            return Err(Q8SectionSinkError::OutputChannelCountTooLarge {
+                rows: expected_rows,
+                limit: MAX_Q8_OUTPUT_CHANNELS,
+            });
+        }
+        Ok(Self {
+            writer,
+            section: section.into(),
+            expected_rows,
+            next_row: 0,
+            value_bytes: Vec::new(),
+            scale_bytes: Vec::with_capacity(expected_rows * std::mem::size_of::<f32>()),
+        })
+    }
+
+    /// Appends the scale tail after all Q8 values have been streamed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a named refusal when a prior row failed or a stream write cannot complete.
+    pub fn finish(self) -> Result<(), Q8SectionSinkError> {
+        if self.next_row != self.expected_rows {
+            return Err(Q8SectionSinkError::Incomplete {
+                expected: self.expected_rows,
+                written: self.next_row,
+            });
+        }
+        self.writer
+            .write_section(&self.section, &self.scale_bytes)
+            .map_err(Q8SectionSinkError::Artifact)
+    }
+}
+
+impl<W: std::io::Write + std::io::Seek> Q8RowSink for Q8SectionSink<'_, W> {
+    type Error = Q8SectionSinkError;
+
+    fn write_q8_row(&mut self, row: usize, scale: f32, values: &[i8]) -> Result<(), Self::Error> {
+        if row != self.next_row {
+            return Err(Q8SectionSinkError::RowOutOfOrder {
+                expected: self.next_row,
+                actual: row,
+            });
+        }
+        if values.len() > MAX_Q8_OUTPUT_CHANNEL_WIDTH {
+            return Err(Q8SectionSinkError::OutputChannelTooWide {
+                width: values.len(),
+                limit: MAX_Q8_OUTPUT_CHANNEL_WIDTH,
+            });
+        }
+        self.value_bytes.clear();
+        self.value_bytes
+            .extend(values.iter().map(|&value| value as u8));
+        self.writer
+            .write_section(&self.section, &self.value_bytes)
+            .map_err(Q8SectionSinkError::Artifact)?;
+        self.scale_bytes.extend_from_slice(&scale.to_le_bytes());
+        self.next_row += 1;
+        Ok(())
+    }
+}
+
+/// Converts one safetensors matrix directly into its declared Q8 `.fttsq` section.
+///
+/// The section must have been declared with exactly `matrix.len() + rows * 4` bytes, with a Q8
+/// tensor at relative offset zero followed by its F32 scale tensor. This function calls the shared
+/// [`quantize_output_channel_q8`] path through [`quantize_matrix_q8_rows`], so offline artifact
+/// bytes and runtime quantization are produced by the same numerical primitive.
+///
+/// # Errors
+///
+/// Returns a precise source-shape, quantization, bounded-scale-tail, or artifact-write failure.
+pub fn stream_matrix_q8_section<W: std::io::Write + std::io::Seek>(
+    matrix: &TensorView<'_>,
+    writer: &mut FttsqStreamingWriter<W>,
+    section: &str,
+) -> Result<(), MatrixQuantizationError<Q8SectionSinkError>> {
+    let shape = matrix.shape();
+    if shape.len() < 2 {
+        return Err(MatrixQuantizationError::ExpectedMatrix { rank: shape.len() });
+    }
+    let row_count = shape[0];
+    let mut sink = Q8SectionSink::new(writer, section, row_count)
+        .map_err(|source| MatrixQuantizationError::Sink { row: 0, source })?;
+    quantize_matrix_q8_rows(matrix, &mut sink)?;
+    sink.finish()
+        .map_err(|source| MatrixQuantizationError::Sink {
+            row: row_count,
+            source,
+        })
+}
+
 /// Quantizes one output channel with the canonical symmetric per-channel Q8 recipe.
 ///
 /// The returned scale is `max(abs(row)) / 127`. All-zero rows use the explicit scale `1.0`,
@@ -266,9 +467,11 @@ pub fn quantize_matrix_q8_rows<S: Q8RowSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fttsq::{AccessClass, FttsqReader, FttsqStreamPlan, StoredDtype, TensorEntry};
     use crate::safetensors::SafetensorsIndex;
     use serde_json::json;
     use std::convert::Infallible;
+    use std::io::Cursor;
 
     #[derive(Default)]
     struct RecordingSink {
@@ -383,6 +586,63 @@ mod tests {
         assert_eq!(sink.rows[1].0, 1);
         assert_eq!(sink.rows[1].1.to_bits(), (3.0_f32 / 127.0).to_bits());
         assert_eq!(sink.rows[1].2, vec![127, 0, -127]);
+    }
+
+    #[test]
+    fn matrix_q8_section_streams_values_then_bounded_scale_tail() {
+        let source = f32_matrix(2, 3, &[1.0, -2.0, 0.5, 3.0, 0.0, -3.0]);
+        let index = SafetensorsIndex::parse(&source).expect("fixture parses");
+        let matrix = index.view("matrix", &source).expect("matrix view exists");
+        let plan = FttsqStreamPlan::new("test-model", "a".repeat(64))
+            .license_notice("Copyright 2026 Alibaba Cloud\nApache-2.0")
+            .section("matrix", AccessClass::HotRecurrentTalker, 14)
+            .tensor(TensorEntry {
+                name: "matrix.weight".to_owned(),
+                section: "matrix".to_owned(),
+                dtype: StoredDtype::Q8,
+                shape: vec![2, 3],
+                offset: 0,
+                length: 6,
+                scales: Some("matrix.weight.scales".to_owned()),
+            })
+            .tensor(TensorEntry {
+                name: "matrix.weight.scales".to_owned(),
+                section: "matrix".to_owned(),
+                dtype: StoredDtype::F32,
+                shape: vec![2],
+                offset: 6,
+                length: 8,
+                scales: None,
+            });
+        let mut writer = plan
+            .begin(Cursor::new(Vec::new()))
+            .expect("section metadata is valid");
+
+        stream_matrix_q8_section(&matrix, &mut writer, "matrix")
+            .expect("matrix streams through the canonical Q8 primitive");
+        let artifact = writer
+            .finish()
+            .expect("completed section finalizes its digest")
+            .into_inner();
+        let reader = FttsqReader::open(&artifact).expect("artifact verifies");
+
+        assert_eq!(
+            reader
+                .tensor_bytes("matrix.weight", &artifact)
+                .expect("Q8 bytes resolve"),
+            &[64, 129, 32, 127, 0, 129]
+        );
+        let scales = reader
+            .tensor_bytes("matrix.weight.scales", &artifact)
+            .expect("scale bytes resolve");
+        assert_eq!(
+            scales,
+            &[
+                (2.0_f32 / 127.0).to_le_bytes(),
+                (3.0_f32 / 127.0).to_le_bytes(),
+            ]
+            .concat()
+        );
     }
 
     #[test]
