@@ -1,0 +1,599 @@
+{
+  "activation_rails": {
+    "codec_decoder_dim": 1536,
+    "codec_decoder_hidden": 512,
+    "codec_decoder_intermediate": 1024,
+    "codec_latent_dim": 1024,
+    "microdecoder_hidden": 1024,
+    "microdecoder_intermediate": 3072,
+    "talker_attention_width": 2048,
+    "talker_hidden": 1024,
+    "talker_intermediate": 3072,
+    "text_embedding_width": 2048,
+    "text_projection_out": 1024
+  },
+  "codec_receptive_field": {
+    "conv_only_left_context_frames": 11.3796875,
+    "declared_decode_upsample_rate": 1920,
+    "hop_math_agrees": true,
+    "live_transformer_kv_bytes_bf16": 2359296,
+    "live_transformer_kv_bytes_f32": 4718592,
+    "live_transformer_kv_values": 1179648,
+    "ring_buffer_note": "conv_only_left_context_frames is what the causal-conv ring buffers must hold; the transformer term is an information horizon, not storage -- the sliding window bounds live KV at `window` positions per layer",
+    "stages": [
+      {
+        "cumulative_frames": 2.0,
+        "dilation": 1,
+        "kernel": 3,
+        "left_context_frames": 2.0,
+        "rate_vs_frame": "1",
+        "stage": "pre_conv"
+      },
+      {
+        "cumulative_frames": 570.0,
+        "left_context_frames": 568.0,
+        "rate_vs_frame": "1",
+        "stage": "pre_transformer (8 x sliding window 72)"
+      },
+      {
+        "cumulative_frames": 570.0,
+        "kernel": 2,
+        "left_context_frames": 0.0,
+        "rate_vs_frame": "2",
+        "stage": "upsample.0.0 tconv",
+        "stride": 2
+      },
+      {
+        "cumulative_frames": 573.0,
+        "dilation": 1,
+        "kernel": 7,
+        "left_context_frames": 3.0,
+        "rate_vs_frame": "2",
+        "stage": "upsample.0.1 dwconv"
+      },
+      {
+        "cumulative_frames": 573.0,
+        "kernel": 2,
+        "left_context_frames": 0.0,
+        "rate_vs_frame": "4",
+        "stage": "upsample.1.0 tconv",
+        "stride": 2
+      },
+      {
+        "cumulative_frames": 574.5,
+        "dilation": 1,
+        "kernel": 7,
+        "left_context_frames": 1.5,
+        "rate_vs_frame": "4",
+        "stage": "upsample.1.1 dwconv"
+      },
+      {
+        "cumulative_frames": 576.0,
+        "dilation": 1,
+        "kernel": 7,
+        "left_context_frames": 1.5,
+        "rate_vs_frame": "4",
+        "stage": "decoder.0 conv"
+      },
+      {
+        "cumulative_frames": 576.25,
+        "kernel": 16,
+        "left_context_frames": 0.25,
+        "rate_vs_frame": "32",
+        "stage": "decoder.1 tconv",
+        "stride": 8
+      },
+      {
+        "cumulative_frames": 576.4375,
+        "dilation": 1,
+        "kernel": 7,
+        "left_context_frames": 0.1875,
+        "rate_vs_frame": "32",
+        "stage": "decoder.1.block.2.conv1"
+      },
+      {
+        "cumulative_frames": 577.0,
+        "dilation": 3,
+        "kernel": 7,
+        "left_context_frames": 0.5625,
+        "rate_vs_frame": "32",
+        "stage": "decoder.1.block.3.conv1"
+      },
+      {
+        "cumulative_frames": 578.6875,
+        "dilation": 9,
+        "kernel": 7,
+        "left_context_frames": 1.6875,
+        "rate_vs_frame": "32",
+        "stage": "decoder.1.block.4.conv1"
+      },
+      {
+        "cumulative_frames": 578.71875,
+        "kernel": 10,
+        "left_context_frames": 0.03125,
+        "rate_vs_frame": "160",
+        "stage": "decoder.2 tconv",
+        "stride": 5
+      },
+      {
+        "cumulative_frames": 578.75625,
+        "dilation": 1,
+        "kernel": 7,
+        "left_context_frames": 0.0375,
+        "rate_vs_frame": "160",
+        "stage": "decoder.2.block.2.conv1"
+      },
+      {
+        "cumulative_frames": 578.86875,
+        "dilation": 3,
+        "kernel": 7,
+        "left_context_frames": 0.1125,
+        "rate_vs_frame": "160",
+        "stage": "decoder.2.block.3.conv1"
+      },
+      {
+        "cumulative_frames": 579.20625,
+        "dilation": 9,
+        "kernel": 7,
+        "left_context_frames": 0.3375,
+        "rate_vs_frame": "160",
+        "stage": "decoder.2.block.4.conv1"
+      },
+      {
+        "cumulative_frames": 579.2125,
+        "kernel": 8,
+        "left_context_frames": 0.00625,
+        "rate_vs_frame": "640",
+        "stage": "decoder.3 tconv",
+        "stride": 4
+      },
+      {
+        "cumulative_frames": 579.221875,
+        "dilation": 1,
+        "kernel": 7,
+        "left_context_frames": 0.009375,
+        "rate_vs_frame": "640",
+        "stage": "decoder.3.block.2.conv1"
+      },
+      {
+        "cumulative_frames": 579.25,
+        "dilation": 3,
+        "kernel": 7,
+        "left_context_frames": 0.028125,
+        "rate_vs_frame": "640",
+        "stage": "decoder.3.block.3.conv1"
+      },
+      {
+        "cumulative_frames": 579.334375,
+        "dilation": 9,
+        "kernel": 7,
+        "left_context_frames": 0.084375,
+        "rate_vs_frame": "640",
+        "stage": "decoder.3.block.4.conv1"
+      },
+      {
+        "cumulative_frames": 579.3359375,
+        "kernel": 6,
+        "left_context_frames": 0.0015625,
+        "rate_vs_frame": "1920",
+        "stage": "decoder.4 tconv",
+        "stride": 3
+      },
+      {
+        "cumulative_frames": 579.3390625,
+        "dilation": 1,
+        "kernel": 7,
+        "left_context_frames": 0.003125,
+        "rate_vs_frame": "1920",
+        "stage": "decoder.4.block.2.conv1"
+      },
+      {
+        "cumulative_frames": 579.3484375,
+        "dilation": 3,
+        "kernel": 7,
+        "left_context_frames": 0.009375,
+        "rate_vs_frame": "1920",
+        "stage": "decoder.4.block.3.conv1"
+      },
+      {
+        "cumulative_frames": 579.3765625,
+        "dilation": 9,
+        "kernel": 7,
+        "left_context_frames": 0.028125,
+        "rate_vs_frame": "1920",
+        "stage": "decoder.4.block.4.conv1"
+      },
+      {
+        "cumulative_frames": 579.3796875,
+        "dilation": 1,
+        "kernel": 7,
+        "left_context_frames": 0.003125,
+        "rate_vs_frame": "1920",
+        "stage": "decoder.6 conv"
+      }
+    ],
+    "total_left_context_frames": 579.3796875,
+    "total_upsample": 1920,
+    "transformer_left_context_frames": 568.0
+  },
+  "components": {
+    "codec_decoder": {
+      "by_dtype": {
+        "F32": 457292548
+      },
+      "by_role": {
+        "decoder": {
+          "bytes": 457292548,
+          "tensor_count": 271
+        }
+      },
+      "bytes": 457292548,
+      "tensor_count": 271
+    },
+    "codec_encoder": {
+      "by_dtype": {
+        "F32": 224937216
+      },
+      "by_role": {
+        "encoder": {
+          "bytes": 224937216,
+          "tensor_count": 225
+        }
+      },
+      "bytes": 224937216,
+      "tensor_count": 225
+    },
+    "microdecoder": {
+      "by_dtype": {
+        "BF16": 283140608
+      },
+      "by_role": {
+        "body": {
+          "bytes": 157311488,
+          "tensor_count": 56
+        },
+        "per_depth_embedding": {
+          "bytes": 62914560,
+          "tensor_count": 15
+        },
+        "per_depth_head": {
+          "bytes": 62914560,
+          "tensor_count": 15
+        }
+      },
+      "bytes": 283140608,
+      "tensor_count": 86
+    },
+    "speaker_encoder": {
+      "by_dtype": {
+        "BF16": 17708672
+      },
+      "by_role": {
+        "encoder": {
+          "bytes": 17708672,
+          "tensor_count": 76
+        }
+      },
+      "bytes": 17708672,
+      "tensor_count": 76
+    },
+    "talker": {
+      "by_dtype": {
+        "BF16": 893517824
+      },
+      "by_role": {
+        "body": {
+          "bytes": 880934912,
+          "tensor_count": 309
+        },
+        "codec_embedding": {
+          "bytes": 6291456,
+          "tensor_count": 1
+        },
+        "primary_head": {
+          "bytes": 6291456,
+          "tensor_count": 1
+        }
+      },
+      "bytes": 893517824,
+      "tensor_count": 311
+    },
+    "text_path": {
+      "by_dtype": {
+        "BF16": 634918912
+      },
+      "by_role": {
+        "cold_embedding": {
+          "bytes": 622329856,
+          "tensor_count": 1
+        },
+        "projection": {
+          "bytes": 12589056,
+          "tensor_count": 4
+        }
+      },
+      "bytes": 634918912,
+      "tensor_count": 5
+    }
+  },
+  "derivation": "every numeric row is computed from TENSOR_INVENTORY.json plus the pinned configs; no value is transcribed from a prose document",
+  "frame": {
+    "code_groups": 16,
+    "frames_per_second": 12.5,
+    "residual_steps_per_frame": 15,
+    "sample_rate": 24000,
+    "samples_per_frame": 1920
+  },
+  "generator": "scripts/generate_execution_census.py",
+  "microdecoder_hot_working_set": {
+    "body_bytes": 157311488,
+    "footprint_bytes": 283812352,
+    "kv_values": 163840,
+    "note": "footprint is what must stay resident; traffic is what a naive sequential pass moves per frame because the body is reread once per residual step. These are different numbers and conflating them is the error the hot pack exists to avoid",
+    "per_depth_embedding_bytes": 62914560,
+    "per_depth_head_bytes": 62914560,
+    "q8_projection": {
+      "body_bytes": 78655744,
+      "footprint_bytes": 142242048,
+      "note": "the checkpoint stores BF16; the hot pack targets Q8, so weight rows halve while the high-precision KV and RoPE table do not. This is the number the plan's residency target is stated against",
+      "per_depth_embedding_bytes": 31457280,
+      "per_depth_head_bytes": 31457280,
+      "traffic_bytes_per_frame": 1242750720
+    },
+    "rope_table_values": 4096,
+    "stored_dtype": "BF16",
+    "traffic_bytes_per_frame": 2485501440,
+    "traffic_footprint_ratio": 8.758
+  },
+  "overflow_k_table": {
+    "binding_note": "global_binding_row spans the whole checkpoint including the enrollment-only encoders; decode_path_binding_row is the bound a per-frame kernel must actually prove. Both ship selftest rows -- the encoder one only in the enrollment build",
+    "bound": "i32",
+    "decode_path_binding_row": {
+      "i32_headroom": 9.25,
+      "k": 7168,
+      "tensor": "decoder.decoder.0.conv.weight",
+      "u8s8_worst_abs_accumulator": 232135680
+    },
+    "global_binding_row": {
+      "i32_headroom": 8.09,
+      "k": 8192,
+      "tensor": "encoder.encoder.layers.12.conv.weight",
+      "u8s8_worst_abs_accumulator": 265297920
+    },
+    "row_count": 520,
+    "rows": [
+      {
+        "i32_headroom": 8.09,
+        "k": 8192,
+        "tensor": "encoder.encoder.layers.12.conv.weight",
+        "u8s8_worst_abs_accumulator": 265297920
+      },
+      {
+        "i32_headroom": 9.25,
+        "k": 7168,
+        "tensor": "decoder.decoder.0.conv.weight",
+        "u8s8_worst_abs_accumulator": 232135680
+      },
+      {
+        "i32_headroom": 12.33,
+        "k": 5376,
+        "tensor": "decoder.decoder.1.block.2.conv1.conv.weight",
+        "u8s8_worst_abs_accumulator": 174101760
+      },
+      {
+        "i32_headroom": 12.33,
+        "k": 5376,
+        "tensor": "decoder.decoder.1.block.3.conv1.conv.weight",
+        "u8s8_worst_abs_accumulator": 174101760
+      },
+      {
+        "i32_headroom": 12.33,
+        "k": 5376,
+        "tensor": "decoder.decoder.1.block.4.conv1.conv.weight",
+        "u8s8_worst_abs_accumulator": 174101760
+      },
+      {
+        "i32_headroom": 14.39,
+        "k": 4608,
+        "tensor": "speaker_encoder.asp.tdnn.conv.weight",
+        "u8s8_worst_abs_accumulator": 149230080
+      },
+      {
+        "i32_headroom": 16.19,
+        "k": 4096,
+        "tensor": "decoder.upsample.0.1.pwconv2.weight",
+        "u8s8_worst_abs_accumulator": 132648960
+      },
+      {
+        "i32_headroom": 16.19,
+        "k": 4096,
+        "tensor": "decoder.upsample.1.1.pwconv2.weight",
+        "u8s8_worst_abs_accumulator": 132648960
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "decoder.decoder.1.block.1.conv.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "encoder.encoder.layers.14.conv.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "encoder.encoder.layers.9.conv.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "speaker_encoder.fc.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.code_predictor.model.layers.0.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.code_predictor.model.layers.1.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.code_predictor.model.layers.2.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.code_predictor.model.layers.3.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.code_predictor.model.layers.4.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.model.layers.0.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.model.layers.1.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.model.layers.10.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.model.layers.11.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.model.layers.12.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.model.layers.13.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.model.layers.14.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      }
+    ],
+    "worst_by_component": {
+      "codec_decoder": {
+        "i32_headroom": 9.25,
+        "k": 7168,
+        "tensor": "decoder.decoder.0.conv.weight",
+        "u8s8_worst_abs_accumulator": 232135680
+      },
+      "codec_encoder": {
+        "i32_headroom": 8.09,
+        "k": 8192,
+        "tensor": "encoder.encoder.layers.12.conv.weight",
+        "u8s8_worst_abs_accumulator": 265297920
+      },
+      "microdecoder": {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.code_predictor.model.layers.0.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      "speaker_encoder": {
+        "i32_headroom": 14.39,
+        "k": 4608,
+        "tensor": "speaker_encoder.asp.tdnn.conv.weight",
+        "u8s8_worst_abs_accumulator": 149230080
+      },
+      "talker": {
+        "i32_headroom": 21.59,
+        "k": 3072,
+        "tensor": "talker.model.layers.0.mlp.down_proj.weight",
+        "u8s8_worst_abs_accumulator": 99486720
+      },
+      "text_path": {
+        "i32_headroom": 32.38,
+        "k": 2048,
+        "tensor": "talker.model.text_embedding.weight",
+        "u8s8_worst_abs_accumulator": 66324480
+      }
+    },
+    "worst_case_operands": "u8 x s8"
+  },
+  "schema_version": 1,
+  "source_pin": "Qwen/Qwen3-TTS-12Hz-0.6B-Base@5d83992436eae1d760afd27aff78a71d676296fc",
+  "talker_kv": {
+    "by_duration": [
+      {
+        "frames": 125,
+        "kv_bytes_bf16": 14336000,
+        "kv_bytes_f32": 28672000,
+        "kv_values": 7168000,
+        "seconds": 10
+      },
+      {
+        "frames": 750,
+        "kv_bytes_bf16": 86016000,
+        "kv_bytes_f32": 172032000,
+        "kv_values": 43008000,
+        "seconds": 60
+      },
+      {
+        "frames": 2037,
+        "kv_bytes_bf16": 233619456,
+        "kv_bytes_f32": 467238912,
+        "kv_values": 116809728,
+        "seconds": 163
+      },
+      {
+        "frames": 3750,
+        "kv_bytes_bf16": 430080000,
+        "kv_bytes_f32": 860160000,
+        "kv_values": 215040000,
+        "seconds": 300
+      },
+      {
+        "frames": 8187,
+        "kv_bytes_bf16": 938950656,
+        "kv_bytes_f32": 1877901312,
+        "kv_values": 469475328,
+        "seconds": 655
+      }
+    ],
+    "bytes_per_token_bf16": 114688,
+    "bytes_per_token_f32": 229376,
+    "max_position_embeddings": 32768,
+    "values_per_token": 57344
+  },
+  "totals": {
+    "payload_bytes": 2511515780,
+    "tensor_count": 974
+  }
+}

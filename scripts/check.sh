@@ -121,6 +121,15 @@ fi
 stage_pass
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 1b. Execution census is regenerated from the pinned inputs, not hand-edited
+# ─────────────────────────────────────────────────────────────────────────────
+stage_start "execution-census drift guard (census matches its pinned inputs)"
+if ! python3 scripts/generate_execution_census.py --check; then
+    stage_fail "docs/truth-pack/EXECUTION_CENSUS.json is stale; run scripts/generate_execution_census.py"
+fi
+stage_pass
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 2. The validators themselves still detect violations
 # ─────────────────────────────────────────────────────────────────────────────
 stage_start "repo-validator selftest (each rule fires on a mutated fixture)"
