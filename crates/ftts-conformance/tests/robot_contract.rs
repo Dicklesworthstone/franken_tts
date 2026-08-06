@@ -135,11 +135,11 @@ fn run_error_carries_an_exit_code_and_reaches_stderr() {
 fn a_drifted_event_fails_conformance() {
     // Negative controls: the test would be worthless if it only ever saw valid input.
     let mut missing = minimal("run_complete");
-    missing
-        .as_object_mut()
-        .expect("object")
-        .remove("exit_code");
-    assert!(!validate_event(&missing).is_empty(), "missing field accepted");
+    missing.as_object_mut().expect("object").remove("exit_code");
+    assert!(
+        !validate_event(&missing).is_empty(),
+        "missing field accepted"
+    );
 
     let mut extra = minimal("health");
     extra
@@ -153,7 +153,10 @@ fn a_drifted_event_fails_conformance() {
         .as_object_mut()
         .expect("object")
         .insert("index".to_owned(), json!("three"));
-    assert!(!validate_event(&wrong_type).is_empty(), "wrong type accepted");
+    assert!(
+        !validate_event(&wrong_type).is_empty(),
+        "wrong type accepted"
+    );
 
     let mut stale = minimal("run_start");
     stale
@@ -175,7 +178,10 @@ fn an_ndjson_stream_validates_line_by_line() {
     // A stream is line-oriented by contract: a pretty-printed object spanning several lines is
     // a violation, because `while read line` is how agents consume this.
     let pretty = serde_json::to_string_pretty(&minimal("health")).expect("json");
-    assert!(!validate_ndjson(&pretty).is_empty(), "multi-line object accepted");
+    assert!(
+        !validate_ndjson(&pretty).is_empty(),
+        "multi-line object accepted"
+    );
 }
 
 #[test]
