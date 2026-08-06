@@ -490,6 +490,8 @@ def emit_stimulus_manifest(
     *,
     incumbent: str,
     candidate: str,
+    duration_bucket: float | None = None,
+    tolerance: float = 1.0,
 ) -> dict[str, Any]:
     """Build the manifest consumed by scripts/listening/run_panel.py.
 
@@ -498,15 +500,31 @@ def emit_stimulus_manifest(
     `anchor_low`. Only cells rendered for BOTH systems plus the reference are emitted: the
     listening harness requires a complete triple per cell and would otherwise silently drop
     them, turning missing renders into quiet coverage loss.
+
+    `duration_bucket` selects one reference-length bucket. A panel must hold reference length
+    CONSTANT: the listening harness identifies a cell by (speaker, text, language, regime), so
+    mixing 3s and 30s references of the same speaker would put two different stimuli in one
+    cell and confound the system contrast with a reference-length effect. Reference length is
+    a real axis — it is varied ACROSS panels, one bucket each, not within one.
     """
     by_reference = {r.reference_id: r for r in corpus.references}
+    if duration_bucket is not None:
+        by_reference = {
+            rid: ref
+            for rid, ref in by_reference.items()
+            if abs(ref.duration_seconds - duration_bucket) <= tolerance
+        }
     by_text = {t.text_id: t for t in corpus.texts}
     items: list[dict[str, Any]] = []
     complete_cells = 0
     incomplete: list[str] = []
+    claimed_cells: dict[tuple[str, str], str] = {}
 
     for key in sorted(renders):
-        reference_id, text_id, system = key.split("|")
+        parts = key.split("|")
+        if len(parts) != 3:
+            continue  # foil entries are keyed "foil|<speaker_id>" and handled below
+        reference_id, text_id, system = parts
         if system != "reference":
             continue
         reference = by_reference.get(reference_id)
@@ -522,6 +540,16 @@ def emit_stimulus_manifest(
         if not all(k in renders for k in roles.values()):
             incomplete.append(f"{reference_id}|{text_id}")
             continue
+
+        cell = (reference.speaker_id, text_id)
+        if cell in claimed_cells:
+            raise CorpusError(
+                f"cell {cell} is claimed by two references ({claimed_cells[cell]} and "
+                f"{reference_id}). Pass duration_bucket= to hold reference length constant: a "
+                "panel that mixes reference lengths confounds the system contrast with a "
+                "reference-length effect"
+            )
+        claimed_cells[cell] = reference_id
         complete_cells += 1
 
         axes = set(text.axes)
