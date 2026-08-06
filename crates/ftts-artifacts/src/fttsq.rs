@@ -49,6 +49,7 @@
 
 use std::{collections::BTreeMap, fmt};
 
+use ftts_kernels::mmap::{MappedFile, MemoryAdvice, MemoryAdviceOutcome, MemoryResidency};
 use serde_json::{Value, json};
 
 use crate::sha256::{Sha256, hex_digest, to_hex};
@@ -577,6 +578,198 @@ pub struct FttsqReader {
     tensors: Vec<TensorEntry>,
     section_index: BTreeMap<String, usize>,
     tensor_index: BTreeMap<String, usize>,
+}
+
+/// The observable result of applying one access-class policy to a mapped section.
+///
+/// An advice failure is reported but does not reject an otherwise valid artifact: `madvise` is a
+/// performance hint, never an integrity mechanism. The reader still verifies every section digest
+/// before this record is produced, so a failed hint cannot turn corruption into a delayed fault.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageAdviceOutcome {
+    /// The access class requires no syscall; the section remains lazily mapped.
+    NotRequested,
+    /// The matching native advisory request succeeded.
+    Applied,
+    /// The section has no bytes to advise.
+    SkippedEmpty,
+    /// The build/platform uses the safe owned-byte fallback instead of an unimplemented OS FFI.
+    Unsupported,
+    /// The OS rejected a performance hint; artifact correctness is unaffected.
+    Failed(String),
+}
+
+/// An observed residency count for one section at a policy boundary.
+///
+/// This records a measurement for the OQ-18 access-class evidence, not a contract with the kernel:
+/// page-cache state can change immediately after `mincore` returns, and a failed observation must
+/// never reject an otherwise valid artifact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageResidencyOutcome {
+    /// The kernel reported the number of resident pages in the section's range.
+    Measured {
+        /// Pages resident at the observation point.
+        resident_pages: usize,
+        /// Pages spanned by this section.
+        total_pages: usize,
+    },
+    /// This build has no audited residency-query implementation.
+    Unsupported,
+    /// The OS rejected the observation; artifact integrity is unaffected.
+    Failed(String),
+}
+
+/// One section's page-in decision and what the loader actually requested.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageAdviceApplication {
+    /// Artifact section name.
+    pub section: String,
+    /// The pure access-class policy selected by [`AccessClass::page_policy`].
+    pub policy: PagePolicy,
+    /// The OS hint issued for this section, if the policy calls for one.
+    pub requested: Option<MemoryAdvice>,
+    /// Residency observed immediately before the policy request.
+    pub residency_before: PageResidencyOutcome,
+    /// The outcome of that request.
+    pub outcome: PageAdviceOutcome,
+    /// Residency observed immediately after the policy request and before eager v1 digest checks.
+    pub residency_after: PageResidencyOutcome,
+}
+
+/// A fully verified `.fttsq` held as a read-only mapping (or the safe owned-byte fallback).
+///
+/// The mapping owns the bytes while [`FttsqReader`] owns only the validated directory, so tensor
+/// views borrow the artifact rather than duplicating multi-gigabyte payloads. The loader validates
+/// the directory's structure and ranges, applies bounded OS advice, then verifies every digest
+/// before returning. That ordering lets `MADV_WILLNEED` begin while validation runs; the mapping is
+/// never exposed to callers until the hardened reader has accepted every section digest.
+#[derive(Debug)]
+pub struct MappedFttsq {
+    mapping: MappedFile,
+    reader: FttsqReader,
+    page_advice: Vec<PageAdviceApplication>,
+}
+
+impl MappedFttsq {
+    /// Map, fully validate, and apply the access-class page-in plan to an artifact.
+    ///
+    /// The integrity check remains eager because the v1 format carries a digest per section rather
+    /// than a per-page Merkle tree. Consequently, this loader establishes a *policy* guarantee —
+    /// the cold embedding is never sent `MADV_WILLNEED` — and records the pre-digest residency
+    /// measurement, not a claim that opening v1 avoids every cold-section page fault. A
+    /// page-granular integrity format is required before that stronger claim can be made honestly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a named [`FttsqError`] for mapping, structural, or digest-validation failures.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, FttsqError> {
+        let path = path.as_ref();
+        let mapping = MappedFile::open(path).map_err(|error| FttsqError::Io {
+            operation: "memory-map artifact".to_owned(),
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+        // Structural validation bounds each requested range before an OS call. The subsequent
+        // digest pass is still mandatory before this mapping can be returned to a caller.
+        let reader = FttsqReader::parse_directory(mapping.as_slice())?;
+        let page_advice = apply_page_in_plan(&mapping, &reader);
+        reader.verify_digests(mapping.as_slice())?;
+        Ok(Self {
+            mapping,
+            reader,
+            page_advice,
+        })
+    }
+
+    /// The fully validated directory over this artifact.
+    #[must_use]
+    pub const fn reader(&self) -> &FttsqReader {
+        &self.reader
+    }
+
+    /// The policy application record, in the same priority order as `page_in_plan`.
+    #[must_use]
+    pub fn page_advice(&self) -> &[PageAdviceApplication] {
+        &self.page_advice
+    }
+
+    /// Borrow one tensor's logical bytes without copying the mapped payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same named lookup/range errors as [`FttsqReader::tensor_bytes`].
+    pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], FttsqError> {
+        self.reader.tensor_bytes(name, self.mapping.as_slice())
+    }
+
+    /// The artifact's mapped (or fallback-owned) byte length.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.mapping.len()
+    }
+
+    /// Whether this artifact is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.mapping.is_empty()
+    }
+}
+
+fn apply_page_in_plan(mapping: &MappedFile, reader: &FttsqReader) -> Vec<PageAdviceApplication> {
+    reader
+        .page_in_plan()
+        .into_iter()
+        .map(|(section, policy)| {
+            let requested = match policy {
+                PagePolicy::Resident => Some(MemoryAdvice::WillNeed),
+                PagePolicy::LazyRowGranular => Some(MemoryAdvice::Random),
+                PagePolicy::OnDemand => None,
+            };
+
+            // This is intentionally a runtime assertion rather than a documentation promise. A
+            // future policy refactor must fail immediately if it ever routes the 622 MB cold text
+            // embedding through `MADV_WILLNEED`.
+            assert!(
+                policy.may_prefetch() || requested != Some(MemoryAdvice::WillNeed),
+                "a non-prefetch policy must never issue MADV_WILLNEED"
+            );
+
+            let residency_before = observe_residency(mapping, section.offset, section.length);
+            let outcome = match requested {
+                Some(advice) => match mapping.advise(section.offset, section.length, advice) {
+                    Ok(MemoryAdviceOutcome::Applied) => PageAdviceOutcome::Applied,
+                    Ok(MemoryAdviceOutcome::SkippedEmpty) => PageAdviceOutcome::SkippedEmpty,
+                    Ok(MemoryAdviceOutcome::Unsupported) => PageAdviceOutcome::Unsupported,
+                    Err(error) => PageAdviceOutcome::Failed(error.to_string()),
+                },
+                None => PageAdviceOutcome::NotRequested,
+            };
+            let residency_after = observe_residency(mapping, section.offset, section.length);
+
+            PageAdviceApplication {
+                section: section.name.clone(),
+                policy,
+                requested,
+                residency_before,
+                outcome,
+                residency_after,
+            }
+        })
+        .collect()
+}
+
+fn observe_residency(mapping: &MappedFile, offset: u64, length: u64) -> PageResidencyOutcome {
+    match mapping.resident_pages(offset, length) {
+        Ok(MemoryResidency::Measured {
+            resident_pages,
+            total_pages,
+        }) => PageResidencyOutcome::Measured {
+            resident_pages,
+            total_pages,
+        },
+        Ok(MemoryResidency::Unsupported) => PageResidencyOutcome::Unsupported,
+        Err(error) => PageResidencyOutcome::Failed(error.to_string()),
+    }
 }
 
 impl FttsqReader {
@@ -2053,6 +2246,11 @@ mod tests {
         FttsqWriter::new("qwen3-tts-12hz-0.6b-base", "d".repeat(64))
             .license_notice(NOTICE)
             .section("m", AccessClass::HotRecurrentMicrodecoder, vec![3_u8; 128])
+            .section(
+                "embedding",
+                AccessClass::ColdTextEmbedding,
+                vec![9_u8; 8192],
+            )
             .tensor(TensorEntry {
                 name: "m.w".to_owned(),
                 section: "m".to_owned(),
@@ -2060,6 +2258,15 @@ mod tests {
                 shape: vec![128],
                 offset: 0,
                 length: 128,
+                scales: None,
+            })
+            .tensor(TensorEntry {
+                name: "embedding.one_row".to_owned(),
+                section: "embedding".to_owned(),
+                dtype: StoredDtype::Q8,
+                shape: vec![32],
+                offset: 4096,
+                length: 32,
                 scales: None,
             })
             .write_to_path(&path)
@@ -2070,6 +2277,61 @@ mod tests {
         assert_eq!(
             reader.tensor_bytes("m.w", &bytes).expect("resolves"),
             &vec![3_u8; 128][..]
+        );
+
+        let mapped = MappedFttsq::open(&path).expect("mapped artifact validates");
+        assert_eq!(mapped.len(), bytes.len());
+        assert_eq!(
+            mapped
+                .tensor_bytes("embedding.one_row")
+                .expect("row range resolves without copying the section"),
+            &vec![9_u8; 32][..]
+        );
+
+        let micro = mapped
+            .page_advice()
+            .iter()
+            .find(|application| application.section == "m")
+            .expect("microdecoder application is recorded");
+        assert_eq!(micro.policy, PagePolicy::Resident);
+        assert_eq!(micro.requested, Some(MemoryAdvice::WillNeed));
+        assert!(
+            !matches!(micro.outcome, PageAdviceOutcome::Failed(_)),
+            "a valid mapped microdecoder section must receive a usable advice result: {micro:?}"
+        );
+
+        let embedding = mapped
+            .page_advice()
+            .iter()
+            .find(|application| application.section == "embedding")
+            .expect("embedding application is recorded");
+        assert_eq!(embedding.policy, PagePolicy::LazyRowGranular);
+        assert_eq!(embedding.requested, Some(MemoryAdvice::Random));
+        assert!(
+            !embedding.policy.may_prefetch(),
+            "the cold embedding policy must make wholesale prefetch impossible"
+        );
+        for observation in [&embedding.residency_before, &embedding.residency_after] {
+            match observation {
+                PageResidencyOutcome::Measured {
+                    resident_pages,
+                    total_pages,
+                } => assert!(
+                    resident_pages <= total_pages,
+                    "the OQ-18 residency measurement exceeded the section's page span"
+                ),
+                PageResidencyOutcome::Unsupported => {}
+                PageResidencyOutcome::Failed(detail) => {
+                    panic!("the cold embedding residency measurement failed: {detail}")
+                }
+            }
+        }
+        assert!(
+            mapped.page_advice().iter().all(|application| {
+                application.policy.may_prefetch()
+                    || application.requested != Some(MemoryAdvice::WillNeed)
+            }),
+            "a non-prefetch section was routed to MADV_WILLNEED"
         );
 
         // The temporary must not survive a successful write.
