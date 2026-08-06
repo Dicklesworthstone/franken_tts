@@ -5,6 +5,13 @@
 //! Every future unsafe kernel must be feature-gated, carry a `SAFETY:` comment,
 //! and retain a bit-identical safe scalar fallback.
 //!
+//! ## Frankentorch boundary
+//!
+//! This Phase-0 scaffold intentionally has no frankentorch dependency: it does
+//! not yet expose a kernel facade that consumes one. Add each dependency only
+//! alongside a real facade API and its scalar fallback; do not predeclare a
+//! machine-local or otherwise unused substrate dependency.
+//!
 //! # Permanent integer-kernel law
 //!
 //! A route cannot become dispatchable until [`selftest::run_selftest`] proves its all-extreme

@@ -18,9 +18,6 @@ repository = "https://github.com/Dicklesworthstone/franken_tts"
 
 [workspace.dependencies]
 asupersync = { path = "../asupersync", default-features = false }
-ft-core = { path = "/dp/frankentorch/crates/ft-core" }
-ft-kernel-cpu = { path = "/dp/frankentorch/crates/ft-kernel-cpu" }
-ft-serialize = { path = "/dp/frankentorch/crates/ft-serialize" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
