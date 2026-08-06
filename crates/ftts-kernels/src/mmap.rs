@@ -228,7 +228,7 @@ impl MappedFile {
 
         #[cfg(not(all(feature = "native-mmap", unix)))]
         {
-            let _ = offset;
+            let _ = (offset, length);
             Ok(MemoryResidency::Unsupported)
         }
     }

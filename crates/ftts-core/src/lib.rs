@@ -612,6 +612,11 @@ impl TtsEngine {
         observer: &dyn SynthesisObserver,
     ) -> Result<SynthesisResult, EngineError> {
         let _admission = self.acquire_synthesis_admission(observer)?;
+        cancellation.checkpoint().inspect_err(|_| {
+            observer.on_event(SynthesisEvent::Health {
+                event: HealthEvent::Cancelled,
+            });
+        })?;
         let prepared = text_preparer
             .prepare(&request.text, &request.normalization_options)
             .map_err(EngineError::TextPreparation)?;
