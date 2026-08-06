@@ -46,6 +46,9 @@ PROLIFERATION_RE = re.compile(
 
 EXPECTED_BINS = {"ftts": "src/bin/ftts.rs", "franken_tts": "src/main.rs"}
 SHIM_BODY = "fn main() -> std::process::ExitCode {\n    ftts_cli::cli_main()\n}\n"
+DEMO_CONTRACT_PREFIX = "Demo/"
+DEMO_CONTRACT_TEST = Path("crates/ftts-conformance/tests/model_gate_demo.rs")
+DEMO_CONTRACT_DOCS = Path("crates/ftts-conformance/src/lib.rs")
 
 SKIP_DIRS = {"target", ".git", "node_modules", "__pycache__", ".beads"}
 
@@ -303,6 +306,42 @@ def check_file_proliferation(report: Report, manifests: dict[str, Path], root: P
                 )
 
 
+def check_demo_contract_namespace(report: Report, manifests: dict[str, Path], root: Path) -> None:
+    """Keep illustrative receipts from hiding a production ladder skip.
+
+    `scripts/summarize_receipts.py` intentionally classifies Demo/* receipts separately so the
+    convention demonstration does not keep the gate permanently yellow. That exemption is safe
+    only when the namespace remains confined to its demonstration test and its documented
+    examples; a production contract typo would otherwise be silently excluded from the gate.
+    """
+    report.checked.append("demo-contract-namespace")
+    for manifest in manifests.values():
+        for source in rust_sources(manifest.parent):
+            source_rel = Path(rel(source, root))
+            if source_rel == DEMO_CONTRACT_TEST:
+                continue
+            in_doc_block = False
+            for lineno, line in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
+                stripped = line.lstrip()
+                is_rustdoc = stripped.startswith("//!") or stripped.startswith("///")
+                if source_rel == DEMO_CONTRACT_DOCS and stripped.startswith("/**"):
+                    in_doc_block = True
+                    is_rustdoc = True
+                elif in_doc_block:
+                    is_rustdoc = True
+                if DEMO_CONTRACT_PREFIX in line and not (
+                    source_rel == DEMO_CONTRACT_DOCS and is_rustdoc
+                ):
+                    report.fail(
+                        "demo-contract-namespace",
+                        f"{source_rel}:{lineno}",
+                        "`Demo/` contracts are reserved for model_gate_demo.rs and Rustdoc "
+                        "examples in ftts-conformance/src/lib.rs",
+                    )
+                if in_doc_block and "*/" in line:
+                    in_doc_block = False
+
+
 def check_workspace_membership(report: Report, workspace: dict, manifests: dict[str, Path]) -> None:
     """Every crate directory is a declared member — a virtual root discovers nothing on its own."""
     report.checked.append("workspace-membership")
@@ -343,6 +382,7 @@ def run(root: Path = REPO_ROOT) -> Report:
     check_banned_dependencies(report, manifests, root)
     check_cli_shims(report, manifests, root)
     check_file_proliferation(report, manifests, root)
+    check_demo_contract_namespace(report, manifests, root)
     return report
 
 
@@ -355,7 +395,7 @@ def run(root: Path = REPO_ROOT) -> Report:
 #  reports it. If a future refactor silently defangs a rule, this goes red.
 
 _FIXTURE_WORKSPACE = """[workspace]
-members = ["crates/ftts-core", "crates/ftts-kernels", "crates/ftts-cli"]
+members = ["crates/ftts-core", "crates/ftts-kernels", "crates/ftts-cli", "crates/ftts-conformance"]
 resolver = "3"
 
 [workspace.package]
@@ -401,6 +441,11 @@ def _write_fixture(root: Path) -> None:
             'edition.workspace = true\n\n[dependencies]\nft-core = { path = "/x" }\n',
         ),
         ("ftts-cli", _FIXTURE_CLI_MANIFEST),
+        (
+            "ftts-conformance",
+            '[package]\nname = "ftts-conformance"\nversion.workspace = true\n'
+            'edition.workspace = true\n\n[lints]\nworkspace = true\n',
+        ),
     ):
         crate_dir = root / "crates" / crate
         (crate_dir / "src").mkdir(parents=True, exist_ok=True)
@@ -410,6 +455,14 @@ def _write_fixture(root: Path) -> None:
     (cli_src / "bin").mkdir(parents=True, exist_ok=True)
     (cli_src / "main.rs").write_text(SHIM_BODY, encoding="utf-8")
     (cli_src / "bin" / "ftts.rs").write_text(SHIM_BODY, encoding="utf-8")
+    conformance = root / "crates" / "ftts-conformance"
+    (conformance / "tests").mkdir(parents=True, exist_ok=True)
+    (conformance / "src" / "lib.rs").write_text(
+        '/// `Demo/` is reserved for this documentation example.\n', encoding="utf-8"
+    )
+    (conformance / "tests" / "model_gate_demo.rs").write_text(
+        'const CONTRACT: &str = "Demo/ModelGate";\n', encoding="utf-8"
+    )
 
 
 def _append(path: Path, text: str) -> None:
@@ -488,6 +541,14 @@ _MUTATIONS: list[tuple[str, str, object]] = [
         "a forked source file appears",
         "no-file-proliferation",
         lambda r: (r / "crates/ftts-core/src/decoder_v2.rs").write_text("//! nope\n", encoding="utf-8"),
+    ),
+    (
+        "a production receipt uses the reserved Demo/ namespace",
+        "demo-contract-namespace",
+        lambda r: _append(
+            r / "crates/ftts-core/src/lib.rs",
+            'pub const INVALID_CONTRACT: &str = "Demo/Production";\n',
+        ),
     ),
     (
         "a crate directory is not a workspace member",
