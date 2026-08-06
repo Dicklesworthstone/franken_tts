@@ -258,16 +258,16 @@ macro_rules! assert_close {
         tolerance = $tolerance:expr,
         source = $source:expr $(,)?
     ) => {
-        $crate::macro_support::assert_close(
-            $crate::test_name!(),
-            $crate::macro_support::IntoContract::into_contract($contract),
-            $seam,
-            $expected,
-            $actual,
-            $tolerance,
-            $source,
-            ::core::option::Option::None,
-        )
+        $crate::macro_support::assert_close($crate::macro_support::CloseAssertion {
+            test: $crate::test_name!(),
+            contract: $crate::macro_support::IntoContract::into_contract($contract),
+            seam: $seam,
+            expected: $expected,
+            actual: $actual,
+            tolerance: $tolerance,
+            tolerance_source: $source,
+            shape: ::core::option::Option::None,
+        })
     };
     (
         contract = $contract:expr,
@@ -278,16 +278,16 @@ macro_rules! assert_close {
         source = $source:expr,
         shape = $shape:expr $(,)?
     ) => {
-        $crate::macro_support::assert_close(
-            $crate::test_name!(),
-            $crate::macro_support::IntoContract::into_contract($contract),
-            $seam,
-            $expected,
-            $actual,
-            $tolerance,
-            $source,
-            ::core::option::Option::Some($shape),
-        )
+        $crate::macro_support::assert_close($crate::macro_support::CloseAssertion {
+            test: $crate::test_name!(),
+            contract: $crate::macro_support::IntoContract::into_contract($contract),
+            seam: $seam,
+            expected: $expected,
+            actual: $actual,
+            tolerance: $tolerance,
+            tolerance_source: $source,
+            shape: ::core::option::Option::Some($shape),
+        })
     };
 }
 
@@ -373,21 +373,46 @@ pub mod macro_support {
         }
     }
 
+    /// Everything [`assert_close`] needs, as named fields.
+    ///
+    /// A struct rather than a parameter list: the macro fills all eight, and eight positional
+    /// arguments of which three are `&str` is a call site where a transposed pair (seam vs
+    /// tolerance source) compiles cleanly and lies in the receipt.
+    pub struct CloseAssertion<'a> {
+        /// The test emitting the receipt, from [`crate::test_name!`].
+        pub test: &'a str,
+        /// The ladder rung this check belongs to, when it is one.
+        pub contract: Option<&'a str>,
+        /// The seam under test, e.g. `talker.layer17.attn_out`.
+        pub seam: &'a str,
+        /// Reference values, from the oracle dump.
+        pub expected: &'a [f32],
+        /// Values produced by the implementation under test.
+        pub actual: &'a [f32],
+        /// The absolute tolerance applied elementwise.
+        pub tolerance: f64,
+        /// The artifact that justifies `tolerance` — never a hand-picked constant.
+        pub tolerance_source: &'a str,
+        /// Row-major shape, for reporting the first divergence as coordinates.
+        pub shape: Option<&'a [usize]>,
+    }
+
     /// Backs [`crate::assert_close!`].
     ///
     /// # Panics
     ///
     /// Panics with the self-localizing report when the comparison does not hold.
-    pub fn assert_close(
-        test: &str,
-        contract: Option<&str>,
-        seam: &str,
-        expected: &[f32],
-        actual: &[f32],
-        tolerance: f64,
-        tolerance_source: &str,
-        shape: Option<&[usize]>,
-    ) -> Comparison {
+    pub fn assert_close(assertion: CloseAssertion<'_>) -> Comparison {
+        let CloseAssertion {
+            test,
+            contract,
+            seam,
+            expected,
+            actual,
+            tolerance,
+            tolerance_source,
+            shape,
+        } = assertion;
         let comparison = compare_f32(expected, actual, tolerance);
         let outcome = if comparison.holds() {
             Outcome::Passed

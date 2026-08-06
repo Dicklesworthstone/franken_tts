@@ -447,7 +447,7 @@ mod tests {
         let contents = fs::read_to_string(&path).expect("sink is readable");
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 2, "append must not truncate: {contents}");
-        for line in lines {
+        for line in &lines {
             let parsed: Value = serde_json::from_str(line).expect("every line is one JSON object");
             assert_eq!(parsed["event"], "contract_check");
         }
