@@ -68,6 +68,27 @@ entry that will not notice when the divergence returns.
 The convention (and the harness macros implementing it) is defined once, in the `ftts-conformance`
 crate docs — `cargo doc -p ftts-conformance --open`. Bead `frankentts-p0-model-gated-77h`.
 
+### Fuzzing
+
+The normal gate does not run an unbounded fuzzer. `fuzz/` is an isolated `cargo-fuzz` workspace
+with committed corpus seeds, so a nightly/deep runner can exercise the hostile-input boundary
+without turning every pull request into a nondeterministic time-budget decision:
+
+```bash
+cargo fuzz run safetensors_parser -- -max_total_time=300
+cargo fuzz run fttsq_parser -- -max_total_time=300
+cargo fuzz run tokenizer_metadata -- -max_total_time=300
+cargo fuzz run tokenizer_text -- -max_total_time=300
+```
+
+Run those commands from `fuzz/`; a crash artifact is retained under `fuzz/artifacts/` (ignored
+from git), minimized with `cargo fuzz tmin <target> <artifact>`, then promoted to the target's
+committed `fuzz/corpus/<target>/` directory with a regression test before the parser fix lands.
+The current registered targets cover the implemented safetensors and `.fttsq` readers plus
+tokenizer metadata and lossy UTF-8 text conversion. `.fttspack`, `.ftvoice`, `.ftvoice-cache`,
+WAV/FLAC, and codec chunk scheduling have no parser/runtime yet, so there are deliberately no
+no-op targets for them; each must add a real target and seed with its implementation bead.
+
 ### The multiple-build-targets rule
 
 `ftts` and `franken_tts` are two thin shims over one `cli_main()`, and doctrine #9 requires each

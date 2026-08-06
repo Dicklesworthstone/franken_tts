@@ -1,4 +1,7 @@
 /target
+/fuzz/target
+/fuzz/artifacts
+/fuzz/Cargo.lock
 Cargo.lock.orig
 *.fttsq
 *.fttspack

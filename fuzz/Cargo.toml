@@ -1,0 +1,44 @@
+[package]
+name = "frankentts-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ftts-artifacts = { path = "../crates/ftts-artifacts" }
+ftts-model-qwen = { path = "../crates/ftts-model-qwen" }
+
+[[bin]]
+name = "safetensors_parser"
+path = "fuzz_targets/safetensors_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fttsq_parser"
+path = "fuzz_targets/fttsq_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokenizer_metadata"
+path = "fuzz_targets/tokenizer_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokenizer_text"
+path = "fuzz_targets/tokenizer_text.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
