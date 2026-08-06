@@ -56,6 +56,34 @@ pub enum FttsError {
 }
 
 impl FttsError {
+    /// A stable, actionable next step for this failure class.
+    ///
+    /// Kept separate from the message so an agent can branch on remediation without parsing prose,
+    /// and so the message stays free to name the specific offending path or value.
+    pub const fn remediation(&self) -> &'static str {
+        match self {
+            Self::Generic(_) => {
+                "see the message; if it names an unimplemented phase, the capability is not built yet"
+            }
+            Self::Usage(_) => "re-run with --help to see the accepted argument shapes",
+            Self::ModelNotFound(_) => {
+                "pass --model PATH or set FTTS_MODEL_DIR; `ftts robot health` lists every directory searched"
+            }
+            Self::Input(_) => {
+                "check the input text or file encoding; input must be non-empty UTF-8"
+            }
+            Self::BudgetTimeout(_) => {
+                "raise the budget, shorten the text, or choose a faster profile"
+            }
+            Self::ArtifactFormat(_) => {
+                "regenerate the artifact with a matching ftts version; `ftts robot health` reports the expected format"
+            }
+            Self::EnrollmentQualityRefusal(_) => {
+                "supply a cleaner reference, or pass --force to accept the warned-about quality"
+            }
+        }
+    }
+
     pub const fn exit_code(&self) -> FttsExitCode {
         match self {
             Self::Generic(_) => FttsExitCode::Generic,

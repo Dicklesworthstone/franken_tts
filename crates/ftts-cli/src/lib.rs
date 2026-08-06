@@ -495,19 +495,121 @@ fn run_say(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<(), FttsError> {
-    let text = read_text(args, stdin)?;
+    let run = robot::RunContext::generate();
+    // `--stream raw` puts PCM on stdout, so events move to stderr. One contract, chosen once here
+    // so no later emission can pick the other stream and interleave NDJSON with audio bytes.
+    let raw_stream = args.stream == Some(StreamMode::Raw);
+
+    let outcome = run_say_events(cli, args, environment, stdin, &run, &mut |event| {
+        if raw_stream {
+            write_json_line(stderr, event)
+        } else {
+            write_json_line(stdout, event)
+        }
+    });
+
+    if let Err(error) = &outcome {
+        // The error is reported on the machine contract, not only as a human line: run_error is a
+        // stderr event by definition (see the catalogue), so it goes to stderr on both stream
+        // shapes.
+        let mut event = run.event(robot::EventType::RunError);
+        event.insert("exit_code".to_owned(), json!(error.exit_code().as_u8()));
+        event.insert("kind".to_owned(), json!(error.exit_code().description()));
+        event.insert("message".to_owned(), json!(error.to_string()));
+        event.insert("remediation".to_owned(), json!(error.remediation()));
+        event.insert("elapsed_ms".to_owned(), json!(run.elapsed_ms()));
+        write_json_line(stderr, &Value::Object(event))?;
+    }
+
+    outcome
+}
+
+/// Emit one `stage` event and advance the run's stage counter.
+fn emit_stage(
+    run: &robot::RunContext,
+    emit: &mut dyn FnMut(&Value) -> Result<(), FttsError>,
+    name: &str,
+    state: &str,
+    seq: &mut u64,
+) -> Result<(), FttsError> {
+    let mut event = run.event(robot::EventType::Stage);
+    event.insert("name".to_owned(), json!(name));
+    event.insert("seq".to_owned(), json!(*seq));
+    event.insert("state".to_owned(), json!(state));
+    event.insert("elapsed_ms".to_owned(), json!(run.elapsed_ms()));
+    event.insert("budget_ms".to_owned(), Value::Null);
+    *seq += 1;
+    emit(&Value::Object(event))
+}
+
+/// The `say` pipeline proper, emitting its lifecycle through `emit`.
+///
+/// Split out so the caller owns stream selection and the single `run_error` emission point: a
+/// pipeline that emitted its own errors would have to know which stream it was on at every `?`.
+fn run_say_events(
+    cli: &Cli,
+    args: &SayArgs,
+    environment: &Environment,
+    stdin: &mut dyn Read,
+    run: &robot::RunContext,
+    emit: &mut dyn FnMut(&Value) -> Result<(), FttsError>,
+) -> Result<(), FttsError> {
     let settings = EffectiveSettings::resolve(cli, environment)?;
+
+    let mut start = run.event(robot::EventType::RunStart);
+    start.insert("command".to_owned(), json!("say"));
+    start.insert("profile".to_owned(), json!(settings.profile.as_str()));
+    start.insert(
+        "packet_frames".to_owned(),
+        json!(settings.packet_frames.as_str()),
+    );
+    start.insert("math_mode".to_owned(), json!(settings.math_mode.as_str()));
+    start.insert("stateless".to_owned(), json!(true));
+    start.insert("seed".to_owned(), json!(cli.seed));
+    start.insert("model".to_owned(), json!(args.model.as_deref()));
+    start.insert(
+        "voice".to_owned(),
+        json!(args.voice.as_ref().map(|path| path.display().to_string())),
+    );
+    emit(&Value::Object(start))?;
+
+    let mut seq = 0u64;
+
+    emit_stage(run, emit, "resolve", "begin", &mut seq)?;
+    let text = read_text(args, stdin)?;
     let model = resolve_model(args.model.as_deref(), environment)?;
     let voice = resolve_optional_file(args.voice.as_deref(), "voice pack")?;
+    emit_stage(run, emit, "resolve", "end", &mut seq)?;
+
     let request = SynthesisRequest::new(text)
         .with_normalization_options(settings.normalization_options())
         .with_normalization_trace(cli.trace.is_some());
+
+    // Privacy-safe by construction: shape and rule names only, never the text itself. The CLI
+    // promises no persisted synthesis history, and an event stream an agent may log is exactly
+    // where that promise would leak if this carried the input.
+    let mut prepared = run.event(robot::EventType::TextPrepared);
+    prepared.insert("normalize".to_owned(), json!(settings.normalize.as_str()));
+    prepared.insert(
+        "unicode_version".to_owned(),
+        json!(ftts_model_qwen::tokenizer::unicode_version()),
+    );
+    prepared.insert("char_count".to_owned(), json!(request.text.chars().count()));
+    prepared.insert(
+        "trace_requested".to_owned(),
+        json!(request.trace_normalization),
+    );
+    emit(&Value::Object(prepared))?;
+
+    emit_stage(run, emit, "admission", "begin", &mut seq)?;
     let admission = admission_plan(&request.text, &settings)?;
+    emit_stage(run, emit, "admission", "end", &mut seq)?;
 
     if args.check {
         let event = json!({
             "schema_version": ROBOT_SCHEMA_VERSION,
             "event": "check_complete",
+            "run_id": run.run_id(),
             "model": model,
             "voice": voice,
             "profile": settings.profile.as_str(),
@@ -521,11 +623,13 @@ fn run_say(
             "output": args.output.as_ref().map(|path| path.display().to_string()),
             "admission": admission,
         });
-        if args.stream == Some(StreamMode::Raw) {
-            write_json_line(stderr, &event)?;
-        } else {
-            write_json_line(stdout, &event)?;
-        }
+        emit(&event)?;
+        let mut complete = run.event(robot::EventType::RunComplete);
+        complete.insert("exit_code".to_owned(), json!(FttsExitCode::Success.as_u8()));
+        complete.insert("elapsed_ms".to_owned(), json!(run.elapsed_ms()));
+        complete.insert("frames".to_owned(), json!(0));
+        complete.insert("audio_bytes".to_owned(), json!(0));
+        emit(&Value::Object(complete))?;
         return Ok(());
     }
 
@@ -821,23 +925,6 @@ fn run_doctor(
     }
 }
 
-fn exit_codes_json() -> BTreeMap<String, String> {
-    [
-        FttsExitCode::Success,
-        FttsExitCode::Generic,
-        FttsExitCode::Usage,
-        FttsExitCode::ModelNotFound,
-        FttsExitCode::Input,
-        FttsExitCode::BudgetTimeout,
-        FttsExitCode::Cancelled,
-        FttsExitCode::ArtifactFormat,
-        FttsExitCode::EnrollmentQualityRefusal,
-    ]
-    .into_iter()
-    .map(|code| (code.as_u8().to_string(), code.description().to_owned()))
-    .collect()
-}
-
 fn write_json_line(writer: &mut dyn Write, value: &Value) -> Result<(), FttsError> {
     serde_json::to_writer(&mut *writer, value)
         .map_err(|error| FttsError::Generic(format!("cannot serialize CLI JSON: {error}")))?;
@@ -1044,10 +1131,105 @@ mod tests {
         .expect("check path");
 
         assert!(stderr.is_empty());
-        let event: Value = serde_json::from_slice(&stdout).expect("versioned JSON event");
-        assert_eq!(event["schema_version"], ROBOT_SCHEMA_VERSION);
-        assert_eq!(event["event"], "check_complete");
-        assert_eq!(event["admission"]["status"], "scaffold_accepted");
-        assert_eq!(event["normalization_trace_requested"], false);
+        let text = String::from_utf8(stdout).expect("utf-8 events");
+
+        // The whole emitted stream must conform, not just the event this test cares about.
+        assert!(
+            robot::validate_ndjson(&text).is_empty(),
+            "emitted stream violates the contract: {:?}",
+            robot::validate_ndjson(&text)
+        );
+
+        let events: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+            .collect();
+        let names: Vec<&str> = events
+            .iter()
+            .map(|event| event["event"].as_str().expect("event name"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "run_start",
+                "stage",
+                "stage",
+                "text_prepared",
+                "stage",
+                "stage",
+                "check_complete",
+                "run_complete",
+            ],
+            "the skeleton lifecycle must flow end-to-end on the empty pipeline"
+        );
+
+        // Every event in a run repeats the same run_id, which is what lets an agent stitch a run
+        // together across the two streams.
+        let run_id = events[0]["run_id"]
+            .as_str()
+            .expect("run_start carries run_id");
+        assert!(!run_id.is_empty());
+        assert!(events.iter().all(|event| event["run_id"] == run_id));
+        assert!(
+            events
+                .iter()
+                .all(|event| event["schema_version"] == ROBOT_SCHEMA_VERSION)
+        );
+
+        // Stage sequence numbers are dense and ordered, so a consumer can detect a dropped event.
+        let seqs: Vec<u64> = events
+            .iter()
+            .filter(|event| event["event"] == "stage")
+            .map(|event| event["seq"].as_u64().expect("seq"))
+            .collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3]);
+
+        let check = &events[6];
+        assert_eq!(check["admission"]["status"], "scaffold_accepted");
+        assert_eq!(check["normalization_trace_requested"], false);
+
+        // text_prepared reports shape and provenance only; the input text must never appear.
+        let prepared = &events[3];
+        assert_eq!(prepared["char_count"], "checked text".chars().count());
+        assert!(prepared["unicode_version"].is_string());
+        assert!(
+            !text.contains("checked text"),
+            "the event stream must not carry the user's text"
+        );
+
+        assert_eq!(events[7]["exit_code"], 0);
+    }
+
+    #[test]
+    fn a_newline_inside_a_field_cannot_break_ndjson_framing() {
+        // The entire contract rests on one JSON object per line. serde_json escapes control
+        // characters, so a message containing a newline stays one line and the newline survives as
+        // data -- but nothing pinned that until now, and a hand-rolled serializer or a raw write
+        // path would silently break every downstream parser.
+        let run = robot::RunContext::with_id("r-test");
+        let error = FttsError::Generic("first\nsecond".to_owned());
+        let mut event = run.event(robot::EventType::RunError);
+        event.insert("exit_code".to_owned(), json!(error.exit_code().as_u8()));
+        event.insert("kind".to_owned(), json!(error.exit_code().description()));
+        event.insert("message".to_owned(), json!(error.to_string()));
+        event.insert("remediation".to_owned(), json!(error.remediation()));
+        event.insert("elapsed_ms".to_owned(), json!(0));
+        let value = Value::Object(event);
+
+        let mut buffer = Vec::new();
+        write_json_line(&mut buffer, &value).expect("serializes");
+        let text = String::from_utf8(buffer).expect("utf-8");
+
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "framing broken by an embedded newline"
+        );
+        assert!(robot::validate_ndjson(&text).is_empty());
+        let parsed: Value = serde_json::from_str(text.trim_end()).expect("still one object");
+        assert!(
+            parsed["message"].as_str().expect("message").contains('\n'),
+            "the newline must survive as data, not be stripped"
+        );
     }
 }

@@ -802,6 +802,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ftts-core",
+ "ftts-model-qwen",
  "serde_json",
 ]
 

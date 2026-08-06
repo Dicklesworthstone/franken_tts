@@ -457,7 +457,12 @@ fn flush_bytes(output: &mut String, bytes: &mut Vec<u8>) {
     }
 }
 
-fn unicode_version() -> String {
+/// The Unicode version this build normalizes against.
+///
+/// Exposed so the robot `text_prepared` event can report normalization provenance without the
+/// event carrying any of the user's text.
+#[must_use]
+pub fn unicode_version() -> String {
     let (major, minor, patch) = unicode_normalization::UNICODE_VERSION;
     format!("{major}.{minor}.{patch}")
 }

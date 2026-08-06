@@ -441,6 +441,44 @@ pub const EVENTS: &[EventSpec] = &[
         ],
     },
     EventSpec {
+        name: "text_prepared",
+        kind: Kind::Stream,
+        stream: Stream::Events,
+        summary: "text normalization finished; reports SHAPE and PROVENANCE only, never the text",
+        fields: &[
+            FieldSpec {
+                name: "run_id",
+                ty: "string",
+                required: true,
+                summary: "owning run",
+            },
+            FieldSpec {
+                name: "normalize",
+                ty: "string",
+                required: true,
+                summary: "normalization mode in force",
+            },
+            FieldSpec {
+                name: "unicode_version",
+                ty: "string",
+                required: true,
+                summary: "Unicode version this build normalizes against",
+            },
+            FieldSpec {
+                name: "char_count",
+                ty: "u64",
+                required: true,
+                summary: "input length in characters; a size, never the content",
+            },
+            FieldSpec {
+                name: "trace_requested",
+                ty: "bool",
+                required: true,
+                summary: "whether a normalization trace was requested",
+            },
+        ],
+    },
+    EventSpec {
         name: "check_complete",
         kind: Kind::Reply,
         stream: Stream::Events,
@@ -677,6 +715,7 @@ pub enum EventType {
     RunComplete,
     RunError,
     CheckComplete,
+    TextPrepared,
     Backends,
     Selftest,
     VoiceInspect,
@@ -693,6 +732,7 @@ impl EventType {
             Self::RunComplete => "run_complete",
             Self::RunError => "run_error",
             Self::CheckComplete => "check_complete",
+            Self::TextPrepared => "text_prepared",
             Self::Backends => "backends",
             Self::Selftest => "selftest",
             Self::VoiceInspect => "voice_inspect",
@@ -710,6 +750,59 @@ impl EventType {
     /// The catalogue entry for this event.
     pub fn spec(self) -> &'static EventSpec {
         event_spec(self.name()).expect("every EventType variant is catalogued")
+    }
+}
+
+/// Run-scoped emitter state: the shared `run_id` and the run's own clock.
+///
+/// Every event in a run repeats its `run_id`, and the lifecycle events carry `elapsed_ms` measured
+/// from the same origin, so an agent can stitch a run together from either stream without guessing.
+/// The id is derived from the process id and a monotonic start stamp: unique per run, cheap, and
+/// carrying nothing about the user's text or filesystem — the CLI is stateless by default and the
+/// run id must not become a back door for run history.
+#[derive(Debug)]
+pub struct RunContext {
+    run_id: String,
+    started: std::time::Instant,
+}
+
+impl RunContext {
+    /// Adopt an explicit id — used by tests so assertions are not clock-dependent.
+    #[must_use]
+    pub fn with_id(run_id: impl Into<String>) -> Self {
+        Self {
+            run_id: run_id.into(),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Derive a fresh id for this process invocation.
+    #[must_use]
+    pub fn generate() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos());
+        Self::with_id(format!("r{:x}{:08x}", std::process::id(), nanos))
+    }
+
+    /// The id every event in this run repeats.
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// Milliseconds since the run began.
+    #[must_use]
+    pub fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// An object carrying the common fields plus this run's id.
+    #[must_use]
+    pub fn event(&self, event_type: EventType) -> serde_json::Map<String, Value> {
+        let mut object = event_type.event();
+        object.insert("run_id".to_owned(), json!(self.run_id));
+        object
     }
 }
 
@@ -1014,6 +1107,7 @@ mod tests {
             EventType::RunComplete,
             EventType::RunError,
             EventType::CheckComplete,
+            EventType::TextPrepared,
             EventType::Backends,
             EventType::Selftest,
             EventType::VoiceInspect,

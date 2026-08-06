@@ -444,6 +444,56 @@
           "type": "string"
         },
         {
+          "name": "normalize",
+          "required": true,
+          "summary": "normalization mode in force",
+          "type": "string"
+        },
+        {
+          "name": "unicode_version",
+          "required": true,
+          "summary": "Unicode version this build normalizes against",
+          "type": "string"
+        },
+        {
+          "name": "char_count",
+          "required": true,
+          "summary": "input length in characters; a size, never the content",
+          "type": "u64"
+        },
+        {
+          "name": "trace_requested",
+          "required": true,
+          "summary": "whether a normalization trace was requested",
+          "type": "bool"
+        }
+      ],
+      "kind": "stream",
+      "name": "text_prepared",
+      "stream": "events",
+      "summary": "text normalization finished; reports SHAPE and PROVENANCE only, never the text"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "run_id",
+          "required": true,
+          "summary": "owning run",
+          "type": "string"
+        },
+        {
           "name": "model",
           "required": true,
           "summary": "resolved model artifact",
