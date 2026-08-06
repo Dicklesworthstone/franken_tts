@@ -1,0 +1,1971 @@
+{
+  "artifact_kind": "cpu_fp32_oracle_nondeterminism_floor",
+  "claim_scope": {
+    "applies_to": "the pinned CPU FP32 fallback oracle only",
+    "does_not_establish": "native CUDA or cross-device tolerances; those require a separately captured native-device envelope"
+  },
+  "comparison": {
+    "array_pairs_compared": 32640,
+    "comparison_policy": "all pairwise comparisons across the supplied independent captures, including cross-thread-count pairs",
+    "stage_count": 202
+  },
+  "contract_a": {
+    "L0_prompt_token_ids": {
+      "differing_elements": 0,
+      "max_abs": 0.0,
+      "source_seams": [
+        "prompt_build/prompt.reference_ids",
+        "prompt_build/prompt.text_ids"
+      ],
+      "status": "observed"
+    },
+    "L1_operator_seams": {
+      "reason": "the fixture generator records L2+ named module seams, not individual operators",
+      "status": "not_observed"
+    },
+    "L2_layer_and_component_activations": {
+      "differing_elements": 0,
+      "max_abs": 0.0,
+      "source_seams": [
+        "codec_decode/codec.generated_waveform",
+        "codec_decode/codec_decoder.block_00.input",
+        "codec_decode/codec_decoder.block_00.output",
+        "codec_decode/codec_decoder.block_01.input",
+        "codec_decode/codec_decoder.block_01.output",
+        "codec_decode/codec_decoder.block_02.input",
+        "codec_decode/codec_decoder.block_02.output",
+        "codec_decode/codec_decoder.block_03.input",
+        "codec_decode/codec_decoder.block_03.output",
+        "codec_decode/codec_decoder.block_04.input",
+        "codec_decode/codec_decoder.block_04.output",
+        "codec_decode/codec_decoder.block_05.input",
+        "codec_decode/codec_decoder.block_05.output",
+        "codec_decode/codec_decoder.block_06.input",
+        "codec_decode/codec_decoder.block_06.output",
+        "codec_decode/codec_decoder.input.input",
+        "codec_decode/codec_decoder.input.output",
+        "codec_decode/codec_decoder.transformer_layer_00.input",
+        "codec_decode/codec_decoder.transformer_layer_00.output",
+        "codec_decode/codec_decoder.transformer_layer_01.input",
+        "codec_decode/codec_decoder.transformer_layer_01.output",
+        "codec_decode/codec_decoder.transformer_layer_02.input",
+        "codec_decode/codec_decoder.transformer_layer_02.output",
+        "codec_decode/codec_decoder.transformer_layer_03.input",
+        "codec_decode/codec_decoder.transformer_layer_03.output",
+        "codec_decode/codec_decoder.transformer_layer_04.input",
+        "codec_decode/codec_decoder.transformer_layer_04.output",
+        "codec_decode/codec_decoder.transformer_layer_05.input",
+        "codec_decode/codec_decoder.transformer_layer_05.output",
+        "codec_decode/codec_decoder.transformer_layer_06.input",
+        "codec_decode/codec_decoder.transformer_layer_06.output",
+        "codec_decode/codec_decoder.transformer_layer_07.input",
+        "codec_decode/codec_decoder.transformer_layer_07.output",
+        "codec_decode/codec_decoder.upsample_0_0.input",
+        "codec_decode/codec_decoder.upsample_0_0.output",
+        "codec_decode/codec_decoder.upsample_0_1.input",
+        "codec_decode/codec_decoder.upsample_0_1.output",
+        "codec_decode/codec_decoder.upsample_1_0.input",
+        "codec_decode/codec_decoder.upsample_1_0.output",
+        "codec_decode/codec_decoder.upsample_1_1.input",
+        "codec_decode/codec_decoder.upsample_1_1.output",
+        "prompt_build/prompt.reference_codec_codes",
+        "prompt_build/prompt.reference_ids",
+        "prompt_build/prompt.speaker_embedding",
+        "prompt_build/prompt.text_ids",
+        "prompt_build/speaker_encoder.block_0.input",
+        "prompt_build/speaker_encoder.block_0.output",
+        "prompt_build/speaker_encoder.block_1.input",
+        "prompt_build/speaker_encoder.block_1.output",
+        "prompt_build/speaker_encoder.block_2.input",
+        "prompt_build/speaker_encoder.block_2.output",
+        "prompt_build/speaker_encoder.block_3.input",
+        "prompt_build/speaker_encoder.block_3.output",
+        "prompt_build/speaker_encoder.input",
+        "prompt_build/speaker_encoder.output",
+        "talker_free_running/microdecoder.head_01.input",
+        "talker_free_running/microdecoder.head_01.output",
+        "talker_free_running/microdecoder.head_02.input",
+        "talker_free_running/microdecoder.head_02.output",
+        "talker_free_running/microdecoder.head_03.input",
+        "talker_free_running/microdecoder.head_03.output",
+        "talker_free_running/microdecoder.head_04.input",
+        "talker_free_running/microdecoder.head_04.output",
+        "talker_free_running/microdecoder.head_05.input",
+        "talker_free_running/microdecoder.head_05.output",
+        "talker_free_running/microdecoder.head_06.input",
+        "talker_free_running/microdecoder.head_06.output",
+        "talker_free_running/microdecoder.head_07.input",
+        "talker_free_running/microdecoder.head_07.output",
+        "talker_free_running/microdecoder.head_08.input",
+        "talker_free_running/microdecoder.head_08.output",
+        "talker_free_running/microdecoder.head_09.input",
+        "talker_free_running/microdecoder.head_09.output",
+        "talker_free_running/microdecoder.head_10.input",
+        "talker_free_running/microdecoder.head_10.output",
+        "talker_free_running/microdecoder.head_11.input",
+        "talker_free_running/microdecoder.head_11.output",
+        "talker_free_running/microdecoder.head_12.input",
+        "talker_free_running/microdecoder.head_12.output",
+        "talker_free_running/microdecoder.head_13.input",
+        "talker_free_running/microdecoder.head_13.output",
+        "talker_free_running/microdecoder.head_14.input",
+        "talker_free_running/microdecoder.head_14.output",
+        "talker_free_running/microdecoder.head_15.input",
+        "talker_free_running/microdecoder.head_15.output",
+        "talker_free_running/microdecoder.input.input",
+        "talker_free_running/microdecoder.input.output",
+        "talker_free_running/microdecoder.layer_00.input",
+        "talker_free_running/microdecoder.layer_00.output",
+        "talker_free_running/microdecoder.layer_01.input",
+        "talker_free_running/microdecoder.layer_01.output",
+        "talker_free_running/microdecoder.layer_02.input",
+        "talker_free_running/microdecoder.layer_02.output",
+        "talker_free_running/microdecoder.layer_03.input",
+        "talker_free_running/microdecoder.layer_03.output",
+        "talker_free_running/microdecoder.layer_04.input",
+        "talker_free_running/microdecoder.layer_04.output",
+        "talker_free_running/talker.codec_codes",
+        "talker_free_running/talker.codec_head.input",
+        "talker_free_running/talker.codec_head.output",
+        "talker_free_running/talker.generated_hidden",
+        "talker_free_running/talker.input.input",
+        "talker_free_running/talker.input.output",
+        "talker_free_running/talker.layer_00.input",
+        "talker_free_running/talker.layer_00.output",
+        "talker_free_running/talker.layer_01.input",
+        "talker_free_running/talker.layer_01.output",
+        "talker_free_running/talker.layer_02.input",
+        "talker_free_running/talker.layer_02.output",
+        "talker_free_running/talker.layer_03.input",
+        "talker_free_running/talker.layer_03.output",
+        "talker_free_running/talker.layer_04.input",
+        "talker_free_running/talker.layer_04.output",
+        "talker_free_running/talker.layer_05.input",
+        "talker_free_running/talker.layer_05.output",
+        "talker_free_running/talker.layer_06.input",
+        "talker_free_running/talker.layer_06.output",
+        "talker_free_running/talker.layer_07.input",
+        "talker_free_running/talker.layer_07.output",
+        "talker_free_running/talker.layer_08.input",
+        "talker_free_running/talker.layer_08.output",
+        "talker_free_running/talker.layer_09.input",
+        "talker_free_running/talker.layer_09.output",
+        "talker_free_running/talker.layer_10.input",
+        "talker_free_running/talker.layer_10.output",
+        "talker_free_running/talker.layer_11.input",
+        "talker_free_running/talker.layer_11.output",
+        "talker_free_running/talker.layer_12.input",
+        "talker_free_running/talker.layer_12.output",
+        "talker_free_running/talker.layer_13.input",
+        "talker_free_running/talker.layer_13.output",
+        "talker_free_running/talker.layer_14.input",
+        "talker_free_running/talker.layer_14.output",
+        "talker_free_running/talker.layer_15.input",
+        "talker_free_running/talker.layer_15.output",
+        "talker_free_running/talker.layer_16.input",
+        "talker_free_running/talker.layer_16.output",
+        "talker_free_running/talker.layer_17.input",
+        "talker_free_running/talker.layer_17.output",
+        "talker_free_running/talker.layer_18.input",
+        "talker_free_running/talker.layer_18.output",
+        "talker_free_running/talker.layer_19.input",
+        "talker_free_running/talker.layer_19.output",
+        "talker_free_running/talker.layer_20.input",
+        "talker_free_running/talker.layer_20.output",
+        "talker_free_running/talker.layer_21.input",
+        "talker_free_running/talker.layer_21.output",
+        "talker_free_running/talker.layer_22.input",
+        "talker_free_running/talker.layer_22.output",
+        "talker_free_running/talker.layer_23.input",
+        "talker_free_running/talker.layer_23.output",
+        "talker_free_running/talker.layer_24.input",
+        "talker_free_running/talker.layer_24.output",
+        "talker_free_running/talker.layer_25.input",
+        "talker_free_running/talker.layer_25.output",
+        "talker_free_running/talker.layer_26.input",
+        "talker_free_running/talker.layer_26.output",
+        "talker_free_running/talker.layer_27.input",
+        "talker_free_running/talker.layer_27.output",
+        "teacher_forced_frame_0000/microdecoder.head_01.input",
+        "teacher_forced_frame_0000/microdecoder.head_01.output",
+        "teacher_forced_frame_0000/microdecoder.head_02.input",
+        "teacher_forced_frame_0000/microdecoder.head_02.output",
+        "teacher_forced_frame_0000/microdecoder.head_03.input",
+        "teacher_forced_frame_0000/microdecoder.head_03.output",
+        "teacher_forced_frame_0000/microdecoder.head_04.input",
+        "teacher_forced_frame_0000/microdecoder.head_04.output",
+        "teacher_forced_frame_0000/microdecoder.head_05.input",
+        "teacher_forced_frame_0000/microdecoder.head_05.output",
+        "teacher_forced_frame_0000/microdecoder.head_06.input",
+        "teacher_forced_frame_0000/microdecoder.head_06.output",
+        "teacher_forced_frame_0000/microdecoder.head_07.input",
+        "teacher_forced_frame_0000/microdecoder.head_07.output",
+        "teacher_forced_frame_0000/microdecoder.head_08.input",
+        "teacher_forced_frame_0000/microdecoder.head_08.output",
+        "teacher_forced_frame_0000/microdecoder.head_09.input",
+        "teacher_forced_frame_0000/microdecoder.head_09.output",
+        "teacher_forced_frame_0000/microdecoder.head_10.input",
+        "teacher_forced_frame_0000/microdecoder.head_10.output",
+        "teacher_forced_frame_0000/microdecoder.head_11.input",
+        "teacher_forced_frame_0000/microdecoder.head_11.output",
+        "teacher_forced_frame_0000/microdecoder.head_12.input",
+        "teacher_forced_frame_0000/microdecoder.head_12.output",
+        "teacher_forced_frame_0000/microdecoder.head_13.input",
+        "teacher_forced_frame_0000/microdecoder.head_13.output",
+        "teacher_forced_frame_0000/microdecoder.head_14.input",
+        "teacher_forced_frame_0000/microdecoder.head_14.output",
+        "teacher_forced_frame_0000/microdecoder.head_15.input",
+        "teacher_forced_frame_0000/microdecoder.head_15.output",
+        "teacher_forced_frame_0000/microdecoder.input.input",
+        "teacher_forced_frame_0000/microdecoder.input.output",
+        "teacher_forced_frame_0000/microdecoder.layer_00.input",
+        "teacher_forced_frame_0000/microdecoder.layer_00.output",
+        "teacher_forced_frame_0000/microdecoder.layer_01.input",
+        "teacher_forced_frame_0000/microdecoder.layer_01.output",
+        "teacher_forced_frame_0000/microdecoder.layer_02.input",
+        "teacher_forced_frame_0000/microdecoder.layer_02.output",
+        "teacher_forced_frame_0000/microdecoder.layer_03.input",
+        "teacher_forced_frame_0000/microdecoder.layer_03.output",
+        "teacher_forced_frame_0000/microdecoder.layer_04.input",
+        "teacher_forced_frame_0000/microdecoder.layer_04.output",
+        "teacher_forced_frame_0000/microdecoder.teacher_forced_logits"
+      ],
+      "status": "observed"
+    },
+    "L3_logits": {
+      "differing_elements": 0,
+      "max_abs": 0.0,
+      "source_seams": [
+        "talker_free_running/microdecoder.head_01.input",
+        "talker_free_running/microdecoder.head_01.output",
+        "talker_free_running/microdecoder.head_02.input",
+        "talker_free_running/microdecoder.head_02.output",
+        "talker_free_running/microdecoder.head_03.input",
+        "talker_free_running/microdecoder.head_03.output",
+        "talker_free_running/microdecoder.head_04.input",
+        "talker_free_running/microdecoder.head_04.output",
+        "talker_free_running/microdecoder.head_05.input",
+        "talker_free_running/microdecoder.head_05.output",
+        "talker_free_running/microdecoder.head_06.input",
+        "talker_free_running/microdecoder.head_06.output",
+        "talker_free_running/microdecoder.head_07.input",
+        "talker_free_running/microdecoder.head_07.output",
+        "talker_free_running/microdecoder.head_08.input",
+        "talker_free_running/microdecoder.head_08.output",
+        "talker_free_running/microdecoder.head_09.input",
+        "talker_free_running/microdecoder.head_09.output",
+        "talker_free_running/microdecoder.head_10.input",
+        "talker_free_running/microdecoder.head_10.output",
+        "talker_free_running/microdecoder.head_11.input",
+        "talker_free_running/microdecoder.head_11.output",
+        "talker_free_running/microdecoder.head_12.input",
+        "talker_free_running/microdecoder.head_12.output",
+        "talker_free_running/microdecoder.head_13.input",
+        "talker_free_running/microdecoder.head_13.output",
+        "talker_free_running/microdecoder.head_14.input",
+        "talker_free_running/microdecoder.head_14.output",
+        "talker_free_running/microdecoder.head_15.input",
+        "talker_free_running/microdecoder.head_15.output",
+        "talker_free_running/talker.codec_head.input",
+        "talker_free_running/talker.codec_head.output",
+        "teacher_forced_frame_0000/microdecoder.head_01.input",
+        "teacher_forced_frame_0000/microdecoder.head_01.output",
+        "teacher_forced_frame_0000/microdecoder.head_02.input",
+        "teacher_forced_frame_0000/microdecoder.head_02.output",
+        "teacher_forced_frame_0000/microdecoder.head_03.input",
+        "teacher_forced_frame_0000/microdecoder.head_03.output",
+        "teacher_forced_frame_0000/microdecoder.head_04.input",
+        "teacher_forced_frame_0000/microdecoder.head_04.output",
+        "teacher_forced_frame_0000/microdecoder.head_05.input",
+        "teacher_forced_frame_0000/microdecoder.head_05.output",
+        "teacher_forced_frame_0000/microdecoder.head_06.input",
+        "teacher_forced_frame_0000/microdecoder.head_06.output",
+        "teacher_forced_frame_0000/microdecoder.head_07.input",
+        "teacher_forced_frame_0000/microdecoder.head_07.output",
+        "teacher_forced_frame_0000/microdecoder.head_08.input",
+        "teacher_forced_frame_0000/microdecoder.head_08.output",
+        "teacher_forced_frame_0000/microdecoder.head_09.input",
+        "teacher_forced_frame_0000/microdecoder.head_09.output",
+        "teacher_forced_frame_0000/microdecoder.head_10.input",
+        "teacher_forced_frame_0000/microdecoder.head_10.output",
+        "teacher_forced_frame_0000/microdecoder.head_11.input",
+        "teacher_forced_frame_0000/microdecoder.head_11.output",
+        "teacher_forced_frame_0000/microdecoder.head_12.input",
+        "teacher_forced_frame_0000/microdecoder.head_12.output",
+        "teacher_forced_frame_0000/microdecoder.head_13.input",
+        "teacher_forced_frame_0000/microdecoder.head_13.output",
+        "teacher_forced_frame_0000/microdecoder.head_14.input",
+        "teacher_forced_frame_0000/microdecoder.head_14.output",
+        "teacher_forced_frame_0000/microdecoder.head_15.input",
+        "teacher_forced_frame_0000/microdecoder.head_15.output",
+        "teacher_forced_frame_0000/microdecoder.teacher_forced_logits"
+      ],
+      "status": "observed"
+    },
+    "L4_greedy_codec_tokens": {
+      "differing_elements": 0,
+      "max_abs": 0.0,
+      "source_seams": [
+        "talker_free_running/talker.codec_codes"
+      ],
+      "status": "observed"
+    },
+    "L5_codec_waveform": {
+      "differing_elements": 0,
+      "max_abs": 0.0,
+      "source_seams": [
+        "codec_decode/codec.generated_waveform"
+      ],
+      "status": "observed"
+    }
+  },
+  "runs": [
+    {
+      "fixture_manifest_sha256": "c2d9e3b60fb1f1b4449af3ba41acc6e164efade751b26482d26a582a54590761",
+      "provenance_sha256": "bb2e6b6a8511734022c68b7df6d9c4c49aeaa711944bdf0d139463541602e20b",
+      "root": "/Users/jemanuel/.cache/frankentts/oracle-fixtures/nondet-floor-cpu-t1-a-20260806",
+      "torch_interop_threads": 14,
+      "torch_intraop_threads": 1
+    },
+    {
+      "fixture_manifest_sha256": "d7a012ae840220d7582f57948170e2a991184e7fc2ef5daf93b0f1c5d77e67bf",
+      "provenance_sha256": "64ff405dea30aff1d5fa01317e7d151f2ee06fa982e9893572fa52b6385d4975",
+      "root": "/Users/jemanuel/.cache/frankentts/oracle-fixtures/nondet-floor-cpu-t1-b-20260806",
+      "torch_interop_threads": 14,
+      "torch_intraop_threads": 1
+    },
+    {
+      "fixture_manifest_sha256": "3126c93e34a772ec619db5a5757244348fea0b74044cddce4a90a76a6a318a89",
+      "provenance_sha256": "1b194f73ee8213ba079b0f82320dbaf4d54f63a36b97e7e2ab51e920a9298d39",
+      "root": "/Users/jemanuel/.cache/frankentts/oracle-fixtures/nondet-floor-cpu-t4-a-20260806",
+      "torch_interop_threads": 14,
+      "torch_intraop_threads": 4
+    },
+    {
+      "fixture_manifest_sha256": "fdd629be815f8beaca03ee538aeefb8a5476a8fbd3bb02ecd65584e4b8d76e51",
+      "provenance_sha256": "0dc960da3f42c8dfb441258351a3651ca4b1afed2a4eb49f6623d87de43e2f21",
+      "root": "/Users/jemanuel/.cache/frankentts/oracle-fixtures/nondet-floor-cpu-t4-b-20260806",
+      "torch_interop_threads": 14,
+      "torch_intraop_threads": 4
+    }
+  ],
+  "schema_version": 1,
+  "stage_envelopes": {
+    "codec_decode/codec.generated_waveform": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 46080,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_00.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 737280,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_00.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 1105920,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_01.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 1105920,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_01.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 4423680,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_02.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 4423680,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_02.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 11059200,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_03.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 11059200,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_03.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 22118400,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_04.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 22118400,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_04.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 33177600,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_05.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 33177600,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_05.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 33177600,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_06.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 33177600,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.block_06.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 345600,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.input.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 2880,
+      "first_divergence": null,
+      "kind": "discrete",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.input.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 345600,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_00.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 117924,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_00.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 92160,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_01.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 117924,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_01.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 92160,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_02.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 117924,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_02.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 92160,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_03.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 117924,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_03.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 92160,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_04.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 117924,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_04.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 92160,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_05.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 117924,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_05.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 92160,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_06.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 117924,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_06.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 92160,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_07.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 117924,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.transformer_layer_07.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 92160,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.upsample_0_0.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 184320,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.upsample_0_0.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 368640,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.upsample_0_1.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 368640,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.upsample_0_1.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 368640,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.upsample_1_0.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 368640,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.upsample_1_0.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 737280,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.upsample_1_1.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 737280,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "codec_decode/codec_decoder.upsample_1_1.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 737280,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "prompt_build/prompt.reference_codec_codes": {
+      "array_pairs": 12,
+      "differing_elements": 0,
+      "elements_compared": 2496,
+      "first_divergence": null,
+      "kind": "discrete",
+      "max_abs": 0.0
+    },
+    "prompt_build/prompt.reference_ids": {
+      "array_pairs": 12,
+      "differing_elements": 0,
+      "elements_compared": 84,
+      "first_divergence": null,
+      "kind": "discrete",
+      "max_abs": 0.0
+    },
+    "prompt_build/prompt.speaker_embedding": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "prompt_build/prompt.text_ids": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 240,
+      "first_divergence": null,
+      "kind": "discrete",
+      "max_abs": 0.0
+    },
+    "prompt_build/speaker_encoder.block_0.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 285696,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "prompt_build/speaker_encoder.block_0.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 1142784,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "prompt_build/speaker_encoder.block_1.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 1142784,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "prompt_build/speaker_encoder.block_1.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 1142784,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "prompt_build/speaker_encoder.block_2.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 1142784,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "prompt_build/speaker_encoder.block_2.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 1142784,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "prompt_build/speaker_encoder.block_3.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 1142784,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "prompt_build/speaker_encoder.block_3.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 1142784,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "prompt_build/speaker_encoder.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 285696,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "prompt_build/speaker_encoder.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_01.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_01.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 98304,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_02.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_02.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_03.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_03.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_04.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_04.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_05.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_05.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_06.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_06.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_07.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_07.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_08.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_08.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_09.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_09.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_10.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_10.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_11.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_11.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_12.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_12.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_13.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_13.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_14.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_14.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_15.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.head_15.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.input.input": {
+      "array_pairs": 1440,
+      "differing_elements": 0,
+      "elements_compared": 397224,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.input.output": {
+      "array_pairs": 2520,
+      "differing_elements": 0,
+      "elements_compared": 2752512,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.layer_00.input": {
+      "array_pairs": 2160,
+      "differing_elements": 0,
+      "elements_compared": 495576,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.layer_00.output": {
+      "array_pairs": 360,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.layer_01.input": {
+      "array_pairs": 2160,
+      "differing_elements": 0,
+      "elements_compared": 495576,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.layer_01.output": {
+      "array_pairs": 360,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.layer_02.input": {
+      "array_pairs": 2160,
+      "differing_elements": 0,
+      "elements_compared": 495576,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.layer_02.output": {
+      "array_pairs": 360,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.layer_03.input": {
+      "array_pairs": 2160,
+      "differing_elements": 0,
+      "elements_compared": 495576,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.layer_03.output": {
+      "array_pairs": 360,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.layer_04.input": {
+      "array_pairs": 2160,
+      "differing_elements": 0,
+      "elements_compared": 495576,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/microdecoder.layer_04.output": {
+      "array_pairs": 360,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.codec_codes": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 384,
+      "first_divergence": null,
+      "kind": "discrete",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.codec_head.input": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.codec_head.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 1437696,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.generated_hidden": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.input.input": {
+      "array_pairs": 312,
+      "differing_elements": 0,
+      "elements_compared": 591696,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.input.output": {
+      "array_pairs": 1608,
+      "differing_elements": 0,
+      "elements_compared": 15495552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_00.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_00.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_01.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_01.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_02.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_02.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_03.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_03.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_04.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_04.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_05.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_05.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_06.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_06.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_07.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_07.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_08.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_08.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_09.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_09.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_10.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_10.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_11.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_11.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_12.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_12.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_13.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_13.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_14.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_14.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_15.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_15.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_16.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_16.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_17.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_17.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_18.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_18.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_19.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_19.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_20.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_20.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_21.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_21.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_22.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_22.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_23.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_23.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_24.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_24.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_25.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_25.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_26.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_26.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_27.input": {
+      "array_pairs": 288,
+      "differing_elements": 0,
+      "elements_compared": 849552,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "talker_free_running/talker.layer_27.output": {
+      "array_pairs": 48,
+      "differing_elements": 0,
+      "elements_compared": 479232,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_01.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_01.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_02.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_02.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_03.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_03.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_04.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_04.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_05.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_05.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_06.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_06.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_07.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_07.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_08.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_08.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_09.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_09.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_10.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_10.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_11.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_11.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_12.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_12.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_13.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_13.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_14.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_14.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_15.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 24576,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.head_15.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 49152,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.input.input": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.input.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.layer_00.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 498432,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.layer_00.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.layer_01.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 498432,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.layer_01.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.layer_02.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 498432,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.layer_02.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.layer_03.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 498432,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.layer_03.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.layer_04.input": {
+      "array_pairs": 144,
+      "differing_elements": 0,
+      "elements_compared": 498432,
+      "first_divergence": null,
+      "kind": "mixed",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.layer_04.output": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 393216,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    },
+    "teacher_forced_frame_0000/microdecoder.teacher_forced_logits": {
+      "array_pairs": 24,
+      "differing_elements": 0,
+      "elements_compared": 737280,
+      "first_divergence": null,
+      "kind": "floating",
+      "max_abs": 0.0
+    }
+  }
+}
