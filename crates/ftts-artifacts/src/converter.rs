@@ -3,10 +3,18 @@
 //! The offline `.fttsq` converter must not own a second numerical recipe. Both paths call the
 //! row primitive in this module, so their Q8 bytes and scales are identical by construction.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::fttsq::{FttsqError, FttsqStreamingWriter};
-use crate::safetensors::TensorView;
+use serde_json::Value;
+
+use crate::census::{CensusReport, WeightsManifest};
+use crate::fttsq::{
+    AccessClass, FttsqError, FttsqStreamPlan, FttsqStreamingWriter, StoredDtype,
+    TensorEntry as ArtifactTensorEntry,
+};
+use crate::safetensors::{Dtype, SafetensorsIndex, TensorView, WeightsError};
+use crate::sha256::Sha256;
 
 /// Largest input width accepted by the bounded Q8 matrix-row adapter.
 ///
@@ -23,6 +31,314 @@ pub const MAX_Q8_OUTPUT_CHANNEL_WIDTH: usize = 65_536;
 /// one MiB: a converter cannot quietly turn a malicious outer dimension into an unbounded scale
 /// allocation while it waits to append that tail after the Q8 payload.
 pub const MAX_Q8_OUTPUT_CHANNELS: usize = 262_144;
+
+/// The storage recipe for one source tensor in a portable `.fttsq` artifact.
+///
+/// The conversion plan must state this policy for every tensor in its source manifest. That makes
+/// protected high-precision tensors an explicit, auditable choice rather than an accidental
+/// fallback, and it prevents a new checkpoint tensor from being silently omitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorStoragePolicy {
+    /// Preserve the source BF16 or F32 bytes exactly.
+    Verbatim,
+    /// Quantize a rank-two-or-greater weight matrix with canonical per-output-channel Q8 scales.
+    Q8PerOutputChannel,
+}
+
+/// One source tensor's explicit artifact location and storage recipe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorConversion {
+    source_name: String,
+    artifact_name: String,
+    access_class: AccessClass,
+    storage: TensorStoragePolicy,
+}
+
+impl TensorConversion {
+    /// Declares a source tensor that remains at its source precision.
+    #[must_use]
+    pub fn verbatim(
+        source_name: impl Into<String>,
+        artifact_name: impl Into<String>,
+        access_class: AccessClass,
+    ) -> Self {
+        Self {
+            source_name: source_name.into(),
+            artifact_name: artifact_name.into(),
+            access_class,
+            storage: TensorStoragePolicy::Verbatim,
+        }
+    }
+
+    /// Declares a source matrix that uses the shared canonical Q8 quantization primitive.
+    #[must_use]
+    pub fn q8_per_output_channel(
+        source_name: impl Into<String>,
+        artifact_name: impl Into<String>,
+        access_class: AccessClass,
+    ) -> Self {
+        Self {
+            source_name: source_name.into(),
+            artifact_name: artifact_name.into(),
+            access_class,
+            storage: TensorStoragePolicy::Q8PerOutputChannel,
+        }
+    }
+
+    fn section_name(&self) -> String {
+        format!("tensor:{}", self.artifact_name)
+    }
+
+    fn scales_name(&self) -> String {
+        format!("{}.scales", self.artifact_name)
+    }
+}
+
+/// Metadata, pinned source digest, and per-tensor policy for one bounded conversion.
+///
+/// A real model recipe supplies one [`TensorConversion`] for **every** tensor named by its
+/// [`WeightsManifest`]. The plan contains no source payload and no machine-specific packing; it
+/// can therefore be reviewed before a multi-gigabyte conversion opens an output file.
+#[derive(Clone, Debug)]
+pub struct StreamingConversionPlan {
+    model_family: String,
+    source_sha256: String,
+    license_notice: String,
+    model_config: Value,
+    quantization_manifest: Value,
+    tensors: Vec<TensorConversion>,
+}
+
+impl StreamingConversionPlan {
+    /// Starts a portable conversion plan tied to the expected source SHA-256.
+    #[must_use]
+    pub fn new(model_family: impl Into<String>, source_sha256: impl Into<String>) -> Self {
+        Self {
+            model_family: model_family.into(),
+            source_sha256: source_sha256.into(),
+            license_notice: String::new(),
+            model_config: Value::Null,
+            quantization_manifest: Value::Null,
+            tensors: Vec::new(),
+        }
+    }
+
+    /// Sets the required Apache-2.0 attribution and change notice.
+    #[must_use]
+    pub fn license_notice(mut self, notice: impl Into<String>) -> Self {
+        self.license_notice = notice.into();
+        self
+    }
+
+    /// Records the frozen source model configuration in the artifact directory.
+    #[must_use]
+    pub fn model_config(mut self, config: Value) -> Self {
+        self.model_config = config;
+        self
+    }
+
+    /// Records the reviewed per-tensor quantization recipe in the artifact directory.
+    #[must_use]
+    pub fn quantization_manifest(mut self, manifest: Value) -> Self {
+        self.quantization_manifest = manifest;
+        self
+    }
+
+    /// Adds one explicit source-to-artifact tensor conversion.
+    #[must_use]
+    pub fn tensor(mut self, tensor: TensorConversion) -> Self {
+        self.tensors.push(tensor);
+        self
+    }
+}
+
+/// A plan validation failure detected before a destination stream is opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConversionPlanError {
+    /// The plan did not declare a conversion recipe for any source tensor.
+    NoTensorPolicies,
+    /// One source tensor was declared twice with conflicting or duplicate policies.
+    DuplicateSourcePolicy {
+        /// Source tensor name.
+        name: String,
+    },
+    /// A policy named a tensor absent from the validated source checkpoint.
+    SourceTensorMissing {
+        /// Source tensor name.
+        name: String,
+    },
+    /// A source tensor had no policy, so emitting an artifact would silently omit it.
+    SourceTensorUnplanned {
+        /// Source tensor name.
+        name: String,
+    },
+    /// Two policies would create the same artifact tensor name.
+    DuplicateArtifactTensor {
+        /// Artifact tensor name.
+        name: String,
+    },
+    /// Artifact names cannot be empty because the container uses them as stable keys.
+    EmptyArtifactTensorName {
+        /// Source tensor whose artifact name was empty.
+        source_name: String,
+    },
+    /// A Q8 policy was assigned to a non-matrix tensor.
+    Q8RequiresMatrix {
+        /// Source tensor name.
+        name: String,
+        /// Source rank.
+        rank: usize,
+    },
+    /// A Q8 matrix had no values in an output channel.
+    Q8EmptyOutputChannel {
+        /// Source tensor name.
+        name: String,
+    },
+    /// A Q8 matrix would exceed the converter's fixed row scratch bound.
+    Q8OutputChannelTooWide {
+        /// Source tensor name.
+        name: String,
+        /// Values per output channel.
+        width: usize,
+        /// Fixed adapter limit.
+        limit: usize,
+    },
+    /// A Q8 scale tail would exceed the converter's fixed memory bound.
+    Q8OutputChannelCountTooLarge {
+        /// Source tensor name.
+        name: String,
+        /// Output-channel count.
+        rows: usize,
+        /// Fixed scale-tail limit.
+        limit: usize,
+    },
+    /// The source shape cannot be represented by the portable u64 container directory.
+    ShapeOutOfRange {
+        /// Source tensor name.
+        name: String,
+    },
+    /// The derived section length could not fit in the portable container format.
+    SectionLengthOverflow {
+        /// Source tensor name.
+        name: String,
+    },
+}
+
+impl fmt::Display for ConversionPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoTensorPolicies => f.write_str("conversion plan has no tensor policies"),
+            Self::DuplicateSourcePolicy { name } => {
+                write!(
+                    f,
+                    "conversion plan names source tensor `{name}` more than once"
+                )
+            }
+            Self::SourceTensorMissing { name } => {
+                write!(
+                    f,
+                    "conversion plan names source tensor `{name}`, which is absent"
+                )
+            }
+            Self::SourceTensorUnplanned { name } => {
+                write!(
+                    f,
+                    "source tensor `{name}` has no explicit conversion policy"
+                )
+            }
+            Self::DuplicateArtifactTensor { name } => {
+                write!(
+                    f,
+                    "conversion plan would emit artifact tensor `{name}` more than once"
+                )
+            }
+            Self::EmptyArtifactTensorName { source_name } => write!(
+                f,
+                "conversion plan gives source tensor `{source_name}` an empty artifact name"
+            ),
+            Self::Q8RequiresMatrix { name, rank } => write!(
+                f,
+                "Q8 conversion for `{name}` requires rank 2 or greater, got rank {rank}"
+            ),
+            Self::Q8EmptyOutputChannel { name } => {
+                write!(f, "Q8 conversion for `{name}` has an empty output channel")
+            }
+            Self::Q8OutputChannelTooWide { name, width, limit } => write!(
+                f,
+                "Q8 conversion for `{name}` has output-channel width {width}, exceeding {limit}"
+            ),
+            Self::Q8OutputChannelCountTooLarge { name, rows, limit } => write!(
+                f,
+                "Q8 conversion for `{name}` has {rows} output channels, exceeding {limit}"
+            ),
+            Self::ShapeOutOfRange { name } => {
+                write!(
+                    f,
+                    "source tensor `{name}` has a shape outside the artifact range"
+                )
+            }
+            Self::SectionLengthOverflow { name } => {
+                write!(
+                    f,
+                    "source tensor `{name}` overflows its planned artifact section length"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConversionPlanError {}
+
+/// Failure while converting a manifest-validated safetensors checkpoint.
+#[derive(Debug)]
+pub enum StreamingConversionError {
+    /// The source bytes were not a valid supported safetensors file.
+    Source(WeightsError),
+    /// The source file did not match its complete pinned manifest.
+    SourceCensus(Box<CensusReport>),
+    /// The source bytes did not match the plan's pinned SHA-256.
+    SourceDigestMismatch {
+        /// Digest the plan requires.
+        expected: String,
+        /// Digest calculated over the exact source bytes.
+        actual: String,
+    },
+    /// The conversion plan was incomplete or structurally inconsistent.
+    Plan(ConversionPlanError),
+    /// The container refused planned metadata or could not write the destination stream.
+    Artifact(FttsqError),
+    /// The shared Q8 primitive refused a source matrix or destination section.
+    Quantization(MatrixQuantizationError<Q8SectionSinkError>),
+}
+
+impl fmt::Display for StreamingConversionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(error) => write!(f, "cannot parse source checkpoint: {error}"),
+            Self::SourceCensus(report) => f.write_str(&report.render()),
+            Self::SourceDigestMismatch { expected, actual } => write!(
+                f,
+                "source checkpoint SHA-256 mismatch: expected {expected}, got {actual}"
+            ),
+            Self::Plan(error) => write!(f, "invalid conversion plan: {error}"),
+            Self::Artifact(error) => write!(f, "cannot write .fttsq artifact: {error}"),
+            Self::Quantization(error) => write!(f, "cannot quantize artifact matrix: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StreamingConversionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error),
+            Self::SourceCensus(report) => Some(report),
+            Self::Plan(error) => Some(error),
+            Self::Artifact(error) => Some(error),
+            Self::Quantization(error) => Some(error),
+            Self::SourceDigestMismatch { .. } => None,
+        }
+    }
+}
 
 /// Failure while quantizing one output channel.
 #[derive(Clone, Debug, PartialEq)]
@@ -320,8 +636,11 @@ impl<W: std::io::Write + std::io::Seek> Q8RowSink for Q8SectionSink<'_, W> {
             });
         }
         self.value_bytes.clear();
-        self.value_bytes
-            .extend(values.iter().map(|&value| value as u8));
+        self.value_bytes.extend(
+            values
+                .iter()
+                .map(|&value| u8::from_ne_bytes(value.to_ne_bytes())),
+        );
         self.writer
             .write_section(&self.section, &self.value_bytes)
             .map_err(Q8SectionSinkError::Artifact)?;
@@ -350,7 +669,9 @@ pub fn stream_matrix_q8_section<W: std::io::Write + std::io::Seek>(
     if shape.len() < 2 {
         return Err(MatrixQuantizationError::ExpectedMatrix { rank: shape.len() });
     }
-    let row_count = shape[0];
+    let Some(&row_count) = shape.first() else {
+        return Err(MatrixQuantizationError::ExpectedMatrix { rank: 0 });
+    };
     let mut sink = Q8SectionSink::new(writer, section, row_count)
         .map_err(|source| MatrixQuantizationError::Sink { row: 0, source })?;
     quantize_matrix_q8_rows(matrix, &mut sink)?;
@@ -359,6 +680,287 @@ pub fn stream_matrix_q8_section<W: std::io::Write + std::io::Seek>(
             row: row_count,
             source,
         })
+}
+
+/// Converts a manifest-validated safetensors checkpoint into a portable `.fttsq` stream.
+///
+/// The source is borrowed so a caller may provide a memory map rather than a copied checkpoint.
+/// Before the output stream is opened, this function parses the safetensors directory, verifies
+/// the complete [`WeightsManifest`], verifies the plan's source SHA-256, and checks that every
+/// source tensor has exactly one explicit policy. It then writes one complete section per source
+/// tensor in plan order: high-precision payloads are copied verbatim and Q8 matrices use
+/// [`quantize_output_channel_q8`] through [`stream_matrix_q8_section`].
+///
+/// The destination is caller-owned deliberately. Pass a same-filesystem temporary file, sync it,
+/// and rename it only after this returns successfully; a failed conversion must never publish a
+/// partial artifact. The stream itself never retains a source tensor, Q8 payload, or section
+/// payload after it has been written.
+///
+/// # Errors
+///
+/// Refuses invalid safetensors bytes, a stale or wrong source manifest, digest mismatches,
+/// incomplete/ambiguous policy coverage, non-finite Q8 values, or container I/O/metadata errors.
+pub fn convert_safetensors_streaming<W: std::io::Write + std::io::Seek>(
+    source: &[u8],
+    manifest: &WeightsManifest,
+    plan: &StreamingConversionPlan,
+    destination: W,
+) -> Result<W, StreamingConversionError> {
+    let index = SafetensorsIndex::parse(source).map_err(StreamingConversionError::Source)?;
+    manifest
+        .verify(&index)
+        .map_err(StreamingConversionError::SourceCensus)?;
+
+    let actual_digest = sha256_hex(source);
+    if actual_digest != plan.source_sha256 {
+        return Err(StreamingConversionError::SourceDigestMismatch {
+            expected: plan.source_sha256.clone(),
+            actual: actual_digest,
+        });
+    }
+
+    let artifact_plan =
+        build_artifact_plan(&index, plan).map_err(StreamingConversionError::Plan)?;
+    let mut writer = artifact_plan
+        .begin(destination)
+        .map_err(StreamingConversionError::Artifact)?;
+
+    for tensor in &plan.tensors {
+        let matrix_or_values = index.view(&tensor.source_name, source).ok_or_else(|| {
+            StreamingConversionError::Plan(ConversionPlanError::SourceTensorMissing {
+                name: tensor.source_name.clone(),
+            })
+        })?;
+        let section = tensor.section_name();
+        match tensor.storage {
+            TensorStoragePolicy::Verbatim => writer
+                .write_section(&section, matrix_or_values.as_bytes())
+                .map_err(StreamingConversionError::Artifact)?,
+            TensorStoragePolicy::Q8PerOutputChannel => {
+                stream_matrix_q8_section(&matrix_or_values, &mut writer, &section)
+                    .map_err(StreamingConversionError::Quantization)?;
+            }
+        }
+    }
+
+    writer.finish().map_err(StreamingConversionError::Artifact)
+}
+
+fn build_artifact_plan(
+    index: &SafetensorsIndex,
+    plan: &StreamingConversionPlan,
+) -> Result<FttsqStreamPlan, ConversionPlanError> {
+    if plan.tensors.is_empty() {
+        return Err(ConversionPlanError::NoTensorPolicies);
+    }
+
+    let mut seen_sources = BTreeSet::<String>::new();
+    let mut seen_artifacts = BTreeSet::<String>::new();
+    for tensor in &plan.tensors {
+        if !seen_sources.insert(tensor.source_name.clone()) {
+            return Err(ConversionPlanError::DuplicateSourcePolicy {
+                name: tensor.source_name.clone(),
+            });
+        }
+        if index.entry(&tensor.source_name).is_none() {
+            return Err(ConversionPlanError::SourceTensorMissing {
+                name: tensor.source_name.clone(),
+            });
+        }
+        if tensor.artifact_name.is_empty() {
+            return Err(ConversionPlanError::EmptyArtifactTensorName {
+                source_name: tensor.source_name.clone(),
+            });
+        }
+        if !seen_artifacts.insert(tensor.artifact_name.clone()) {
+            return Err(ConversionPlanError::DuplicateArtifactTensor {
+                name: tensor.artifact_name.clone(),
+            });
+        }
+        if tensor.storage == TensorStoragePolicy::Q8PerOutputChannel {
+            let entry = index.entry(&tensor.source_name).ok_or_else(|| {
+                ConversionPlanError::SourceTensorMissing {
+                    name: tensor.source_name.clone(),
+                }
+            })?;
+            if entry.shape.len() < 2 {
+                return Err(ConversionPlanError::Q8RequiresMatrix {
+                    name: tensor.source_name.clone(),
+                    rank: entry.shape.len(),
+                });
+            }
+            let Some((&rows, trailing_shape)) = entry.shape.split_first() else {
+                return Err(ConversionPlanError::Q8RequiresMatrix {
+                    name: tensor.source_name.clone(),
+                    rank: 0,
+                });
+            };
+            let row_width = trailing_shape
+                .iter()
+                .try_fold(1_usize, |product, &dimension| {
+                    product.checked_mul(dimension)
+                })
+                .ok_or_else(|| ConversionPlanError::ShapeOutOfRange {
+                    name: tensor.source_name.clone(),
+                })?;
+            if row_width == 0 {
+                return Err(ConversionPlanError::Q8EmptyOutputChannel {
+                    name: tensor.source_name.clone(),
+                });
+            }
+            if row_width > MAX_Q8_OUTPUT_CHANNEL_WIDTH {
+                return Err(ConversionPlanError::Q8OutputChannelTooWide {
+                    name: tensor.source_name.clone(),
+                    width: row_width,
+                    limit: MAX_Q8_OUTPUT_CHANNEL_WIDTH,
+                });
+            }
+            if rows > MAX_Q8_OUTPUT_CHANNELS {
+                return Err(ConversionPlanError::Q8OutputChannelCountTooLarge {
+                    name: tensor.source_name.clone(),
+                    rows,
+                    limit: MAX_Q8_OUTPUT_CHANNELS,
+                });
+            }
+            let scales_name = tensor.scales_name();
+            if !seen_artifacts.insert(scales_name.clone()) {
+                return Err(ConversionPlanError::DuplicateArtifactTensor { name: scales_name });
+            }
+        }
+    }
+
+    for entry in index.entries() {
+        if !seen_sources.contains(&entry.name) {
+            return Err(ConversionPlanError::SourceTensorUnplanned {
+                name: entry.name.clone(),
+            });
+        }
+    }
+
+    let mut artifact_plan = FttsqStreamPlan::new(&plan.model_family, &plan.source_sha256)
+        .license_notice(&plan.license_notice)
+        .model_config(plan.model_config.clone())
+        .quantization_manifest(plan.quantization_manifest.clone());
+
+    for tensor in &plan.tensors {
+        let entry = index.entry(&tensor.source_name).ok_or_else(|| {
+            ConversionPlanError::SourceTensorMissing {
+                name: tensor.source_name.clone(),
+            }
+        })?;
+        let shape = artifact_shape(entry, &tensor.source_name)?;
+        let section = tensor.section_name();
+        match tensor.storage {
+            TensorStoragePolicy::Verbatim => {
+                let length = u64::try_from(entry.byte_len()).map_err(|_| {
+                    ConversionPlanError::SectionLengthOverflow {
+                        name: tensor.source_name.clone(),
+                    }
+                })?;
+                artifact_plan = artifact_plan
+                    .section(section.clone(), tensor.access_class, length)
+                    .tensor(ArtifactTensorEntry {
+                        name: tensor.artifact_name.clone(),
+                        section,
+                        dtype: stored_dtype(entry.dtype),
+                        shape,
+                        offset: 0,
+                        length,
+                        scales: None,
+                    });
+            }
+            TensorStoragePolicy::Q8PerOutputChannel => {
+                let rows = entry.shape.first().copied().ok_or_else(|| {
+                    ConversionPlanError::Q8RequiresMatrix {
+                        name: tensor.source_name.clone(),
+                        rank: entry.shape.len(),
+                    }
+                })?;
+                let values_len = u64::try_from(entry.element_count()).map_err(|_| {
+                    ConversionPlanError::SectionLengthOverflow {
+                        name: tensor.source_name.clone(),
+                    }
+                })?;
+                let scales_len = u64::try_from(rows)
+                    .ok()
+                    .and_then(|rows| {
+                        rows.checked_mul(u64::try_from(std::mem::size_of::<f32>()).ok()?)
+                    })
+                    .ok_or_else(|| ConversionPlanError::SectionLengthOverflow {
+                        name: tensor.source_name.clone(),
+                    })?;
+                let section_len = values_len.checked_add(scales_len).ok_or_else(|| {
+                    ConversionPlanError::SectionLengthOverflow {
+                        name: tensor.source_name.clone(),
+                    }
+                })?;
+                let scales_name = tensor.scales_name();
+                artifact_plan = artifact_plan
+                    .section(section.clone(), tensor.access_class, section_len)
+                    .tensor(ArtifactTensorEntry {
+                        name: tensor.artifact_name.clone(),
+                        section: section.clone(),
+                        dtype: StoredDtype::Q8,
+                        shape,
+                        offset: 0,
+                        length: values_len,
+                        scales: Some(scales_name.clone()),
+                    })
+                    .tensor(ArtifactTensorEntry {
+                        name: scales_name,
+                        section,
+                        dtype: StoredDtype::F32,
+                        shape: vec![u64::try_from(rows).map_err(|_| {
+                            ConversionPlanError::ShapeOutOfRange {
+                                name: tensor.source_name.clone(),
+                            }
+                        })?],
+                        offset: values_len,
+                        length: scales_len,
+                        scales: None,
+                    });
+            }
+        }
+    }
+
+    Ok(artifact_plan)
+}
+
+fn artifact_shape(
+    entry: &crate::safetensors::TensorEntry,
+    source_name: &str,
+) -> Result<Vec<u64>, ConversionPlanError> {
+    entry
+        .shape
+        .iter()
+        .copied()
+        .map(u64::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ConversionPlanError::ShapeOutOfRange {
+            name: source_name.to_owned(),
+        })
+}
+
+const fn stored_dtype(source: Dtype) -> StoredDtype {
+    match source {
+        Dtype::Bf16 => StoredDtype::Bf16,
+        Dtype::F32 => StoredDtype::F32,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher.finish()
+    };
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 /// Quantizes one output channel with the canonical symmetric per-channel Q8 recipe.
@@ -467,6 +1069,7 @@ pub fn quantize_matrix_q8_rows<S: Q8RowSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::census::ExpectedTensor;
     use crate::fttsq::{AccessClass, FttsqReader, FttsqStreamPlan, StoredDtype, TensorEntry};
     use crate::safetensors::SafetensorsIndex;
     use serde_json::json;
@@ -511,6 +1114,29 @@ mod tests {
         bytes.extend_from_slice(&header);
         bytes.extend_from_slice(&payload);
         bytes
+    }
+
+    fn safetensors(parts: &[(&str, Dtype, &[usize], &[u8])]) -> Vec<u8> {
+        let mut directory = serde_json::Map::new();
+        let mut payload = Vec::new();
+        for (name, dtype, shape, bytes) in parts {
+            let begin = payload.len();
+            payload.extend_from_slice(bytes);
+            directory.insert(
+                (*name).to_owned(),
+                json!({
+                    "dtype": dtype.as_str(),
+                    "shape": shape,
+                    "data_offsets": [begin, payload.len()],
+                }),
+            );
+        }
+        let header = serde_json::to_vec(&serde_json::Value::Object(directory))
+            .expect("fixture directory serializes");
+        let mut source = (header.len() as u64).to_le_bytes().to_vec();
+        source.extend_from_slice(&header);
+        source.extend_from_slice(&payload);
+        source
     }
 
     #[test]
@@ -643,6 +1269,114 @@ mod tests {
             ]
             .concat()
         );
+    }
+
+    #[test]
+    fn manifest_verified_multi_tensor_stream_is_deterministic_and_verbatim_where_required() {
+        let weight = [1.0_f32, -2.0, 0.5, 3.0, 0.0, -3.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let bias = [0x80_u16, 0x3f80]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let source = safetensors(&[
+            ("weight", Dtype::F32, &[2, 3], &weight),
+            ("bias", Dtype::Bf16, &[2], &bias),
+        ]);
+        let manifest = WeightsManifest::from_expectations(
+            "small pinned fixture",
+            [
+                ExpectedTensor::new("weight", vec![2, 3], Dtype::F32),
+                ExpectedTensor::new("bias", vec![2], Dtype::Bf16),
+            ],
+        );
+        let plan = StreamingConversionPlan::new("qwen3-tts-fixture", sha256_hex(&source))
+            .license_notice("Copyright 2026 Alibaba Cloud\nApache-2.0")
+            .model_config(json!({ "fixture": true }))
+            .quantization_manifest(json!({
+                "weight": "q8_per_output_channel",
+                "bias": "verbatim_bf16",
+            }))
+            .tensor(TensorConversion::q8_per_output_channel(
+                "weight",
+                "weight",
+                AccessClass::HotRecurrentTalker,
+            ))
+            .tensor(TensorConversion::verbatim(
+                "bias",
+                "bias",
+                AccessClass::Metadata,
+            ));
+
+        let first =
+            convert_safetensors_streaming(&source, &manifest, &plan, Cursor::new(Vec::new()))
+                .expect("fixture converts")
+                .into_inner();
+        let second =
+            convert_safetensors_streaming(&source, &manifest, &plan, Cursor::new(Vec::new()))
+                .expect("second fixture conversion is deterministic")
+                .into_inner();
+        assert_eq!(
+            first, second,
+            "identical source and plan must be byte-identical"
+        );
+
+        let reader = FttsqReader::open(&first).expect("artifact verifies its section digests");
+        let mut runtime_q8 = [0_i8; 6];
+        let runtime_first_scale =
+            quantize_output_channel_q8(&[1.0_f32, -2.0, 0.5], &mut runtime_q8[..3])
+                .expect("shared runtime primitive quantizes the first row");
+        let runtime_second_scale =
+            quantize_output_channel_q8(&[3.0_f32, 0.0, -3.0], &mut runtime_q8[3..])
+                .expect("shared runtime primitive quantizes the second row");
+        assert_eq!(
+            reader
+                .tensor_bytes("weight", &first)
+                .expect("Q8 weights resolve"),
+            runtime_q8.map(|value| value as u8)
+        );
+        assert_eq!(
+            reader
+                .tensor_bytes("weight.scales", &first)
+                .expect("Q8 scales resolve"),
+            &[
+                runtime_first_scale.to_le_bytes(),
+                runtime_second_scale.to_le_bytes(),
+            ]
+            .concat()
+        );
+        assert_eq!(
+            reader
+                .tensor_bytes("bias", &first)
+                .expect("protected BF16 values resolve"),
+            bias
+        );
+    }
+
+    #[test]
+    fn streaming_conversion_refuses_unpinned_source_before_writing() {
+        let source = f32_matrix(1, 2, &[1.0, -1.0]);
+        let manifest = WeightsManifest::from_expectations(
+            "digest fixture",
+            [ExpectedTensor::new("matrix", vec![1, 2], Dtype::F32)],
+        );
+        let plan = StreamingConversionPlan::new("qwen3-tts-fixture", "0".repeat(64))
+            .license_notice("Copyright 2026 Alibaba Cloud\nApache-2.0")
+            .tensor(TensorConversion::q8_per_output_channel(
+                "matrix",
+                "matrix",
+                AccessClass::HotRecurrentTalker,
+            ));
+
+        let error =
+            convert_safetensors_streaming(&source, &manifest, &plan, Cursor::new(Vec::new()))
+                .expect_err("a wrong source digest must refuse before artifact construction");
+        assert!(matches!(
+            error,
+            StreamingConversionError::SourceDigestMismatch { .. }
+        ));
     }
 
     #[test]
