@@ -101,6 +101,40 @@ impl Outcome {
 ///
 /// A comparison whose fixture provenance is unknown cannot be debugged: "actual != expected" is
 /// useless without knowing which oracle dump produced `expected` and whether it is still current.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureProvenance {
+    /// Claim tier emitted by the fixture generator, e.g. `native_cuda` or `cpu_fp32_fallback`.
+    pub oracle_class: String,
+    /// Device on which the oracle actually executed, e.g. `cpu` or `cuda:0`.
+    pub device: String,
+    /// Floating-point dtype used for the capture, e.g. `float32` or `bfloat16`.
+    pub dtype: String,
+}
+
+impl CaptureProvenance {
+    /// Creates an all-or-nothing capture identity so a receipt cannot omit its precision or device.
+    #[must_use]
+    pub fn new(
+        oracle_class: impl Into<String>,
+        device: impl Into<String>,
+        dtype: impl Into<String>,
+    ) -> Self {
+        Self {
+            oracle_class: oracle_class.into(),
+            device: device.into(),
+            dtype: dtype.into(),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "oracle_class": self.oracle_class,
+            "device": self.device,
+            "dtype": self.dtype,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FixtureProvenance {
     /// Path or identifier of the oracle dump.
@@ -109,6 +143,8 @@ pub struct FixtureProvenance {
     pub sha256: Option<String>,
     /// Upstream revision the fixture was generated against.
     pub revision: Option<String>,
+    /// Device/precision claim made by the fixture producer, when supplied by its manifest.
+    pub capture: Option<CaptureProvenance>,
 }
 
 impl FixtureProvenance {
@@ -119,6 +155,7 @@ impl FixtureProvenance {
             source: source.into(),
             sha256: None,
             revision: None,
+            capture: None,
         }
     }
 
@@ -136,11 +173,24 @@ impl FixtureProvenance {
         self
     }
 
+    /// Attaches the oracle class, actual device, and capture precision from fixture provenance.
+    #[must_use]
+    pub fn with_capture_provenance(
+        mut self,
+        oracle_class: impl Into<String>,
+        device: impl Into<String>,
+        dtype: impl Into<String>,
+    ) -> Self {
+        self.capture = Some(CaptureProvenance::new(oracle_class, device, dtype));
+        self
+    }
+
     fn to_json(&self) -> Value {
         json!({
             "source": self.source,
             "sha256": self.sha256,
             "revision": self.revision,
+            "capture": self.capture.as_ref().map(CaptureProvenance::to_json),
         })
     }
 }
@@ -405,7 +455,8 @@ mod tests {
             .provenance(
                 FixtureProvenance::new("fixtures/talker_l17.npz")
                     .with_sha256("abc123")
-                    .with_revision("5d839924"),
+                    .with_revision("5d839924")
+                    .with_capture_provenance("cpu_fp32_fallback", "cpu", "float32"),
             )
             .tolerance(1.5e-3, "docs/truth-pack/nondeterminism-floor.json")
             .seed(42)
@@ -416,6 +467,12 @@ mod tests {
         assert_eq!(value["seam"], "talker.layer17.attn_out");
         assert_eq!(value["fixture"]["sha256"], "abc123");
         assert_eq!(value["fixture"]["revision"], "5d839924");
+        assert_eq!(
+            value["fixture"]["capture"]["oracle_class"],
+            "cpu_fp32_fallback"
+        );
+        assert_eq!(value["fixture"]["capture"]["device"], "cpu");
+        assert_eq!(value["fixture"]["capture"]["dtype"], "float32");
         assert_eq!(
             value["tolerance_source"],
             "docs/truth-pack/nondeterminism-floor.json"

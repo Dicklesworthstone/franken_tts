@@ -4,8 +4,10 @@
 This is deliberately an oracle tool, not an inference frontend.  It runs the full,
 checked-out upstream package at the source pin and a locally materialized weights directory at
 the HF pin.  It refuses package drift, source drift, network fallback, and an existing output
-directory.  The default device is CUDA because only native-device fixtures may become the
-correctness oracle; ``--device cpu --cpu-smoke`` exists solely for repeatability diagnostics.
+directory. The default device is CUDA because only native-device fixtures may establish the
+native-device correctness oracle. ``--device cpu`` is a deliberate FP32 fallback capture: it
+unblocks implementation-side ConformanceExact work while its provenance prevents it from being
+mistaken for a CUDA golden. A later native CUDA capture measures the cross-device floor.
 
 Example (the output directory must not exist):
 
@@ -185,6 +187,48 @@ class SavedTensor:
     sha256: str
     shape: list[int]
     dtype: str
+
+
+@dataclass(frozen=True)
+class CaptureProfile:
+    """The execution class a fixture is allowed to claim."""
+
+    device_map: str
+    torch_dtype_name: str
+    oracle_class: str
+
+
+def capture_profile(device: str) -> CaptureProfile:
+    """Return the explicit, provenance-bearing profile for one requested capture device."""
+    if device == "cuda":
+        return CaptureProfile(
+            device_map="cuda:0",
+            torch_dtype_name="bfloat16",
+            oracle_class="native_cuda",
+        )
+    if device == "cpu":
+        return CaptureProfile(
+            device_map="cpu",
+            torch_dtype_name="float32",
+            oracle_class="cpu_fp32_fallback",
+        )
+    fail(f"unsupported fixture capture device {device!r}")
+
+
+def assert_required_conformance_seams(saved: list[SavedTensor], mode_name: str) -> None:
+    """Refuse a manifest that lacks one of the L2/L4 CPU-unblocking seams."""
+    paths = [item.path for item in saved]
+    required = {
+        "talker layer activation": lambda path: "/talker.layer_" in path
+        and path.startswith("stages/talker_free_running/"),
+        "microdecoder depth activation": lambda path: "/microdecoder.layer_" in path
+        and path.startswith("stages/teacher_forced_frame_"),
+        "codec decode block activation": lambda path: "/codec_decoder." in path
+        and path.startswith("stages/codec_decode/"),
+    }
+    missing = [name for name, predicate in required.items() if not any(predicate(path) for path in paths)]
+    if missing:
+        fail(f"{mode_name}: fixture capture missed required conformance seams: {', '.join(missing)}")
 
 
 class HookRecorder:
@@ -400,6 +444,7 @@ def run_case(wrapper: Any, case: dict[str, Any], output_dir: Path, recorder: Hoo
             recorder.save("codec.generated_waveform", torch.from_numpy(waveform))
 
         files = [item.__dict__ for item in recorder.saved]
+        assert_required_conformance_seams(recorder.saved, mode_name)
         mode_manifest = {
             "mode": mode_name,
             "x_vector_only_mode": xvector_only,
@@ -425,14 +470,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--corpus", type=Path, required=True, help="versioned JSON corpus definition")
     parser.add_argument("--output", type=Path, required=True, help="new fixture directory; it must not already exist")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    parser.add_argument("--cpu-smoke", action="store_true", help="acknowledge that a CPU run is not a native-device golden")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if args.device == "cpu" and not args.cpu_smoke:
-        fail("CPU fixtures are smoke-only; pass --cpu-smoke to label them as such")
+    profile = capture_profile(args.device)
     if args.output.exists():
         fail(f"output already exists; choose a new directory rather than overwriting {args.output}")
     if args.output.parent.exists() and not args.output.parent.is_dir():
@@ -464,25 +507,34 @@ def main() -> int:
     if args.device == "cuda" and not torch.cuda.is_available():
         fail("native oracle requires CUDA, but torch.cuda.is_available() is false")
 
-    device_map = "cuda:0" if args.device == "cuda" else "cpu"
+    torch_dtype = torch.bfloat16 if profile.torch_dtype_name == "bfloat16" else torch.float32
     wrapper = Qwen3TTSModel.from_pretrained(
         str(model_dir),
-        device_map=device_map,
-        dtype=torch.bfloat16,
+        device_map=profile.device_map,
+        dtype=torch_dtype,
         attn_implementation="eager",
         local_files_only=True,
     )
     wrapper.model.train(False)
     args.output.mkdir(parents=True)
     provenance = {
-        "schema_version": 1,
-        "oracle_class": "native_cuda" if args.device == "cuda" else "cpu_smoke_only",
+        "schema_version": 2,
+        "oracle_class": profile.oracle_class,
         "source_pin": PINNED_GH_REV,
         "weights_pin": PINNED_HF_REV,
         "runtime": runtime,
-        "device": str(wrapper.device),
+        "device_provenance": {
+            "requested_device": args.device,
+            "device_map": profile.device_map,
+            "wrapper_device": str(wrapper.device),
+            "parameter_devices": sorted({str(parameter.device) for parameter in wrapper.model.parameters()}),
+            "parameter_dtypes": sorted(
+                {str(parameter.dtype).removeprefix("torch.") for parameter in wrapper.model.parameters()}
+            ),
+            "torch_version": str(torch.__version__),
+        },
         "attn_implementation": "eager",
-        "dtype": "bfloat16",
+        "dtype": profile.torch_dtype_name,
         "generation": {"do_sample": False, "top_k": 1, "top_p": 1.0, "temperature": 1.0, "repetition_penalty": 1.0},
         "weight_hashes": weight_hashes,
         "corpus_sha256": sha256(corpus_path),
@@ -498,7 +550,10 @@ def main() -> int:
     finally:
         recorder.close()
     root_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "oracle_class": profile.oracle_class,
+        "capture_device": str(wrapper.device),
+        "capture_dtype": profile.torch_dtype_name,
         "provenance_sha256": sha256(args.output / "provenance.json"),
         "cases": corpus_entries,
     }

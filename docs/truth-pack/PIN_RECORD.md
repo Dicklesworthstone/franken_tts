@@ -78,9 +78,11 @@ The source-package pins above are authoritative for `qwen-tts`, `transformers`, 
 For the packages the upstream project leaves unpinned, the local oracle smoke environment is
 **Python 3.13.9; `torch==2.7.1`; `torchaudio==2.7.1`; `librosa==0.11.0`;
 `soundfile==0.13.1`**, with `qwen-tts==0.1.1`, `transformers==4.57.3`, and
-`accelerate==1.12.0`. It uses eager attention, BF16 parameters, and `device_map=cpu`. The fixture
-generator must assert these versions before producing or consuming oracle fixtures; configuration
-metadata is not an acceptable substitute.
+`accelerate==1.12.0`. CPU fixture capture uses eager attention, FP32 parameters, and
+`device_map=cpu`; its provenance records `oracle_class=cpu_fp32_fallback`, requested and actual
+devices, parameter devices/dtypes, and the torch version. The fixture generator must assert these
+versions before producing or consuming oracle fixtures; configuration metadata is not an acceptable
+substitute.
 
 At GitHub source pin `022e286b98fbec7e1e916cb940cdf532cd9f488e`, this environment loaded the
 model on Apple Silicon CPU and ran canonical-greedy x-vector synthesis twice with the same one-second,
@@ -91,11 +93,12 @@ minimum of two new tokens; `max_new_tokens=1` is not a valid smoke because it le
 The curated truth-pack snapshot alone is not importable for this run because it omits
 `qwen_tts.core.tokenizer_25hz.vq`; use a full checkout verified at the source pin.
 
-**Performance-baseline decision:** this proves fixed-runtime CPU execution and repeatability only.
-It does **not** prove CPU-to-CUDA canonical-greedy token equality (the host had no CUDA device), so
-official CPU is **not an admissible G2 performance incumbent** and no CPU/GPU ratio may be reported.
-Correctness fixtures remain frozen from the unmodified native-device oracle; a CUDA run with
-codec-token capture over the declared corpus must establish the cross-device nondeterminism envelope.
+**Claim-tier decision:** CPU/FP32 fixture capture supplies named talker, microdecoder, and codec
+seams for implementation-side ConformanceExact work. It is not a native-CUDA golden and does
+**not** prove CPU-to-CUDA canonical-greedy token equality (the host had no CUDA device), so official
+CPU is **not** an admissible G2 performance incumbent and no CPU/GPU ratio may be reported. A CUDA
+run with codec-token capture over the declared corpus must establish the cross-device
+nondeterminism envelope before any native-device equivalence claim.
 
 ## Non-pinnable reference
 

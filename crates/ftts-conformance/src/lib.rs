@@ -128,8 +128,8 @@ pub mod prelude {
         ExecutionPath, ModelGate, NONEXISTENT_FALLBACK, require_native_execution,
     };
     pub use crate::report::{
-        FixtureProvenance, Outcome, Receipt, Stage, bytes_hash, emit_stage, pcm_hash,
-        token_stream_hash,
+        CaptureProvenance, FixtureProvenance, Outcome, Receipt, Stage, bytes_hash, emit_stage,
+        pcm_hash, token_stream_hash,
     };
     pub use crate::{gated, xfail};
 }
