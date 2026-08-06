@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 #[cfg(test)]
 use clap::CommandFactory;
 use clap::{Parser, Subcommand, ValueEnum};
+use ftts_core::{NormalizationMode, NormalizationOptions, SynthesisRequest};
 use serde_json::{Value, json};
 
 const ROBOT_SCHEMA_VERSION: u8 = 1;
@@ -91,7 +92,7 @@ struct Cli {
     #[arg(long, global = true, value_enum)]
     normalize: Option<NormalizeMode>,
 
-    /// Optional structured trace directory. No trace is written by the Phase-0 skeleton.
+    /// Request a structured trace from synthesis without default-persisting sensitive text.
     #[arg(long, global = true, value_name = "DIR")]
     trace: Option<PathBuf>,
 
@@ -308,6 +309,16 @@ impl NormalizeMode {
     }
 }
 
+impl From<NormalizeMode> for NormalizationMode {
+    fn from(mode: NormalizeMode) -> Self {
+        match mode {
+            NormalizeMode::Verbatim => Self::Verbatim,
+            NormalizeMode::Conservative => Self::Conservative,
+            NormalizeMode::LocaleAware => Self::LocaleAware,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum StreamMode {
     Raw,
@@ -416,6 +427,13 @@ impl EffectiveSettings {
             normalize,
         })
     }
+
+    fn normalization_options(&self) -> NormalizationOptions {
+        NormalizationOptions {
+            mode: self.normalize.into(),
+            ..NormalizationOptions::default()
+        }
+    }
 }
 
 fn parse_env_value<T>(
@@ -479,7 +497,10 @@ fn run_say(
     let settings = EffectiveSettings::resolve(cli, environment)?;
     let model = resolve_model(args.model.as_deref(), environment)?;
     let voice = resolve_optional_file(args.voice.as_deref(), "voice pack")?;
-    let admission = admission_plan(&text, &settings)?;
+    let request = SynthesisRequest::new(text)
+        .with_normalization_options(settings.normalization_options())
+        .with_normalization_trace(cli.trace.is_some());
+    let admission = admission_plan(&request.text, &settings)?;
 
     if args.check {
         let event = json!({
@@ -492,6 +513,7 @@ fn run_say(
             "math_mode": settings.math_mode.as_str(),
             "voice_pack": settings.voice_pack.as_str(),
             "normalize": settings.normalize.as_str(),
+            "normalization_trace_requested": request.trace_normalization,
             "seed": cli.seed,
             "trace": cli.trace.as_ref().map(|path| path.display().to_string()),
             "output": args.output.as_ref().map(|path| path.display().to_string()),
@@ -860,6 +882,31 @@ mod tests {
                 .normalize,
             NormalizeMode::Verbatim
         );
+        assert_eq!(
+            EffectiveSettings::resolve(&cli, &Environment::default())
+                .expect("default settings")
+                .normalization_options(),
+            NormalizationOptions::default(),
+            "CLI defaults must use the same verbatim options as the library"
+        );
+    }
+
+    #[test]
+    fn cli_normalization_modes_map_to_shared_engine_options() {
+        for (cli_mode, engine_mode) in [
+            (NormalizeMode::Verbatim, NormalizationMode::Verbatim),
+            (NormalizeMode::Conservative, NormalizationMode::Conservative),
+            (NormalizeMode::LocaleAware, NormalizationMode::LocaleAware),
+        ] {
+            let settings = EffectiveSettings {
+                profile: ExecutionProfile::Balanced,
+                packet_frames: PacketFrames::Four,
+                math_mode: MathMode::Strict,
+                voice_pack: VoicePackProfile::Portable,
+                normalize: cli_mode,
+            };
+            assert_eq!(settings.normalization_options().mode, engine_mode);
+        }
     }
 
     #[test]
@@ -905,5 +952,6 @@ mod tests {
         assert_eq!(event["schema_version"], ROBOT_SCHEMA_VERSION);
         assert_eq!(event["event"], "check_complete");
         assert_eq!(event["admission"]["status"], "scaffold_accepted");
+        assert_eq!(event["normalization_trace_requested"], false);
     }
 }
