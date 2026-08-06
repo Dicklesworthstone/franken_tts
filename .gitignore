@@ -14,3 +14,6 @@ Cargo.lock.orig
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# Truth-pack snapshots: hashes are committed (docs/truth-pack/MANIFEST.sha256), bytes are not.
+docs/truth-pack/snapshots/

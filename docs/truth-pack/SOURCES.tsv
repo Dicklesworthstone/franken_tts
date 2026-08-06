@@ -1,0 +1,55 @@
+# franken_tts truth pack — source inventory.
+# Columns: origin<TAB>remote_path<TAB>local_path<TAB>class
+#
+# origin      : hf | gh | url        (hf/gh resolve against the pins in fetch-truth-pack.sh)
+# remote_path : path within the pinned repo, or a full URL when origin=url
+# local_path  : path under snapshots/
+# class       : core     = a plan fact depends on these bytes; hash mismatch is STOP-THE-LINE
+#               support  = read during porting, not directly load-bearing for a plan-§2 fact
+#               drift-ok = upstream rerenders this; mismatch is a notice, not a stop
+#
+# Weight shards are NOT listed here: they are 2.5 GB of LFS content verified from
+# WEIGHTS.lfs.json via the HF paths-info API (or by download under --with-weights).
+
+hf	config.json	hf/config.json	core
+hf	generation_config.json	hf/generation_config.json	core
+hf	speech_tokenizer/config.json	hf/speech_tokenizer/config.json	core
+hf	speech_tokenizer/configuration.json	hf/speech_tokenizer/configuration.json	core
+hf	speech_tokenizer/preprocessor_config.json	hf/speech_tokenizer/preprocessor_config.json	core
+hf	preprocessor_config.json	hf/preprocessor_config.json	core
+hf	tokenizer_config.json	hf/tokenizer_config.json	core
+hf	vocab.json	hf/vocab.json	core
+hf	merges.txt	hf/merges.txt	core
+hf	README.md	hf/README.md	core
+hf	.gitattributes	hf/.gitattributes	support
+
+gh	LICENSE	gh/LICENSE	core
+gh	README.md	gh/README.md	core
+gh	pyproject.toml	gh/pyproject.toml	core
+gh	qwen_tts/core/models/modeling_qwen3_tts.py	gh/qwen_tts/core/models/modeling_qwen3_tts.py	core
+gh	qwen_tts/core/models/configuration_qwen3_tts.py	gh/qwen_tts/core/models/configuration_qwen3_tts.py	core
+gh	qwen_tts/core/models/processing_qwen3_tts.py	gh/qwen_tts/core/models/processing_qwen3_tts.py	core
+gh	qwen_tts/core/models/__init__.py	gh/qwen_tts/core/models/__init__.py	support
+gh	qwen_tts/core/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py	gh/qwen_tts/core/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py	core
+gh	qwen_tts/core/tokenizer_12hz/configuration_qwen3_tts_tokenizer_v2.py	gh/qwen_tts/core/tokenizer_12hz/configuration_qwen3_tts_tokenizer_v2.py	core
+gh	qwen_tts/inference/qwen3_tts_model.py	gh/qwen_tts/inference/qwen3_tts_model.py	core
+gh	qwen_tts/inference/qwen3_tts_tokenizer.py	gh/qwen_tts/inference/qwen3_tts_tokenizer.py	core
+gh	qwen_tts/cli/demo.py	gh/qwen_tts/cli/demo.py	core
+gh	qwen_tts/core/__init__.py	gh/qwen_tts/core/__init__.py	support
+gh	qwen_tts/__init__.py	gh/qwen_tts/__init__.py	support
+gh	qwen_tts/__main__.py	gh/qwen_tts/__main__.py	support
+gh	examples/test_model_12hz_base.py	gh/examples/test_model_12hz_base.py	core
+gh	examples/test_tokenizer_12hz.py	gh/examples/test_tokenizer_12hz.py	core
+gh	examples/test_model_12hz_custom_voice.py	gh/examples/test_model_12hz_custom_voice.py	support
+gh	examples/test_model_12hz_voice_design.py	gh/examples/test_model_12hz_voice_design.py	support
+gh	finetuning/sft_12hz.py	gh/finetuning/sft_12hz.py	core
+gh	finetuning/dataset.py	gh/finetuning/dataset.py	support
+gh	finetuning/README.md	gh/finetuning/README.md	support
+gh	assets/Qwen3_TTS.pdf	gh/assets/Qwen3_TTS.pdf	support
+# 25 Hz tokenizer: not our checkpoint, but plan §2.8 makes it a scheduled-epic trigger.
+gh	qwen_tts/core/tokenizer_25hz/configuration_qwen3_tts_tokenizer_v1.py	gh/qwen_tts/core/tokenizer_25hz/configuration_qwen3_tts_tokenizer_v1.py	support
+gh	qwen_tts/core/tokenizer_25hz/modeling_qwen3_tts_tokenizer_v1.py	gh/qwen_tts/core/tokenizer_25hz/modeling_qwen3_tts_tokenizer_v1.py	support
+
+url	https://arxiv.org/pdf/2601.15621v1	paper/2601.15621v1.pdf	core
+# arXiv rerenders HTML from the same v1 source; the PDF above is the authority.
+url	https://arxiv.org/html/2601.15621v1	paper/2601.15621v1.html	drift-ok

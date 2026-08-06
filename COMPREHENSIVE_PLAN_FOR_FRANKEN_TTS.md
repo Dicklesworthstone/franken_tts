@@ -81,15 +81,25 @@ Qwen3-TTS-12Hz-0.6B-Base is a **hierarchical autoregressive codec-token TTS mode
 
 ```
 for each 80 ms audio frame:
-    run the 28-layer main talker once            # → semantic/primary code (1 token)
+    run the 28-layer main talker once            # → semantic/primary code (1 token, 3072-way head)
     sample the primary code
     reset the tiny fixed microdecoder KV state
-    for residual_depth in 0..15:                 # 15 SEQUENTIAL 5-layer forwards
+    for residual_depth in 0..14:                 # 15 SEQUENTIAL 5-layer forwards
         run the 5-layer residual-code microdecoder one step
         run the residual_depth-specific 2048-way head
         sample the residual code                 # conditions the NEXT depth
+    # --- the talker's next input, which v2 of this plan omitted [VERIFIED @pin, C-1] ---
+    talker_next_input = sum(talker_emb(code0),
+                            depth_emb[j](code_{j+1}) for j in 0..14)   # all 16 codes SUMMED
+                      + (trailing_text_hidden[step] if step < len(text) else tts_pad_embed)
     enqueue the 16-code frame for the codec
 ```
+
+**The text stream is consumed one hidden per frame, interleaved with audio generation — not as a
+prefill-only prefix.** Any forward that treats text as fully consumed at prefill desyncs after the
+first frame. Per-depth embedding/head list index `j` serves code **`j+1`**; code 0 is embedded by the
+*talker's* `codec_embedding`, not by any microdecoder embedding (C-2 — a silent-wrongness trap).
+Citations: `docs/truth-pack/FACT_DISPOSITIONS.md` (C-1, C-2).
 
 Serial work per second of speech: **12.5 × 28 = 350 talker-layer evaluations** plus **12.5 × 15 × 5 = 937.5 microdecoder-layer evaluations**, plus the codec. The 12.5 Hz frame rate remains highly attractive — but "only 12.5 heavyweight sequential steps per second" materially understates the work, and v1 of this plan repeated that understatement. Throughout this document the module is called the **Residual-Code Microdecoder** (never "the MTP module") precisely so its behavior cannot be mentally flattened into a single call. Residual codes are autoregressively dependent within the frame **[SOURCE]** — any "the groups are independent" optimization is invalid (v1's batch-of-frames MTP idea is deleted).
 
@@ -102,7 +112,7 @@ Cloning has two paths: **x-vector (speaker-embedding)** — no transcript needed
 | HF repo | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | [SOURCE] |
 | Siblings | 1.7B-Base (upper-bound reference only); CustomVoice (out of scope); **25Hz variants (see §2.8 long-form)** | [SOURCE] |
 | Dtype / size | bf16; repo ≈ 2.52 GB (≈1.83 GB talker + speech tokenizer); system ≈ 0.9B params; community Q8 ≈ 993 MB talker + 291 MB codec | [REPORTED] |
-| License | Apache-2.0 (verify LICENSE verbatim at pin — OQ-1) | [REPORTED] |
+| License | Apache-2.0 — **code repo** ships verbatim stock Apache-2.0 (`Copyright 2026 Alibaba Cloud`); **weights repo ships NO `LICENSE` and NO `NOTICE`**, only the model-card `license:` tag (C-4, OQ-1) | [VERIFIED code / METADATA-ONLY weights] |
 | Ecosystem | official repo (cloning/streaming/eval/finetune), GGML (CPU/Metal/CUDA/Vulkan), mlx-audio; executable oracles, not performance ceilings | [REPORTED] |
 
 ### 2.3 The main talker — **[SOURCE]**
@@ -128,7 +138,8 @@ The remaining talker [OPEN]s narrow to: the exact position *schedule* (`rope_del
 - Five layers, 1024-wide geometry (same shape family as a talker layer).
 - Invoked with `max_new_tokens = num_code_groups − 1 = 15` — **fifteen sequential 5-layer forwards per frame**.
 - **Per-depth embeddings and per-depth 2,048-way output heads**; each sampled residual token conditions the next depth.
-- **Ordinary RoPE** (`apply_rotary_pos_emb`, no scaling) — **a different rotary kernel than the talker's mRoPE**; the two are separate, independently conformed kernels (§5.3).
+- **Ordinary RoPE** (`apply_rotary_pos_emb`, no scaling) — **a different rotary kernel than the talker's mRoPE**; the two are separate, independently conformed kernels (§5.3). **Its `rope_theta` is 1e6, the SAME as the talker's** — "plain" means *no mRoPE sectioning*, **not** a different theta; a port defaulting it to 1e4 is silently wrong (C-3). The codec decoder is the one at theta 1e4.
+- **QK-Norm confirmed present** (RMSNorm over `head_dim` only, before RoPE, eps 1e-6) on both this module and the talker; `attention_bias: false` everywhere ⇒ no QKV/O biases (E-1).
 - Sampling defaults: temperature 0.9, top_k 50, top_p 1.0.
 - Its KV state for one frame (≤16 positions × 5 layers) is tiny — comfortably cache-resident. **Its weights, not its attention history, are the problem.**
 - Training/finetuning forward computes all 15 residual positions in **one causal sequence pass** — which is exactly what makes it usable as a **block verifier** for speculative decoding (§7.5).
@@ -174,7 +185,7 @@ ECAPA-TDNN-style: **128 mel bins, 24 kHz input, 1,024-d output; channels `[512, 
 
 ### 2.10 Required neural-op set
 
-Text tokenization + normalization modes (§8.7); cold-row text embedding + the 2048→2048→1024 SiLU projection; **two rotary kernels** (talker mRoPE sections [24,20,20]; microdecoder plain RoPE); RMSNorm (+QK-Norm if confirmed); GQA decode attention + KV cache; SwiGLU-class MLP; the fixed 15-step microdecoder loop with per-depth embeddings/heads; per-level samplers (talker: T0.9/k50/rep1.05; residual: T0.9/k50) + canonical greedy mode; stateful causal Conv1d + windowed small attention + upsampling for the codec decoder; codec encoder + ECAPA speaker encoder (enrollment build); STFT/mel; audio decode/resample/VAD/diagnostics; WAV/PCM emission.
+Text tokenization + normalization modes (§8.7); cold-row text embedding + the 2048→2048→1024 SiLU projection; **two rotary kernels over three configs** (talker mRoPE sections [24,20,20] θ=1e6; microdecoder plain RoPE **θ=1e6**; codec decoder θ=1e4 windowed — C-3); RMSNorm + **QK-Norm (confirmed present, head_dim-only, pre-RoPE, eps 1e-6 — E-1)**; GQA decode attention + KV cache; SwiGLU-class MLP; the fixed 15-step microdecoder loop with per-depth embeddings/heads; per-level samplers (talker: T0.9/k50/rep1.05; residual: T0.9/k50) + canonical greedy mode; stateful causal Conv1d + windowed small attention + upsampling for the codec decoder; codec encoder + ECAPA speaker encoder (enrollment build); STFT/mel; audio decode/resample/VAD/diagnostics; WAV/PCM emission.
 
 ---
 
@@ -741,10 +752,18 @@ Per-component blocking (each OQ blocks only its dependents). Promoted-to-[SOURCE
 | **OQ-13** | GGML conversion's exact kept-high-precision set | §6.3 validation |
 | **OQ-14** | Official streaming internals: first-packet path, flush behavior, prompt differences vs non-streaming | stream contract, TTFA |
 | **OQ-15** | Oracle runtime pins; does official CPU reproduce its own GPU tokens? | §9 oracle, G2 baseline |
-| **OQ-16** | Pocket: weights gating/licensing (needed just to RUN it in the bakeoff); voice-state format | bakeoff Gate A; Phase-5 track |
+| **OQ-16 [SOURCE; partially resolved — Gate A access BLOCKED 2026-08-05]** | Pocket: weights gating/licensing (needed just to RUN it in the bakeoff); voice-state format. See the resolution immediately below. | bakeoff Gate A; Phase-5 track |
 | **OQ-17** | Energy/thermal measurement method (joules/generated-minute) | §15, bakeoff harness |
 | **OQ-18** | Per-SKU cache-residency of the **~110 MB-class hot working set under talker interference** (M4/M5 SLC; AMD L3-per-CCD; Intel) — operationalized as measured DRAM bytes/frame vs the one-read floor (§7.4) | §7.4 hot-pack design, G2 targets |
 | **OQ-19** | The **named speculative-sampling algorithm + distributional-correctness proof** for top-k/top-p + repetition-penalty at both levels (accepted prefixes ≡ sequential sampler's distribution; rejections from the verifier's adjusted conditional). A research deliverable; **AF-3 is reliability-only and never substitutes** | §7.5 sampled mode |
+
+### OQ-16 resolution — Pocket access, license, and voice state **[SOURCE; checked 2026-08-05]**
+
+- **Access / Gate A status:** the official `kyutai/pocket-tts` HF API declares `gated: "auto"` and `license: "cc-by-4.0"`; its anonymous weight resolver returns `401`, `GatedRepo`, and says that authentication plus model access are required. This workspace has neither an HF credential nor a local Pocket cache, so **the weights have not been obtained and Gate A remains BLOCKED**. A human with authority to accept the model gate must authenticate to HF, accept the displayed terms, download the required voice-cloning revision, and record its immutable revision plus SHA-256 before Gate A runs. The displayed gate separately prohibits unlawful/non-consensual cloning and other harmful/deceptive use; it does not relax the project's consent rule.
+- **Redistribution:** CC BY 4.0 permits reproduction, sharing, and adapted material, but sharing the original or a converted/quantized artifact must retain supplied creator/copyright/notice/URI information, identify modifications, and state/link the CC BY 4.0 license. Therefore a hypothetical Pocket `.fttsq` / dual-engine distribution needs a Pocket-specific NOTICE containing Kyutai attribution, the model URL and pinned source revision, `CC-BY-4.0`, the conversion/quantization statement, and the original gate-use notice when supplied. This is a license-obligation summary, not legal advice; re-check the gated model card and included notices at the accepted pin.
+- **Voice-state format / Gate B mapping:** upstream `export_model_state` writes a flat safetensors map with keys `<StatefulModule-name>/<tensor-key>`. For each FlowLM attention module, the reusable state is `cache` shaped `[2, batch, T, heads, head_dim]` (K/V) plus `offset`; current export writes `<module>/offset`. Import also accepts legacy `<module>/current_end` and reconstructs `offset` from `current_end.shape[0]`, then loads the remaining tensors and expands a sliced cache with NaN capacity before generation. The state is created by Mimi-encoding the reference audio, projecting it into FlowLM conditioning, then prompting the FlowLM; it is thus a **derived prompt/KV cache**, not an audio/provenance-bearing portable voice recipe.
+- **Compatibility consequence:** upstream stores no model revision, model/config hash, dtype declaration, prompt-builder version, or engine ABI in this safetensors payload, and its `current_end` import is already a compatibility migration. Treat Pocket voice-state files as untrusted, engine-specific `.ftvoice-cache` inputs: reject malformed names/shapes/dtypes, require an external full compatibility key, and regenerate from an owned, consented source voice on any mismatch. Do not map them directly to portable `.ftvoice`.
+- **Sources:** HF model metadata/gate: `https://huggingface.co/api/models/kyutai/pocket-tts`; official resolver endpoint: `https://huggingface.co/kyutai/pocket-tts/resolve/main/tts_b6369a24.safetensors`; Pocket source pinned for this reading: `https://github.com/kyutai-labs/pocket-tts/commit/d108410d23eef7e01db282f9442891162dbc3db6` (`README.md`, `pocket_tts/models/tts_model.py`, `pocket_tts/modules/transformer.py`, `pocket_tts/modules/stateful_module.py`); CC BY 4.0 legal code: `https://creativecommons.org/licenses/by/4.0/legalcode`.
 
 ---
 

@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "Weight-shard integrity for Qwen/Qwen3-TTS-12Hz-0.6B-Base @ HF_REV.",
+    "sha256 is the Git-LFS object id, which for LFS pointers IS the SHA-256 of the file",
+    "content. Obtained from the HF paths-info API at pin time, so integrity is verifiable",
+    "without a 2.5 GB download; `fetch-truth-pack.sh --with-weights` downloads and re-hashes.",
+    "xet_hash is HF's content-defined-chunking dedup hash, recorded as a second witness only."
+  ],
+  "repo": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+  "revision": "5d83992436eae1d760afd27aff78a71d676296fc",
+  "retrieved_utc": "2026-08-06",
+  "api": "POST https://huggingface.co/api/models/{repo}/paths-info/{revision}",
+  "total_bytes": 2511637364,
+  "files": [
+    {
+      "path": "model.safetensors",
+      "size": 1829344272,
+      "sha256": "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6",
+      "git_blob_oid": "401a365c4572f09f44d48bb336fdbf94cd1e3ad2",
+      "xet_hash": "84eafc54f91c928d76018d2c43a535f3613cdbf86a0252b1840783c33686c9f1",
+      "role": "talker + text embedding + microdecoder + per-depth heads + speaker encoder"
+    },
+    {
+      "path": "speech_tokenizer/model.safetensors",
+      "size": 682293092,
+      "sha256": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
+      "git_blob_oid": "026d66bfb5d730dcfd56450c5e9e51b3ef4e0712",
+      "xet_hash": "2770552d9ac6119e00cc15f368f2e08a4ae4787b1f94234e639af510f8eb2ea0",
+      "role": "codec encoder + decoder + RVQ codebooks"
+    }
+  ],
+  "note_on_shards": [
+    "The plan said 'all weight shards'. There are NO shards: the repo ships exactly two",
+    "unsharded safetensors files and no *.index.json. Recorded as CORRECTION C-6 in",
+    "FACT_DISPOSITIONS.md; the loader must not expect an index file."
+  ]
+}

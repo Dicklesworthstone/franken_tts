@@ -1,0 +1,43 @@
+# franken_tts truth pack — SHA-256 of every snapshotted source.
+# HF  Qwen/Qwen3-TTS-12Hz-0.6B-Base @ 5d83992436eae1d760afd27aff78a71d676296fc
+# GH  QwenLM/Qwen3-TTS @ 022e286b98fbec7e1e916cb940cdf532cd9f488e
+# Regenerate: ./fetch-truth-pack.sh --write-manifest   (pin-time only)
+# Verify:     ./fetch-truth-pack.sh --verify
+a44a6081c73ad75f0255bb2bb5cab74ef1829565a895a24e53a4f11290ab7655  core  gh/LICENSE
+51f4497e70e9ae024b10ee4bbcb470366f10592edeab56c58d2194ba2dadb745  core  gh/README.md
+b818867cf8f190185eae83238bde3adfc0c47c1864e587efdc59ee8ab5c7d0cb  support  gh/assets/Qwen3_TTS.pdf
+73f7cba58548990a3a3f602db593fe8ae4516a81535cfe38e15943733928fb29  core  gh/examples/test_model_12hz_base.py
+70a6933d26f1bf951c30fb2c62030915c64c927c31eab1cf9a3a301abb8fb5b5  support  gh/examples/test_model_12hz_custom_voice.py
+6d770da93ca10bb8c769c56d36a4b19ad215ac904f9c4b947c368bbff632978f  support  gh/examples/test_model_12hz_voice_design.py
+20e84a767e300f84036b21473ca85ba06b911efae6f616c82b98068937d1cf76  core  gh/examples/test_tokenizer_12hz.py
+7a0bb1d3396ff4a41ff5958ba5db0b87547ac05df91874208d530e73e8be476f  support  gh/finetuning/README.md
+fd15ee9e71822d9fc1cdf8eb6d6f042836d186e95de5920087d80828cf98a1cb  support  gh/finetuning/dataset.py
+74d4359bff1ac5eddaca99f0cb5a8b76a55ffbd94af0ab50bffd49aee0e5c473  core  gh/finetuning/sft_12hz.py
+3e82fcb21b9d48bba789a7c0a2c2dcb88ad60c4d297d60ae4575ee3eb4e4d5aa  core  gh/pyproject.toml
+ea52de59d070fde366467a6902d0edcfc1b0575b8c570a0c71020c41d6a593ed  support  gh/qwen_tts/__init__.py
+7791bc1fe172af87902c52d83262aaf32f1029219a013db1df16dc6730501d97  support  gh/qwen_tts/__main__.py
+ea28e0930753e05cbdd53ab7bd90b7be81ab859549902771db15f0b3abfcd5eb  core  gh/qwen_tts/cli/demo.py
+1b380d9de843b6d585d938c339d066136567ca7125412674234204af4386679e  support  gh/qwen_tts/core/__init__.py
+917d38d8fd7ed84de73703fd2394d535ca416e15694d1e50324e4a06d4022c82  support  gh/qwen_tts/core/models/__init__.py
+f52867f14fde06a416dd14864d503ce6d13d0a08d5f5da30191e1c80c13f5d18  core  gh/qwen_tts/core/models/configuration_qwen3_tts.py
+25c42656bcf810f06ef6bc1839bd7083f3c8cfedac3a147c4060b4262b1c96a0  core  gh/qwen_tts/core/models/modeling_qwen3_tts.py
+61472203188e46eda68d740c25f0f228ece24a61ecf942e57d6e49e78b4d6bcd  core  gh/qwen_tts/core/models/processing_qwen3_tts.py
+9e30c24394b00cb0366d7da3482b7436468acc1cd3da1a6fe614a1d34653a5e3  core  gh/qwen_tts/core/tokenizer_12hz/configuration_qwen3_tts_tokenizer_v2.py
+844e8dd8c0182ef9c6463c874631c22ef3c5a4fd1899dd657016164cc5379628  core  gh/qwen_tts/core/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py
+28f94f715df7d96d365c9cea0021d9cca8c63d2f48f48423c43a3d3cae28ef02  support  gh/qwen_tts/core/tokenizer_25hz/configuration_qwen3_tts_tokenizer_v1.py
+8c6d5b7cfb133967f04286e069138ef7fe0cfca30e9acf3326106f6117135a7f  support  gh/qwen_tts/core/tokenizer_25hz/modeling_qwen3_tts_tokenizer_v1.py
+e1da450732857c1f5fe3e36ebab85db2f6dc6a48caaff6973f463384e30275e4  core  gh/qwen_tts/inference/qwen3_tts_model.py
+ac2d855022a1bd21d33ab7b267ec952eef71f81d3f8d969a306139ff1a929515  core  gh/qwen_tts/inference/qwen3_tts_tokenizer.py
+11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361  support  hf/.gitattributes
+181187b6057906bd960bc7f938d0b7a16652509776a0d52c4885b4ae5ccda0ea  core  hf/README.md
+2e714c787c8edb98b05432685cddb634add2de4d4e645f653d68251ef72ba011  core  hf/config.json
+f1b90b4513f3b34c62851049e2492d7b4c5940daf1276f89c82b8ef04127f3aa  core  hf/generation_config.json
+599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3  core  hf/merges.txt
+efdde1022ea9d76928bf7a9cd53139138f5ba2e466e837f08f6105ab1af1c119  core  hf/preprocessor_config.json
+ee65bb901c876664ab8707c487157aa1a6ee57c65969b28fb5ec9dc211e68167  core  hf/speech_tokenizer/config.json
+6bc26d64eb5024b4d1dab5a52371958b429256d6c9d59787f1f5294a54e0cebd  core  hf/speech_tokenizer/configuration.json
+fcb3805e597e786d4067706e602f6688524640f8d3396790e2e09b5942fcbdfb  core  hf/speech_tokenizer/preprocessor_config.json
+dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670  core  hf/tokenizer_config.json
+ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910  core  hf/vocab.json
+364063d03ad8764ca719846b2b2742b9624e6e2b07f123b2c2081aaaa09df856  drift-ok  paper/2601.15621v1.html
+4a857188ba3478a410faacc0045cf00b40a00ecb0499617b4e9d70e7cf4b87c8  core  paper/2601.15621v1.pdf
