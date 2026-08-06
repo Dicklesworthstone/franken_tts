@@ -100,6 +100,27 @@ CPU is **not** an admissible G2 performance incumbent and no CPU/GPU ratio may b
 run with codec-token capture over the declared corpus must establish the cross-device
 nondeterminism envelope before any native-device equivalence claim.
 
+### Machine-local CPU fixture pointer
+
+The current CPU/FP32 capture is intentionally not committed because it is a sensitive research
+artifact. Its local root is
+`/Users/jemanuel/.cache/frankentts/oracle-fixtures/ft7-cpu-fp32-r1/`; the root
+`fixture_manifest.json` SHA-256 is
+`5ec2bc3f3217f9e026198c0694b3993d9911f7e954ea726c69ebd95e7d5ba4dd`.
+
+Regenerate only into a **new** output directory (the generator refuses to overwrite an existing
+capture), using a full Qwen3-TTS checkout verified at the GitHub pin and the frozen CPU oracle
+environment above:
+
+```bash
+python3 scripts/gen_reference_fixtures.py \
+  --source-dir /path/to/full/Qwen3-TTS \
+  --model-dir docs/truth-pack/snapshots/hf \
+  --corpus docs/conformance/oracle_corpus.json \
+  --output /Users/jemanuel/.cache/frankentts/oracle-fixtures/ft7-cpu-fp32-r2 \
+  --device cpu
+```
+
 ## Non-pinnable reference
 
 Plan §17 also cites `doc.rust-lang.org/.../lints/levels.html` for `forbid` being un-overridable.
