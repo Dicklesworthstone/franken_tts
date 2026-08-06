@@ -1,0 +1,152 @@
+{
+  "schema_version": "1.0.0",
+  "corpus_id": "bakeoff-texts-seed-1",
+  "note": "Target texts for the bakeoff. These are the SYNTHESIZED side of the corpus; reference audio lives in references.json and must be consent-clean. Authored for this project, so no third-party text licensing applies. Category and axis tags drive coverage validation and the tail reporting in docs/CONFORMANCE_AND_LISTENING.md.",
+  "texts": [
+    {"text_id": "en-prose-001", "language": "en", "category": "prose", "axes": [], "text": "The station was almost empty at that hour, and the announcement boards had gone quiet."},
+    {"text_id": "en-prose-002", "language": "en", "category": "prose", "axes": [], "text": "She kept the letter in the drawer for a year before deciding what to do with it."},
+    {"text_id": "en-prose-003", "language": "en", "category": "prose", "axes": [], "text": "Rain had been falling since morning, steady enough that nobody bothered to comment on it."},
+    {"text_id": "en-prose-004", "language": "en", "category": "prose", "axes": [], "text": "The repair took four hours, most of it spent waiting for a part that never arrived."},
+    {"text_id": "en-prose-005", "language": "en", "category": "prose", "axes": [], "text": "He learned the route by walking it, not by looking at a map."},
+
+    {"text_id": "en-dialogue-001", "language": "en", "category": "dialogue", "axes": [], "text": "\"Are you sure about this?\" she asked. \"Reasonably,\" he said. \"That's not the same as yes.\""},
+    {"text_id": "en-dialogue-002", "language": "en", "category": "dialogue", "axes": [], "text": "\"We close at six.\" \"It's five fifty-eight.\" \"Then you'd better be quick.\""},
+    {"text_id": "en-dialogue-003", "language": "en", "category": "dialogue", "axes": [], "text": "\"Did you hear back?\" \"Not yet.\" \"Will you tell me when you do?\" \"You'll know before I do.\""},
+    {"text_id": "en-dialogue-004", "language": "en", "category": "dialogue", "axes": ["breaths"], "text": "\"Wait — wait. Just... give me a second. Okay. Okay, go ahead.\""},
+
+    {"text_id": "en-numbers-001", "language": "en", "category": "numbers", "axes": ["numbers"], "text": "The reading came in at 1,247 units, up from 983 the previous quarter, a rise of 26.9 percent."},
+    {"text_id": "en-numbers-002", "language": "en", "category": "numbers", "axes": ["numbers"], "text": "Call 555-0142 between 9:30 and 17:00, or leave a message on extension 4081."},
+    {"text_id": "en-numbers-003", "language": "en", "category": "numbers", "axes": ["numbers"], "text": "Set the oven to 425 degrees, bake for 35 to 40 minutes, and rest it for a further 10."},
+    {"text_id": "en-numbers-004", "language": "en", "category": "numbers", "axes": ["numbers"], "text": "Version 2.11.3 shipped on 2026-03-14 and was superseded eleven days later by 2.12.0."},
+    {"text_id": "en-numbers-005", "language": "en", "category": "numbers", "axes": ["numbers"], "text": "Between 1918 and 1939 the population fell by two thirds, from roughly 90,000 to under 30,000."},
+
+    {"text_id": "en-currency-001", "language": "en", "category": "currency", "axes": ["numbers"], "text": "The invoice totalled $1,842.60, of which $147.41 was tax and $95.00 was shipping."},
+    {"text_id": "en-currency-002", "language": "en", "category": "currency", "axes": ["numbers"], "text": "They quoted €2.4 million, then revised it to £1.95 million after the survey."},
+    {"text_id": "en-currency-003", "language": "en", "category": "currency", "axes": ["numbers"], "text": "It costs ¥980 in Tokyo and about $6.50 once you account for the exchange rate."},
+
+    {"text_id": "en-names-001", "language": "en", "category": "names", "axes": [], "text": "Siobhan Nguyen and Krzysztof Wojciechowski met Ravi Subramanian outside the Beaulieu gallery."},
+    {"text_id": "en-names-002", "language": "en", "category": "names", "axes": [], "text": "The paper was written by Ibarra, Oyelaran-Oyeyinka, and Þórdís Jóhannsdóttir."},
+    {"text_id": "en-names-003", "language": "en", "category": "names", "axes": [], "text": "We drove from Worcestershire through Leominster to Beaulieu, then on to Kirkcudbright."},
+
+    {"text_id": "en-acronyms-001", "language": "en", "category": "acronyms", "axes": [], "text": "The NASA and NOAA teams submitted a joint RFC to the IETF, copying the WHO and the IAEA."},
+    {"text_id": "en-acronyms-002", "language": "en", "category": "acronyms", "axes": [], "text": "Configure the VPN over TLS 1.3, disable SMBv1, and confirm the SSD is using NVMe not SATA."},
+    {"text_id": "en-acronyms-003", "language": "en", "category": "acronyms", "axes": [], "text": "The CEO, the CFO, and two SVPs reviewed the Q3 EBITDA before the SEC filing."},
+
+    {"text_id": "en-urls-001", "language": "en", "category": "urls", "axes": [], "text": "Full details are at https://example.org/docs/v2/getting-started?lang=en#install."},
+    {"text_id": "en-urls-002", "language": "en", "category": "urls", "axes": [], "text": "Email support@example.co.uk or open an issue at github.com/example/project/issues/482."},
+    {"text_id": "en-urls-003", "language": "en", "category": "urls", "axes": [], "text": "Run curl -sSL https://get.example.dev/install.sh | sh, then check ~/.local/bin is on your PATH."},
+
+    {"text_id": "en-quotations-001", "language": "en", "category": "quotations", "axes": [], "text": "He wrote: \"We are what we repeatedly do.\" Then, in the margin, \"— but not only that.\""},
+    {"text_id": "en-quotations-002", "language": "en", "category": "quotations", "axes": [], "text": "The report says the delay was \"foreseeable,\" \"avoidable,\" and — the word that stung — \"routine.\""},
+
+    {"text_id": "en-long-001", "language": "en", "category": "long_sentence", "axes": [], "text": "Although the committee had been meeting weekly since March, and although each of its members had, at one point or another, expressed private reservations about the timetable, no formal objection was recorded until the final session, by which time the schedule had already been circulated to the regional offices."},
+    {"text_id": "en-long-002", "language": "en", "category": "long_sentence", "axes": [], "text": "The engine, which had been rebuilt twice — once badly, in a hurry, by someone who left no notes, and once properly, over the following winter — still made a sound on cold mornings that nobody could quite account for."},
+
+    {"text_id": "en-sibilant-001", "language": "en", "category": "prose", "axes": ["sibilants"], "text": "Sister Cecily's scissors sliced the silk cleanly, so she seldom saw stray stitches surface."},
+    {"text_id": "en-sibilant-002", "language": "en", "category": "prose", "axes": ["sibilants"], "text": "Six specialists assessed the census statistics, stressing that the sample sizes seemed insufficient."},
+    {"text_id": "en-sibilant-003", "language": "en", "category": "prose", "axes": ["sibilants"], "text": "The ship's mast shifted, the sails hissed, and the sea spray struck the starboard side."},
+    {"text_id": "en-sibilant-004", "language": "en", "category": "dialogue", "axes": ["sibilants"], "text": "\"She says she's certain.\" \"Certain of success, or certain of the census?\" \"Both, apparently.\""},
+
+    {"text_id": "en-breath-001", "language": "en", "category": "prose", "axes": ["breaths"], "text": "He ran the last stretch — hard — and then, bent double, tried to explain what had happened."},
+    {"text_id": "en-breath-002", "language": "en", "category": "dialogue", "axes": ["breaths"], "text": "\"I can't — hold on — I can't get it open. Is it... is it meant to turn the other way?\""},
+
+    {"text_id": "en-emph-001", "language": "en", "category": "prose", "axes": [], "text": "It wasn't that he disagreed. It was that he had never, at any point, been asked."},
+    {"text_id": "en-emph-002", "language": "en", "category": "prose", "axes": [], "text": "Do not press the button twice. Press it once. Wait. Then, only if nothing happens, press it again."},
+
+    {"text_id": "en-longform-001", "language": "en", "category": "long_form", "axes": ["long_form"], "text": "The first surveys of the valley were made in the summer of 1873, by a team of four who had been told to expect three weeks of work and stayed for nine. Their notebooks, which survive almost complete, record the weather every morning, the condition of the pack animals, and — with a thoroughness that later readers have found both useful and slightly maddening — the price of every meal they bought along the way. What the notebooks do not record, anywhere, is why the survey was commissioned. The official file was lost in a fire at the regional office in 1904, and the correspondence that might have explained it was, by all accounts, never copied. Historians have proposed three explanations. The first is that the survey was routine, one of dozens ordered that decade, and that its file was simply unremarkable. The second is that it was connected to a mineral claim which was later abandoned, and that the paperwork was deliberately allowed to lapse. The third, and the least supported, is that the survey was a pretext for something else entirely. What is certain is that the maps produced that summer remained in use for over forty years, and that at least two of the four surveyors never worked in the field again."},
+    {"text_id": "en-longform-002", "language": "en", "category": "long_form", "axes": ["long_form", "numbers"], "text": "Consider a system that processes eighty items per second at steady state. If each item requires four sequential stages, and each stage takes an average of three milliseconds, then the naive expectation is a throughput ceiling near eighty-three items per second — which is close enough to the observed figure that it invites the wrong conclusion. The wrong conclusion is that the system is near its limit. In fact the four stages do not contend for the same resource. Stages one and three are bound by memory bandwidth; stages two and four are bound by a single lock. Measured separately, the lock is held for one point one milliseconds per item, which places a hard ceiling at roughly nine hundred items per second, while the memory path saturates at about one hundred and forty. The binding constraint, therefore, is memory, and the lock — the thing everyone assumed was the problem, because locks usually are — has more than six times the headroom it needs. Removing it would buy nothing. This is worth stating plainly because the team spent five weeks removing it."},
+
+    {"text_id": "zh-prose-001", "language": "zh", "category": "prose", "axes": [], "text": "那天下午的雨一直没停，街上的人都躲进了屋檐底下。"},
+    {"text_id": "zh-prose-002", "language": "zh", "category": "prose", "axes": [], "text": "他把那封信放在抽屉里，过了一年才决定怎么处理。"},
+    {"text_id": "zh-prose-003", "language": "zh", "category": "prose", "axes": [], "text": "修理花了四个小时，其中大半时间都在等一个始终没送到的零件。"},
+    {"text_id": "zh-prose-004", "language": "zh", "category": "prose", "axes": [], "text": "这条路他是走出来的，不是在地图上看出来的。"},
+
+    {"text_id": "zh-dialogue-001", "language": "zh", "category": "dialogue", "axes": [], "text": "「你确定吗？」她问。「大致确定。」他说。「那和确定不是一回事。」"},
+    {"text_id": "zh-dialogue-002", "language": "zh", "category": "dialogue", "axes": [], "text": "「我们六点关门。」「现在五点五十八。」「那你得快一点了。」"},
+    {"text_id": "zh-dialogue-003", "language": "zh", "category": "dialogue", "axes": ["breaths"], "text": "「等一下……等一下。让我缓口气。好，好了，你说吧。」"},
+
+    {"text_id": "zh-numbers-001", "language": "zh", "category": "numbers", "axes": ["numbers"], "text": "这次读数是一千二百四十七，比上季度的九百八十三高出百分之二十六点九。"},
+    {"text_id": "zh-numbers-002", "language": "zh", "category": "numbers", "axes": ["numbers"], "text": "请在上午九点半到下午五点之间拨打 555-0142，或者留言到分机 4081。"},
+    {"text_id": "zh-numbers-003", "language": "zh", "category": "numbers", "axes": ["numbers"], "text": "从1918年到1939年，人口减少了三分之二，从大约九万降到不足三万。"},
+
+    {"text_id": "zh-currency-001", "language": "zh", "category": "currency", "axes": ["numbers"], "text": "发票总额为一千八百四十二元六角，其中税款一百四十七元四角一分。"},
+    {"text_id": "zh-currency-002", "language": "zh", "category": "currency", "axes": ["numbers"], "text": "他们报价二百四十万欧元，勘测之后改成了一百九十五万英镑。"},
+
+    {"text_id": "zh-names-001", "language": "zh", "category": "names", "axes": [], "text": "欧阳雪、司马鸿达和诸葛文彬在美术馆门口遇见了拉维·苏布拉马尼安。"},
+    {"text_id": "zh-names-002", "language": "zh", "category": "names", "axes": [], "text": "我们从乌鲁木齐经过呼和浩特到齐齐哈尔，最后到了佳木斯。"},
+
+    {"text_id": "zh-acronyms-001", "language": "zh", "category": "acronyms", "axes": [], "text": "NASA 和 NOAA 的团队向 IETF 提交了一份联合 RFC，并抄送给了 WHO。"},
+    {"text_id": "zh-acronyms-002", "language": "zh", "category": "acronyms", "axes": [], "text": "请通过 TLS 1.3 配置 VPN，关闭 SMBv1，并确认硬盘使用的是 NVMe 而不是 SATA。"},
+
+    {"text_id": "zh-urls-001", "language": "zh", "category": "urls", "axes": [], "text": "详细说明请见 https://example.org/docs/v2/getting-started?lang=zh#install 。"},
+    {"text_id": "zh-urls-002", "language": "zh", "category": "urls", "axes": [], "text": "请发邮件到 support@example.co.uk，或在 github.com/example/project/issues/482 提交问题。"},
+
+    {"text_id": "zh-quotations-001", "language": "zh", "category": "quotations", "axes": [], "text": "他写道：「我们是自己反复做的事情的总和。」又在旁边补了一句：「——但不止如此。」"},
+
+    {"text_id": "zh-long-001", "language": "zh", "category": "long_sentence", "axes": [], "text": "尽管委员会从三月起每周都开会，尽管每位成员都曾在某个时刻私下表达过对时间表的保留意见，但直到最后一次会议之前都没有任何正式的反对被记录下来，而那时日程表早已分发到了各个地区办事处。"},
+
+    {"text_id": "zh-sibilant-001", "language": "zh", "category": "prose", "axes": ["sibilants"], "text": "四十四只石狮子，是谁在四点四十四分数清楚的？"},
+    {"text_id": "zh-sibilant-002", "language": "zh", "category": "prose", "axes": ["sibilants"], "text": "三十三位专家审查了这些统计数字，坚持认为样本规模似乎不足。"},
+
+    {"text_id": "zh-emph-001", "language": "zh", "category": "prose", "axes": [], "text": "不要连按两次。按一次，等一会儿，只有在没有反应的时候才再按一次。"},
+
+    {"text_id": "zh-longform-001", "language": "zh", "category": "long_form", "axes": ["long_form"], "text": "对这片山谷最早的勘测是在一八七三年夏天完成的，勘测队一共四个人，出发时被告知工作大约需要三周，结果待了九周。他们的笔记本几乎完整地保存了下来，里面记录了每天早晨的天气、驮畜的状况，以及——后来的读者觉得既有用又有点让人恼火的详尽程度——沿途每一顿饭的价钱。笔记本里唯独没有记录的，是这次勘测究竟因何而起。官方档案在一九零四年地区办事处的一场火灾中遗失，可能解释缘由的往来信件，据说从未抄录副本。历史学者提出过三种说法。第一种认为这只是例行勘测，那十年里下达过几十次，档案本身平淡无奇。第二种认为它与一项后来被放弃的矿权申请有关，文件因此被有意搁置。第三种说法证据最少，认为勘测只是某件别的事情的借口。可以确定的是，那年夏天绘制的地图此后沿用了四十多年，而四位勘测者中至少有两人再也没有回到野外工作。"},
+
+    {"text_id": "es-prose-001", "language": "es", "category": "prose", "axes": [], "text": "La estación estaba casi vacía a esa hora y los paneles de anuncios se habían quedado en silencio."},
+    {"text_id": "es-prose-002", "language": "es", "category": "prose", "axes": [], "text": "Guardó la carta en el cajón durante un año antes de decidir qué hacer con ella."},
+    {"text_id": "es-prose-003", "language": "es", "category": "prose", "axes": [], "text": "Aprendió el camino andándolo, no mirando un mapa."},
+
+    {"text_id": "es-dialogue-001", "language": "es", "category": "dialogue", "axes": [], "text": "—¿Estás seguro? —preguntó ella. —Razonablemente. —Eso no es lo mismo que sí."},
+    {"text_id": "es-dialogue-002", "language": "es", "category": "dialogue", "axes": ["breaths"], "text": "—Espera… espera. Dame un segundo. Vale. Vale, sigue."},
+
+    {"text_id": "es-numbers-001", "language": "es", "category": "numbers", "axes": ["numbers"], "text": "La lectura fue de 1.247 unidades, frente a 983 el trimestre anterior, un aumento del 26,9 por ciento."},
+    {"text_id": "es-numbers-002", "language": "es", "category": "numbers", "axes": ["numbers"], "text": "Entre 1918 y 1939 la población cayó dos tercios, de unos 90.000 a menos de 30.000."},
+
+    {"text_id": "es-currency-001", "language": "es", "category": "currency", "axes": ["numbers"], "text": "La factura ascendió a 1.842,60 €, de los cuales 147,41 € eran impuestos."},
+
+    {"text_id": "es-names-001", "language": "es", "category": "names", "axes": [], "text": "Iñaki Etxebarría y Guadalupe Ñúñez se encontraron con Jörg Müller en Jerez de la Frontera."},
+
+    {"text_id": "es-acronyms-001", "language": "es", "category": "acronyms", "axes": [], "text": "Los equipos de la NASA y la NOAA enviaron un RFC conjunto al IETF, con copia a la OMS."},
+
+    {"text_id": "es-urls-001", "language": "es", "category": "urls", "axes": [], "text": "Los detalles están en https://example.org/docs/v2/empezar?lang=es#instalar."},
+
+    {"text_id": "es-sibilant-001", "language": "es", "category": "prose", "axes": ["sibilants"], "text": "Seis científicos suizos susurraron sus sospechas sobre el censo sin cesar."},
+
+    {"text_id": "es-long-001", "language": "es", "category": "long_sentence", "axes": [], "text": "Aunque el comité llevaba reuniéndose semanalmente desde marzo, y aunque cada uno de sus miembros había expresado en privado, en algún momento, sus reservas sobre el calendario, no se registró ninguna objeción formal hasta la sesión final, cuando el programa ya se había distribuido a las oficinas regionales."},
+
+    {"text_id": "es-longform-001", "language": "es", "category": "long_form", "axes": ["long_form"], "text": "Los primeros reconocimientos del valle se hicieron en el verano de 1873, a cargo de un equipo de cuatro personas a las que se les había dicho que el trabajo duraría tres semanas y que permanecieron nueve. Sus cuadernos, conservados casi completos, registran el tiempo cada mañana, el estado de las bestias de carga y, con una minuciosidad que los lectores posteriores han encontrado a la vez útil y algo exasperante, el precio de cada comida que compraron por el camino. Lo que los cuadernos no registran en ningún sitio es por qué se encargó el reconocimiento. El expediente oficial se perdió en un incendio en la oficina regional en 1904, y la correspondencia que podría haberlo explicado nunca llegó a copiarse. Lo que sí es seguro es que los mapas trazados aquel verano siguieron usándose durante más de cuarenta años."},
+
+    {"text_id": "ja-prose-001", "language": "ja", "category": "prose", "axes": [], "text": "その時間の駅はほとんど人がおらず、案内板も静かになっていた。"},
+    {"text_id": "ja-prose-002", "language": "ja", "category": "prose", "axes": [], "text": "彼女はその手紙を一年間引き出しにしまってから、どうするか決めた。"},
+    {"text_id": "ja-prose-003", "language": "ja", "category": "prose", "axes": [], "text": "その道は地図で覚えたのではなく、歩いて覚えたものだった。"},
+
+    {"text_id": "ja-dialogue-001", "language": "ja", "category": "dialogue", "axes": [], "text": "「本当に大丈夫なの？」と彼女が聞いた。「まあ、だいたいは」「それは大丈夫とは言わないよ」"},
+    {"text_id": "ja-dialogue-002", "language": "ja", "category": "dialogue", "axes": ["breaths"], "text": "「ちょっと……ちょっと待って。少しだけ息を整えさせて。うん、大丈夫。どうぞ」"},
+
+    {"text_id": "ja-numbers-001", "language": "ja", "category": "numbers", "axes": ["numbers"], "text": "今回の測定値は千二百四十七で、前期の九百八十三から二十六・九パーセント増えた。"},
+    {"text_id": "ja-numbers-002", "language": "ja", "category": "numbers", "axes": ["numbers"], "text": "午前九時半から午後五時までの間に 555-0142 へお電話ください。内線は 4081 です。"},
+
+    {"text_id": "ja-currency-001", "language": "ja", "category": "currency", "axes": ["numbers"], "text": "請求額は千八百四十二円六十銭で、そのうち百四十七円四十一銭が税金でした。"},
+
+    {"text_id": "ja-names-001", "language": "ja", "category": "names", "axes": [], "text": "五十嵐さんと日下部さん、それに小鳥遊さんが、四条烏丸で待ち合わせた。"},
+
+    {"text_id": "ja-acronyms-001", "language": "ja", "category": "acronyms", "axes": [], "text": "NASA と NOAA のチームは、WHO にも写しを送って IETF に共同の RFC を提出した。"},
+
+    {"text_id": "ja-urls-001", "language": "ja", "category": "urls", "axes": [], "text": "詳しくは https://example.org/docs/v2/getting-started?lang=ja#install をご覧ください。"},
+
+    {"text_id": "ja-sibilant-001", "language": "ja", "category": "prose", "axes": ["sibilants"], "text": "新設の調査室では、少数の専門家が資料をしっかり精査し、修正の指示をすぐに出した。"},
+
+    {"text_id": "ja-long-001", "language": "ja", "category": "long_sentence", "axes": [], "text": "委員会は三月から毎週のように会合を重ねており、委員の誰もがどこかの時点で日程について私的には懸念を口にしていたにもかかわらず、正式な異議が記録されたのは最終回になってからで、その頃にはすでに日程表は各地方事務所に配られていた。"},
+
+    {"text_id": "ja-longform-001", "language": "ja", "category": "long_form", "axes": ["long_form"], "text": "この谷の最初の測量が行われたのは一八七三年の夏で、三週間で終わると言われて出発した四人の一行は、結局九週間そこに留まることになった。ほぼ完全な形で残された彼らの手帳には、毎朝の天候、荷役動物の状態、そして後年の読者が有用でありながらいくらか煩わしくも感じる几帳面さで、道中に買った食事の値段までが記録されている。だが手帳のどこにも書かれていないのは、なぜこの測量が命じられたのかということである。公式の記録は一九〇四年の地方事務所の火災で失われ、事情を説明したかもしれない書簡は、伝えられるところによれば写しが取られることはなかった。確かなのは、その夏に作られた地図が四十年以上にわたって使われ続けたということだけである。"},
+
+    {"text_id": "cs-enzh-001", "language": "mixed", "primary_language": "en", "category": "code_switching", "axes": ["code_switching"], "text": "She said the meeting is at 三点半, in the 会议室 on the second floor, not the one downstairs."},
+    {"text_id": "cs-enzh-002", "language": "mixed", "primary_language": "zh", "category": "code_switching", "axes": ["code_switching"], "text": "这个 feature 的 latency 明显下降了，不过 throughput 还是老样子。"},
+    {"text_id": "cs-enzh-003", "language": "mixed", "primary_language": "zh", "category": "code_switching", "axes": ["code_switching", "acronyms"], "text": "先把 VPN 连上，然后 clone 那个 repo，最后跑一下 CI 就行了。"},
+    {"text_id": "cs-enes-001", "language": "mixed", "primary_language": "en", "category": "code_switching", "axes": ["code_switching"], "text": "He kept saying \"no pasa nada\" whenever the deployment failed, which stopped being funny by Thursday."},
+    {"text_id": "cs-enes-002", "language": "mixed", "primary_language": "es", "category": "code_switching", "axes": ["code_switching"], "text": "El equipo hizo un rollback porque el build estaba roto desde el último merge."},
+    {"text_id": "cs-enja-001", "language": "mixed", "primary_language": "ja", "category": "code_switching", "axes": ["code_switching"], "text": "この API の response time が上がったので、キャッシュを一度 flush してみましょう。"},
+    {"text_id": "cs-enja-002", "language": "mixed", "primary_language": "en", "category": "code_switching", "axes": ["code_switching"], "text": "The reviewer wrote \"了解しました\" and then approved it without a single comment."},
+    {"text_id": "cs-multi-001", "language": "mixed", "primary_language": "en", "category": "code_switching", "axes": ["code_switching", "names"], "text": "We heard from Müller in Zürich, from 王小明 in 深圳, and from Iñaki in Bilbao, all on the same morning."}
+  ]
+}
