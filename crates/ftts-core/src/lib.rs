@@ -7,8 +7,11 @@
 //! cancellation, budget, observer, and bounded-streaming contracts are real so
 //! later model stages cannot introduce a second orchestration path.
 
+pub mod admission;
+
 use std::{
     env, fmt,
+    ops::Range,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -239,18 +242,206 @@ fn bounded_queue<T>(capacity: usize, kind: StreamKind) -> (BoundedSender<T>, Bou
     )
 }
 
+/// The caller-visible text-normalization policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NormalizationMode {
+    /// Pinned upstream semantics: NFC and nothing else.
+    #[default]
+    Verbatim,
+    /// Reserved for unambiguous policies; currently deliberately no-op beyond NFC.
+    Conservative,
+    /// Apply explicit language-span pronunciation entries after NFC.
+    LocaleAware,
+}
+
+/// A byte range in normalized text with a caller-supplied language identifier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LanguageSpan {
+    /// The range, expressed over the NFC-normalized input.
+    pub range: Range<usize>,
+    /// A caller-supplied BCP-47-like language identifier.
+    pub language: String,
+}
+
+/// An explicit pronunciation expansion.
+///
+/// Entries are only applied in a matching language span, or globally when
+/// `language` is `"und"`. The engine neither persists nor logs this text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PronunciationEntry {
+    /// Language to which the entry applies.
+    pub language: String,
+    /// Surface text to recognize.
+    pub surface: String,
+    /// Caller-supplied spoken replacement.
+    pub spoken: String,
+}
+
+/// Caller-supplied behavior layered over the pinned verbatim path.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NormalizationOptions {
+    /// Requested policy. The default is the ConformanceExact verbatim route.
+    pub mode: NormalizationMode,
+    /// Explicit language overrides for locale-aware entries.
+    pub language_spans: Vec<LanguageSpan>,
+    /// Caller-supplied pronunciation entries for locale-aware handling.
+    pub pronunciation_lexicon: Vec<PronunciationEntry>,
+}
+
+/// One observable normalization change.
+///
+/// This detailed form is returned only to the caller that owns the input text.
+/// Observer events use [`NormalizationTraceSummary`] instead, so trace sinks do
+/// not receive sensitive before/after text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalizationChange {
+    /// Stable name of the rule that made the change.
+    pub rule: &'static str,
+    /// Input before the rule was applied.
+    pub before: String,
+    /// Output after the rule was applied.
+    pub after: String,
+}
+
+/// A deterministic record of what the normalizer did and why.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalizationTrace {
+    /// Policy used for the request.
+    pub mode: NormalizationMode,
+    /// Unicode data version used by the tokenizer implementation.
+    pub unicode_version: String,
+    /// Detailed caller-owned changes.
+    pub changes: Vec<NormalizationChange>,
+}
+
+impl NormalizationTrace {
+    /// Produces the privacy-safe observer form of this trace.
+    #[must_use]
+    pub fn summary(&self) -> NormalizationTraceSummary {
+        let mut rules = self
+            .changes
+            .iter()
+            .map(|change| change.rule.to_owned())
+            .collect::<Vec<_>>();
+        rules.sort_unstable();
+        rules.dedup();
+        NormalizationTraceSummary {
+            mode: self.mode,
+            unicode_version: self.unicode_version.clone(),
+            rules,
+            change_count: self.changes.len(),
+        }
+    }
+}
+
+/// The privacy-safe normalization information allowed on an observer event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalizationTraceSummary {
+    /// Policy used for the request.
+    pub mode: NormalizationMode,
+    /// Unicode data version used by the tokenizer implementation.
+    pub unicode_version: String,
+    /// Applied rule names, sorted and deduplicated.
+    pub rules: Vec<String>,
+    /// Number of detailed changes made by those rules.
+    pub change_count: usize,
+}
+
+/// Token ids and a caller-owned trace returned by a model-specific text preparer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedText {
+    /// Token ids the model will consume.
+    pub token_ids: Vec<u32>,
+    /// Detailed normalization record, retained only in request-local memory.
+    pub normalization_trace: NormalizationTrace,
+}
+
+impl PreparedText {
+    /// Constructs a prepared text payload from model-specific tokenization.
+    #[must_use]
+    pub fn new(token_ids: Vec<u32>, normalization_trace: NormalizationTrace) -> Self {
+        Self {
+            token_ids,
+            normalization_trace,
+        }
+    }
+}
+
+/// Named failure from a model-specific text preparer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextPreparationError {
+    message: String,
+}
+
+impl TextPreparationError {
+    /// Constructs a named preparation failure without exposing model error types to the engine.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for TextPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TextPreparationError {}
+
+/// Model-specific text preparation used by the blocking engine facade.
+///
+/// `ftts-core` owns this boundary so it never depends on a particular model
+/// crate. Model crates implement it with their tokenizer and retain ownership
+/// of the detailed text trace.
+pub trait TextPreparer: Send + Sync {
+    /// Normalizes and tokenizes one request according to its explicit options.
+    fn prepare(
+        &self,
+        text: &str,
+        options: &NormalizationOptions,
+    ) -> Result<PreparedText, TextPreparationError>;
+}
+
 /// A synchronous synthesis request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SynthesisRequest {
     /// Text to synthesize. The Phase 0 shell accepts an empty request.
     pub text: String,
+    /// Caller-owned policy passed unchanged to the model-specific tokenizer.
+    pub normalization_options: NormalizationOptions,
+    /// Whether the observer may receive a privacy-safe normalization summary.
+    pub trace_normalization: bool,
 }
 
 impl SynthesisRequest {
     /// Creates a request from caller-owned text.
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self {
+            text: text.into(),
+            normalization_options: NormalizationOptions::default(),
+            trace_normalization: false,
+        }
+    }
+
+    /// Replaces the default verbatim normalization policy for this request.
+    #[must_use]
+    pub fn with_normalization_options(
+        mut self,
+        normalization_options: NormalizationOptions,
+    ) -> Self {
+        self.normalization_options = normalization_options;
+        self
+    }
+
+    /// Allows the caller-owned observer to receive a text-free trace summary.
+    #[must_use]
+    pub const fn with_normalization_trace(mut self, trace_normalization: bool) -> Self {
+        self.trace_normalization = trace_normalization;
+        self
     }
 }
 
@@ -266,6 +457,8 @@ pub struct EnrollmentRequest {
 pub struct SynthesisResult {
     /// Number of generated codec frames.
     pub generated_frames: u64,
+    /// Number of token ids produced by the request-local text preparer.
+    pub prepared_token_count: usize,
 }
 
 /// A completed empty-pipeline enrollment result.
@@ -307,6 +500,13 @@ pub enum SynthesisEvent {
     },
     /// A talker-frame boundary was reached.
     FrameProgress { frame: u64 },
+    /// A caller explicitly requested a privacy-safe normalization trace summary.
+    TextPrepared {
+        /// Number of token ids that entered the model path.
+        token_count: usize,
+        /// No raw or rewritten text is included in this observer payload.
+        normalization: NormalizationTraceSummary,
+    },
     /// A packet entered the PCM stream.
     PacketEmitted {
         frame_count: u8,
@@ -347,6 +547,8 @@ pub enum EngineError {
     StreamDisconnected(StreamKind),
     /// A queue receive timed out.
     QueueTimeout,
+    /// The model-specific text preparer rejected the request.
+    TextPreparation(TextPreparationError),
     /// Engine construction received an invalid setting.
     InvalidConfiguration(&'static str),
     /// The owned runtime could not be constructed.
@@ -361,6 +563,7 @@ impl fmt::Display for EngineError {
             Self::BudgetExceeded(stage) => write!(formatter, "{stage:?} stage budget exceeded"),
             Self::StreamDisconnected(kind) => write!(formatter, "{kind:?} stream disconnected"),
             Self::QueueTimeout => formatter.write_str("bounded queue receive timed out"),
+            Self::TextPreparation(error) => write!(formatter, "text preparation failed: {error}"),
             Self::InvalidConfiguration(message) => formatter.write_str(message),
             Self::Runtime(message) => write!(formatter, "runtime initialization failed: {message}"),
         }
@@ -401,13 +604,23 @@ impl TtsEngine {
     }
 
     /// Runs the Phase 0 empty synthesis pipeline through the owned runtime.
-    pub fn synthesize(
+    pub fn synthesize<P: TextPreparer + ?Sized>(
         &self,
-        _request: SynthesisRequest,
+        request: SynthesisRequest,
+        text_preparer: &P,
         cancellation: &CancellationToken,
         observer: &dyn SynthesisObserver,
     ) -> Result<SynthesisResult, EngineError> {
         let _admission = self.acquire_synthesis_admission(observer)?;
+        let prepared = text_preparer
+            .prepare(&request.text, &request.normalization_options)
+            .map_err(EngineError::TextPreparation)?;
+        if request.trace_normalization {
+            observer.on_event(SynthesisEvent::TextPrepared {
+                token_count: prepared.token_ids.len(),
+                normalization: prepared.normalization_trace.summary(),
+            });
+        }
         self.run_stage(
             EngineStage::Synthesis,
             self.config.synthesis_stage_budget,
@@ -418,6 +631,7 @@ impl TtsEngine {
         observer.on_event(SynthesisEvent::FrameProgress { frame: 0 });
         Ok(SynthesisResult {
             generated_frames: 0,
+            prepared_token_count: prepared.token_ids.len(),
         })
     }
 
@@ -564,6 +778,29 @@ mod tests {
         .expect("test engine builds")
     }
 
+    struct TestTextPreparer;
+
+    impl TextPreparer for TestTextPreparer {
+        fn prepare(
+            &self,
+            _text: &str,
+            options: &NormalizationOptions,
+        ) -> Result<PreparedText, TextPreparationError> {
+            Ok(PreparedText::new(
+                vec![7, 11],
+                NormalizationTrace {
+                    mode: options.mode,
+                    unicode_version: "15.1.0".to_owned(),
+                    changes: vec![NormalizationChange {
+                        rule: "unicode_nfc",
+                        before: "caller-owned secret".to_owned(),
+                        after: "caller-owned secret".to_owned(),
+                    }],
+                },
+            ))
+        }
+    }
+
     #[test]
     fn empty_pipeline_emits_admission_stage_and_frame_events() {
         let engine = engine_with_budget(Duration::from_secs(1));
@@ -571,10 +808,16 @@ mod tests {
         let observer = RecordingObserver::default();
 
         let result = engine
-            .synthesize(SynthesisRequest::new(""), &cancellation, &observer)
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &cancellation,
+                &observer,
+            )
             .expect("empty pipeline succeeds");
 
         assert_eq!(result.generated_frames, 0);
+        assert_eq!(result.prepared_token_count, 2);
         let events = observer.events();
         assert!(matches!(
             events.as_slice(),
@@ -600,7 +843,12 @@ mod tests {
         let observer = RecordingObserver::default();
 
         let error = engine
-            .synthesize(SynthesisRequest::new("cancelled"), &cancellation, &observer)
+            .synthesize(
+                SynthesisRequest::new("cancelled"),
+                &TestTextPreparer,
+                &cancellation,
+                &observer,
+            )
             .expect_err("cancelled request must not run");
 
         assert_eq!(error, EngineError::Cancelled);
@@ -675,6 +923,48 @@ mod tests {
     }
 
     #[test]
+    fn explicit_normalization_trace_is_text_free() {
+        let engine = engine_with_budget(Duration::from_secs(1));
+        let observer = RecordingObserver::default();
+        let request = SynthesisRequest::new("caller-owned secret")
+            .with_normalization_options(NormalizationOptions {
+                mode: NormalizationMode::LocaleAware,
+                ..NormalizationOptions::default()
+            })
+            .with_normalization_trace(true);
+
+        engine
+            .synthesize(
+                request,
+                &TestTextPreparer,
+                &CancellationToken::new(),
+                &observer,
+            )
+            .expect("explicit trace request succeeds");
+
+        let trace = observer
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                SynthesisEvent::TextPrepared {
+                    token_count,
+                    normalization,
+                } => Some((token_count, normalization)),
+                _ => None,
+            })
+            .expect("explicit request emits a trace summary");
+        assert_eq!(trace.0, 2);
+        assert_eq!(trace.1.mode, NormalizationMode::LocaleAware);
+        assert_eq!(trace.1.unicode_version, "15.1.0");
+        assert_eq!(trace.1.rules, vec!["unicode_nfc"]);
+        assert_eq!(trace.1.change_count, 1);
+        assert!(
+            !format!("{:?}", trace.1).contains("caller-owned secret"),
+            "observer trace summaries must never contain sensitive before/after text"
+        );
+    }
+
+    #[test]
     fn many_utterances_without_deadlock_watchdog() {
         let (done_sender, done_receiver) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
@@ -684,6 +974,7 @@ mod tests {
                 engine
                     .synthesize(
                         SynthesisRequest::new("watchdog"),
+                        &TestTextPreparer,
                         &CancellationToken::new(),
                         &observer,
                     )
