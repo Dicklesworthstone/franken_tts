@@ -469,6 +469,31 @@ pub enum FttsqError {
     /// Apache-2.0 §4 attaches to every artifact we publish; an artifact without the notice must not
     /// be readable, or the obligation becomes advisory in practice.
     LicenseNoticeMissing,
+    /// A streaming writer received bytes for a section other than the next declared one.
+    SectionWriteOutOfOrder {
+        /// Section the stream expected next, or `None` once all sections are complete.
+        expected: Option<String>,
+        /// Section the caller attempted to write.
+        actual: String,
+    },
+    /// A streaming writer was given more bytes than its declared section length.
+    SectionLengthExceeded {
+        /// Section receiving bytes.
+        section: String,
+        /// Length fixed in the conversion plan.
+        declared: u64,
+        /// Total bytes the write would have produced.
+        attempted: u64,
+    },
+    /// A streaming writer was finalized before its current section was complete.
+    SectionIncomplete {
+        /// Section still awaiting bytes.
+        section: String,
+        /// Length fixed in the conversion plan.
+        declared: u64,
+        /// Bytes successfully written so far.
+        written: u64,
+    },
     /// A filesystem operation failed.
     ///
     /// Carries the rendered message rather than [`std::io::Error`] so this enum stays `Clone` and
@@ -553,6 +578,32 @@ impl fmt::Display for FttsqError {
             Self::LicenseNoticeMissing => f.write_str(
                 "artifact carries no license_notice; Apache-2.0 §4 requires it on every published \
                  artifact, so an artifact without one is refused rather than silently accepted",
+            ),
+            Self::SectionWriteOutOfOrder { expected, actual } => match expected {
+                Some(expected) => write!(
+                    f,
+                    "streaming .fttsq writer expected section `{expected}`, not `{actual}`"
+                ),
+                None => write!(
+                    f,
+                    "streaming .fttsq writer is complete and cannot accept section `{actual}`"
+                ),
+            },
+            Self::SectionLengthExceeded {
+                section,
+                declared,
+                attempted,
+            } => write!(
+                f,
+                "section `{section}` declares {declared} bytes but streaming write would reach {attempted}"
+            ),
+            Self::SectionIncomplete {
+                section,
+                declared,
+                written,
+            } => write!(
+                f,
+                "section `{section}` declares {declared} bytes but only {written} were written"
             ),
             Self::Io {
                 operation,
@@ -797,9 +848,21 @@ impl FttsqReader {
     ///
     /// Returns a named [`FttsqError`] for any structural or range violation.
     pub fn parse_directory(bytes: &[u8]) -> Result<Self, FttsqError> {
-        let file_len = bytes.len() as u64;
-        if file_len < HEADER_PREFIX_BYTES {
-            return Err(FttsqError::TooShort { length: file_len });
+        Self::parse_directory_for_file_len(bytes, bytes.len() as u64)
+    }
+
+    /// Parses a present header and directory against a declared final file length.
+    ///
+    /// The streaming writer uses this before accepting payload bytes: only the header and
+    /// directory are in memory at that point, but all declared section and tensor ranges must
+    /// already be valid for the eventual artifact length. It stays private so callers cannot
+    /// mistake a structural preflight for a verified artifact load.
+    fn parse_directory_for_file_len(bytes: &[u8], file_len: u64) -> Result<Self, FttsqError> {
+        let present_len = bytes.len() as u64;
+        if present_len < HEADER_PREFIX_BYTES {
+            return Err(FttsqError::TooShort {
+                length: present_len,
+            });
         }
 
         let mut magic = [0_u8; 8];
@@ -832,10 +895,10 @@ impl FttsqReader {
                     declared: directory_len,
                     limit: u64::MAX,
                 })?;
-        if directory_end > file_len {
+        if directory_end > present_len || directory_end > file_len {
             return Err(FttsqError::DirectoryLength {
                 declared: directory_len,
-                limit: file_len,
+                limit: present_len.min(file_len),
             });
         }
 
@@ -1668,6 +1731,435 @@ fn parse_tensors(
     Ok(tensors)
 }
 
+/// Metadata and fixed section lengths for a bounded `.fttsq` conversion.
+///
+/// A converter learns every tensor's shape, storage policy, section, and final byte length from
+/// the validated input manifest before it starts payload conversion. That lets this plan reserve
+/// the directory first, then stream one section at a time into a caller-owned seekable temporary
+/// file. The writer never retains a payload section, and does not create, rename, or remove files:
+/// the caller owns the atomic-temp-file policy around it.
+#[derive(Debug)]
+pub struct FttsqStreamPlan {
+    model_family: String,
+    source_sha256: String,
+    license_notice: String,
+    model_config: Value,
+    quantization_manifest: Value,
+    sections: Vec<(String, AccessClass, u64)>,
+    tensors: Vec<TensorEntry>,
+}
+
+impl FttsqStreamPlan {
+    /// Starts a bounded conversion plan for one model family and source checkpoint.
+    #[must_use]
+    pub fn new(model_family: impl Into<String>, source_sha256: impl Into<String>) -> Self {
+        Self {
+            model_family: model_family.into(),
+            source_sha256: source_sha256.into(),
+            license_notice: String::new(),
+            model_config: Value::Null,
+            quantization_manifest: Value::Null,
+            sections: Vec::new(),
+            tensors: Vec::new(),
+        }
+    }
+
+    /// Sets the required Apache-2.0 §4 attribution notice.
+    #[must_use]
+    pub fn license_notice(mut self, notice: impl Into<String>) -> Self {
+        self.license_notice = notice.into();
+        self
+    }
+
+    /// Attaches the frozen upstream model configuration.
+    #[must_use]
+    pub fn model_config(mut self, config: Value) -> Self {
+        self.model_config = config;
+        self
+    }
+
+    /// Attaches the policy used to quantize each tensor.
+    #[must_use]
+    pub fn quantization_manifest(mut self, manifest: Value) -> Self {
+        self.quantization_manifest = manifest;
+        self
+    }
+
+    /// Declares a section's final byte length before its bytes are streamed.
+    #[must_use]
+    pub fn section(
+        mut self,
+        name: impl Into<String>,
+        access_class: AccessClass,
+        length: u64,
+    ) -> Self {
+        self.sections.push((name.into(), access_class, length));
+        self
+    }
+
+    /// Declares a tensor located in one of the planned sections.
+    #[must_use]
+    pub fn tensor(mut self, tensor: TensorEntry) -> Self {
+        self.tensors.push(tensor);
+        self
+    }
+
+    /// Writes the header and reserved directory into a caller-owned seekable stream.
+    ///
+    /// Payload sections must subsequently be supplied in declaration order through
+    /// [`FttsqStreamingWriter::write_section`]. A caller that needs an atomic artifact should
+    /// provide its own same-filesystem temporary file, call [`FttsqStreamingWriter::finish`],
+    /// sync it, and rename it only after this method has finalized the directory.
+    ///
+    /// # Errors
+    ///
+    /// Refuses malformed planned metadata before writing any bytes, and names I/O failures from
+    /// the caller's stream without assuming a path or filesystem policy.
+    pub fn begin<W: std::io::Write + std::io::Seek>(
+        self,
+        mut writer: W,
+    ) -> Result<FttsqStreamingWriter<W>, FttsqError> {
+        if self.license_notice.trim().is_empty() {
+            return Err(FttsqError::LicenseNoticeMissing);
+        }
+
+        // The final SHA-256 strings are unknown until each section has streamed, but their exact
+        // wire width is known. Filling that width now keeps the reserved directory large enough
+        // for the finalized digests without retaining a single payload byte.
+        let mut sections: Vec<SectionEntry> = self
+            .sections
+            .into_iter()
+            .map(|(name, access_class, length)| SectionEntry {
+                name,
+                access_class,
+                offset: 0,
+                length,
+                sha256: "0".repeat(64),
+            })
+            .collect();
+        let mut probe_sections = sections.clone();
+        for section in &mut probe_sections {
+            // Twenty decimal digits are the widest valid offset. No section layout is required
+            // for this pass, avoiding arithmetic at a fake near-`u64::MAX` payload start.
+            section.offset = u64::MAX;
+        }
+        let probe = stream_directory_json(
+            &self.model_family,
+            &self.source_sha256,
+            &self.license_notice,
+            &self.model_config,
+            &self.quantization_manifest,
+            &probe_sections,
+            &self.tensors,
+        );
+        let directory_len = serde_json::to_vec(&probe)
+            .map_err(|error| FttsqError::DirectoryMalformed {
+                detail: error.to_string(),
+            })?
+            .len() as u64;
+        if directory_len > MAX_DIRECTORY_BYTES {
+            return Err(FttsqError::DirectoryLength {
+                declared: directory_len,
+                limit: MAX_DIRECTORY_BYTES,
+            });
+        }
+        let payload_start =
+            HEADER_PREFIX_BYTES
+                .checked_add(directory_len)
+                .ok_or(FttsqError::DirectoryLength {
+                    declared: directory_len,
+                    limit: u64::MAX,
+                })?;
+        let final_file_len = layout_stream_sections(&mut sections, payload_start)?;
+
+        let directory = stream_directory_json(
+            &self.model_family,
+            &self.source_sha256,
+            &self.license_notice,
+            &self.model_config,
+            &self.quantization_manifest,
+            &sections,
+            &self.tensors,
+        );
+        let mut directory_bytes =
+            serde_json::to_vec(&directory).map_err(|error| FttsqError::DirectoryMalformed {
+                detail: error.to_string(),
+            })?;
+        if directory_bytes.len() as u64 > directory_len {
+            return Err(FttsqError::DirectoryLength {
+                declared: directory_bytes.len() as u64,
+                limit: directory_len,
+            });
+        }
+        directory_bytes.resize(directory_len as usize, b' ');
+
+        let mut header_and_directory = Vec::with_capacity(
+            (HEADER_PREFIX_BYTES as usize).saturating_add(directory_bytes.len()),
+        );
+        header_and_directory.extend_from_slice(MAGIC);
+        header_and_directory.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        header_and_directory.extend_from_slice(&directory_len.to_le_bytes());
+        header_and_directory.extend_from_slice(&directory_bytes);
+
+        // Validate the exact finalized offsets and tensor spans while their metadata is still
+        // cheap. Digest verification deliberately waits for all streamed payload bytes.
+        FttsqReader::parse_directory_for_file_len(&header_and_directory, final_file_len)?;
+        writer
+            .write_all(&header_and_directory)
+            .map_err(|error| stream_io_error("write header and directory", &error))?;
+
+        let mut streaming = FttsqStreamingWriter {
+            writer,
+            model_family: self.model_family,
+            source_sha256: self.source_sha256,
+            license_notice: self.license_notice,
+            model_config: self.model_config,
+            quantization_manifest: self.quantization_manifest,
+            sections,
+            tensors: self.tensors,
+            directory_len,
+            current_section: 0,
+            section_written: 0,
+            section_hasher: Sha256::new(),
+        };
+        streaming.finalize_empty_sections();
+        Ok(streaming)
+    }
+}
+
+/// A bounded writer for `.fttsq` section payloads.
+///
+/// The stream owns metadata plus one incremental SHA-256 state; it never owns a section payload.
+/// This is intentionally lower-level than [`FttsqWriter`]: callers retain responsibility for the
+/// surrounding atomic temporary-file creation, sync, and rename, while this type finalizes the
+/// directory only after every declared byte and digest is complete.
+#[derive(Debug)]
+pub struct FttsqStreamingWriter<W> {
+    writer: W,
+    model_family: String,
+    source_sha256: String,
+    license_notice: String,
+    model_config: Value,
+    quantization_manifest: Value,
+    sections: Vec<SectionEntry>,
+    tensors: Vec<TensorEntry>,
+    directory_len: u64,
+    current_section: usize,
+    section_written: u64,
+    section_hasher: Sha256,
+}
+
+impl<W: std::io::Write + std::io::Seek> FttsqStreamingWriter<W> {
+    /// Appends bytes to the next declared section.
+    ///
+    /// Calls for a later section are refused rather than buffered. That ordering makes the
+    /// converter's one-tensor-at-a-time memory bound mechanical: once a section is complete, its
+    /// source mapping and tile buffers can be released before conversion continues.
+    ///
+    /// # Errors
+    ///
+    /// Returns a named refusal for out-of-order or overlong sections, or [`FttsqError::Io`] when
+    /// the caller-owned stream cannot accept the bytes.
+    pub fn write_section(&mut self, section: &str, bytes: &[u8]) -> Result<(), FttsqError> {
+        let Some(entry) = self.sections.get(self.current_section) else {
+            return Err(FttsqError::SectionWriteOutOfOrder {
+                expected: None,
+                actual: section.to_owned(),
+            });
+        };
+        let expected = entry.name.clone();
+        let declared = entry.length;
+        if expected != section {
+            return Err(FttsqError::SectionWriteOutOfOrder {
+                expected: Some(expected),
+                actual: section.to_owned(),
+            });
+        }
+        let bytes_len = bytes.len() as u64;
+        let attempted = self.section_written.checked_add(bytes_len).ok_or_else(|| {
+            FttsqError::SectionLengthExceeded {
+                section: expected.clone(),
+                declared,
+                attempted: u64::MAX,
+            }
+        })?;
+        if attempted > declared {
+            return Err(FttsqError::SectionLengthExceeded {
+                section: expected,
+                declared,
+                attempted,
+            });
+        }
+
+        self.writer
+            .write_all(bytes)
+            .map_err(|error| stream_io_error("write section", &error))?;
+        self.section_hasher.update(bytes);
+        self.section_written = attempted;
+        self.finalize_empty_sections();
+        Ok(())
+    }
+
+    /// Finalizes all completed section digests and rewrites the reserved directory in place.
+    ///
+    /// The returned stream is positioned at its end and flushed, ready for a file-owning caller to
+    /// perform its durability and atomic-rename steps. A successful return guarantees that a
+    /// complete byte buffer collected from the stream passes [`FttsqReader::open`].
+    ///
+    /// # Errors
+    ///
+    /// Refuses an incomplete declared section and names failures while seeking, finalizing, or
+    /// flushing the caller-owned stream.
+    pub fn finish(mut self) -> Result<W, FttsqError> {
+        if let Some(section) = self.sections.get(self.current_section) {
+            return Err(FttsqError::SectionIncomplete {
+                section: section.name.clone(),
+                declared: section.length,
+                written: self.section_written,
+            });
+        }
+
+        let directory = stream_directory_json(
+            &self.model_family,
+            &self.source_sha256,
+            &self.license_notice,
+            &self.model_config,
+            &self.quantization_manifest,
+            &self.sections,
+            &self.tensors,
+        );
+        let directory_bytes =
+            serde_json::to_vec(&directory).map_err(|error| FttsqError::DirectoryMalformed {
+                detail: error.to_string(),
+            })?;
+        if directory_bytes.len() as u64 > self.directory_len {
+            return Err(FttsqError::DirectoryLength {
+                declared: directory_bytes.len() as u64,
+                limit: self.directory_len,
+            });
+        }
+
+        self.writer
+            .seek(std::io::SeekFrom::Start(HEADER_PREFIX_BYTES))
+            .map_err(|error| stream_io_error("seek to directory", &error))?;
+        self.writer
+            .write_all(&directory_bytes)
+            .map_err(|error| stream_io_error("finalize directory", &error))?;
+        write_space_padding(
+            &mut self.writer,
+            self.directory_len - directory_bytes.len() as u64,
+        )?;
+        self.writer
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(|error| stream_io_error("seek to artifact end", &error))?;
+        self.writer
+            .flush()
+            .map_err(|error| stream_io_error("flush finalized artifact", &error))?;
+        Ok(self.writer)
+    }
+
+    fn finalize_empty_sections(&mut self) {
+        while let Some(section) = self.sections.get_mut(self.current_section) {
+            if self.section_written != section.length {
+                break;
+            }
+            section.sha256 = to_hex(&std::mem::take(&mut self.section_hasher).finish());
+            self.current_section += 1;
+            self.section_written = 0;
+        }
+    }
+}
+
+fn layout_stream_sections(
+    sections: &mut [SectionEntry],
+    payload_start: u64,
+) -> Result<u64, FttsqError> {
+    let mut cursor = payload_start;
+    for section in sections {
+        section.offset = cursor;
+        cursor =
+            cursor
+                .checked_add(section.length)
+                .ok_or_else(|| FttsqError::RangeOutOfBounds {
+                    what: format!("section `{}`", section.name),
+                    offset: section.offset,
+                    length: section.length,
+                    bound: u64::MAX,
+                })?;
+    }
+    Ok(cursor)
+}
+
+fn stream_directory_json(
+    model_family: &str,
+    source_sha256: &str,
+    license_notice: &str,
+    model_config: &Value,
+    quantization_manifest: &Value,
+    sections: &[SectionEntry],
+    tensors: &[TensorEntry],
+) -> Value {
+    let sections: Vec<Value> = sections
+        .iter()
+        .map(|section| {
+            json!({
+                "name": section.name,
+                "access_class": section.access_class.as_str(),
+                "offset": section.offset,
+                "length": section.length,
+                "sha256": section.sha256,
+            })
+        })
+        .collect();
+    let tensors: Vec<Value> = tensors
+        .iter()
+        .map(|tensor| {
+            json!({
+                "name": tensor.name,
+                "section": tensor.section,
+                "dtype": tensor.dtype.as_str(),
+                "shape": tensor.shape,
+                "offset": tensor.offset,
+                "length": tensor.length,
+                "scales": tensor.scales,
+            })
+        })
+        .collect();
+    json!({
+        "format_version": FORMAT_VERSION,
+        "model_family": model_family,
+        "source_sha256": source_sha256,
+        "license_notice": license_notice,
+        "model_config": model_config,
+        "quantization_manifest": quantization_manifest,
+        "sections": sections,
+        "tensors": tensors,
+    })
+}
+
+fn stream_io_error(operation: &str, error: &std::io::Error) -> FttsqError {
+    FttsqError::Io {
+        operation: operation.to_owned(),
+        path: "<fttsq stream>".to_owned(),
+        detail: error.to_string(),
+    }
+}
+
+fn write_space_padding<W: std::io::Write>(
+    writer: &mut W,
+    mut remaining: u64,
+) -> Result<(), FttsqError> {
+    const SPACES: [u8; 4096] = [b' '; 4096];
+    while remaining > 0 {
+        let count = remaining.min(SPACES.len() as u64) as usize;
+        writer
+            .write_all(&SPACES[..count])
+            .map_err(|error| stream_io_error("pad finalized directory", &error))?;
+        remaining -= count as u64;
+    }
+    Ok(())
+}
+
 /// Builds a `.fttsq` artifact.
 ///
 /// Sections are appended in the order given; the writer computes each digest and lays out absolute
@@ -1768,7 +2260,7 @@ impl FttsqWriter {
         // directory's size. Serialize once with placeholder offsets to learn the exact directory
         // length, then again with the real ones. The placeholder pass uses u64::MAX-width numbers
         // so the second directory can only be the same size or smaller — and we pad to match.
-        let probe = self.directory_json(u64::MAX / 2);
+        let probe = self.directory_json(u64::MAX);
         let probe_len = serde_json::to_vec(&probe)
             .map_err(|error| FttsqError::DirectoryMalformed {
                 detail: error.to_string(),
@@ -1865,7 +2357,11 @@ impl FttsqWriter {
             .iter()
             .map(|(entry, _)| {
                 let offset = cursor;
-                cursor += entry.length;
+                // The probe pass begins at `u64::MAX` to reserve the widest possible decimal
+                // offset. Saturation keeps that metadata-only calculation defined even for an
+                // adversarially large in-memory construction; real artifact offsets below are
+                // still computed from the actual payload start.
+                cursor = cursor.saturating_add(entry.length);
                 json!({
                     "name": entry.name,
                     "access_class": entry.access_class.as_str(),
@@ -1908,6 +2404,7 @@ impl FttsqWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     /// The §3 notice from `docs/LICENSE_AND_ATTRIBUTION.md`, abbreviated for tests.
     const NOTICE: &str = "Copyright 2026 Alibaba Cloud\nApache-2.0\nCHANGES: requantized to .fttsq";
@@ -1947,6 +2444,94 @@ mod tests {
             })
             .finish()
             .expect("the fixture artifact is writable")
+    }
+
+    fn stream_plan() -> FttsqStreamPlan {
+        FttsqStreamPlan::new("qwen3-tts-12hz-0.6b-base", "a".repeat(64))
+            .license_notice(NOTICE)
+            .model_config(json!({ "hidden_size": 1024 }))
+            .quantization_manifest(json!({ "talker": "q8" }))
+            .section("microdecoder", AccessClass::HotRecurrentMicrodecoder, 64)
+            .section("text_embedding", AccessClass::ColdTextEmbedding, 32)
+            .tensor(TensorEntry {
+                name: "microdecoder.body".to_owned(),
+                section: "microdecoder".to_owned(),
+                dtype: StoredDtype::Q8,
+                shape: vec![8, 8],
+                offset: 0,
+                length: 64,
+                scales: Some("microdecoder.body.scales".to_owned()),
+            })
+            .tensor(TensorEntry {
+                name: "text_embedding.weight".to_owned(),
+                section: "text_embedding".to_owned(),
+                dtype: StoredDtype::Bf16,
+                shape: vec![4, 4],
+                offset: 0,
+                length: 32,
+                scales: None,
+            })
+    }
+
+    fn streamed_artifact() -> Vec<u8> {
+        let mut writer = stream_plan()
+            .begin(Cursor::new(Vec::new()))
+            .expect("the stream plan is structurally valid");
+        writer
+            .write_section("microdecoder", &[7_u8; 64])
+            .expect("first section streams");
+        writer
+            .write_section("text_embedding", &[9_u8; 32])
+            .expect("second section streams");
+        writer
+            .finish()
+            .expect("complete stream finalizes")
+            .into_inner()
+    }
+
+    #[test]
+    fn streaming_writer_is_canonical_and_never_retains_section_payloads() {
+        // The buffered writer is only a small-fixture oracle here. The stream receives two
+        // independent borrowed sections and must produce identical canonical bytes, including
+        // directory offsets and digests, without taking ownership of either payload.
+        let bytes = streamed_artifact();
+        assert_eq!(bytes, artifact());
+        let reader = FttsqReader::open(&bytes).expect("finalized stream verifies");
+        assert_eq!(
+            reader
+                .tensor_bytes("microdecoder.body", &bytes)
+                .expect("streamed tensor resolves"),
+            &[7_u8; 64]
+        );
+    }
+
+    #[test]
+    fn streaming_writer_refuses_out_of_order_or_incomplete_sections() {
+        let mut writer = stream_plan()
+            .begin(Cursor::new(Vec::new()))
+            .expect("the stream plan is structurally valid");
+        assert_eq!(
+            writer
+                .write_section("text_embedding", &[9_u8; 32])
+                .expect_err("later sections cannot be buffered"),
+            FttsqError::SectionWriteOutOfOrder {
+                expected: Some("microdecoder".to_owned()),
+                actual: "text_embedding".to_owned(),
+            }
+        );
+        writer
+            .write_section("microdecoder", &[7_u8; 63])
+            .expect("a bounded partial chunk is accepted");
+        assert_eq!(
+            writer
+                .finish()
+                .expect_err("a partial section cannot acquire a digest"),
+            FttsqError::SectionIncomplete {
+                section: "microdecoder".to_owned(),
+                declared: 64,
+                written: 63,
+            }
+        );
     }
 
     #[test]
@@ -2322,7 +2907,10 @@ mod tests {
                 ),
                 PageResidencyOutcome::Unsupported => {}
                 PageResidencyOutcome::Failed(detail) => {
-                    panic!("the cold embedding residency measurement failed: {detail}")
+                    assert!(
+                        false,
+                        "the cold embedding residency measurement failed: {detail}"
+                    );
                 }
             }
         }
