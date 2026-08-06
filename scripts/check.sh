@@ -1,9 +1,198 @@
 #!/usr/bin/env bash
-# The one command used by CI and local development for the Phase-0 gate.
-set -euo pipefail
+#
+# The one command. CI runs exactly this script as its single test step, so the gate lives in
+# one place and cannot drift from a duplicated list of workflow commands.
+#
+#   ./scripts/check.sh
+#
+# Stages run in cheapest-first order and STOP AT THE FIRST FAILURE, so a structural mistake is
+# reported in under two seconds instead of after a ten-minute build.
+#
+# Every stage prints a receipt: PASS, FAIL, or SKIP with a reason. A SKIP is never folded into
+# "green" — the closing banner reads GREEN WITH SKIPS and lists them (AGENTS.md Doctrine #0.4:
+# a skipped check is never presented as passing).
+#
+# Environment:
+#   FTTS_CHECK_NO_RCH=1     bypass the remote compilation helper, run cargo locally
+#   FTTS_CHECK_UBS_TIMEOUT  seconds to bound `ubs --diff` (default 300)
+#
+# Exit 0 = every required stage passed. Exit 1 = a stage failed.
+#
+# Bead: frankentts-p0-ci-083.
 
-cargo fmt --check
-cargo check --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-ubs --diff
+set -uo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+
+BOLD=$'\033[1m'; RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+if [[ ! -t 1 ]]; then BOLD=""; RED=""; GREEN=""; YELLOW=""; DIM=""; OFF=""; fi
+
+STAGE_NUM=0
+SKIPPED=()
+START_ALL=$SECONDS
+
+banner() { printf '%s\n' "${DIM}────────────────────────────────────────────────────────────${OFF}"; }
+
+stage_start() {
+    STAGE_NUM=$((STAGE_NUM + 1))
+    STAGE_NAME="$1"
+    STAGE_START=$SECONDS
+    printf '%s\n' "${BOLD}[${STAGE_NUM}] ${STAGE_NAME}${OFF}"
+}
+
+stage_pass() { printf '    %sPASS%s  %s (%ss)\n\n' "$GREEN" "$OFF" "$STAGE_NAME" "$((SECONDS - STAGE_START))"; }
+
+stage_skip() {
+    SKIPPED+=("$STAGE_NAME: $1")
+    printf '    %sSKIP%s  %s — %s\n\n' "$YELLOW" "$OFF" "$STAGE_NAME" "$1"
+}
+
+stage_fail() {
+    printf '    %sFAIL%s  %s (%ss)\n' "$RED" "$OFF" "$STAGE_NAME" "$((SECONDS - STAGE_START))"
+    [[ -n "${1:-}" ]] && printf '    %s\n' "$1"
+    banner
+    printf '%sGATE FAILED%s at stage %s: %s\n' "$RED$BOLD" "$OFF" "$STAGE_NUM" "$STAGE_NAME"
+    printf 'Fix the root cause and re-run ./scripts/check.sh — do not skip past this.\n'
+    exit 1
+}
+
+# Heavy cargo work is offloaded to remote workers when the helper is available; rch fails open
+# to a local build, so this is transparent either way.
+CARGO_RUNNER=(cargo)
+CARGO_MODE="local cargo"
+if [[ -z "${FTTS_CHECK_NO_RCH:-}" ]] && command -v rch >/dev/null 2>&1; then
+    CARGO_RUNNER=(rch exec -- cargo)
+    CARGO_MODE="rch exec (falls open to local)"
+fi
+
+run_cargo() { "${CARGO_RUNNER[@]}" "$@"; }
+
+printf '%sfranken_tts gate%s  %s\n' "$BOLD" "$OFF" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+printf '%scargo via: %s%s\n' "$DIM" "$CARGO_MODE" "$OFF"
+banner
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Repo structure — architectural rules cargo cannot state
+# ─────────────────────────────────────────────────────────────────────────────
+stage_start "repo validators (forbid-unsafe architecture, frankentorch facade, CLI shims)"
+if ! python3 scripts/validate_repo.py; then
+    stage_fail "structural rule violated; see the file:rule lines above"
+fi
+stage_pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. The validators themselves still detect violations
+# ─────────────────────────────────────────────────────────────────────────────
+stage_start "repo-validator selftest (each rule fires on a mutated fixture)"
+if ! python3 scripts/validate_repo.py --selftest target/repo-validate >/dev/null; then
+    python3 scripts/validate_repo.py --selftest target/repo-validate || true
+    stage_fail "a structural rule stopped detecting its violation"
+fi
+stage_pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. The listening protocol still detects degradation
+# ─────────────────────────────────────────────────────────────────────────────
+stage_start "listening-harness selftest (equivalence, tail gate, power controls)"
+if ! python3 scripts/listening/run_panel.py selftest --out target/listening-selftest >/dev/null; then
+    python3 scripts/listening/run_panel.py selftest --out target/listening-selftest || true
+    stage_fail "the listening harness no longer reproduces its predeclared verdicts"
+fi
+stage_pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Formatting
+# ─────────────────────────────────────────────────────────────────────────────
+stage_start "cargo fmt --check"
+if ! cargo fmt --check; then
+    stage_fail "run \`cargo fmt\`"
+fi
+stage_pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Type check — and the multiple-build-targets warning is FATAL
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Doctrine #9: `ftts` and `franken_tts` are two thin shims over one `cli_main()`, each [[bin]]
+# pointing at its OWN file. Two targets sharing a path still compiles, but cargo warns — and
+# that warning is the early symptom of the shared-path mistake, so the gate treats it as an
+# error rather than letting it scroll past.
+stage_start "cargo check --locked --all-targets"
+CHECK_LOG="target/check-stage.log"
+mkdir -p target
+if ! run_cargo check --locked --all-targets 2>&1 | tee "$CHECK_LOG"; then
+    stage_fail "see $CHECK_LOG"
+fi
+if grep -q "present in multiple build targets" "$CHECK_LOG"; then
+    grep -n "present in multiple build targets" "$CHECK_LOG"
+    stage_fail "a source file is claimed by more than one build target (doctrine #9: each [[bin]] needs its own shim file)"
+fi
+stage_pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Lints
+# ─────────────────────────────────────────────────────────────────────────────
+stage_start "cargo clippy --locked --all-targets -- -D warnings"
+if ! run_cargo clippy --locked --all-targets -- -D warnings; then
+    stage_fail "fix the lint; do not \`allow\` it without a recorded reason"
+fi
+stage_pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Tests — the hard gate
+# ─────────────────────────────────────────────────────────────────────────────
+stage_start "cargo test --locked (HARD GATE — must exit 0 before any bead closes)"
+if ! run_cargo test --locked; then
+    stage_fail "no bead closes while this is red"
+fi
+stage_pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Bug scan over the working-tree diff (bounded; optional tool)
+# ─────────────────────────────────────────────────────────────────────────────
+stage_start "ubs --diff"
+UBS_TIMEOUT="${FTTS_CHECK_UBS_TIMEOUT:-300}"
+if ! command -v ubs >/dev/null 2>&1; then
+    stage_skip "ubs is not installed on this machine"
+else
+    # Pick a bounding command if one exists. Note the status is captured from a bare
+    # invocation, not from inside `if ! …` — there `$?` is the status of the negation, so a
+    # timeout's 124 would be invisible.
+    BOUND=()
+    if command -v timeout >/dev/null 2>&1; then
+        BOUND=(timeout "$UBS_TIMEOUT")
+    elif command -v gtimeout >/dev/null 2>&1; then
+        BOUND=(gtimeout "$UBS_TIMEOUT")
+    fi
+
+    if [[ ${#BOUND[@]} -eq 0 ]]; then
+        ubs --diff
+        UBS_RC=$?
+        [[ $UBS_RC -ne 0 ]] && stage_fail "ubs reported findings (exit $UBS_RC)"
+        SKIPPED+=("ubs bound: no timeout(1) on this machine, ran unbounded")
+        printf '    %sPASS%s  %s (%ss, %sunbounded — no timeout(1)%s)\n\n' \
+            "$GREEN" "$OFF" "$STAGE_NAME" "$((SECONDS - STAGE_START))" "$YELLOW" "$OFF"
+    else
+        "${BOUND[@]}" ubs --diff
+        UBS_RC=$?
+        if [[ $UBS_RC -eq 124 ]]; then
+            stage_fail "ubs exceeded its ${UBS_TIMEOUT}s bound (raise FTTS_CHECK_UBS_TIMEOUT if that is legitimate)"
+        elif [[ $UBS_RC -ne 0 ]]; then
+            stage_fail "ubs reported findings (exit $UBS_RC)"
+        fi
+        stage_pass
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+banner
+ELAPSED=$((SECONDS - START_ALL))
+if [[ ${#SKIPPED[@]} -eq 0 ]]; then
+    printf '%sALL GREEN%s  %s stages, %ss\n' "$GREEN$BOLD" "$OFF" "$STAGE_NUM" "$ELAPSED"
+else
+    printf '%sGREEN WITH SKIPS%s  %s stages, %ss — %s skipped:\n' \
+        "$YELLOW$BOLD" "$OFF" "$STAGE_NUM" "$ELAPSED" "${#SKIPPED[@]}"
+    for entry in "${SKIPPED[@]}"; do printf '  %s- %s%s\n' "$YELLOW" "$entry" "$OFF"; done
+    printf '%sThis is NOT a full green bar. Do not quote it as one.%s\n' "$DIM" "$OFF"
+fi
+exit 0

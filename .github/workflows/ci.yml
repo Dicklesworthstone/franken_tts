@@ -1,0 +1,174 @@
+name: CI
+
+# The `gate` job runs scripts/check.sh and nothing else. The gate lives in the script, so this
+# workflow can never drift from what a developer runs locally — if you want to change what CI
+# enforces, change scripts/check.sh.
+#
+# The `cross` job is ADVISORY (continue-on-error): it type-checks all five release targets from
+# day 0 so target rot surfaces early, without blocking a merge on a platform we do not yet ship.
+#
+# Bead: frankentts-p0-ci-083.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A stray ~/.cargo/config or CI default must not silently change what we build.
+  RUSTFLAGS: ""
+  # Sibling repositories are pinned by commit, not by branch: the workspace consumes them
+  # through path dependencies, so an upstream force-push would otherwise change what we build
+  # against without any diff here. Bump these deliberately.
+  FRANKENTORCH_REF: 886965dc7302165a3cfbce517eea2dcd4ef9c3b6
+  ASUPERSYNC_REF: 385347d0a31121d2b8f808357c28a45a414a3094
+
+jobs:
+  gate:
+    name: gate (scripts/check.sh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # The workspace has a path dep on `../asupersync`, so the repo itself must live one
+      # directory down for that relative path to resolve inside the checkout.
+      - name: Check out franken_tts
+        uses: actions/checkout@v4
+        with:
+          path: frankentts
+
+      - name: Check out asupersync (path dep ../asupersync)
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          ref: ${{ env.ASUPERSYNC_REF }}
+          token: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+          path: asupersync
+
+      - name: Check out frankentorch (path dep /dp/frankentorch)
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankentorch
+          ref: ${{ env.FRANKENTORCH_REF }}
+          token: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+          path: frankentorch
+
+      # frankentorch is referenced by an ABSOLUTE path in Cargo.toml, so it has to appear at
+      # /dp/frankentorch. A symlink is enough for cargo path resolution.
+      - name: Mount frankentorch at /dp/frankentorch
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /dp
+          sudo ln -sfn "$GITHUB_WORKSPACE/frankentorch" /dp/frankentorch
+          test -f /dp/frankentorch/crates/ft-core/Cargo.toml \
+            || { echo "::error::frankentorch checkout does not have the expected layout"; exit 1; }
+
+      # rust-toolchain.toml pins the nightly; rustup honours it automatically. Installing the
+      # components explicitly makes a toolchain problem fail here with a clear message rather
+      # than midway through the gate.
+      - name: Install pinned toolchain
+        working-directory: frankentts
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frankentts
+
+      - name: Cargo.lock is current
+        working-directory: frankentts
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      # ubs is not available on a hosted runner. check.sh reports that stage as SKIP and closes
+      # with GREEN WITH SKIPS rather than pretending the scan ran — see AGENTS.md Doctrine #0.4.
+      # ubs is enforced locally before every commit.
+      - name: Run the gate
+        working-directory: frankentts
+        env:
+          FTTS_CHECK_NO_RCH: "1"
+        run: ./scripts/check.sh
+
+  cross:
+    name: advisory cross-check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+    steps:
+      - name: Check out franken_tts
+        uses: actions/checkout@v4
+        with:
+          path: frankentts
+
+      - name: Check out asupersync (path dep ../asupersync)
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          ref: ${{ env.ASUPERSYNC_REF }}
+          token: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+          path: asupersync
+
+      - name: Check out frankentorch (path dep /dp/frankentorch)
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/frankentorch
+          ref: ${{ env.FRANKENTORCH_REF }}
+          token: ${{ secrets.SIBLING_REPO_TOKEN || github.token }}
+          path: frankentorch
+
+      - name: Mount frankentorch at /dp/frankentorch
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /dp
+          sudo ln -sfn "$GITHUB_WORKSPACE/frankentorch" /dp/frankentorch
+
+      - name: Add target
+        working-directory: frankentts
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frankentts
+          key: ${{ matrix.target }}
+
+      # `cargo check` emits metadata without linking, so every target is checkable from a Linux
+      # runner without a cross linker or an SDK. The scalar kernel fallback must compile
+      # everywhere by construction; this is what catches it when it stops.
+      - name: cargo check --target ${{ matrix.target }}
+        working-directory: frankentts
+        run: cargo check --locked --all-targets --target ${{ matrix.target }}
+
+  cross-summary:
+    name: advisory cross-check summary
+    runs-on: ubuntu-latest
+    needs: cross
+    if: always()
+    steps:
+      # `cross` is advisory, so its result must be visible without being able to block a merge.
+      # A silent advisory job is the same as no advisory job.
+      - name: Report
+        run: |
+          set -euo pipefail
+          result="${{ needs.cross.result }}"
+          echo "### Advisory 5-target cross-check: \`$result\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$result" != "success" ]; then
+            echo "::warning::One or more release targets no longer type-check. This does not block the merge, but target rot compounds — see the per-target jobs above."
+            echo "One or more targets failed. Not blocking, but fix it before it compounds." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "All five release targets type-check." >> "$GITHUB_STEP_SUMMARY"
+          fi
