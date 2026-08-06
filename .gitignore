@@ -1,0 +1,13 @@
+/target
+Cargo.lock.orig
+*.fttsq
+*.fttspack
+*.ftvoice
+*.ftvoice-cache
+*.fttsdraft
+/models
+/snapshots
+*.wav
+*.npz
+*.npy
+.DS_Store
