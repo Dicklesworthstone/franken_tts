@@ -474,11 +474,10 @@ impl TtsEngine {
         R: Send + 'static,
         F: FnOnce(CancellationToken) -> Result<R, EngineError> + Send + 'static,
     {
-        cancellation.checkpoint().map_err(|error| {
+        cancellation.checkpoint().inspect_err(|_| {
             observer.on_event(SynthesisEvent::Health {
                 event: HealthEvent::Cancelled,
             });
-            error
         })?;
         observer.on_event(SynthesisEvent::StageStarted { stage });
         let started = Instant::now();
