@@ -56,7 +56,22 @@ stage_fail() {
     [[ -n "${1:-}" ]] && printf '    %s\n' "$1"
     banner
     printf '%sGATE FAILED%s at stage %s: %s\n' "$RED$BOLD" "$OFF" "$STAGE_NUM" "$STAGE_NAME"
-    printf 'Fix the root cause and re-run ./scripts/check.sh — do not skip past this.\n'
+    # Several agents share one working tree, so most red gates are somebody's half-finished
+    # edit rather than anything wrong with committed code. Saying so here is the difference
+    # between a one-glance attribution and an investigation that ends with you "fixing"
+    # another agent's live crate — which AGENTS.md forbids and which destroys in-flight work.
+    if [[ -n "$DIRTY_FILES" ]]; then
+        printf '\n%sATTRIBUTION: the working tree is DIRTY (%s uncommitted path(s)).%s\n' \
+            "$YELLOW$BOLD" "$DIRTY_COUNT" "$OFF"
+        printf 'This failure may belong to an in-flight edit, not to committed code. Check\n'
+        printf 'whether the failing file is in this list before changing anything:\n'
+        printf '%s\n' "$DIRTY_FILES" | sed 's/^/    /'
+        printf '\nTo judge committed code alone, compare against HEAD (%s) — e.g.\n' "$HEAD_SHA"
+        printf '    git show HEAD:<failing-file> | grep <the-missing-symbol>\n'
+        printf '%sDo NOT edit another agent'"'"'s uncommitted work to make this gate pass.%s\n' \
+            "$YELLOW" "$OFF"
+    fi
+    printf '\nFix the root cause and re-run ./scripts/check.sh — do not skip past this.\n'
     exit 1
 }
 
@@ -80,8 +95,20 @@ fi
 
 run_cargo() { "${CARGO_RUNNER[@]}" "$@"; }
 
+# Working-tree provenance, captured ONCE up front so the verdict can be attributed. A gate
+# result is only meaningful against a known tree state, and in this repo the tree is shared.
+HEAD_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+DIRTY_FILES="$(git status --porcelain 2>/dev/null | grep -v '^?? \.ntm/' || true)"
+DIRTY_COUNT="$(printf '%s' "$DIRTY_FILES" | grep -c . || true)"
+
 printf '%sfranken_tts gate%s  %s\n' "$BOLD" "$OFF" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 printf '%scargo via: %s%s\n' "$DIM" "$CARGO_MODE" "$OFF"
+if [[ -z "$DIRTY_FILES" ]]; then
+    printf '%stree:      %s (clean)%s\n' "$DIM" "$HEAD_SHA" "$OFF"
+else
+    printf '%stree:      %s + %s%s uncommitted path(s)%s%s — a failure below may not be yours%s\n' \
+        "$DIM" "$HEAD_SHA" "$YELLOW" "$DIRTY_COUNT" "$OFF" "$DIM" "$OFF"
+fi
 banner
 
 # ─────────────────────────────────────────────────────────────────────────────
