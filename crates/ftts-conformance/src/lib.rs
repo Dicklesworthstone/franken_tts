@@ -157,10 +157,13 @@ macro_rules! require_model {
         match $crate::gate::ModelGate::resolve() {
             $crate::gate::ModelGate::Present { artifact } => artifact,
             $crate::gate::ModelGate::Absent { reason } => {
-                $crate::report::Receipt::new($crate::test_name!(), $crate::report::Outcome::Skipped)
-                    .contract($contract)
-                    .reason(reason)
-                    .emit();
+                $crate::report::Receipt::new(
+                    $crate::test_name!(),
+                    $crate::report::Outcome::Skipped,
+                )
+                .contract($contract)
+                .reason(reason)
+                .emit();
                 return;
             }
         }
@@ -296,12 +299,7 @@ pub mod macro_support {
     /// # Panics
     ///
     /// Panics with the self-localizing report when the sequences are not identical.
-    pub fn assert_exact<T>(
-        test: &str,
-        seam: &str,
-        expected: &[T],
-        actual: &[T],
-    ) -> ExactComparison
+    pub fn assert_exact<T>(test: &str, seam: &str, expected: &[T], actual: &[T]) -> ExactComparison
     where
         T: PartialEq + std::fmt::Debug,
     {
