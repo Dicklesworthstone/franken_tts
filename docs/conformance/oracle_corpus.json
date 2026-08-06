@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "synthetic-tone-en",
+      "text": "Hello.",
+      "language": "English",
+      "reference_audio": "synthetic_220hz_24khz.wav",
+      "reference_text": "Hello.",
+      "reference_provenance": "Deterministic non-human 220 Hz sine wave generated locally for CPU fixture plumbing; not a voice recording.",
+      "max_new_tokens": 2
+    }
+  ]
+}

@@ -46,6 +46,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
+import tomllib
+
 REPO = Path(__file__).resolve().parent.parent
 PINNED_GH_REV = "022e286b98fbec7e1e916cb940cdf532cd9f488e"
 PINNED_HF_REV = "5d83992436eae1d760afd27aff78a71d676296fc"
@@ -89,8 +91,28 @@ def package_version(name: str) -> str:
     return version.split("+", 1)[0]
 
 
-def assert_runtime() -> dict[str, str]:
-    actual = {name: package_version(name) for name in PINNED_RUNTIME}
+def source_package_version(source_dir: Path) -> str:
+    """Read the package version from the source tree that the oracle will actually import."""
+    pyproject = source_dir / "pyproject.toml"
+    if not pyproject.is_file():
+        fail(f"source checkout has no pyproject.toml: {source_dir}")
+    try:
+        project = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("project", {})
+    except tomllib.TOMLDecodeError as error:
+        fail(f"invalid source pyproject.toml: {error}")
+    if project.get("name") != "qwen-tts" or not isinstance(project.get("version"), str):
+        fail("source pyproject.toml does not identify qwen-tts with a concrete version")
+    return project["version"]
+
+
+def assert_runtime(source_dir: Path) -> dict[str, str]:
+    # `qwen_tts` is intentionally imported from the verified checkout below, not an independently
+    # installed wheel that might disagree with the asserted source pin. Its pyproject is therefore
+    # the authoritative package-version witness for this run.
+    actual = {
+        name: source_package_version(source_dir) if name == "qwen-tts" else package_version(name)
+        for name in PINNED_RUNTIME
+    }
     mismatches = [
         f"{name}={actual[name]} (need {expected})"
         for name, expected in PINNED_RUNTIME.items()
@@ -493,7 +515,7 @@ def main() -> int:
     model_dir = args.model_dir.resolve()
     corpus_path = args.corpus.resolve()
     assert_source_pin(source_dir)
-    runtime = assert_runtime()
+    runtime = assert_runtime(source_dir)
     weight_hashes = assert_model_pin(model_dir)
     cases = load_corpus(corpus_path)
 
