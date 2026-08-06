@@ -6,8 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["native-mmap"]
+# The only audited OS-memory interface in this crate. Disabling it preserves correctness through
+# the owned-byte fallback, which is useful for targets without a supported mmap implementation.
+native-mmap = []
+
 [dependencies]
 ft-core.workspace = true
 ft-kernel-cpu.workspace = true
 ft-serialize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
