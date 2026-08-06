@@ -72,6 +72,31 @@ versions and assert them at oracle runtime; there is no upstream pin to inherit.
 is the sharpest risk: it supplies the mel filterbank for the speaker encoder (OQ-9), and mel
 implementations drift across releases.
 
+### OQ-15 resolution — frozen local CPU oracle environment
+
+The source-package pins above are authoritative for `qwen-tts`, `transformers`, and `accelerate`.
+For the packages the upstream project leaves unpinned, the local oracle smoke environment is
+**Python 3.13.9; `torch==2.7.1`; `torchaudio==2.7.1`; `librosa==0.11.0`;
+`soundfile==0.13.1`**, with `qwen-tts==0.1.1`, `transformers==4.57.3`, and
+`accelerate==1.12.0`. It uses eager attention, BF16 parameters, and `device_map=cpu`. The fixture
+generator must assert these versions before producing or consuming oracle fixtures; configuration
+metadata is not an acceptable substitute.
+
+At GitHub source pin `022e286b98fbec7e1e916cb940cdf532cd9f488e`, this environment loaded the
+model on Apple Silicon CPU and ran canonical-greedy x-vector synthesis twice with the same one-second,
+24 kHz, 220 Hz in-memory reference, `text="Hello."`, and `max_new_tokens=2`. Each run produced
+1,920 finite 24 kHz samples, with identical waveform SHA-256
+`55a955c119292ba1df21d460c1a90eaacbd2384a6b9543cf26e5f546bc24289a`. The source enforces a
+minimum of two new tokens; `max_new_tokens=1` is not a valid smoke because it leaves no hidden states.
+The curated truth-pack snapshot alone is not importable for this run because it omits
+`qwen_tts.core.tokenizer_25hz.vq`; use a full checkout verified at the source pin.
+
+**Performance-baseline decision:** this proves fixed-runtime CPU execution and repeatability only.
+It does **not** prove CPU-to-CUDA canonical-greedy token equality (the host had no CUDA device), so
+official CPU is **not an admissible G2 performance incumbent** and no CPU/GPU ratio may be reported.
+Correctness fixtures remain frozen from the unmodified native-device oracle; a CUDA run with
+codec-token capture over the declared corpus must establish the cross-device nondeterminism envelope.
+
 ## Non-pinnable reference
 
 Plan §17 also cites `doc.rust-lang.org/.../lints/levels.html` for `forbid` being un-overridable.
