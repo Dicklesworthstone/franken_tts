@@ -162,6 +162,75 @@ impl fmt::Display for AccessClass {
     }
 }
 
+/// What the loader should do with a section's pages.
+///
+/// This is the **decision** layer: a total, pure function of the access class, unit-testable with
+/// no syscalls and no `unsafe`. Applying it — `mmap` plus the matching `madvise` — belongs to the
+/// audited unsafe island in `ftts-kernels`, because `ftts-artifacts` is `forbid(unsafe_code)`.
+/// Keeping the two apart means the policy can be argued about and tested here, where getting it
+/// wrong is cheap, rather than inside a syscall wrapper where it is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PagePolicy {
+    /// Fault in eagerly and keep resident: `MADV_WILLNEED`.
+    ///
+    /// Only for sections read every frame. The microdecoder pack is the whole reason this variant
+    /// exists — it is reread 15× per frame and its residency is the project's #1 design center.
+    Resident,
+    /// Map lazily and let the kernel fault pages in as they are touched, a row at a time.
+    ///
+    /// **Never** `MADV_WILLNEED`. The text embedding is ~622 MB of which one synthesis touches a
+    /// few kilobytes; prefetching it wholesale would dominate startup and evict the very pages
+    /// [`PagePolicy::Resident`] exists to protect.
+    LazyRowGranular,
+    /// Map lazily, no advice. Enrollment sections a synthesis run never touches.
+    OnDemand,
+}
+
+impl PagePolicy {
+    /// The stable wire string, for `ftts inspect` and the loader's trace events.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::LazyRowGranular => "lazy_row_granular",
+            Self::OnDemand => "on_demand",
+        }
+    }
+
+    /// Whether the loader may issue `MADV_WILLNEED` for this policy.
+    ///
+    /// The single invariant the whole policy exists to enforce. Expressed as its own predicate so
+    /// the syscall island can assert on it directly rather than re-deriving it from the class.
+    #[must_use]
+    pub const fn may_prefetch(self) -> bool {
+        matches!(self, Self::Resident)
+    }
+}
+
+impl fmt::Display for PagePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AccessClass {
+    /// The page-in policy for this access class. Total, and the only place the mapping is defined.
+    #[must_use]
+    pub const fn page_policy(self) -> PagePolicy {
+        match self {
+            Self::HotRecurrentMicrodecoder | Self::HotRecurrentTalker | Self::HotCodecDecoder => {
+                PagePolicy::Resident
+            }
+            Self::ColdTextEmbedding => PagePolicy::LazyRowGranular,
+            // Metadata is tiny and read once at load; enrollment sections are untouched by
+            // synthesis. Neither earns a prefetch that would compete with the hot pack.
+            Self::EnrollmentSpeakerEncoder | Self::EnrollmentCodecEncoder | Self::Metadata => {
+                PagePolicy::OnDemand
+            }
+        }
+    }
+}
+
 /// How a tensor's elements are stored in the container.
 ///
 /// Narrow on purpose, and unknown values are refused. The high-precision variants exist because
@@ -791,7 +860,362 @@ impl FttsqReader {
         }
         Ok(&payload[tensor.offset as usize..end as usize])
     }
+
+    /// The page-in plan: every section paired with its policy, in the order to apply them.
+    ///
+    /// Ordered [`PagePolicy::Resident`] first. Prefetch order matters under memory pressure — the
+    /// section that gets its `MADV_WILLNEED` in last is the one most likely to find the page cache
+    /// already full, and that must never be the microdecoder pack.
+    ///
+    /// Within the resident group, smaller sections come first: the ~110 MB microdecoder pack lands
+    /// ahead of the ~440 MB talker, so the reread-15×-per-frame working set wins the race for
+    /// cache it would otherwise lose to a body read once per frame.
+    #[must_use]
+    pub fn page_in_plan(&self) -> Vec<(&SectionEntry, PagePolicy)> {
+        let mut plan: Vec<(&SectionEntry, PagePolicy)> = self
+            .sections
+            .iter()
+            .map(|section| (section, section.access_class.page_policy()))
+            .collect();
+        plan.sort_by_key(|(section, policy)| {
+            let rank = match policy {
+                PagePolicy::Resident => 0_u8,
+                PagePolicy::LazyRowGranular => 1,
+                PagePolicy::OnDemand => 2,
+            };
+            (rank, section.length)
+        });
+        plan
+    }
+
+    /// Audits the artifact's tensor directory against an expected inventory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the itemized [`ArtifactCensus`] when anything is missing, extra, or mis-declared.
+    pub fn verify_census(&self, manifest: &ArtifactManifest) -> Result<(), Box<ArtifactCensus>> {
+        let report = manifest.audit(self);
+        if report.is_green() {
+            Ok(())
+        } else {
+            Err(Box::new(report))
+        }
+    }
 }
+
+/// One tensor the artifact is required to carry, and where.
+///
+/// Distinct from [`crate::census::ExpectedTensor`] on purpose, and the difference is not
+/// incidental: that one audits an *upstream* checkpoint, so it speaks
+/// [`crate::safetensors::Dtype`] (bf16/f32) and has no notion of sections. A `.fttsq` is a
+/// **quantized** artifact, so its expectations are keyed on [`StoredDtype`] and additionally pin
+/// the [`AccessClass`] — a tensor that lands in the wrong section still loads and still produces
+/// correct audio, while quietly destroying the residency the whole optimization program depends on.
+/// That failure is invisible to a dtype-and-shape census, which is exactly why this one exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedArtifactTensor {
+    /// Tensor name, exactly as the directory records it.
+    pub name: String,
+    /// Required logical shape.
+    pub shape: Vec<u64>,
+    /// Required storage dtype after quantization.
+    pub dtype: StoredDtype,
+    /// The access class whose section must hold it.
+    pub access_class: AccessClass,
+}
+
+/// One way an artifact diverged from its expected inventory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArtifactFinding {
+    /// A required tensor is absent. Certain failure downstream.
+    Missing {
+        /// The tensor.
+        name: String,
+    },
+    /// The artifact carries a tensor the manifest does not list — the signature of a different
+    /// checkpoint or a converter that changed its naming.
+    Extra {
+        /// The tensor.
+        name: String,
+    },
+    /// Present, but not the shape we compiled kernels for.
+    ShapeMismatch {
+        /// The tensor.
+        name: String,
+        /// Expected shape.
+        expected: Vec<u64>,
+        /// Shape found.
+        found: Vec<u64>,
+    },
+    /// Present, but quantized differently than the recipe says.
+    DtypeMismatch {
+        /// The tensor.
+        name: String,
+        /// Expected dtype.
+        expected: StoredDtype,
+        /// Dtype found.
+        found: StoredDtype,
+    },
+    /// Present and correct, but filed under the wrong access class.
+    ///
+    /// The quiet one: audio stays correct while the page-in policy silently becomes wrong.
+    WrongAccessClass {
+        /// The tensor.
+        name: String,
+        /// Expected class.
+        expected: AccessClass,
+        /// Class found.
+        found: AccessClass,
+    },
+    /// A tensor names a section the artifact does not declare.
+    DanglingSection {
+        /// The tensor.
+        name: String,
+        /// The section it named.
+        section: String,
+    },
+}
+
+impl ArtifactFinding {
+    /// The tensor this finding is about.
+    #[must_use]
+    pub fn tensor(&self) -> &str {
+        match self {
+            Self::Missing { name }
+            | Self::Extra { name }
+            | Self::ShapeMismatch { name, .. }
+            | Self::DtypeMismatch { name, .. }
+            | Self::WrongAccessClass { name, .. }
+            | Self::DanglingSection { name, .. } => name,
+        }
+    }
+
+    /// Short class label, for counting findings by kind.
+    #[must_use]
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::Missing { .. } => "missing",
+            Self::Extra { .. } => "extra",
+            Self::ShapeMismatch { .. } => "shape_mismatch",
+            Self::DtypeMismatch { .. } => "dtype_mismatch",
+            Self::WrongAccessClass { .. } => "wrong_access_class",
+            Self::DanglingSection { .. } => "dangling_section",
+        }
+    }
+}
+
+impl fmt::Display for ArtifactFinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing { name } => write!(f, "MISSING       {name}"),
+            Self::Extra { name } => write!(f, "EXTRA         {name}"),
+            Self::ShapeMismatch {
+                name,
+                expected,
+                found,
+            } => write!(
+                f,
+                "SHAPE         {name}: expected {expected:?}, found {found:?}"
+            ),
+            Self::DtypeMismatch {
+                name,
+                expected,
+                found,
+            } => write!(
+                f,
+                "DTYPE         {name}: expected {expected}, found {found}"
+            ),
+            Self::WrongAccessClass {
+                name,
+                expected,
+                found,
+            } => write!(
+                f,
+                "ACCESS_CLASS  {name}: expected {expected}, found {found}"
+            ),
+            Self::DanglingSection { name, section } => {
+                write!(
+                    f,
+                    "DANGLING      {name}: names undeclared section `{section}`"
+                )
+            }
+        }
+    }
+}
+
+/// The expected tensor inventory for one artifact.
+///
+/// The **mechanism**, not the data: which tensors a `.fttsq` must carry, at which precision, comes
+/// from the OQ-2 inventory crossed with the converter's per-tensor quantization policy. This module
+/// does not hard-code that recipe, because it is per-artifact and measured.
+#[derive(Clone, Debug, Default)]
+pub struct ArtifactManifest {
+    label: String,
+    expected: Vec<ExpectedArtifactTensor>,
+}
+
+impl ArtifactManifest {
+    /// Starts a manifest with a human label used in the report header.
+    #[must_use]
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            expected: Vec::new(),
+        }
+    }
+
+    /// Adds one expectation.
+    #[must_use]
+    pub fn expect(mut self, tensor: ExpectedArtifactTensor) -> Self {
+        self.expected.push(tensor);
+        self
+    }
+
+    /// The label.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// How many tensors are expected.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.expected.len()
+    }
+
+    /// Whether the manifest expects nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.expected.is_empty()
+    }
+
+    /// Audits a reader against this manifest, reporting **every** divergence.
+    ///
+    /// Deliberately does not stop at the first finding: a converter bug usually produces a family
+    /// of related divergences, and seeing all of them at once is the difference between one fix and
+    /// twenty rounds of rerunning a multi-gigabyte conversion.
+    #[must_use]
+    pub fn audit(&self, reader: &FttsqReader) -> ArtifactCensus {
+        let mut findings = Vec::new();
+        let expected_names: BTreeMap<&str, &ExpectedArtifactTensor> = self
+            .expected
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), tensor))
+            .collect();
+
+        for expectation in &self.expected {
+            let Some(found) = reader.tensor(&expectation.name) else {
+                findings.push(ArtifactFinding::Missing {
+                    name: expectation.name.clone(),
+                });
+                continue;
+            };
+            if found.shape != expectation.shape {
+                findings.push(ArtifactFinding::ShapeMismatch {
+                    name: expectation.name.clone(),
+                    expected: expectation.shape.clone(),
+                    found: found.shape.clone(),
+                });
+            }
+            if found.dtype != expectation.dtype {
+                findings.push(ArtifactFinding::DtypeMismatch {
+                    name: expectation.name.clone(),
+                    expected: expectation.dtype,
+                    found: found.dtype,
+                });
+            }
+            match reader.section(&found.section) {
+                Some(section) if section.access_class != expectation.access_class => {
+                    findings.push(ArtifactFinding::WrongAccessClass {
+                        name: expectation.name.clone(),
+                        expected: expectation.access_class,
+                        found: section.access_class,
+                    });
+                }
+                Some(_) => {}
+                None => findings.push(ArtifactFinding::DanglingSection {
+                    name: expectation.name.clone(),
+                    section: found.section.clone(),
+                }),
+            }
+        }
+
+        for tensor in reader.tensors() {
+            if !expected_names.contains_key(tensor.name.as_str()) {
+                findings.push(ArtifactFinding::Extra {
+                    name: tensor.name.clone(),
+                });
+            }
+        }
+
+        ArtifactCensus {
+            label: self.label.clone(),
+            expected: self.expected.len(),
+            found: reader.tensors().len(),
+            findings,
+        }
+    }
+}
+
+/// The itemized result of an artifact census.
+#[derive(Clone, Debug)]
+pub struct ArtifactCensus {
+    label: String,
+    expected: usize,
+    found: usize,
+    findings: Vec<ArtifactFinding>,
+}
+
+impl ArtifactCensus {
+    /// Whether the artifact matched its manifest exactly.
+    #[must_use]
+    pub fn is_green(&self) -> bool {
+        self.findings.is_empty()
+    }
+
+    /// Every divergence found.
+    #[must_use]
+    pub fn findings(&self) -> &[ArtifactFinding] {
+        &self.findings
+    }
+
+    /// How many findings of one class.
+    #[must_use]
+    pub fn count_of(&self, class: &str) -> usize {
+        self.findings
+            .iter()
+            .filter(|finding| finding.class() == class)
+            .count()
+    }
+
+    /// A readable, itemized report.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "artifact census `{}`: expected {} tensors, artifact declares {} — {}\n",
+            self.label,
+            self.expected,
+            self.found,
+            if self.is_green() {
+                "GREEN".to_owned()
+            } else {
+                format!("{} FINDINGS", self.findings.len())
+            }
+        );
+        for finding in &self.findings {
+            out.push_str(&format!("  {finding}\n"));
+        }
+        out
+    }
+}
+
+impl fmt::Display for ArtifactCensus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.render())
+    }
+}
+
+impl std::error::Error for ArtifactCensus {}
 
 fn required_str<'a>(value: Option<&'a Value>, path: &str) -> Result<&'a str, FttsqError> {
     value
@@ -1675,6 +2099,232 @@ mod tests {
             !path.exists(),
             "a refused artifact must not leave a file behind"
         );
+    }
+
+    /// The invariant the whole page-in policy exists to enforce.
+    #[test]
+    fn the_cold_text_embedding_is_never_prefetched_and_hot_classes_always_are() {
+        assert_eq!(
+            AccessClass::ColdTextEmbedding.page_policy(),
+            PagePolicy::LazyRowGranular
+        );
+        assert!(
+            !AccessClass::ColdTextEmbedding.page_policy().may_prefetch(),
+            "MADV_WILLNEED over the ~622 MB embedding would evict the microdecoder pack"
+        );
+
+        for hot in [
+            AccessClass::HotRecurrentMicrodecoder,
+            AccessClass::HotRecurrentTalker,
+            AccessClass::HotCodecDecoder,
+        ] {
+            assert_eq!(hot.page_policy(), PagePolicy::Resident);
+            assert!(hot.page_policy().may_prefetch());
+        }
+        for cold in [
+            AccessClass::EnrollmentSpeakerEncoder,
+            AccessClass::EnrollmentCodecEncoder,
+            AccessClass::Metadata,
+        ] {
+            assert_eq!(cold.page_policy(), PagePolicy::OnDemand);
+            assert!(!cold.page_policy().may_prefetch());
+        }
+
+        // is_hot() and the policy must not be able to disagree — two encodings of one fact.
+        for class in [
+            AccessClass::HotRecurrentMicrodecoder,
+            AccessClass::HotRecurrentTalker,
+            AccessClass::HotCodecDecoder,
+            AccessClass::ColdTextEmbedding,
+            AccessClass::EnrollmentSpeakerEncoder,
+            AccessClass::EnrollmentCodecEncoder,
+            AccessClass::Metadata,
+        ] {
+            assert_eq!(
+                class.is_hot(),
+                class.page_policy().may_prefetch(),
+                "is_hot() and page_policy() disagree for {class}"
+            );
+            assert_eq!(
+                class.is_row_granular(),
+                class.page_policy() == PagePolicy::LazyRowGranular,
+                "is_row_granular() and page_policy() disagree for {class}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_page_in_plan_prefetches_the_microdecoder_before_the_larger_talker() {
+        // Sizes stand in for the real ~110 MB pack and ~440 MB talker.
+        let bytes = FttsqWriter::new("qwen3-tts-12hz-0.6b-base", "f".repeat(64))
+            .license_notice(NOTICE)
+            .section("talker", AccessClass::HotRecurrentTalker, vec![1_u8; 400])
+            .section("embedding", AccessClass::ColdTextEmbedding, vec![2_u8; 900])
+            .section(
+                "micro",
+                AccessClass::HotRecurrentMicrodecoder,
+                vec![3_u8; 100],
+            )
+            .section("meta", AccessClass::Metadata, vec![4_u8; 8])
+            .finish()
+            .expect("writable");
+        let reader = FttsqReader::open(&bytes).expect("readable");
+
+        let plan = reader.page_in_plan();
+        let order: Vec<&str> = plan
+            .iter()
+            .map(|(section, _)| section.name.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["micro", "talker", "embedding", "meta"],
+            "resident sections first, smallest first, so the 15x-reread pack wins the cache race"
+        );
+        assert_eq!(plan[0].1, PagePolicy::Resident);
+        assert_eq!(plan[2].1, PagePolicy::LazyRowGranular);
+        assert_eq!(plan[3].1, PagePolicy::OnDemand);
+
+        // Nothing outside the resident group may ever be prefetched.
+        for (section, policy) in &plan {
+            assert_eq!(
+                policy.may_prefetch(),
+                section.access_class.is_hot(),
+                "section `{}` would be prefetched against policy",
+                section.name
+            );
+        }
+    }
+
+    fn census_fixture() -> (Vec<u8>, ArtifactManifest) {
+        let bytes = FttsqWriter::new("qwen3-tts-12hz-0.6b-base", "g".repeat(64))
+            .license_notice(NOTICE)
+            .section(
+                "micro",
+                AccessClass::HotRecurrentMicrodecoder,
+                vec![1_u8; 64],
+            )
+            .section("embedding", AccessClass::ColdTextEmbedding, vec![2_u8; 32])
+            .tensor(TensorEntry {
+                name: "micro.body".to_owned(),
+                section: "micro".to_owned(),
+                dtype: StoredDtype::Q8,
+                shape: vec![8, 8],
+                offset: 0,
+                length: 64,
+                scales: None,
+            })
+            .tensor(TensorEntry {
+                name: "text_embedding.weight".to_owned(),
+                section: "embedding".to_owned(),
+                dtype: StoredDtype::Bf16,
+                shape: vec![4, 4],
+                offset: 0,
+                length: 32,
+                scales: None,
+            })
+            .finish()
+            .expect("writable");
+
+        let manifest = ArtifactManifest::new("qwen3-tts pinned")
+            .expect(ExpectedArtifactTensor {
+                name: "micro.body".to_owned(),
+                shape: vec![8, 8],
+                dtype: StoredDtype::Q8,
+                access_class: AccessClass::HotRecurrentMicrodecoder,
+            })
+            .expect(ExpectedArtifactTensor {
+                name: "text_embedding.weight".to_owned(),
+                shape: vec![4, 4],
+                dtype: StoredDtype::Bf16,
+                access_class: AccessClass::ColdTextEmbedding,
+            });
+        (bytes, manifest)
+    }
+
+    #[test]
+    fn a_matching_artifact_passes_its_census() {
+        let (bytes, manifest) = census_fixture();
+        let reader = FttsqReader::open(&bytes).expect("readable");
+        let report = manifest.audit(&reader);
+        assert!(report.is_green(), "{}", report.render());
+        assert!(reader.verify_census(&manifest).is_ok());
+    }
+
+    /// Each divergence class must be caught, and all of them reported in one pass.
+    #[test]
+    fn the_census_names_every_divergence_class_in_one_pass() {
+        let (bytes, _) = census_fixture();
+        let reader = FttsqReader::open(&bytes).expect("readable");
+
+        let manifest = ArtifactManifest::new("deliberately wrong")
+            // Right name, wrong shape AND wrong dtype: both must be reported, not just the first.
+            .expect(ExpectedArtifactTensor {
+                name: "micro.body".to_owned(),
+                shape: vec![16, 4],
+                dtype: StoredDtype::Q4,
+                access_class: AccessClass::HotRecurrentMicrodecoder,
+            })
+            // Correct in every respect except where it lives — the silent one.
+            .expect(ExpectedArtifactTensor {
+                name: "text_embedding.weight".to_owned(),
+                shape: vec![4, 4],
+                dtype: StoredDtype::Bf16,
+                access_class: AccessClass::HotRecurrentTalker,
+            })
+            // Required but absent.
+            .expect(ExpectedArtifactTensor {
+                name: "codec.decoder.weight".to_owned(),
+                shape: vec![2],
+                dtype: StoredDtype::Q8,
+                access_class: AccessClass::HotCodecDecoder,
+            });
+
+        let report = manifest.audit(&reader);
+        assert!(!report.is_green());
+        assert_eq!(report.count_of("shape_mismatch"), 1, "{}", report.render());
+        assert_eq!(report.count_of("dtype_mismatch"), 1, "{}", report.render());
+        assert_eq!(
+            report.count_of("wrong_access_class"),
+            1,
+            "a tensor in the wrong access class still produces correct audio while destroying \
+             residency — the census is the only thing that catches it:\n{}",
+            report.render()
+        );
+        assert_eq!(report.count_of("missing"), 1, "{}", report.render());
+
+        let rendered = report.render();
+        for expected in [
+            "micro.body",
+            "text_embedding.weight",
+            "codec.decoder.weight",
+            "ACCESS_CLASS",
+            "SHAPE",
+            "DTYPE",
+            "MISSING",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "census report is missing `{expected}`:\n{rendered}"
+            );
+        }
+
+        assert!(reader.verify_census(&manifest).is_err());
+    }
+
+    /// An artifact carrying tensors nobody expected is a *different checkpoint*.
+    #[test]
+    fn unexpected_tensors_are_reported_as_extra() {
+        let (bytes, _) = census_fixture();
+        let reader = FttsqReader::open(&bytes).expect("readable");
+        let manifest = ArtifactManifest::new("partial").expect(ExpectedArtifactTensor {
+            name: "micro.body".to_owned(),
+            shape: vec![8, 8],
+            dtype: StoredDtype::Q8,
+            access_class: AccessClass::HotRecurrentMicrodecoder,
+        });
+        let report = manifest.audit(&reader);
+        assert_eq!(report.count_of("extra"), 1, "{}", report.render());
+        assert!(report.render().contains("text_embedding.weight"));
     }
 
     #[test]
