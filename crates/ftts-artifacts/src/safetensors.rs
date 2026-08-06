@@ -756,8 +756,8 @@ mod tests {
     #[test]
     fn refuses_a_truncated_file() {
         assert_eq!(
-            SafetensorsIndex::parse(&[0u8; 4]),
-            Err(WeightsError::TooShortForHeader { len: 4 })
+            SafetensorsIndex::parse(&[0u8; 4]).expect_err("must refuse"),
+            WeightsError::TooShortForHeader { len: 4 }
         );
     }
 
@@ -788,8 +788,8 @@ mod tests {
 
         let buffer = assemble(&serde_json::json!([1, 2]), &[]);
         assert_eq!(
-            SafetensorsIndex::parse(&buffer),
-            Err(WeightsError::HeaderNotObject)
+            SafetensorsIndex::parse(&buffer).expect_err("must refuse"),
+            WeightsError::HeaderNotObject
         );
     }
 
@@ -800,11 +800,11 @@ mod tests {
             &[0u8; 8],
         );
         assert_eq!(
-            SafetensorsIndex::parse(&buffer),
-            Err(WeightsError::UnsupportedDtype {
+            SafetensorsIndex::parse(&buffer).expect_err("must refuse"),
+            WeightsError::UnsupportedDtype {
                 name: "w".to_owned(),
                 raw: "I64".to_owned(),
-            })
+            }
         );
     }
 

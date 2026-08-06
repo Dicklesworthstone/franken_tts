@@ -792,6 +792,7 @@ name = "ftts-artifacts"
 version = "0.1.0"
 dependencies = [
  "ftts-core",
+ "serde_json",
 ]
 
 [[package]]
