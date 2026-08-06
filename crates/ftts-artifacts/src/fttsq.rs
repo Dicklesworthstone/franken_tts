@@ -1386,10 +1386,13 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
         let error = FttsqReader::open(&bytes).expect_err("a bit flip must be caught");
-        match &error {
-            FttsqError::DigestMismatch { section, .. } => assert_eq!(section, "text_embedding"),
-            other => assert!(false, "expected a digest mismatch, got {other}"),
-        }
+        assert!(
+            matches!(
+                &error,
+                FttsqError::DigestMismatch { section, .. } if section == "text_embedding"
+            ),
+            "expected a digest mismatch for text_embedding, got {error}"
+        );
         // Structure alone still parses — which is exactly why the digest gate has to exist.
         assert!(FttsqReader::parse_directory(&bytes).is_ok());
     }
