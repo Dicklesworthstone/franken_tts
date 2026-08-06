@@ -8,6 +8,7 @@
 //! later model stages cannot introduce a second orchestration path.
 
 pub mod admission;
+pub mod health;
 
 use std::{
     env, fmt,
@@ -503,6 +504,34 @@ pub enum HealthEvent {
     BudgetExceeded,
     /// A request observed cooperative cancellation.
     Cancelled,
+    /// A runtime-health detector fired ([`health`]).
+    ///
+    /// Carried through the same observer as every other lifecycle event so a caller learns about
+    /// a NaN, a stall, a repetition loop or a silent output *while the run is happening*, rather
+    /// than inferring it afterwards from audio it cannot listen to. The violation itself says
+    /// whether the output is still usable — see [`health::HealthViolation::invalidates_output`].
+    Violation(health::HealthViolation),
+}
+
+impl HealthEvent {
+    /// Whether this signal means the run's output must not be presented as a clean result.
+    #[must_use]
+    pub const fn invalidates_output(self) -> bool {
+        match self {
+            Self::BudgetExceeded | Self::Cancelled => true,
+            Self::Violation(violation) => violation.invalidates_output(),
+        }
+    }
+
+    /// Stable wire string for robot mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::Cancelled => "cancelled",
+            Self::Violation(violation) => violation.as_str(),
+        }
+    }
 }
 
 /// Lifecycle information delivered to a caller-owned observer.
@@ -1117,6 +1146,43 @@ mod tests {
             !format!("{:?}", trace.1).contains("caller-owned secret"),
             "observer trace summaries must never contain sensitive before/after text"
         );
+    }
+
+    #[test]
+    fn a_health_violation_reaches_the_caller_through_the_observer() {
+        // The wiring the reliability bead requires: a detector firing must be visible to the
+        // caller through the SAME hook as every other lifecycle event. A violation that only
+        // exists inside the engine is a violation nobody can act on.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let observer = move |event: SynthesisEvent| {
+            if let SynthesisEvent::Health { event } = event {
+                sink.lock().expect("observer lock").push(event);
+            }
+        };
+
+        let violation = health::HealthViolation::OutputSilent {
+            silent_millis: 1_500,
+        };
+        observer(SynthesisEvent::Health {
+            event: HealthEvent::Violation(violation),
+        });
+        let demotion = health::HealthViolation::KernelDemoted {
+            from: health::KernelTier::Optimized("i8mm"),
+            to: health::KernelTier::Scalar,
+        };
+        observer(SynthesisEvent::Health {
+            event: HealthEvent::Violation(demotion),
+        });
+
+        let events = seen.lock().expect("observer lock").clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], HealthEvent::Violation(violation));
+        assert_eq!(events[0].as_str(), "output_silent");
+        // Silence invalidates the result; a kernel demotion does not — the run is still correct.
+        assert!(events[0].invalidates_output());
+        assert!(!events[1].invalidates_output());
+        assert_eq!(events[1].as_str(), "kernel_demoted");
     }
 
     #[test]

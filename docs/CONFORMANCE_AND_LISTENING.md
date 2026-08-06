@@ -354,3 +354,115 @@ bump. Verdicts produced under a superseded `policy_version` are invalid.
 | `policy_version` | Date | Change | Signed off |
 |---|---|---|---|
 | `2026-08-06.1` | 2026-08-06 | Initial operationalization: SESOI + margins for five families, 24/32 panel design, screening rules, permutation-calibrated tail gate, six protocol instances, release binding. Status `PROVISIONAL`. (`frankentts-v-listening-25m`) | pending LPO |
+
+---
+
+## 5. Reliability gates
+
+Plan §9.6. Correctness work concentrates on numerics; production TTS dies on hostile inputs and
+stuck consumers. Every gate here exists because the corresponding failure produces output that a
+*program* reads as success — a plausible-length WAV, a completed run, a nonzero byte count. An
+agent consuming `ftts` cannot listen to the audio, so each failure has to be made inspectable.
+
+Bead: `frankentts-v-reliability-d65`. Implementation: `ftts-core/src/admission.rs`,
+`ftts-core/src/health.rs`, `ftts-core/tests/streaming_failures.rs`.
+
+### 5.1 Resource admission — decide before allocating
+
+The failure prevented is dying halfway through a long generation, after the caller has waited a
+minute and after hundreds of megabytes are committed. Peak memory is predictable from the prompt
+length and the frame cap, so the request is refused whole or admitted whole:
+
+```text
+predicted_max_frames = min(max_new_tokens, 32768 - prompt_tokens)
+predicted_peak_bytes = KV_talker(prompt_tokens, predicted_max_frames)
+                     + 320 KiB + 2.25 MiB + rings + weights_resident
+admit iff predicted_peak_bytes <= budget
+```
+
+Only the talker KV grows with duration (112 KiB/token at BF16); the microdecoder KV resets per
+frame and the codec KV is a fixed 72-frame window. Three worked points are asserted **exactly**, so
+a formula drift fails a test instead of quietly changing capacity: 512+2048 → 280 MiB,
+512+8192 → 952 MiB, full 32768 context → 3.50 GiB.
+
+Enforced at the engine seam after text preparation (prompt length is not knowable before
+tokenization) and before any stage runs. The proof is by *absence*: a rejected request emits no
+stage event, because a stage event would mean work was already committed.
+
+Overflow is its own refusal, never a saturating clamp — a wrapped total is a small plausible number
+that would admit a request certain to die mid-generation.
+
+### 5.2 Truncation is an outcome, not a silence
+
+The reference implementation reaches `max_new_tokens` without EOS and returns the cut-off audio
+with no exception, no warning and no flag. The caller cannot distinguish "the model finished" from
+"the model was cut off mid-word", and an agent cannot hear the difference.
+
+`StopReason::EndOfSpeech` is therefore the **only** clean completion. `FrameCapReached` and
+`DurationLimitReached` are `is_truncated()` and each carries a remedy. Reporting a truncated
+utterance as a plain success is the counterfeit green Doctrine #0.4 forbids.
+
+### 5.3 Runtime health
+
+Seven detectors, each an allocation-free state machine callable per frame. None reads the clock —
+the caller supplies the instant, so tests inject time instead of sleeping.
+
+| Detector | Catches | Invalidates output |
+|---|---|---|
+| `NumericGuard` | NaN/Inf at a named seam, reported at the **first** offending index | yes |
+| `ProgressWatchdog` | a decode loop that stopped advancing | yes |
+| `check_stop_consistency` | a stop reason that contradicts the frame counters | yes |
+| `RunawayDetector` | a stuck token **and** a short repeating cycle | yes |
+| `SilenceDetector` | output that produces bytes but no sound | yes |
+| `KernelSelector` | an ISA kernel that failed its selftest | no — still correct, just slower |
+| `ThermalReporter` | sustained throughput below the opening window | no — a reporting obligation |
+
+Three design points worth stating, because each is a place the obvious implementation is wrong:
+
+- **The seam policy is explicit.** A NaN check over every activation is a real cost in the loop
+  that is the whole project. `All` while developing a kernel, `Sampled` in production (a NaN that
+  occurs at all recurs within a few frames), `Off` only for a measured benchmark. `Off` reports
+  `is_checking() == false`, so a run under it is reported as **unchecked**, never as clean. A
+  sampling interval of zero checks every call rather than disabling the guard — a misconfigured
+  sampler must not be the reason nothing was inspected.
+- **Cycle detection is separate from repeat detection.** A two-token ping-pong never trips a
+  consecutive-repeat counter and is just as dead.
+- **Kernel demotion is one-way.** A tier that failed its selftest has produced a wrong answer on
+  this machine; re-promoting it because a later check passed would trust the evidence that already
+  lied. G1 > G2 — the run finishes slower and correct.
+
+Violations travel to the caller through the same `SynthesisObserver` as every other lifecycle event
+(`SynthesisEvent::Health { event: HealthEvent::Violation(..) }`), so a problem is visible while the
+run is happening. Each carries a remedy, not a label.
+
+### 5.4 Streaming failure semantics
+
+Defined *and* injected — each test forces the failure rather than checking the happy path still
+works. `ftts-core/tests/streaming_failures.rs`, 7 tests:
+
+| Injected | Required behaviour |
+|---|---|
+| consumer stops reading | producer parks at the bound (asserted: no unbounded buffering), cancellation releases it |
+| event consumer blocks | PCM keeps flowing — the two bounded queues cannot deadlock each other |
+| audio consumer blocks | events keep flowing, or a caller could never learn *why* audio stopped |
+| consumer disappears | structured `StreamDisconnected(StreamKind)`, not a panic or a hang |
+| cancellation mid-emission | stops on a packet boundary; every delivered packet contains whole frames |
+| sink write error / disk-full | partial output finalised with a header declaring exactly the bytes present |
+
+The disk-full promise is specifically that the partial file is *playable*. A WAV whose header
+claims more data than the file holds is corrupt, and every player disagrees about how to fail on
+it, so both the RIFF size and the data size are patched to what actually landed.
+
+### 5.5 What is not yet wired
+
+Stated because a reliability section that implies more coverage than exists is itself a
+reliability problem:
+
+- The detectors in §5.3 are implemented and tested but have **no model to observe yet** — Phase 0
+  has no decode loop. They are called from the seams as those seams land.
+- `ftts-cli`'s `say --check` still uses its own scaffold `admission_plan()` rather than
+  `ftts_core::admission`. The engine-side admission is enforced; the CLI preflight is not yet the
+  same computation.
+- Ring-buffer and resident-weight terms in the admission prediction are `0` in Phase 0 — the honest
+  value. A placeholder would make the prediction look complete while being wrong. Both are bounded
+  and land with their components.
