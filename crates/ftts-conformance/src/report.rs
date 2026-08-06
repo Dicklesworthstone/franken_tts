@@ -6,9 +6,67 @@
 //! self-localizing — provenance, seam, tolerance and its source travel with the verdict, so nobody
 //! reruns under a debugger to find out *which* fixture and *which* tolerance were in play.
 
-use std::time::Duration;
+use std::{
+    env,
+    fs::OpenOptions,
+    io::Write,
+    time::{Duration, Instant},
+};
 
 use serde_json::{Value, json};
+
+/// Environment variable naming a file that receives every emitted event as NDJSON.
+///
+/// `libtest` captures stdout and prints it only for failing tests, so the receipt stream that is
+/// supposed to distinguish `skipped` from `passed` is invisible on a green run — precisely when the
+/// distinction matters. Pointing this at a file gives CI (and the ladder runner) the full stream
+/// regardless of capture. Unset means stdout only.
+pub const RECEIPTS_ENV: &str = "FTTS_RECEIPTS";
+
+/// Emits one NDJSON line to stdout and, when [`RECEIPTS_ENV`] is set, appends it to that file.
+///
+/// # Panics
+///
+/// Panics when the sink is configured but unwritable. Dropping receipts silently would recreate the
+/// exact failure this module exists to prevent: a green-looking run whose evidence never existed.
+fn emit_line(line: &str) {
+    println!("{line}");
+    let Ok(path) = env::var(RECEIPTS_ENV) else {
+        return;
+    };
+    if path.trim().is_empty() {
+        return;
+    }
+    append_event_line(&path, line).unwrap_or_else(|error| {
+        panic!(
+            "{RECEIPTS_ENV}={path} is set but the receipt sink is unwritable ({error}); \
+             receipts would be lost silently, which is how a run with no evidence reads as green"
+        )
+    });
+}
+
+/// Appends one NDJSON line to the receipt sink at `path`, creating it if needed.
+///
+/// Split out from the environment lookup so the file behavior is directly testable: edition 2024
+/// makes `env::set_var` `unsafe`, which this crate forbids, so no test can install the variable
+/// in-process.
+///
+/// The line and its terminator go out in a single `write_all`, so concurrent `libtest` threads
+/// appending to the same `O_APPEND` file cannot interleave a partial record.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error when the sink cannot be opened or written.
+pub fn append_event_line(path: &str, line: &str) -> std::io::Result<()> {
+    let mut record = String::with_capacity(line.len() + 1);
+    record.push_str(line);
+    record.push('\n');
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(record.as_bytes())
+}
 
 /// The verdict for one contract check. `Skipped` is never folded into `Passed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,7 +271,7 @@ impl Receipt {
         self.to_json().to_string()
     }
 
-    /// Prints the receipt to stdout as one NDJSON line.
+    /// Emits the receipt as one NDJSON line — to stdout, and to [`RECEIPTS_ENV`] when it is set.
     ///
     /// Panics when the receipt is a skip without a reason: an unexplained skip is indistinguishable
     /// from a silently disabled test, which is the failure mode this whole module exists to prevent.
@@ -223,14 +281,47 @@ impl Receipt {
             "skip receipt for `{}` has no reason; an unexplained skip is a disabled test",
             self.test
         );
-        println!("{}", self.to_line());
+        emit_line(&self.to_line());
+    }
+}
+
+/// A running stage, timed from construction.
+///
+/// Convention (c): an end-to-end run logs every stage transition with wall-clock and the key
+/// intermediate hashes, so a red run names its stage immediately instead of needing a bisect.
+///
+/// ```
+/// use ftts_conformance::report::{Stage, token_stream_hash};
+///
+/// let stage = Stage::start("talker_decode");
+/// let tokens = vec![1_u32, 2, 3];
+/// stage.finish(&[("token_stream", &token_stream_hash(&tokens))]);
+/// ```
+#[derive(Debug)]
+pub struct Stage {
+    name: String,
+    started: Instant,
+}
+
+impl Stage {
+    /// Starts timing a named stage.
+    #[must_use]
+    pub fn start(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            started: Instant::now(),
+        }
+    }
+
+    /// Emits the stage event with its elapsed wall-clock and the supplied intermediate hashes.
+    pub fn finish(self, hashes: &[(&str, &str)]) {
+        emit_stage(&self.name, self.started.elapsed(), hashes);
     }
 }
 
 /// Emits a stage-transition event for multi-stage runs.
 ///
-/// End-to-end scripts log every transition with wall-clock and key intermediate hashes (token
-/// stream, PCM) so a red run names its stage immediately instead of requiring a bisect.
+/// Prefer [`Stage`], which cannot report a wall-clock that drifted from the work it measured.
 pub fn emit_stage(stage: &str, elapsed: Duration, hashes: &[(&str, &str)]) {
     let hash_map: serde_json::Map<String, Value> = hashes
         .iter()
@@ -242,12 +333,60 @@ pub fn emit_stage(stage: &str, elapsed: Duration, hashes: &[(&str, &str)]) {
         "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
         "hashes": Value::Object(hash_map),
     });
-    println!("{event}");
+    emit_line(&event.to_string());
+}
+
+// ── Intermediate hashes ──────────────────────────────────────────────────────────────────────
+//
+// FNV-1a/64. These identify *which* stage first diverged between two runs; they are deliberately
+// NOT cryptographic and must never be used for artifact provenance (`FixtureProvenance::sha256`
+// carries a real digest supplied by the fixture generator). The `fnv1a64:` prefix is part of the
+// value so a reader can never mistake one for the other.
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Stable non-cryptographic hash of raw bytes, rendered as `fnv1a64:<hex>`.
+#[must_use]
+pub fn bytes_hash(bytes: &[u8]) -> String {
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+/// Stable hash of a codec/talker token stream.
+///
+/// Hashes the little-endian encoding, so a stream that differs only in element *order* still
+/// differs in hash — reordering is a real divergence, not an equivalent encoding.
+#[must_use]
+pub fn token_stream_hash(tokens: &[u32]) -> String {
+    let mut bytes = Vec::with_capacity(tokens.len() * 4);
+    for token in tokens {
+        bytes.extend_from_slice(&token.to_le_bytes());
+    }
+    bytes_hash(&bytes)
+}
+
+/// Stable hash of a PCM buffer, over raw sample bits.
+///
+/// Bit-level on purpose: `-0.0`, `+0.0`, and each NaN payload hash differently, because at this
+/// seam those are divergences worth seeing rather than values worth normalizing away.
+#[must_use]
+pub fn pcm_hash(samples: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(samples.len() * 4);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
+    }
+    bytes_hash(&bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn skipped_is_never_reported_as_passed() {
@@ -290,5 +429,66 @@ mod tests {
     #[should_panic(expected = "an unexplained skip is a disabled test")]
     fn a_skip_without_a_reason_is_rejected() {
         Receipt::new("contract_a_l0_tokenizer_ids", Outcome::Skipped).emit();
+    }
+
+    #[test]
+    fn the_receipt_sink_appends_one_parseable_line_per_event() {
+        let path = env::temp_dir().join(format!("ftts-receipts-{}.ndjson", std::process::id()));
+        let path = path.to_str().expect("temp path is UTF-8").to_owned();
+        let _ = fs::remove_file(&path);
+
+        let first = Receipt::new("contract_a_l0_tokenizer_ids", Outcome::Passed).to_line();
+        let second = Receipt::new("contract_a_l4_codec_tokens", Outcome::Skipped)
+            .reason("model artifact unavailable")
+            .to_line();
+        append_event_line(&path, &first).expect("sink is writable");
+        append_event_line(&path, &second).expect("sink appends rather than truncating");
+
+        let contents = fs::read_to_string(&path).expect("sink is readable");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "append must not truncate: {contents}");
+        for line in lines {
+            let parsed: Value = serde_json::from_str(line).expect("every line is one JSON object");
+            assert_eq!(parsed["event"], "contract_check");
+        }
+        // The second receipt keeps its honest verdict all the way to the aggregated file.
+        let last: Value = serde_json::from_str(lines[1]).expect("parses");
+        assert_eq!(last["outcome"], "skipped");
+
+        fs::remove_file(&path).expect("temp sink is removable");
+    }
+
+    #[test]
+    fn an_unwritable_configured_sink_is_a_loud_failure_not_a_lost_receipt() {
+        let error = append_event_line(
+            "/nonexistent/ftts-receipts-directory/receipts.ndjson",
+            "{\"event\":\"contract_check\"}",
+        )
+        .expect_err("writing into a nonexistent directory must fail");
+        // `emit_line` turns exactly this error into a panic; the point is that it is never Ok(()).
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn intermediate_hashes_are_stable_labelled_and_order_sensitive() {
+        assert_eq!(token_stream_hash(&[1, 2, 3]), token_stream_hash(&[1, 2, 3]));
+        assert_ne!(
+            token_stream_hash(&[1, 2, 3]),
+            token_stream_hash(&[1, 3, 2]),
+            "reordering a token stream is a divergence, not an equivalent encoding"
+        );
+        assert_ne!(
+            token_stream_hash(&[1, 2, 3]),
+            token_stream_hash(&[1, 2, 3, 0]),
+            "a trailing element must change the hash"
+        );
+        assert_ne!(
+            pcm_hash(&[0.0]),
+            pcm_hash(&[-0.0]),
+            "bit-level hashing so a sign-of-zero divergence stays visible"
+        );
+        // The algorithm is named in the value so nobody reads it as a content digest.
+        assert!(bytes_hash(b"abc").starts_with("fnv1a64:"));
+        assert_eq!(bytes_hash(b"").len(), "fnv1a64:".len() + 16);
     }
 }

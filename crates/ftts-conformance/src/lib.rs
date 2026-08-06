@@ -32,10 +32,20 @@
 //! One JSON object per event, one per line, on stdout, so CI can aggregate failure patterns across
 //! runs. [`report::Receipt::to_line`] never emits an embedded newline.
 //!
+//! `libtest` captures stdout and reveals it only for failing tests, so on a green run the receipt
+//! stream is invisible — exactly when `skipped`-vs-`passed` needs auditing. Set
+//! [`report::RECEIPTS_ENV`] (`FTTS_RECEIPTS=path.ndjson`) and every event is appended there too:
+//!
+//! ```console
+//! $ FTTS_RECEIPTS=target/receipts.ndjson cargo test -p ftts-conformance
+//! $ jq -r 'select(.outcome=="skipped") | .test + "\t" + .reason' target/receipts.ndjson
+//! ```
+//!
 //! ## (e) Test names encode the contract
 //!
 //! `contract_a_l2_talker_layer17_cosine`, never `test_talker_3`. The name should survive being read
-//! alone in a CI summary.
+//! alone in a CI summary. The macros below fill the receipt's `test` field from the enclosing
+//! function via [`test_name!`], so a receipt cannot drift from the test that emitted it.
 //!
 //! # THE MODEL GATE
 //!
@@ -52,26 +62,32 @@
 //! | loud-failure | fallback ran under an open gate | fail with the seam named |
 //!
 //! Known divergences are **XFAIL, never SKIP**: a ledgered known-bad result must keep executing so
-//! that its unexpected *success* is also detectable.
+//! that its unexpected *success* is also detectable. Use [`xfail`], not an early return.
 //!
-//! # Usage
+//! # Usage — the convention is one import away
 //!
 //! ```
-//! use ftts_conformance::{
-//!     gate::ModelGate,
-//!     report::{Outcome, Receipt},
-//! };
+//! use ftts_conformance::{assert_close, prelude::*, require_model};
 //!
-//! let gate = ModelGate::resolve();
-//! let Some(artifact) = gate.artifact() else {
-//!     // Honest skip: recorded as `skipped`, never as a pass.
-//!     Receipt::new("contract_a_l4_codec_token_stream", Outcome::Skipped)
-//!         .contract("ConformanceExact/L4")
-//!         .reason("model artifact unavailable")
-//!         .emit();
-//!     return;
-//! };
-//! let _ = artifact; // real work goes here
+//! # fn body() {
+//! // Skips honestly (with a reason) and returns when the weights are absent.
+//! let artifact = require_model!("ConformanceExact/L2");
+//!
+//! let expected = load_oracle_dump(&artifact);
+//! let actual = run_native_talker_layer(&artifact);
+//!
+//! // Emits its own receipt either way; on failure, panics with a self-localizing report.
+//! assert_close!(
+//!     seam = "talker.layer17.attn_out",
+//!     expected = &expected,
+//!     actual = &actual,
+//!     tolerance = 1.5e-3,
+//!     source = "docs/truth-pack/nondeterminism-floor.json",
+//!     shape = &[2, 3],
+//! );
+//! # }
+//! # fn load_oracle_dump(_: &std::path::Path) -> Vec<f32> { vec![0.0; 6] }
+//! # fn run_native_talker_layer(_: &std::path::Path) -> Vec<f32> { vec![0.0; 6] }
 //! ```
 
 pub mod compare;
@@ -79,12 +95,289 @@ pub mod gate;
 pub mod report;
 
 /// The imports a conformance test almost always wants.
+///
+/// The macros ([`require_model!`], [`assert_close!`], [`assert_exact!`], [`test_name!`]) are
+/// exported at the crate root by `#[macro_export]`, so import them from there.
 pub mod prelude {
-    pub use crate::compare::{Comparison, compare_f32, coordinates, describe_failure};
+    pub use crate::compare::{
+        Comparison, ExactComparison, Shift, compare_exact, compare_f32, coordinates,
+        describe_exact_failure, describe_failure,
+    };
     pub use crate::gate::{
         ExecutionPath, ModelGate, NONEXISTENT_FALLBACK, require_native_execution,
     };
-    pub use crate::report::{FixtureProvenance, Outcome, Receipt, emit_stage};
+    pub use crate::report::{
+        FixtureProvenance, Outcome, Receipt, Stage, bytes_hash, emit_stage, pcm_hash,
+        token_stream_hash,
+    };
+    pub use crate::{gated, xfail};
+}
+
+/// The path of the enclosing function, as a `&'static str`.
+///
+/// Lets a receipt name itself after the test that emitted it, so convention (e)'s contract-encoding
+/// test name reaches CI without being retyped as a string literal that can silently drift.
+///
+/// ```
+/// use ftts_conformance::test_name;
+///
+/// fn contract_a_l0_tokenizer_ids() -> &'static str {
+///     test_name!()
+/// }
+/// assert!(contract_a_l0_tokenizer_ids().ends_with("contract_a_l0_tokenizer_ids"));
+/// ```
+#[macro_export]
+macro_rules! test_name {
+    () => {{
+        fn probe() {}
+        fn path_of<T>(_: T) -> &'static str {
+            ::core::any::type_name::<T>()
+        }
+        let path = path_of(probe);
+        path.strip_suffix("::probe").unwrap_or(path)
+    }};
+}
+
+/// Resolves the model gate, or emits an honest skip receipt and returns from the enclosing test.
+///
+/// Evaluates to the [`std::path::PathBuf`] of the artifact when the gate is open. This is the
+/// [`gated`] pattern without the closure, for tests that want `?`-free straight-line bodies.
+///
+/// ```
+/// use ftts_conformance::require_model;
+///
+/// # fn body() {
+/// let artifact = require_model!("ConformanceExact/L4");
+/// assert!(artifact.exists());
+/// # }
+/// ```
+#[macro_export]
+macro_rules! require_model {
+    ($contract:expr $(,)?) => {
+        match $crate::gate::ModelGate::resolve() {
+            $crate::gate::ModelGate::Present { artifact } => artifact,
+            $crate::gate::ModelGate::Absent { reason } => {
+                $crate::report::Receipt::new($crate::test_name!(), $crate::report::Outcome::Skipped)
+                    .contract($contract)
+                    .reason(reason)
+                    .emit();
+                return;
+            }
+        }
+    };
+}
+
+/// Asserts two `f32` slices agree within tolerance, emitting a receipt and localizing any failure.
+///
+/// Named arguments, `shape` optional:
+///
+/// ```
+/// use ftts_conformance::assert_close;
+///
+/// let expected = [0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6];
+/// let actual = [0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6];
+/// assert_close!(
+///     seam = "codec.upsample.stage0",
+///     expected = &expected,
+///     actual = &actual,
+///     tolerance = 1e-4,
+///     source = "docs/truth-pack/nondeterminism-floor.json",
+///     shape = &[2, 3],
+/// );
+/// ```
+///
+/// The receipt is emitted **before** the panic, so a failing run leaves a `failed` record in the
+/// aggregated stream rather than a hole where a receipt should have been.
+#[macro_export]
+macro_rules! assert_close {
+    (
+        seam = $seam:expr,
+        expected = $expected:expr,
+        actual = $actual:expr,
+        tolerance = $tolerance:expr,
+        source = $source:expr $(,)?
+    ) => {
+        $crate::macro_support::assert_close(
+            $crate::test_name!(),
+            $seam,
+            $expected,
+            $actual,
+            $tolerance,
+            $source,
+            ::core::option::Option::None,
+        )
+    };
+    (
+        seam = $seam:expr,
+        expected = $expected:expr,
+        actual = $actual:expr,
+        tolerance = $tolerance:expr,
+        source = $source:expr,
+        shape = $shape:expr $(,)?
+    ) => {
+        $crate::macro_support::assert_close(
+            $crate::test_name!(),
+            $seam,
+            $expected,
+            $actual,
+            $tolerance,
+            $source,
+            ::core::option::Option::Some($shape),
+        )
+    };
+}
+
+/// Asserts two sequences are exactly equal — the token-stream counterpart of [`assert_close!`].
+///
+/// ```
+/// use ftts_conformance::assert_exact;
+///
+/// let expected = [11_u32, 22, 33];
+/// let actual = [11_u32, 22, 33];
+/// assert_exact!(seam = "tokenizer.encode", expected = &expected, actual = &actual);
+/// ```
+#[macro_export]
+macro_rules! assert_exact {
+    (
+        seam = $seam:expr,
+        expected = $expected:expr,
+        actual = $actual:expr $(,)?
+    ) => {
+        $crate::macro_support::assert_exact($crate::test_name!(), $seam, $expected, $actual)
+    };
+}
+
+/// Implementation targets for the macros. Not a stable surface — call the macros.
+#[doc(hidden)]
+pub mod macro_support {
+    use crate::{
+        compare::{
+            Comparison, ExactComparison, compare_exact, compare_f32, describe_exact_failure,
+            describe_failure,
+        },
+        report::{Outcome, Receipt},
+    };
+
+    /// Backs [`crate::assert_close!`].
+    ///
+    /// # Panics
+    ///
+    /// Panics with the self-localizing report when the comparison does not hold.
+    pub fn assert_close(
+        test: &str,
+        seam: &str,
+        expected: &[f32],
+        actual: &[f32],
+        tolerance: f64,
+        tolerance_source: &str,
+        shape: Option<&[usize]>,
+    ) -> Comparison {
+        let comparison = compare_f32(expected, actual, tolerance);
+        let outcome = if comparison.holds() {
+            Outcome::Passed
+        } else {
+            Outcome::Failed
+        };
+        Receipt::new(test, outcome)
+            .seam(seam)
+            .tolerance(tolerance, tolerance_source)
+            .detail(comparison.to_json())
+            .emit();
+        assert!(
+            comparison.holds(),
+            "{}",
+            describe_failure(seam, &comparison, tolerance, tolerance_source, shape)
+        );
+        comparison
+    }
+
+    /// Backs [`crate::assert_exact!`].
+    ///
+    /// # Panics
+    ///
+    /// Panics with the self-localizing report when the sequences are not identical.
+    pub fn assert_exact<T>(
+        test: &str,
+        seam: &str,
+        expected: &[T],
+        actual: &[T],
+    ) -> ExactComparison
+    where
+        T: PartialEq + std::fmt::Debug,
+    {
+        let comparison = compare_exact(expected, actual);
+        let outcome = if comparison.holds() {
+            Outcome::Passed
+        } else {
+            Outcome::Failed
+        };
+        Receipt::new(test, outcome)
+            .seam(seam)
+            .detail(comparison.to_json())
+            .emit();
+        assert!(
+            comparison.holds(),
+            "{}",
+            describe_exact_failure(seam, &comparison)
+        );
+        comparison
+    }
+}
+
+/// Runs a known, ledgered divergence as XFAIL — never as a skip.
+///
+/// `body` runs the check and returns `Ok(())` if it now **holds**; a divergence that still
+/// reproduces returns `Err` describing it. Returns `true` when the divergence reproduced (the
+/// expected outcome).
+///
+/// The check keeps executing precisely so its *unexpected success* is detectable: a divergence that
+/// silently healed leaves a stale ledger entry, and the day the divergence returns nothing catches
+/// it. So an unexpected pass fails the test.
+///
+/// ```
+/// use ftts_conformance::xfail;
+///
+/// let still_diverging = xfail(
+///     "contract_a_l0_tokenizer_regex_class",
+///     "ConformanceExact/L0",
+///     "docs/DISCREPANCIES.md#tokenizer-regex",
+///     || Err("upstream splits \\p{N} runs; we split per digit".to_owned()),
+/// );
+/// assert!(still_diverging);
+/// ```
+///
+/// # Panics
+///
+/// Panics when `body` returns `Ok(())`, naming the ledger entry that must now be retired.
+pub fn xfail<F>(test: &str, contract: &str, ledger: &str, body: F) -> bool
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let started = std::time::Instant::now();
+    match body() {
+        Err(divergence) => {
+            report::Receipt::new(test, report::Outcome::ExpectedFailure)
+                .contract(contract)
+                .reason(divergence)
+                .detail(serde_json::json!({ "ledger": ledger }))
+                .elapsed(started.elapsed())
+                .emit();
+            true
+        }
+        Ok(()) => {
+            report::Receipt::new(test, report::Outcome::Failed)
+                .contract(contract)
+                .reason("XFAIL unexpectedly passed")
+                .detail(serde_json::json!({ "ledger": ledger }))
+                .elapsed(started.elapsed())
+                .emit();
+            panic!(
+                "XFAIL `{test}` unexpectedly PASSED: the divergence recorded at `{ledger}` no \
+                 longer reproduces. Re-gate it as an ordinary assertion and retire the ledger \
+                 entry — a stale XFAIL is a test that will not notice when the divergence returns."
+            );
+        }
+    }
 }
 
 /// Runs a model-gated check, or emits an honest skip receipt when weights are absent.

@@ -195,6 +195,200 @@ pub fn describe_failure(
     out
 }
 
+/// How an exact sequence diverged, beyond "some element differs".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shift {
+    /// Everything after the divergence matches once `actual` is shifted forward by one: `actual`
+    /// is missing exactly one element.
+    DroppedFromActual,
+    /// Everything after the divergence matches once `expected` is shifted forward by one: `actual`
+    /// gained exactly one element.
+    InsertedIntoActual,
+}
+
+/// Result of comparing two sequences for exact equality.
+///
+/// Separate from [`Comparison`] because token streams have no tolerance and no cosine: the
+/// meaningful diagnostics are *where* the streams parted, whether one is a prefix of the other,
+/// and whether the tail realigns under a one-element shift.
+#[derive(Clone, Debug)]
+pub struct ExactComparison {
+    /// Length of the expected sequence.
+    pub expected_len: usize,
+    /// Length of the actual sequence.
+    pub actual_len: usize,
+    /// Elements actually compared (the common prefix length).
+    pub compared: usize,
+    /// Elements differing within the common prefix.
+    pub mismatches: usize,
+    /// Index of the first differing element, if any.
+    pub first_divergence: Option<usize>,
+    /// Debug rendering of the expected value at the first divergence.
+    pub first_expected: Option<String>,
+    /// Debug rendering of the actual value at the first divergence.
+    pub first_actual: Option<String>,
+    /// Index the context windows start at.
+    pub context_start: usize,
+    /// Expected values surrounding the first divergence.
+    pub expected_context: Vec<String>,
+    /// Actual values surrounding the first divergence.
+    pub actual_context: Vec<String>,
+    /// Whether the tail realigns under a single-element shift.
+    pub shift: Option<Shift>,
+}
+
+impl ExactComparison {
+    /// Whether the sequences are identical in length and content.
+    #[must_use]
+    pub const fn holds(&self) -> bool {
+        self.mismatches == 0 && self.expected_len == self.actual_len
+    }
+
+    /// Machine-parseable summary for attaching to a [`crate::report::Receipt`].
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            "expected_len": self.expected_len,
+            "actual_len": self.actual_len,
+            "compared": self.compared,
+            "mismatches": self.mismatches,
+            "first_divergence": self.first_divergence,
+            "first_expected": self.first_expected,
+            "first_actual": self.first_actual,
+            "context_start": self.context_start,
+            "expected_context": self.expected_context,
+            "actual_context": self.actual_context,
+            "shift": self.shift.map(|s| match s {
+                Shift::DroppedFromActual => "dropped_from_actual",
+                Shift::InsertedIntoActual => "inserted_into_actual",
+            }),
+        })
+    }
+}
+
+/// Elements of context printed either side of the first divergence.
+const CONTEXT_RADIUS: usize = 4;
+
+/// Compares two sequences for exact equality, localizing the first divergence.
+///
+/// Unlike [`compare_f32`], a length mismatch is *reported* rather than panicked on: a truncated
+/// token stream is one of the outcomes this comparator exists to diagnose (an early stop condition),
+/// not a caller bug.
+#[must_use]
+pub fn compare_exact<T>(expected: &[T], actual: &[T]) -> ExactComparison
+where
+    T: PartialEq + std::fmt::Debug,
+{
+    let compared = expected.len().min(actual.len());
+    let mut mismatches = 0_usize;
+    let mut first: Option<usize> = None;
+    for index in 0..compared {
+        if expected[index] != actual[index] {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some(index);
+            }
+        }
+    }
+
+    // A length difference with a clean common prefix still needs a divergence point to report.
+    let divergence = first.or(if expected.len() == actual.len() {
+        None
+    } else {
+        Some(compared)
+    });
+
+    let shift = divergence.and_then(|at| {
+        if expected.len() == actual.len() + 1 && expected[at + 1..] == actual[at..] {
+            Some(Shift::DroppedFromActual)
+        } else if actual.len() == expected.len() + 1 && expected[at..] == actual[at + 1..] {
+            Some(Shift::InsertedIntoActual)
+        } else {
+            None
+        }
+    });
+
+    let context_start = divergence.map_or(0, |at| at.saturating_sub(CONTEXT_RADIUS));
+    let context_end = divergence.map_or(0, |at| at + CONTEXT_RADIUS + 1);
+    let render = |slice: &[T]| -> Vec<String> {
+        slice
+            .iter()
+            .skip(context_start)
+            .take(context_end.saturating_sub(context_start))
+            .map(|value| format!("{value:?}"))
+            .collect()
+    };
+
+    ExactComparison {
+        expected_len: expected.len(),
+        actual_len: actual.len(),
+        compared,
+        mismatches,
+        first_divergence: divergence,
+        first_expected: divergence
+            .and_then(|at| expected.get(at))
+            .map(|value| format!("{value:?}")),
+        first_actual: divergence
+            .and_then(|at| actual.get(at))
+            .map(|value| format!("{value:?}")),
+        context_start,
+        expected_context: render(expected),
+        actual_context: render(actual),
+        shift,
+    }
+}
+
+/// Renders a self-localizing failure report for an exact-sequence divergence.
+#[must_use]
+pub fn describe_exact_failure(seam: &str, comparison: &ExactComparison) -> String {
+    let mut out = format!(
+        "seam `{seam}` diverged (exact): {} mismatches in the {}-element common prefix; \
+         expected_len {} vs actual_len {}\n",
+        comparison.mismatches, comparison.compared, comparison.expected_len, comparison.actual_len
+    );
+    if let Some(at) = comparison.first_divergence {
+        out.push_str(&format!("  first divergence at index {at}\n"));
+        out.push_str(&format!(
+            "    expected {}\n    actual   {}\n",
+            comparison.first_expected.as_deref().unwrap_or("<past end>"),
+            comparison.first_actual.as_deref().unwrap_or("<past end>"),
+        ));
+        out.push_str(&format!(
+            "  context from index {}\n    expected {:?}\n    actual   {:?}\n",
+            comparison.context_start, comparison.expected_context, comparison.actual_context,
+        ));
+    }
+    // As in `describe_failure`, the diagnosis chain is total: every divergence gets a hint.
+    let clean_prefix = comparison.mismatches == 0;
+    match comparison.shift {
+        Some(Shift::DroppedFromActual) => out.push_str(
+            "  hint: the tail realigns if actual is shifted by one — actual DROPPED an element; \
+             suspect a skipped step or an off-by-one in prompt assembly, not a wrong value\n",
+        ),
+        Some(Shift::InsertedIntoActual) => out.push_str(
+            "  hint: the tail realigns if expected is shifted by one — actual INSERTED an element; \
+             suspect a duplicated step or an extra special token, not a wrong value\n",
+        ),
+        None if clean_prefix && comparison.actual_len < comparison.expected_len => out.push_str(
+            "  hint: actual is a strict PREFIX of expected — suspect an early stop condition or a \
+             truncated decode, not a value bug\n",
+        ),
+        None if clean_prefix => out.push_str(
+            "  hint: expected is a strict PREFIX of actual — suspect a missed stop condition \
+             (decode ran long), not a value bug\n",
+        ),
+        None if comparison.mismatches == 1 => out.push_str(
+            "  hint: exactly one element differs — suspect a sampling tie-break or a single bad \
+             table entry, not the surrounding pipeline\n",
+        ),
+        None => out.push_str(
+            "  hint: divergence persists from the first mismatch onward — suspect WIRING or state \
+             carried into this seam; fix the first index before reading any later one\n",
+        ),
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
