@@ -5,9 +5,14 @@
 //! that Mistral pre-tokenizer, not the Qwen-native expression.  Keep the
 //! native expression available only as an explicit, visible experiment.
 
-use std::{cmp::Reverse, collections::HashMap, env, fmt, ops::Range, str::FromStr};
+use std::{cmp::Reverse, collections::HashMap, env, fmt, str::FromStr};
 
 use fancy_regex::Regex;
+pub use ftts_core::{
+    LanguageSpan, NormalizationChange, NormalizationMode, NormalizationOptions, NormalizationTrace,
+    PronunciationEntry,
+};
+use ftts_core::{PreparedText, TextPreparationError, TextPreparer};
 use unicode_normalization::UnicodeNormalization;
 
 const OFFICIAL_PRETOKENIZER: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -64,58 +69,6 @@ impl FromStr for TokenizerRegex {
             _ => Err(TokenizerError::InvalidRegexMode(value.to_owned())),
         }
     }
-}
-
-/// The caller-visible text preparation policy.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum NormalizationMode {
-    /// Pinned upstream semantics: NFC and nothing else.
-    #[default]
-    Verbatim,
-    /// Reserved for unambiguous policies; currently deliberately no-op beyond NFC.
-    Conservative,
-    /// Apply explicit language-span pronunciation entries after NFC.
-    LocaleAware,
-}
-
-/// A byte range in normalized text with a caller-supplied language identifier.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LanguageSpan {
-    pub range: Range<usize>,
-    pub language: String,
-}
-
-/// An explicit pronunciation expansion.  Entries are only applied in a matching language span
-/// (or globally when `language` is `"und"`).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PronunciationEntry {
-    pub language: String,
-    pub surface: String,
-    pub spoken: String,
-}
-
-/// Caller-supplied behavior layered over the pinned verbatim path.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct NormalizationOptions {
-    pub mode: NormalizationMode,
-    pub language_spans: Vec<LanguageSpan>,
-    pub pronunciation_lexicon: Vec<PronunciationEntry>,
-}
-
-/// A single observable normalization change.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NormalizationChange {
-    pub rule: &'static str,
-    pub before: String,
-    pub after: String,
-}
-
-/// A deterministic record of what the normalizer did and why.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NormalizationTrace {
-    pub mode: NormalizationMode,
-    pub unicode_version: String,
-    pub changes: Vec<NormalizationChange>,
 }
 
 /// Text after requested normalization, plus its explainable trace.
@@ -401,6 +354,19 @@ impl QwenTokenizer {
     }
 }
 
+impl TextPreparer for QwenTokenizer {
+    fn prepare(
+        &self,
+        text: &str,
+        options: &NormalizationOptions,
+    ) -> Result<PreparedText, TextPreparationError> {
+        let (token_ids, normalization_trace) = self
+            .encode_with_normalization(text, options)
+            .map_err(|error| TextPreparationError::new(error.to_string()))?;
+        Ok(PreparedText::new(token_ids, normalization_trace))
+    }
+}
+
 fn parse_merges(merges: &str) -> Result<BpeRanks, TokenizerError> {
     let mut ranks = HashMap::new();
     for (rank, line) in merges.lines().filter(|line| !line.is_empty()).enumerate() {
@@ -647,6 +613,35 @@ mod tests {
         let result = tokenizer.normalize("GPU", &options).expect("normalize");
         assert_eq!(result.text, "gee pee you");
         assert_eq!(result.trace.changes[0].rule, "pronunciation_lexicon");
+    }
+
+    #[test]
+    fn tokenizer_preparer_preserves_the_engine_normalization_options() {
+        let tokenizer = QwenTokenizer::from_files(fixture_files(), TokenizerRegex::Official)
+            .expect("fixture tokenizer");
+        let options = NormalizationOptions {
+            mode: NormalizationMode::LocaleAware,
+            language_spans: vec![LanguageSpan {
+                range: 0..3,
+                language: "en".to_owned(),
+            }],
+            pronunciation_lexicon: vec![PronunciationEntry {
+                language: "en".to_owned(),
+                surface: "GPU".to_owned(),
+                spoken: "gee pee you".to_owned(),
+            }],
+        };
+
+        let prepared = tokenizer.prepare("GPU", &options).expect("prepare text");
+        let expected = tokenizer
+            .encode_with_normalization("GPU", &options)
+            .expect("encode with the same options");
+        assert_eq!(prepared.token_ids, expected.0);
+        assert_eq!(prepared.normalization_trace, expected.1);
+        assert_eq!(
+            prepared.normalization_trace.summary().rules,
+            vec!["pronunciation_lexicon"]
+        );
     }
 
     #[test]
