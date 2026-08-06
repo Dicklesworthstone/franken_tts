@@ -20,8 +20,24 @@ on:
 # actually observed — every run gets killed by the next commit. Observed 2026-08-06: 8
 # consecutive main runs cancelled, one queued 10h, and not one job ever executed its steps.
 # A gate whose result nobody ever sees is not a gate.
+#
+# Setting `cancel-in-progress: false` was NOT enough, because it governs only *in-progress*
+# runs. GitHub keeps at most ONE *pending* run per concurrency group, so on a shared group each
+# new push still cancels the previously queued run. Measured 2026-08-06 on this repo: run
+# 31120416091 queued 16:36:20Z and was cancelled 16:47:19Z — the same second run 31121042924
+# was created. Six consecutive main runs died that way, each with zero jobs ever created.
+#
+# Worse, a single wedged run poisons the group forever. Run 31074936630 (05:42:37Z) had its six
+# jobs cancelled by the old policy, after which its `cross-summary` job — `if: always()`, so it
+# is still scheduled after a cancellation — stuck in `queued` and never got a runner. It held
+# `ci-refs/heads/main` for 11+ hours and could not be cleared: both `POST /cancel` and
+# `POST /force-cancel` return HTTP 502 on it.
+#
+# So main pushes get a group of ONE (keyed by run_id): never coalesced, never superseded, and
+# immune to a neighbour wedging. Pull requests keep the shared, cancelling group, which is where
+# coalescing actually saves runner time.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -162,7 +178,12 @@ jobs:
     name: advisory cross-check summary
     runs-on: ubuntu-latest
     needs: cross
-    if: always()
+    # `always()` keeps the advisory result visible even when `cross` failed — but it also
+    # schedules this job after `cross` was CANCELLED, which is how run 31074936630 ended up with
+    # a summary job queued for 11 hours that no API call could kill. Report on success/failure,
+    # and stand down when the run was cancelled and there is nothing left to report on.
+    if: ${{ !cancelled() }}
+    timeout-minutes: 5
     steps:
       # `cross` is advisory, so its result must be visible without being able to block a merge.
       # A silent advisory job is the same as no advisory job.
