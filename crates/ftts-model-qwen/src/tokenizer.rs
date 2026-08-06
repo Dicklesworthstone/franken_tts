@@ -622,19 +622,19 @@ mod tests {
         let options = NormalizationOptions {
             mode: NormalizationMode::LocaleAware,
             language_spans: vec![LanguageSpan {
-                range: 0..3,
+                range: 0..1,
                 language: "en".to_owned(),
             }],
             pronunciation_lexicon: vec![PronunciationEntry {
                 language: "en".to_owned(),
-                surface: "GPU".to_owned(),
-                spoken: "gee pee you".to_owned(),
+                surface: "a".to_owned(),
+                spoken: "ab".to_owned(),
             }],
         };
 
-        let prepared = tokenizer.prepare("GPU", &options).expect("prepare text");
+        let prepared = tokenizer.prepare("a", &options).expect("prepare text");
         let expected = tokenizer
-            .encode_with_normalization("GPU", &options)
+            .encode_with_normalization("a", &options)
             .expect("encode with the same options");
         assert_eq!(prepared.token_ids, expected.0);
         assert_eq!(prepared.normalization_trace, expected.1);
