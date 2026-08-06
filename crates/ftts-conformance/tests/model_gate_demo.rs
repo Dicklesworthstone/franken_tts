@@ -10,7 +10,7 @@
 
 use std::{fs, path::PathBuf, process, time::Duration};
 
-use ftts_conformance::{gated, prelude::*};
+use ftts_conformance::{assert_close, assert_exact, gated, prelude::*, test_name};
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ftts-gate-demo-{tag}-{}", process::id()));
