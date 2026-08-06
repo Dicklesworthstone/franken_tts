@@ -3,8 +3,10 @@
 //! Shared, stateless command-line dispatch for both FrankenTTS binaries.
 
 mod error;
+pub mod robot;
 
 pub use error::{FttsError, FttsExitCode};
+pub use robot::{EventType, validate_event, validate_ndjson};
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
