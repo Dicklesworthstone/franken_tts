@@ -1,0 +1,101 @@
+#  The bakeoff corpus cell plan.
+#
+#  This file is the coverage CONTRACT. `scripts/bakeoff/build_corpus.py validate` refuses to
+#  emit stimuli for a corpus that does not meet it, so "the corpus is ready" is a computed
+#  fact rather than an opinion.
+#
+#  Scale comes from plan section 11 (Gate A). Per-cell minima come from the power analysis in
+#  docs/CONFORMANCE_AND_LISTENING.md section 4.2 — the panel needs >= 8 speakers and >= 12
+#  texts per family to run its by-speaker and by-text cluster analyses, and >= 8 texts on a
+#  canary axis before that axis can be tail-tested at all.
+#
+#  Bead: frankentts-bake-corpus-48h
+
+schema_version = "1.0.0"
+design_version = "2026-08-06.1"
+
+[scale]
+min_speakers = 50           # plan section 11 floor for Gate A
+target_speakers = 100
+min_texts = 90
+#  A single panel session cannot cover the whole corpus; the listening design samples from it.
+#  These are corpus-completeness floors, not per-panel counts.
+
+[references]
+#  Reference length is a first-class axis: upstream documents quality loss on short references,
+#  and the voice compiler's whole thesis is that reference selection matters.
+duration_buckets_seconds = [3, 10, 30]
+tolerance_seconds = 1.0
+min_speakers_per_duration_bucket = 40
+#  Every speaker must appear in at least this many duration buckets so within-speaker
+#  comparisons across reference length are possible.
+min_buckets_per_speaker = 2
+
+[acoustic_conditions]
+required = ["clean_studio", "ordinary_phone", "reverberant_room", "noisy"]
+min_speakers_per_condition = 12
+#  `noisy` and `reverberant_room` items must also carry the noisy_reference canary axis so the
+#  tail gate can subset them.
+canary_linked = { noisy = "noisy_reference", reverberant_room = "noisy_reference" }
+
+[delivery]
+required = ["neutral", "emotional"]
+min_speakers_per_delivery = 12
+
+[languages]
+required = ["en", "zh", "es", "ja"]
+min_speakers_per_language = 8
+#  Cross-language cloning: reference in language X, target text in language Y.
+min_cross_language_pairs = 6
+
+[text_coverage]
+#  Minimum authored texts per category. Categories are the bead's list; `long_form` is separated
+#  from `long_sentence` because they are different quality regimes (plan section 2.8).
+prose = 12
+dialogue = 8
+numbers = 8
+currency = 4
+names = 4
+acronyms = 4
+urls = 4
+quotations = 2
+long_sentence = 4
+long_form = 4
+code_switching = 6
+
+[canary_axes]
+#  Must match CANARY_AXES in scripts/listening/protocol.py. The tail gate cannot test an axis
+#  that the corpus does not populate, and an untestable axis reports INSUFFICIENT_DATA — which
+#  is not a pass.
+required = ["noisy_reference", "sibilants", "breaths", "code_switching", "numbers", "long_form"]
+min_texts_per_axis = 4
+#  noisy_reference is a property of the REFERENCE recording, not the target text, so it is
+#  satisfied by the acoustic-condition plan above rather than by text tagging.
+reference_supplied_axes = ["noisy_reference"]
+
+[consent]
+#  Doctrine 10. Every reference recording carries an explicit attestation; the validator
+#  refuses the corpus outright if any record is incomplete. There is no partial-credit mode.
+required_fields = [
+  "consent_statement",
+  "consent_obtained_utc",
+  "consent_scope",
+  "speaker_pseudonym",
+  "provenance",
+  "sha256",
+]
+#  Permitted values for `consent_scope`. Anything else is rejected: an unrecognised scope is
+#  treated as no scope at all.
+permitted_scopes = [
+  "explicit_recorded_for_this_project",
+  "licensed_dataset_with_speaker_consent",
+  "public_domain_with_documented_consent",
+]
+#  Scopes we will never accept, listed so a rejection message can be specific about why.
+forbidden_scopes = [
+  "scraped",
+  "web_harvested",
+  "assumed",
+  "implied",
+  "unknown",
+]
