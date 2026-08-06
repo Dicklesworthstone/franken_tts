@@ -19,12 +19,28 @@ use std::sync::OnceLock;
 #[cfg(test)]
 use clap::CommandFactory;
 use clap::{Parser, Subcommand, ValueEnum};
+use ftts_artifacts::census::{ExpectedTensor, WeightsManifest};
+use ftts_artifacts::converter::{
+    StreamingConversionPlan, TensorConversion, TensorStoragePolicy, convert_safetensors_streaming,
+};
+use ftts_artifacts::fttsq::{AccessClass, MappedFttsq};
+use ftts_artifacts::safetensors::Dtype;
 use ftts_core::{NormalizationMode, NormalizationOptions, SynthesisRequest};
+use ftts_kernels::mmap::MappedFile;
 use serde_json::{Value, json};
 
 const ROBOT_SCHEMA_VERSION: u8 = 1;
 const SCAFFOLD_ADMISSION_TEXT_LIMIT_BYTES: usize = 1_048_576;
 const MODEL_BASENAME: &str = "qwen3-tts-12hz-0.6b-base.fttsq";
+const PINNED_MAIN_WEIGHTS_FILENAME: &str = "model.safetensors";
+const PINNED_MAIN_WEIGHTS_SHA256: &str =
+    "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6";
+const PINNED_MODEL_REVISION: &str = "5d83992436eae1d760afd27aff78a71d676296fc";
+const PINNED_MAIN_TENSOR_COUNT: usize = 478;
+const PINNED_TENSOR_INVENTORY: &str =
+    include_str!("../../../docs/truth-pack/TENSOR_INVENTORY.json");
+const PINNED_MODEL_CONFIG: &str = include_str!("../../../docs/truth-pack/snapshots/hf/config.json");
+const APACHE_LICENSE: &str = include_str!("../../../docs/truth-pack/snapshots/gh/LICENSE");
 const ENVIRONMENT_VARIABLES: [&str; 8] = [
     "FTTS_MODEL_DIR",
     "FTTS_THREADS",
@@ -182,7 +198,7 @@ struct ConvertArgs {
     #[arg(value_name = "SOURCE")]
     source: PathBuf,
 
-    /// Destination .fttsq path. Conversion is not implemented in Phase 0.
+    /// Destination .fttsq path. Refuses to overwrite an existing artifact.
     #[arg(short = 'o', long, value_name = "PATH")]
     output: PathBuf,
 }
@@ -477,14 +493,389 @@ fn dispatch(
         Command::Voice(VoiceArgs {
             command: VoiceCommand::Inspect { path },
         }) => run_voice_inspect(path, stdout),
-        Command::Convert(args) => Err(FttsError::Generic(format!(
-            "conversion is not implemented in the Phase-0 skeleton (source: {}, output: {}); use `ftts robot health` to inspect readiness",
-            args.source.display(),
-            args.output.display()
-        ))),
+        Command::Convert(args) => run_convert(&cli, args, environment, stdout, stderr),
         Command::Robot(args) => run_robot(args.command.clone(), environment, stdout),
         Command::Doctor(args) => run_doctor(args, environment, stdout),
     }
+}
+
+/// A source tensor pinned by the truth-pack inventory and its reviewed storage policy.
+#[derive(Clone, Debug)]
+struct PinnedMainTensor {
+    name: String,
+    dtype: Dtype,
+    shape: Vec<usize>,
+    access_class: AccessClass,
+    storage: TensorStoragePolicy,
+}
+
+fn run_convert(
+    cli: &Cli,
+    args: &ConvertArgs,
+    environment: &Environment,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<(), FttsError> {
+    let run = robot::RunContext::generate();
+    let outcome = run_convert_events(cli, args, environment, &run, &mut |event| {
+        write_json_line(stdout, event)
+    });
+
+    if let Err(error) = &outcome {
+        let mut event = run.event(robot::EventType::RunError);
+        event.insert("exit_code".to_owned(), json!(error.exit_code().as_u8()));
+        event.insert("kind".to_owned(), json!(error.exit_code().description()));
+        event.insert("message".to_owned(), json!(error.to_string()));
+        event.insert("remediation".to_owned(), json!(error.remediation()));
+        event.insert("elapsed_ms".to_owned(), json!(run.elapsed_ms()));
+        write_json_line(stderr, &Value::Object(event))?;
+    }
+
+    outcome
+}
+
+/// Converts the pinned main checkpoint and emits the normal run lifecycle receipt.
+///
+/// The source mapping owns no writable state. The destination is first created under a unique
+/// sibling name with `create_new`, then atomically renamed only after the streaming writer, an
+/// `fsync`, and a digest-validating mapped re-read all succeed. We deliberately leave a failed
+/// staging file in place for diagnosis rather than deleting data behind the caller's back.
+fn run_convert_events(
+    cli: &Cli,
+    args: &ConvertArgs,
+    environment: &Environment,
+    run: &robot::RunContext,
+    emit: &mut dyn FnMut(&Value) -> Result<(), FttsError>,
+) -> Result<(), FttsError> {
+    let settings = EffectiveSettings::resolve(cli, environment)?;
+    let mut start = run.event(robot::EventType::RunStart);
+    start.insert("command".to_owned(), json!("convert"));
+    start.insert("profile".to_owned(), json!(settings.profile.as_str()));
+    start.insert(
+        "packet_frames".to_owned(),
+        json!(settings.packet_frames.as_str()),
+    );
+    start.insert("math_mode".to_owned(), json!(settings.math_mode.as_str()));
+    start.insert("stateless".to_owned(), json!(true));
+    start.insert("seed".to_owned(), json!(cli.seed));
+    start.insert("model".to_owned(), Value::Null);
+    start.insert("voice".to_owned(), Value::Null);
+    emit(&Value::Object(start))?;
+
+    let mut seq = 0_u64;
+    emit_stage(run, emit, "source_preflight", "begin", &mut seq)?;
+    let source = resolve_pinned_main_source(&args.source)?;
+    let mapping = MappedFile::open(&source).map_err(|error| {
+        FttsError::Input(format!(
+            "cannot memory-map pinned source checkpoint {}: {error}",
+            source.display()
+        ))
+    })?;
+    let (manifest, plan) = pinned_main_conversion_plan()?;
+    let staging = conversion_staging_path(&args.output)?;
+    emit_stage(run, emit, "source_preflight", "end", &mut seq)?;
+
+    emit_stage(run, emit, "convert", "begin", &mut seq)?;
+    let destination = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .map_err(|error| {
+            FttsError::Input(format!(
+                "cannot create conversion staging artifact {}: {error}; the output path is never overwritten",
+                staging.display()
+            ))
+        })?;
+    let destination = convert_safetensors_streaming(
+        mapping.as_slice(),
+        &manifest,
+        &plan,
+        destination,
+    )
+    .map_err(|error| {
+        FttsError::ArtifactFormat(format!(
+            "conversion failed before publication: {error}; staging artifact retained at {}",
+            staging.display()
+        ))
+    })?;
+    destination.sync_all().map_err(|error| {
+        FttsError::ArtifactFormat(format!(
+            "cannot sync converted artifact at {}: {error}; staging artifact retained",
+            staging.display()
+        ))
+    })?;
+    drop(destination);
+    emit_stage(run, emit, "convert", "end", &mut seq)?;
+
+    emit_stage(run, emit, "verify", "begin", &mut seq)?;
+    let verified = MappedFttsq::open(&staging).map_err(|error| {
+        FttsError::ArtifactFormat(format!(
+            "converted staging artifact did not pass digest re-read: {error}; retained at {}",
+            staging.display()
+        ))
+    })?;
+    if verified.reader().source_sha256() != PINNED_MAIN_WEIGHTS_SHA256 {
+        return Err(FttsError::ArtifactFormat(format!(
+            "converted staging artifact recorded an unexpected source digest {}; retained at {}",
+            verified.reader().source_sha256(),
+            staging.display()
+        )));
+    }
+    drop(verified);
+    std::fs::rename(&staging, &args.output).map_err(|error| {
+        FttsError::ArtifactFormat(format!(
+            "converted artifact verified but could not be published from {} to {}: {error}; staging artifact retained",
+            staging.display(),
+            args.output.display()
+        ))
+    })?;
+    emit_stage(run, emit, "verify", "end", &mut seq)?;
+
+    let mut complete = run.event(robot::EventType::RunComplete);
+    complete.insert("exit_code".to_owned(), json!(FttsExitCode::Success.as_u8()));
+    complete.insert("elapsed_ms".to_owned(), json!(run.elapsed_ms()));
+    complete.insert("frames".to_owned(), json!(0));
+    complete.insert("audio_bytes".to_owned(), json!(0));
+    emit(&Value::Object(complete))
+}
+
+fn resolve_pinned_main_source(source: &Path) -> Result<PathBuf, FttsError> {
+    let source = if source.is_dir() {
+        source.join(PINNED_MAIN_WEIGHTS_FILENAME)
+    } else {
+        source.to_owned()
+    };
+    if !source.is_file() {
+        return Err(FttsError::Input(format!(
+            "pinned main checkpoint {} does not exist or is not a file; pass model.safetensors or its containing directory",
+            source.display()
+        )));
+    }
+    if source.file_name().and_then(|name| name.to_str()) != Some(PINNED_MAIN_WEIGHTS_FILENAME) {
+        return Err(FttsError::Input(format!(
+            "this converter accepts the pinned main checkpoint named {PINNED_MAIN_WEIGHTS_FILENAME}, not {}",
+            source.display()
+        )));
+    }
+    Ok(source)
+}
+
+fn conversion_staging_path(output: &Path) -> Result<PathBuf, FttsError> {
+    if output.exists() {
+        return Err(FttsError::Input(format!(
+            "refusing to overwrite existing output {}; choose a new -o path",
+            output.display()
+        )));
+    }
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            FttsError::Usage("conversion output must name a file, not a directory".to_owned())
+        })?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| FttsError::Generic(format!("system clock is before UNIX_EPOCH: {error}")))?
+        .as_nanos();
+    let staging = parent.join(format!(
+        ".{file_name}.fttsq-converting-{}-{nonce}",
+        std::process::id()
+    ));
+    if staging.exists() {
+        return Err(FttsError::Input(format!(
+            "conversion staging path already exists {}; inspect or move it before retrying",
+            staging.display()
+        )));
+    }
+    Ok(staging)
+}
+
+fn pinned_main_conversion_plan() -> Result<(WeightsManifest, StreamingConversionPlan), FttsError> {
+    let specs = pinned_main_tensor_specs()?;
+    let manifest = WeightsManifest::from_expectations(
+        "Qwen/Qwen3-TTS-12Hz-0.6B-Base main checkpoint",
+        specs
+            .iter()
+            .map(|spec| ExpectedTensor::new(&spec.name, spec.shape.clone(), spec.dtype)),
+    );
+    let model_config = serde_json::from_str(PINNED_MODEL_CONFIG).map_err(|error| {
+        FttsError::Generic(format!(
+            "checked-in pinned model config is invalid JSON: {error}"
+        ))
+    })?;
+    let q8_count = specs
+        .iter()
+        .filter(|spec| spec.storage == TensorStoragePolicy::Q8PerOutputChannel)
+        .count();
+    let mut plan = StreamingConversionPlan::new(
+        "qwen3-tts-12hz-0.6b-base",
+        PINNED_MAIN_WEIGHTS_SHA256,
+    )
+    .license_notice(pinned_license_notice())
+    .model_config(model_config)
+    .quantization_manifest(json!({
+        "source": {
+            "repository": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            "revision": PINNED_MODEL_REVISION,
+            "file": PINNED_MAIN_WEIGHTS_FILENAME,
+            "sha256": PINNED_MAIN_WEIGHTS_SHA256,
+        },
+        "q8_recipe": "symmetric per-output-channel int8; zero_point=0; scale=max_abs(row)/127",
+        "q8_tensor_count": q8_count,
+        "verbatim_tensor_count": specs.len() - q8_count,
+        "q8_scope": "talker and residual-code-microdecoder attention/MLP projection matrices only",
+        "verbatim_scope": "norms, heads, embeddings, speaker path, and every tensor outside the reviewed Q8 projection set",
+    }));
+    for spec in specs {
+        let conversion = match spec.storage {
+            TensorStoragePolicy::Verbatim => {
+                TensorConversion::verbatim(&spec.name, &spec.name, spec.access_class)
+            }
+            TensorStoragePolicy::Q8PerOutputChannel => {
+                TensorConversion::q8_per_output_channel(&spec.name, &spec.name, spec.access_class)
+            }
+        };
+        plan = plan.tensor(conversion);
+    }
+    Ok((manifest, plan))
+}
+
+fn pinned_main_tensor_specs() -> Result<Vec<PinnedMainTensor>, FttsError> {
+    let inventory: Value = serde_json::from_str(PINNED_TENSOR_INVENTORY).map_err(|error| {
+        FttsError::Generic(format!(
+            "checked-in tensor inventory is invalid JSON: {error}"
+        ))
+    })?;
+    if inventory.get("source_pin").and_then(Value::as_str)
+        != Some(&format!(
+            "Qwen/Qwen3-TTS-12Hz-0.6B-Base@{PINNED_MODEL_REVISION}"
+        ))
+    {
+        return Err(FttsError::Generic(
+            "checked-in tensor inventory does not name the pinned Qwen3-TTS revision".to_owned(),
+        ));
+    }
+    let records = inventory
+        .get("tensors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            FttsError::Generic("checked-in tensor inventory lacks tensors[]".to_owned())
+        })?;
+    let mut specs = Vec::new();
+    for record in records {
+        if record.get("source").and_then(Value::as_str) != Some(PINNED_MAIN_WEIGHTS_FILENAME) {
+            continue;
+        }
+        let name = required_inventory_string(record, "name")?.to_owned();
+        let dtype = match required_inventory_string(record, "dtype")? {
+            "BF16" => Dtype::Bf16,
+            "F32" => Dtype::F32,
+            other => {
+                return Err(FttsError::Generic(format!(
+                    "pinned main inventory has unsupported dtype {other:?} for {name}"
+                )));
+            }
+        };
+        let shape = record
+            .get("shape")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                FttsError::Generic(format!("pinned inventory tensor {name} lacks shape[]"))
+            })?
+            .iter()
+            .map(|dimension| {
+                dimension
+                    .as_u64()
+                    .and_then(|dimension| usize::try_from(dimension).ok())
+                    .ok_or_else(|| {
+                        FttsError::Generic(format!(
+                            "pinned inventory tensor {name} has a non-usize shape dimension"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let storage = if is_q8_projection(&name) {
+            TensorStoragePolicy::Q8PerOutputChannel
+        } else {
+            TensorStoragePolicy::Verbatim
+        };
+        specs.push(PinnedMainTensor {
+            access_class: main_access_class(&name)?,
+            name,
+            dtype,
+            shape,
+            storage,
+        });
+    }
+    if specs.len() != PINNED_MAIN_TENSOR_COUNT {
+        return Err(FttsError::Generic(format!(
+            "pinned main inventory contains {} tensors, expected {PINNED_MAIN_TENSOR_COUNT}",
+            specs.len()
+        )));
+    }
+    Ok(specs)
+}
+
+fn required_inventory_string<'a>(record: &'a Value, field: &str) -> Result<&'a str, FttsError> {
+    record.get(field).and_then(Value::as_str).ok_or_else(|| {
+        FttsError::Generic(format!(
+            "checked-in tensor inventory record lacks string {field:?}"
+        ))
+    })
+}
+
+fn is_q8_projection(name: &str) -> bool {
+    (name.starts_with("talker.model.layers.")
+        || name.starts_with("talker.code_predictor.model.layers."))
+        && [
+            ".self_attn.q_proj.weight",
+            ".self_attn.k_proj.weight",
+            ".self_attn.v_proj.weight",
+            ".self_attn.o_proj.weight",
+            ".mlp.gate_proj.weight",
+            ".mlp.up_proj.weight",
+            ".mlp.down_proj.weight",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+fn main_access_class(name: &str) -> Result<AccessClass, FttsError> {
+    if name == "talker.model.text_embedding.weight" {
+        Ok(AccessClass::ColdTextEmbedding)
+    } else if name.starts_with("speaker_encoder.") {
+        Ok(AccessClass::EnrollmentSpeakerEncoder)
+    } else if name.starts_with("talker.code_predictor.")
+        || name == "talker.model.codec_embedding.weight"
+    {
+        Ok(AccessClass::HotRecurrentMicrodecoder)
+    } else if name.starts_with("talker.model.")
+        || name.starts_with("talker.codec_head.")
+        || name.starts_with("talker.text_projection.")
+    {
+        Ok(AccessClass::HotRecurrentTalker)
+    } else {
+        Err(FttsError::Generic(format!(
+            "pinned main tensor {name} has no reviewed access-class assignment"
+        )))
+    }
+}
+
+fn pinned_license_notice() -> String {
+    format!(
+        "This artifact contains model weights derived from\n\
+         Qwen3-TTS-12Hz-0.6B-Base (https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base)\n\
+         and code derived from QwenLM/Qwen3-TTS (https://github.com/QwenLM/Qwen3-TTS).\n\n\
+         Copyright 2026 Alibaba Cloud\n\n\
+         Licensed under the Apache License, Version 2.0.\n\
+         http://www.apache.org/licenses/LICENSE-2.0\n\n\
+         CHANGES: the original bfloat16 weights were converted to franken_tts's\n\
+         quantized .fttsq container. Tensors were requantized according to the\n\
+         artifact's quantization manifest; protected tensors remain verbatim.\n\
+         The model graph is re-implemented in Rust.\n\n\
+         Apache License, Version 2.0:\n\n{APACHE_LICENSE}"
+    )
 }
 
 fn run_say(
@@ -1192,6 +1583,193 @@ mod tests {
             };
             assert_eq!(settings.normalization_options().mode, engine_mode);
         }
+    }
+
+    #[test]
+    fn pinned_main_conversion_plan_preserves_the_reviewed_q8_boundary() {
+        let specs = pinned_main_tensor_specs().expect("checked-in main inventory parses");
+        let (_manifest, _plan) =
+            pinned_main_conversion_plan().expect("checked-in main conversion plan builds");
+        assert_eq!(specs.len(), PINNED_MAIN_TENSOR_COUNT);
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.storage == TensorStoragePolicy::Q8PerOutputChannel)
+                .count(),
+            231,
+            "28 talker + 5 microdecoder layers times seven attention/MLP projections"
+        );
+
+        let text_embedding = specs
+            .iter()
+            .find(|spec| spec.name == "talker.model.text_embedding.weight");
+        assert!(
+            text_embedding.is_some(),
+            "pinned inventory must contain the text embedding"
+        );
+        if let Some(text_embedding) = text_embedding {
+            assert_eq!(text_embedding.storage, TensorStoragePolicy::Verbatim);
+            assert_eq!(text_embedding.access_class, AccessClass::ColdTextEmbedding);
+        }
+
+        let talker_projection = specs
+            .iter()
+            .find(|spec| spec.name == "talker.model.layers.0.mlp.down_proj.weight");
+        assert!(
+            talker_projection.is_some(),
+            "pinned inventory must contain the talker projection"
+        );
+        if let Some(talker_projection) = talker_projection {
+            assert_eq!(
+                talker_projection.storage,
+                TensorStoragePolicy::Q8PerOutputChannel
+            );
+            assert_eq!(
+                talker_projection.access_class,
+                AccessClass::HotRecurrentTalker
+            );
+        }
+
+        let micro_projection = specs
+            .iter()
+            .find(|spec| spec.name == "talker.code_predictor.model.layers.0.mlp.down_proj.weight");
+        assert!(
+            micro_projection.is_some(),
+            "pinned inventory must contain the microdecoder projection"
+        );
+        if let Some(micro_projection) = micro_projection {
+            assert_eq!(
+                micro_projection.storage,
+                TensorStoragePolicy::Q8PerOutputChannel
+            );
+            assert_eq!(
+                micro_projection.access_class,
+                AccessClass::HotRecurrentMicrodecoder
+            );
+        }
+
+        let primary_embedding = specs
+            .iter()
+            .find(|spec| spec.name == "talker.model.codec_embedding.weight");
+        assert!(
+            primary_embedding.is_some(),
+            "pinned inventory must contain the primary-code embedding"
+        );
+        if let Some(primary_embedding) = primary_embedding {
+            assert_eq!(
+                primary_embedding.access_class,
+                AccessClass::HotRecurrentMicrodecoder,
+                "the primary-code embedding feeds residual depth one every frame"
+            );
+        }
+
+        let primary_head = specs
+            .iter()
+            .find(|spec| spec.name == "talker.codec_head.weight");
+        assert!(
+            primary_head.is_some(),
+            "pinned inventory must contain the primary-code head"
+        );
+        if let Some(primary_head) = primary_head {
+            assert_eq!(primary_head.storage, TensorStoragePolicy::Verbatim);
+            assert_eq!(primary_head.access_class, AccessClass::HotRecurrentTalker);
+        }
+
+        let text_projection = specs
+            .iter()
+            .find(|spec| spec.name == "talker.text_projection.linear_fc1.weight");
+        assert!(
+            text_projection.is_some(),
+            "pinned inventory must contain the text-projection MLP"
+        );
+        if let Some(text_projection) = text_projection {
+            assert_eq!(text_projection.storage, TensorStoragePolicy::Verbatim);
+            assert_eq!(
+                text_projection.access_class,
+                AccessClass::HotRecurrentTalker
+            );
+        }
+
+        let head = specs
+            .iter()
+            .find(|spec| spec.name == "talker.code_predictor.lm_head.0.weight");
+        assert!(
+            head.is_some(),
+            "pinned inventory must contain the residual-code head"
+        );
+        if let Some(head) = head {
+            assert_eq!(head.storage, TensorStoragePolicy::Verbatim);
+            assert_eq!(head.access_class, AccessClass::HotRecurrentMicrodecoder);
+        }
+
+        let speaker = specs
+            .iter()
+            .find(|spec| spec.name == "speaker_encoder.fc.weight");
+        assert!(
+            speaker.is_some(),
+            "pinned inventory must contain the speaker encoder"
+        );
+        if let Some(speaker) = speaker {
+            assert_eq!(speaker.storage, TensorStoragePolicy::Verbatim);
+            assert_eq!(speaker.access_class, AccessClass::EnrollmentSpeakerEncoder);
+        }
+    }
+
+    #[test]
+    fn conversion_notice_carries_changes_and_the_full_license() {
+        let notice = pinned_license_notice();
+        assert!(notice.contains("Copyright 2026 Alibaba Cloud"));
+        assert!(notice.contains("CHANGES: the original bfloat16 weights were converted"));
+        assert!(notice.contains("Apache License"));
+        assert!(notice.contains("TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION"));
+    }
+
+    #[test]
+    fn convert_refusal_still_emits_a_versioned_robot_lifecycle() {
+        let cli = Cli {
+            profile: None,
+            packet_frames: None,
+            math_mode: None,
+            voice_pack: None,
+            normalize: None,
+            trace: None,
+            seed: None,
+            command: Command::Robot(RobotArgs {
+                command: RobotCommand::Health,
+            }),
+        };
+        let args = ConvertArgs {
+            // A readable file with the wrong name reaches the explicit pinned-source refusal
+            // before any destination is created.
+            source: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+            output: PathBuf::from("never-created.fttsq"),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let error = run_convert(
+            &cli,
+            &args,
+            &Environment::default(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect_err("the non-pinned source must be refused");
+        assert_eq!(error.exit_code(), FttsExitCode::Input);
+
+        let stdout = String::from_utf8(stdout).expect("NDJSON stdout");
+        let stderr = String::from_utf8(stderr).expect("NDJSON stderr");
+        assert!(robot::validate_ndjson(&stdout).is_empty());
+        assert!(robot::validate_ndjson(&stderr).is_empty());
+        let stdout_events = stdout
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("JSON event"))
+            .collect::<Vec<_>>();
+        assert_eq!(stdout_events[0]["event"], "run_start");
+        assert_eq!(stdout_events[1]["event"], "stage");
+        assert_eq!(
+            serde_json::from_str::<Value>(stderr.trim()).expect("run error")["event"],
+            "run_error"
+        );
     }
 
     #[test]
