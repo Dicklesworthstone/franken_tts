@@ -2907,10 +2907,7 @@ mod tests {
                 ),
                 PageResidencyOutcome::Unsupported => {}
                 PageResidencyOutcome::Failed(detail) => {
-                    assert!(
-                        false,
-                        "the cold embedding residency measurement failed: {detail}"
-                    );
+                    panic!("the cold embedding residency measurement failed: {detail}");
                 }
             }
         }
