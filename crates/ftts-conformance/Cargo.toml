@@ -1,0 +1,18 @@
+[package]
+name = "ftts-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ftts-artifacts = { path = "../ftts-artifacts" }
+ftts-cli = { path = "../ftts-cli" }
+ftts-core = { path = "../ftts-core" }
+ftts-kernels = { path = "../ftts-kernels" }
+ftts-model-qwen = { path = "../ftts-model-qwen" }
+
+[lints]
+workspace = true

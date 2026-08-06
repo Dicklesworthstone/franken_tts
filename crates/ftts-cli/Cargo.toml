@@ -1,0 +1,22 @@
+[package]
+name = "ftts-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+autobins = false
+
+[dependencies]
+ftts-core = { path = "../ftts-core" }
+
+[[bin]]
+name = "franken_tts"
+path = "src/main.rs"
+
+[[bin]]
+name = "ftts"
+path = "src/bin/ftts.rs"
+
+[lints]
+workspace = true

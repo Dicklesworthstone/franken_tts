@@ -1,0 +1,14 @@
+[package]
+name = "ftts-model-qwen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ftts-core = { path = "../ftts-core" }
+ftts-kernels = { path = "../ftts-kernels" }
+
+[lints]
+workspace = true

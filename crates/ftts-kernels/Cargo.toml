@@ -1,0 +1,12 @@
+[package]
+name = "ftts-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ft-core.workspace = true
+ft-kernel-cpu.workspace = true
+ft-serialize.workspace = true

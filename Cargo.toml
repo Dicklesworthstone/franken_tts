@@ -1,0 +1,36 @@
+[workspace]
+members = [
+    "crates/ftts-core",
+    "crates/ftts-model-qwen",
+    "crates/ftts-artifacts",
+    "crates/ftts-kernels",
+    "crates/ftts-cli",
+    "crates/ftts-conformance",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+repository = "https://github.com/Dicklesworthstone/franken_tts"
+
+[workspace.dependencies]
+asupersync = { path = "../asupersync", default-features = false }
+ft-core = { path = "/dp/frankentorch/crates/ft-core" }
+ft-kernel-cpu = { path = "/dp/frankentorch/crates/ft-kernel-cpu" }
+ft-serialize = { path = "/dp/frankentorch/crates/ft-serialize" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.release-perf]
+inherits = "release"
+debug = true
+strip = "none"
