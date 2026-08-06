@@ -174,6 +174,41 @@ fn deliberately_failed_comparison_is_fully_self_localizing() {
     .emit();
 }
 
+/// STATE 4 — XFAIL: a known divergence keeps executing, and healing it is itself detectable.
+///
+/// The bead's rule is "XFAIL never SKIP". A skipped known-bad check stops running, so the day the
+/// divergence returns after being fixed, nothing notices.
+#[test]
+fn known_divergence_is_xfail_and_reports_as_xfail_not_skipped() {
+    let still_diverging = xfail(
+        "demo_known_divergence_tokenizer_regex_class",
+        "Demo/XFAIL",
+        "docs/DISCREPANCIES.md#demo-entry",
+        || Err("demo divergence: upstream splits digit runs, we split per digit".to_owned()),
+    );
+    assert!(still_diverging, "the demo divergence must still reproduce");
+
+    // The wire state is its own, distinct from both `skipped` and `passed`.
+    assert_eq!(Outcome::ExpectedFailure.as_str(), "xfail");
+    assert_ne!(
+        Outcome::ExpectedFailure.as_str(),
+        Outcome::Skipped.as_str(),
+        "an XFAIL must never be recorded as a skip"
+    );
+}
+
+/// An XFAIL that starts passing fails loudly instead of quietly becoming a no-op.
+#[test]
+#[should_panic(expected = "unexpectedly PASSED")]
+fn an_xfail_that_starts_passing_is_a_loud_failure() {
+    xfail(
+        "demo_xfail_that_healed",
+        "Demo/XFAIL",
+        "docs/DISCREPANCIES.md#demo-entry",
+        || Ok(()),
+    );
+}
+
 /// Stage transitions carry wall-clock and intermediate hashes.
 #[test]
 fn stage_events_carry_timing_and_intermediate_hashes() {
@@ -182,6 +217,147 @@ fn stage_events_carry_timing_and_intermediate_hashes() {
         Duration::from_millis(7),
         &[("token_stream", "deadbeef"), ("pcm", "cafebabe")],
     );
+
+    // The timed form cannot report a wall-clock that drifted from the work it measured, and the
+    // hash helpers mean an e2e author never hand-rolls a digest for stage localization.
+    let tokens: Vec<u32> = (0..16).collect();
+    let pcm: Vec<f32> = (0..32_u16).map(|i| f32::from(i) / 32.0).collect();
+    let stage = Stage::start("demo.talker_decode");
+    let stage_hashes = [
+        ("token_stream", token_stream_hash(&tokens)),
+        ("pcm", pcm_hash(&pcm)),
+    ];
+    stage.finish(
+        &stage_hashes
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// The macros carry the convention with one import — including the receipt's test name.
+#[test]
+fn convention_macros_emit_receipts_named_after_the_enclosing_test() {
+    assert!(
+        test_name!().ends_with("convention_macros_emit_receipts_named_after_the_enclosing_test"),
+        "a receipt must be able to name itself after the test that emitted it, got `{}`",
+        test_name!()
+    );
+
+    let expected = [0.10_f32, 0.20, 0.30, 0.40, 0.50, 0.60];
+    let actual = [0.10_f32, 0.20, 0.30, 0.40, 0.50, 0.60];
+    let comparison = assert_close!(
+        seam = "demo.codec.upsample_stage0",
+        expected = &expected,
+        actual = &actual,
+        tolerance = 1.0e-4,
+        source = "docs/truth-pack/nondeterminism-floor.json",
+        shape = &[2, 3],
+    );
+    assert!(comparison.holds());
+
+    let tokens = [11_u32, 22, 33, 44];
+    assert_exact!(
+        seam = "demo.tokenizer.encode",
+        expected = &tokens,
+        actual = &tokens,
+    );
+}
+
+/// A failing `assert_close!` panics with the self-localizing report, not a bare assertion.
+#[test]
+#[should_panic(expected = "demo.talker.layer17.attn_out")]
+fn assert_close_panics_with_the_self_localizing_report() {
+    let expected = [0.10_f32, 0.20, 0.30, 0.40, 0.50, 0.60];
+    let actual = [0.10_f32, 0.20, 0.30, 0.40, 0.75, 0.60];
+    assert_close!(
+        seam = "demo.talker.layer17.attn_out",
+        expected = &expected,
+        actual = &actual,
+        tolerance = 1.0e-4,
+        source = "docs/truth-pack/nondeterminism-floor.json",
+        shape = &[2, 3],
+    );
+}
+
+/// A diverging token stream is localized by index, context, and a shift diagnosis.
+#[test]
+fn exact_token_stream_divergence_is_fully_self_localizing() {
+    // `actual` dropped token 33: the tail realigns under a one-element shift.
+    let expected = [11_u32, 22, 33, 44, 55, 66];
+    let actual = [11_u32, 22, 44, 55, 66];
+
+    let comparison = compare_exact(&expected, &actual);
+    assert!(!comparison.holds());
+    assert_eq!(comparison.first_divergence, Some(2));
+    assert_eq!(comparison.shift, Some(Shift::DroppedFromActual));
+
+    let report = describe_exact_failure("demo.talker.token_stream", &comparison);
+    for required in [
+        "demo.talker.token_stream", // the seam
+        "index 2",                  // where they parted
+        "expected_len 6",
+        "actual_len 5",
+        "context from index",
+        "DROPPED", // the diagnosis, not just the numbers
+        "hint:",
+    ] {
+        assert!(
+            report.contains(required),
+            "exact-divergence report is missing `{required}`:\n{report}"
+        );
+    }
+
+    Receipt::new("demo_exact_stream_divergence_is_self_localizing", Outcome::Passed)
+        .contract("Demo/Observability")
+        .seam("demo.talker.token_stream")
+        .detail(comparison.to_json())
+        .emit();
+}
+
+/// Receipts must reach CI even though `libtest` swallows stdout on green runs.
+///
+/// Re-runs this binary's own child test with `FTTS_RECEIPTS` set, then reads the file. This is the
+/// only honest proof: edition 2024 makes `env::set_var` `unsafe` (forbidden here), so the
+/// environment-driven path cannot be exercised in-process.
+#[test]
+fn receipts_reach_the_sink_file_despite_libtest_capturing_stdout() {
+    let sink = scratch_dir("sink").join("receipts.ndjson");
+    let _ = fs::remove_file(&sink);
+
+    let status = process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", "--nocapture", "receipt_sink_child_emits_two_events"])
+        .env(ftts_conformance::report::RECEIPTS_ENV, &sink)
+        .status()
+        .expect("the test binary re-runs");
+    assert!(status.success(), "child test run failed: {status}");
+
+    let contents = fs::read_to_string(&sink).expect("the sink file exists after the child run");
+    let events: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is one JSON object"))
+        .collect();
+    assert_eq!(events.len(), 2, "expected both events:\n{contents}");
+    assert_eq!(events[0]["event"], "contract_check");
+    assert_eq!(
+        events[0]["outcome"], "skipped",
+        "the honest skip verdict must survive to the aggregated file"
+    );
+    assert_eq!(events[1]["event"], "stage");
+
+    fs::remove_file(&sink).expect("scratch sink is removable");
+}
+
+/// Child of the sink test above. Emits exactly two events and asserts nothing.
+///
+/// It runs in the ordinary test pass too, where `FTTS_RECEIPTS` is unset and it is stdout-only.
+#[test]
+fn receipt_sink_child_emits_two_events() {
+    Receipt::new("demo_receipt_sink_child", Outcome::Skipped)
+        .contract("Demo/Sink")
+        .reason("child process demonstrating the receipt sink")
+        .emit();
+    emit_stage("demo.sink_child", Duration::from_millis(1), &[]);
 }
 
 /// The `gated` helper returns whether the body ran, and agrees with the resolved gate.
