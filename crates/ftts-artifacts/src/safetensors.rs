@@ -837,17 +837,17 @@ mod tests {
             &[0u8; 8],
         );
         let error = SafetensorsIndex::parse(&buffer).expect_err("must refuse");
-        match error {
-            WeightsError::ShapeSpanMismatch {
-                expected_bytes,
-                actual_bytes,
-                ..
-            } => {
-                assert_eq!(expected_bytes, 16);
-                assert_eq!(actual_bytes, 8);
-            }
-            other => panic!("wrong error: {other}"),
-        }
+        assert!(
+            matches!(
+                error,
+                WeightsError::ShapeSpanMismatch {
+                    expected_bytes: 16,
+                    actual_bytes: 8,
+                    ..
+                }
+            ),
+            "wrong error: {error}"
+        );
     }
 
     #[test]
