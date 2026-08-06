@@ -105,6 +105,8 @@ These are the load-bearing, non-negotiable rules distilled from the plan and fro
 
 8. **Honest, measured everything — and audio claims need EARS, not just embeddings.** Every accepted numeric divergence → `docs/DISCREPANCIES.md` (reference behavior, our impl, **measured** impact, kill-switch env var, review date). Every rejected optimization → `docs/NEGATIVE_EVIDENCE.md` (the 5-pass loop). Speaker-embedding cosine is a **secondary** metric computed with multiple unrelated encoders; identity/naturalness claims that matter are settled by blind pairwise listening. Perf head-to-heads use thread/allocator/precision fairness controls and interleaved same-thermal-window pairs; report **time-to-first-audio and real-time factor separately** — a model that streams its first chunk fast but runs 1× RTF and one that starts slow but runs 20× are different products. No silent numerics changes, ever.
 
+   Before each performance lever, sweep `docs/NEGATIVE_EVIDENCE.md`; only current-tree, pinned-reference, parity-qualified measurements enter `docs/PERF_LEDGER.md`.
+
 9. **Two binaries from one entrypoint:** `ftts` (short) + `franken_tts` (long). The shared dispatch lives in the `ftts-cli` crate's lib target as `pub fn cli_main() -> ExitCode`; each binary is a **thin one-line shim** that just calls it — `crates/ftts-cli/src/main.rs` (the `franken_tts` bin) and `crates/ftts-cli/src/bin/ftts.rs` (the `ftts` bin). They are declared explicitly in `[[bin]]` tables (which also disables the implicit package-named bin), but **each `[[bin]]` points at its own shim file** — never the same `path` in two targets. Keep both shims byte-for-byte equivalent: `fn main() -> std::process::ExitCode { ftts_cli::cli_main() }`.
 
 10. **Voice packs carry consent and provenance.** `.ftvoice` embeds the reference hash, provenance, and an explicit consent-attestation field; the enrollment tool warns on multi-speaker/noisy/clipped/whispered references and refuses none of them silently. We never build features whose only purpose is cloning voices from people who didn't provide them (no "clone from YouTube URL" surface), and we never strip or bypass any upstream watermark the model may embed (watermark presence is an OQ to resolve at pin time).
@@ -180,6 +182,8 @@ If any check fails, fix root causes before handing off.
 ### The `cargo test --locked` gate (green-bar requirement)
 
 `cargo test --locked` is a **hard gate**: it MUST exit `0` before any change is handed off or a bead is closed. `scripts/check.sh` is the one-command gate: it runs the repository validators before `cargo fmt --check`, locked check/clippy/test, and bounded `ubs --diff`, stopping on the first failure. CI invokes this same script as its single test step, so the script is the source of truth rather than a duplicated workflow command list.
+
+Full stage list, the eight structural rules in `scripts/validate_repo.py`, the skip-honest banner (`GREEN WITH SKIPS` is **not** a green bar), the advisory 5-target cross-check matrix, and the sibling-repo pinning policy are documented in [`docs/CI_AND_GATES.md`](docs/CI_AND_GATES.md).
 
 Note on the build surface: both binaries (`ftts`, `franken_tts`) compile from thin shims over the shared `cli_main()` in the lib (doctrine #9). The `cargo check --locked --all-targets` gate MUST be free of the "present in multiple build targets" warning — each `[[bin]]` points at its own shim file.
 

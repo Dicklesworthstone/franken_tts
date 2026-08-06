@@ -154,19 +154,51 @@ BF16 ✓; 914,643,008 params ("≈0.9B") ✓; 2,511,637,364 B ≈ 2.51 GB ("≈2
 
 ## Extended (plan right; bytes add a detail a port would guess wrong)
 
-### E-1 — QK-Norm is **present on both** the talker and the microdecoder (closes most of OQ-3)
-Plan §2.3 listed QK-Norm presence/eps as `[OPEN]`. It is present in both attention modules, as
-`Qwen3TTSRMSNorm` over **`head_dim` only** (not the full projection width), applied **before** RoPE:
-- talker: `modeling_qwen3_tts.py:752-774`
-- microdecoder: `:910-929` — `# unlike olmo, only on the head dim!`
+### E-1 — talker QK-Norm, MLP, bias, and residual schema (**resolves OQ-3**)
+Plan §2.3 listed QK-Norm presence/eps and MLP details as `[OPEN]`. QK-Norm is present in both
+attention modules, as `Qwen3TTSRMSNorm` over **`head_dim` only** (not the full projection width),
+applied **after projection and before RoPE**:
+- talker: `modeling_qwen3_tts.py:740-780`
+- microdecoder: `:898-933` — `# unlike olmo, only on the head dim!`
 ```python
 query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
 key_states   = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
 ```
-`eps = config.rms_norm_eps` = **1e-06** for both (talker and `code_predictor_config`).
-Per doctrine #2 these norms stay high-precision. `attention_bias: false` everywhere ⇒ **no QKV/O
-biases**; `hidden_act: "silu"` ⇒ SwiGLU-class MLP. OQ-3's remaining scope shrinks to confirming the
-MLP gate/up ordering against the tensor names at load time.
+`Qwen3TTSRMSNorm` is weight-only (no additive bias) and computes
+`weight * x / sqrt(mean(x^2) + eps)` in f32 before returning to the input dtype
+(`:595-610`). `eps = config.rms_norm_eps` = **1e-06** for both the talker and
+`code_predictor_config` (`hf/config.json:90,147`). Per doctrine #2 these norms stay high precision.
+
+The repeated talker layer is pre-norm and has two residual additions:
+```text
+r0 = x
+a  = attention(RMSNorm(x))                 # Q/K head-norm, then mRoPE, then GQA
+x1 = r0 + a
+r1 = x1
+m  = down_proj(SiLU(gate_proj(RMSNorm(x1))) * up_proj(RMSNorm(x1)))
+out = r1 + m
+```
+The source constructs `gate_proj`, `up_proj`, and `down_proj` with `bias=False` and evaluates
+exactly `down_proj(act_fn(gate_proj(x)) * up_proj(x))` (`modeling_qwen3_tts.py:842-855`); with
+`hidden_act: "silu"` (`hf/config.json:136`), this is SwiGLU with **the gate projection receiving
+SiLU and the up projection ungated**. The layer order and both residual additions are explicit at
+`:1348-1417`.
+
+There are **no additive biases inside the 28 repeated talker blocks**: `attention_bias: false`
+(`hf/config.json:20`) makes Q/K/V/O weight-only (`modeling_qwen3_tts.py:740-750`), and the MLP is
+weight-only as above. This is corroborated by the pinned checkpoint header: layers 0 and 27 contain
+only `input_layernorm.weight`, `post_attention_layernorm.weight`, `self_attn.{q,k,v,o}_proj.weight`,
+`self_attn.{q,k}_norm.weight`, and `mlp.{gate,up,down}_proj.weight`. Do not generalize this to the
+whole wrapper: the outer `text_projection.linear_fc1` and `linear_fc2` are intentionally constructed
+with `bias=True` (`modeling_qwen3_tts.py:1575-1577`) and the pinned checkpoint contains both biases;
+the primary `codec_head` is weight-only (`:1579`).
+
+**Fixture seams for P1 talker L1/L2:** dump and compare (1) each norm input/output, including Q/K
+after projection+reshape and after head-RMSNorm but before mRoPE; (2) mRoPE Q/K; (3) attention output
+before and after `o_proj`; (4) the first residual sum; (5) post-attention RMSNorm; (6)
+`gate_proj`, `SiLU(gate_proj)`, `up_proj`, their elementwise product, and `down_proj`; and (7) the
+second residual sum. This isolates an incorrect head-axis norm, gate/up swap, missing bias, or
+residual ordering before a fuzzy end-to-end L2 failure.
 
 ### E-2 — the talker's primary-code vocab is **3072**, not 2048
 `talker_config.vocab_size: 3072` (`codec_embedding = nn.Embedding(3072, 1024)` `:1441`,
