@@ -179,6 +179,53 @@ fi
 stage_pass
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 5b. The five release targets — the Phase-0 exit criterion, machine-enforced
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Plan §12 Phase 0 exits on "builds green on all 5 targets". That was previously carried only by
+# the workflow's `cross` job, which is `continue-on-error` and skipped on push — so on main the
+# criterion neither ran nor blocked, and an exit gate nothing enforces is not a gate
+# (frankentts-j5j).
+#
+# It is enforced HERE, inside the one job that already blocks, rather than by making `cross`
+# blocking: the workflow comment records a measured reason not to request six concurrent runner
+# slots per push (run 31123043545 sat queued 9m+; the free-plan cap is shared across every
+# Dicklesworthstone repo), and starving the gate to prove a cross-check would trade the criterion
+# we can enforce for one we cannot even observe.
+#
+# `cargo check` emits metadata without linking, so every target is checkable from any host without
+# a cross-linker. A target whose std is not installed is reported as a SKIP naming that exact
+# target — never folded into green — and is a hard FAIL when FTTS_REQUIRE_ALL_TARGETS=1, which CI
+# sets after installing all five.
+RELEASE_TARGETS=(
+    x86_64-unknown-linux-gnu
+    aarch64-unknown-linux-gnu
+    x86_64-apple-darwin
+    aarch64-apple-darwin
+    x86_64-pc-windows-msvc
+)
+stage_start "cross-target check (${#RELEASE_TARGETS[@]} release targets)"
+INSTALLED_TARGETS="$(rustup target list --installed 2>/dev/null || true)"
+MISSING_TARGETS=()
+for target in "${RELEASE_TARGETS[@]}"; do
+    if ! printf '%s\n' "$INSTALLED_TARGETS" | grep -qx "$target"; then
+        MISSING_TARGETS+=("$target")
+        continue
+    fi
+    if ! run_cargo check --locked --all-targets --target "$target"; then
+        stage_fail "$target does not build; the Phase-0 exit criterion covers all ${#RELEASE_TARGETS[@]} targets"
+    fi
+done
+if [[ ${#MISSING_TARGETS[@]} -gt 0 ]]; then
+    if [[ "${FTTS_REQUIRE_ALL_TARGETS:-0}" == "1" ]]; then
+        stage_fail "std missing for: ${MISSING_TARGETS[*]} — run \`rustup target add\` for each (FTTS_REQUIRE_ALL_TARGETS=1 forbids skipping)"
+    fi
+    stage_skip "not checked (std not installed): ${MISSING_TARGETS[*]} — \`rustup target add\` them, or set FTTS_REQUIRE_ALL_TARGETS=1 to make this fatal"
+else
+    stage_pass
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 6. Lints
 # ─────────────────────────────────────────────────────────────────────────────
 stage_start "cargo clippy --locked --all-targets -- -D warnings"
