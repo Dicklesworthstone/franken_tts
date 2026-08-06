@@ -16,6 +16,10 @@
 #   FTTS_CHECK_USE_RCH=1    offload cargo to remote workers — SEE THE WARNING BELOW
 #   FTTS_CHECK_UBS_TIMEOUT  seconds to bound `ubs --diff` (default 300)
 #
+# The test stage sets FTTS_RECEIPTS itself, to target/receipts.ndjson, and the stage after it
+# audits that stream: a model-gated test that skipped for want of weights is surfaced in the
+# closing banner instead of disappearing into `libtest`'s pass count.
+#
 # Exit 0 = every required stage passed. Exit 1 = a stage failed.
 #
 # Bead: frankentts-p0-ci-083.
@@ -151,13 +155,51 @@ stage_pass
 # 7. Tests — the hard gate
 # ─────────────────────────────────────────────────────────────────────────────
 stage_start "cargo test --locked (HARD GATE — must exit 0 before any bead closes)"
+# Capture the receipt stream. `libtest` prints captured stdout only for FAILING tests, so on a
+# green run the receipts that distinguish `skipped` from `passed` would be invisible — exactly
+# when that distinction is worth auditing. The path must be ABSOLUTE: cargo runs each test
+# binary with its own package directory as cwd, so a relative path would scatter one file per
+# crate. Bead: frankentts-p0-model-gated-77h.
+RECEIPTS="$PWD/target/receipts.ndjson"
+mkdir -p target
+rm -f "$RECEIPTS"
+export FTTS_RECEIPTS="$RECEIPTS"
 if ! run_cargo test --locked; then
     stage_fail "no bead closes while this is red"
 fi
 stage_pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Bug scan over the working-tree diff (bounded; optional tool)
+# 8. Receipt honesty — a model-gated test that never ran is not a pass
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Stage 7 has its own skip-honesty problem one level down: `libtest` has no first-class skip, so
+# a test that returns early because the multi-GB weights are absent is reported as `ok`. The
+# honest verdict lives in the receipts, and this stage is what READS them — without a reader the
+# stream is decoration and "skips stay distinguishable from green" is an unenforced claim.
+#
+# The selftest runs first for the same reason stages 2 and 3 exist: a check nobody has seen fail
+# is a check nobody knows works.
+stage_start "receipt honesty (skip-vs-green audit over the test receipts)"
+if [[ ${#CARGO_RUNNER[@]} -gt 1 ]]; then
+    stage_skip "cargo ran through rch; the receipt file stayed on the remote worker"
+else
+    if ! python3 scripts/summarize_receipts.py --selftest >/dev/null; then
+        python3 scripts/summarize_receipts.py --selftest || true
+        stage_fail "a receipt honesty rule stopped detecting its violation"
+    fi
+    RECEIPT_SKIPS="$PWD/target/receipt-skips.txt"
+    if ! python3 scripts/summarize_receipts.py "$RECEIPTS" --skip-summary-file "$RECEIPT_SKIPS"; then
+        stage_fail "the receipt stream is dishonest or dead; see the VIOLATION lines above"
+    fi
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] && SKIPPED+=("model-gated test skipped — $entry")
+    done < "$RECEIPT_SKIPS"
+    stage_pass
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Bug scan over the working-tree diff (bounded; optional tool)
 # ─────────────────────────────────────────────────────────────────────────────
 stage_start "ubs --diff"
 UBS_TIMEOUT="${FTTS_CHECK_UBS_TIMEOUT:-300}"

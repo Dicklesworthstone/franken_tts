@@ -247,6 +247,7 @@ fn convention_macros_emit_receipts_named_after_the_enclosing_test() {
     let expected = [0.10_f32, 0.20, 0.30, 0.40, 0.50, 0.60];
     let actual = [0.10_f32, 0.20, 0.30, 0.40, 0.50, 0.60];
     let comparison = assert_close!(
+        contract = "Demo/Observability",
         seam = "demo.codec.upsample_stage0",
         expected = &expected,
         actual = &actual,
@@ -258,6 +259,7 @@ fn convention_macros_emit_receipts_named_after_the_enclosing_test() {
 
     let tokens = [11_u32, 22, 33, 44];
     assert_exact!(
+        contract = "Demo/Observability",
         seam = "demo.tokenizer.encode",
         expected = &tokens,
         actual = &tokens,
@@ -265,12 +267,16 @@ fn convention_macros_emit_receipts_named_after_the_enclosing_test() {
 }
 
 /// A failing `assert_close!` panics with the self-localizing report, not a bare assertion.
+///
+/// This emits a genuine `failed` receipt on purpose, which is exactly why it carries a `Demo/`
+/// contract: the aggregator must not read a staged failure as a red ladder rung.
 #[test]
 #[should_panic(expected = "demo.talker.layer17.attn_out")]
 fn assert_close_panics_with_the_self_localizing_report() {
     let expected = [0.10_f32, 0.20, 0.30, 0.40, 0.50, 0.60];
     let actual = [0.10_f32, 0.20, 0.30, 0.40, 0.75, 0.60];
     assert_close!(
+        contract = "Demo/Observability",
         seam = "demo.talker.layer17.attn_out",
         expected = &expected,
         actual = &actual,
@@ -365,6 +371,163 @@ fn receipt_sink_child_emits_two_events() {
         .reason("child process demonstrating the receipt sink")
         .emit();
     emit_stage("demo.sink_child", Duration::from_millis(1), &[]);
+}
+
+/// Runs the model-gate child test under an explicit `FTTS_MODEL_DIR`, returning its receipts.
+///
+/// The gate's real entry point is [`ModelGate::resolve`], which reads the environment — and an
+/// environment-driven branch cannot be exercised in-process, because edition 2024 makes
+/// `env::set_var` `unsafe` and this crate forbids it. A child process is the only honest way to
+/// prove that the variable every conformance test depends on actually opens and closes the gate.
+fn child_receipts_with_model_dir(tag: &str, model_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let sink = scratch_dir(&format!("model-dir-{tag}")).join("receipts.ndjson");
+    let _ = fs::remove_file(&sink);
+
+    let status = process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "--nocapture",
+            "model_dir_child_reports_the_resolved_gate",
+        ])
+        .env(ftts_conformance::report::RECEIPTS_ENV, &sink)
+        .env(ftts_conformance::gate::MODEL_DIR_ENV, model_dir)
+        .status()
+        .expect("the test binary re-runs");
+    assert!(status.success(), "child test run failed: {status}");
+
+    let contents = fs::read_to_string(&sink).expect("the sink file exists after the child run");
+    let events: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is one JSON object"))
+        .collect();
+    fs::remove_file(&sink).expect("scratch sink is removable");
+    events
+}
+
+/// STATE 1, through the mechanism the whole suite actually uses: `FTTS_MODEL_DIR` opens the gate.
+///
+/// `resolve_from` proves the logic; only this proves the *wiring*. A typo in the variable name
+/// would leave every model-gated test skipping forever on a machine that has the weights, and the
+/// suite would stay green while testing nothing.
+#[test]
+fn ftts_model_dir_opens_the_gate_and_require_model_runs_the_body() {
+    let dir = scratch_dir("model-dir-present");
+    let artifact = dir.join(ftts_conformance::gate::MODEL_BASENAME);
+    fs::write(
+        &artifact,
+        b"stand-in artifact; the gate checks presence, not contents",
+    )
+    .expect("artifact is writable");
+
+    let events = child_receipts_with_model_dir("present", &dir);
+    fs::remove_file(&artifact).expect("scratch artifact is removable");
+
+    assert_eq!(events.len(), 1, "expected exactly one receipt: {events:?}");
+    assert_eq!(
+        events[0]["outcome"], "passed",
+        "an open gate must run the body, not skip it: {events:?}"
+    );
+    assert_eq!(
+        events[0]["detail"]["artifact"],
+        artifact.display().to_string(),
+        "the body must receive the artifact the environment named"
+    );
+}
+
+/// STATE 2, same mechanism: a directory without the artifact closes the gate, honestly.
+///
+/// The reason must name what was missing — "skipped" alone is indistinguishable from a test
+/// someone quietly disabled.
+#[test]
+fn ftts_model_dir_without_the_artifact_skips_with_a_reason_naming_it() {
+    // The directory exists; the artifact does not. That is the everyday CI condition.
+    let dir = scratch_dir("model-dir-absent");
+    let events = child_receipts_with_model_dir("absent", &dir);
+
+    assert_eq!(events.len(), 1, "expected exactly one receipt: {events:?}");
+    assert_eq!(
+        events[0]["outcome"], "skipped",
+        "absent weights must skip, never pass: {events:?}"
+    );
+    let reason = events[0]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains(ftts_conformance::gate::MODEL_BASENAME),
+        "the skip reason must name the missing artifact, got `{reason}`"
+    );
+}
+
+/// Child of the two `FTTS_MODEL_DIR` tests above. Emits exactly one receipt either way.
+///
+/// It also runs in the ordinary test pass, where it reports whatever the developer's environment
+/// says — a skip on a machine without weights, a real run on one with them.
+#[test]
+fn model_dir_child_reports_the_resolved_gate() {
+    // Closed gate: this emits an honest `skipped` receipt with a reason, and returns.
+    let artifact = ftts_conformance::require_model!("Demo/RequireModel");
+
+    // Open gate: everything below runs, and the native path must be the one that ran.
+    assert!(
+        artifact.is_file(),
+        "an open gate must hand the body a real artifact path"
+    );
+    require_native_execution("demo.require_model", ExecutionPath::Native)
+        .expect("native execution is accepted under an open gate");
+
+    Receipt::new(test_name!(), Outcome::Passed)
+        .contract("Demo/RequireModel")
+        .seam("demo.require_model")
+        .detail(serde_json::json!({ "artifact": artifact.display().to_string() }))
+        .emit();
+}
+
+/// The receipt outcomes and the aggregator that reads them must not drift apart.
+///
+/// `scripts/summarize_receipts.py` rejects an unknown `outcome` — which is right, but it means a
+/// variant added here and not there would fail the gate with "unknown outcome" instead of being
+/// counted. The `wire` match below is exhaustive, so a new variant stops compiling until both
+/// sides are updated.
+#[test]
+fn receipt_outcome_wire_strings_match_the_summarizer() {
+    const fn wire(outcome: Outcome) -> &'static str {
+        match outcome {
+            Outcome::Passed => "passed",
+            Outcome::Failed => "failed",
+            Outcome::Skipped => "skipped",
+            Outcome::ExpectedFailure => "xfail",
+        }
+    }
+
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/summarize_receipts.py");
+    let source = fs::read_to_string(&script).expect("the receipt aggregator is present");
+    let outcomes_line = source
+        .lines()
+        .find(|line| line.starts_with("OUTCOMES = {"))
+        .expect("the aggregator declares the outcome set it accepts");
+
+    for outcome in [
+        Outcome::Passed,
+        Outcome::Failed,
+        Outcome::Skipped,
+        Outcome::ExpectedFailure,
+    ] {
+        assert_eq!(
+            outcome.as_str(),
+            wire(outcome),
+            "the wire string changed without updating this test"
+        );
+        assert!(
+            outcomes_line.contains(&format!("\"{}\"", outcome.as_str())),
+            "`{}` is not in the aggregator's accepted set: {outcomes_line}",
+            outcome.as_str()
+        );
+    }
+
+    // The reserved namespace the crate docs promise, bound to the code that honours it.
+    assert!(
+        source.contains(r#"DEMO_CONTRACT_PREFIX = "Demo/""#),
+        "the aggregator no longer reserves the `Demo/` contract namespace the crate docs describe"
+    );
 }
 
 /// The `gated` helper returns whether the body ran, and agrees with the resolved gate.

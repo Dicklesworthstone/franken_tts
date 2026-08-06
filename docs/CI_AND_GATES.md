@@ -27,10 +27,12 @@ under two seconds instead of after a ten-minute build.
 | 5 | `cargo check --locked --all-targets` | type errors, **and the multiple-build-targets warning** |
 | 6 | `cargo clippy --locked --all-targets -- -D warnings` | lints |
 | 7 | `cargo test --locked` | **the hard gate** — no bead closes while this is red |
-| 8 | `ubs --diff` (bounded) | bug scan over working-tree changes |
+| 8 | `summarize_receipts.py` | a model-gated test that skipped being counted as a pass |
+| 9 | `ubs --diff` (bounded) | bug scan over working-tree changes |
 
-Stages 2 and 3 exist because a validator nobody has seen fail is a validator nobody knows works.
-Both run in about two seconds and guard gates that would otherwise rot silently.
+Stages 2, 3, and the selftest inside stage 8 exist because a validator nobody has seen fail is a
+validator nobody knows works. Each runs in about two seconds and guards a gate that would
+otherwise rot silently.
 
 ### Skip honesty
 
@@ -40,6 +42,31 @@ that banner as it appears; "the gate passed" is not an accurate summary of a run
 
 `ubs` is the only stage that may skip (it is not installed on hosted runners). Everything else is
 required: a missing tool is a failure, not a skip.
+
+#### The second skip layer: model-gated tests
+
+Stage 7 has its own skip honesty problem, one level down. Tests needing the multi-GB weights must
+keep CI green without them, but `libtest` has no first-class skip — an early `return` is reported as
+`ok`, indistinguishable from a real pass. So the honest verdict lives in a **receipt**, not in
+`libtest`'s counts: one NDJSON object per check carrying `outcome` (`passed` / `failed` / `skipped` /
+`xfail`), the seam, the fixture provenance, and the tolerance **with its source**.
+
+`libtest` also captures stdout and prints it only for failing tests, so on a green run those
+receipts are invisible — exactly when the `skipped`-vs-`passed` audit matters. Set `FTTS_RECEIPTS`
+and every receipt is appended to a file as well:
+
+```bash
+FTTS_RECEIPTS=target/receipts.ndjson cargo test --locked -p ftts-conformance
+jq -r 'select(.outcome=="skipped") | .test + "\t" + .reason' target/receipts.ndjson
+```
+
+A run whose ladder rungs are all `skipped` is **not** a green ladder, and the receipt stream is what
+makes that checkable rather than assumed. Known divergences are `xfail`, never `skipped`: they keep
+executing so that a divergence which silently *heals* also fails, instead of leaving a stale ledger
+entry that will not notice when the divergence returns.
+
+The convention (and the harness macros implementing it) is defined once, in the `ftts-conformance`
+crate docs — `cargo doc -p ftts-conformance --open`. Bead `frankentts-p0-model-gated-77h`.
 
 ### The multiple-build-targets rule
 
@@ -52,8 +79,9 @@ independently checks the manifest structure, so the mistake is caught before the
 
 | Variable | Effect |
 |---|---|
-| `FTTS_CHECK_NO_RCH=1` | bypass the remote compilation helper, run cargo locally (CI sets this) |
+| `FTTS_CHECK_USE_RCH=1` | opt in to the remote compilation helper; the gate runs cargo **locally** by default (see [Do not run the gate through rch](#do-not-run-the-gate-through-rch)) |
 | `FTTS_CHECK_UBS_TIMEOUT` | seconds bounding `ubs --diff` (default 300) |
+| `FTTS_RECEIPTS=<path>` | append every conformance receipt/stage event to `<path>` as NDJSON (see below) |
 
 There is deliberately **no knob to skip a stage**. If a stage is in your way, fix it.
 

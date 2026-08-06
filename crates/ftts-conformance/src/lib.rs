@@ -18,14 +18,22 @@
 //!
 //! ## (b) Comparator failures name the first divergent element
 //!
-//! Never a bare assertion. [`compare::compare_f32`] plus [`compare::describe_failure`] report the
-//! first divergent element with row-major coordinates, then max-abs, max-rel, cosine, and
-//! count-over-tolerance — the statistics that separate a SIMD lane bug from a transposed tensor.
+//! Never a bare assertion. Reach for [`assert_close!`] (numeric, tolerance-bounded) or
+//! [`assert_exact!`] (token streams); both emit their own receipt and, on failure, panic with the
+//! self-localizing report rather than `left != right`.
+//!
+//! [`compare::compare_f32`] plus [`compare::describe_failure`] report the first divergent element
+//! with row-major coordinates, then max-abs, max-rel, cosine, and count-over-tolerance — the
+//! statistics that separate a SIMD lane bug from a transposed tensor. For exact sequences,
+//! [`compare::compare_exact`] plus [`compare::describe_exact_failure`] report the index where the
+//! streams parted, the surrounding context, and whether the tail realigns under a one-element
+//! [`compare::Shift`] — the difference between a dropped step and a wrong value.
 //!
 //! ## (c) End-to-end runs log every stage transition
 //!
-//! Wall-clock plus key intermediate hashes (token-stream hash, PCM hash) via [`report::emit_stage`],
-//! so a red run names its stage in seconds instead of requiring a bisect.
+//! Wall-clock plus key intermediate hashes via [`report::Stage`], so a red run names its stage in
+//! seconds instead of requiring a bisect. [`report::token_stream_hash`] and [`report::pcm_hash`]
+//! supply the hashes, so no e2e author hand-rolls a digest.
 //!
 //! ## (d) Logs are machine-parseable
 //!
@@ -40,6 +48,19 @@
 //! $ FTTS_RECEIPTS=target/receipts.ndjson cargo test -p ftts-conformance
 //! $ jq -r 'select(.outcome=="skipped") | .test + "\t" + .reason' target/receipts.ndjson
 //! ```
+//!
+//! `scripts/check.sh` does exactly that on every run and folds any skip it finds into the closing
+//! banner, so a suite whose model-gated rungs never executed reports `GREEN WITH SKIPS` rather than
+//! green. `scripts/summarize_receipts.py` is the reader; without it this stream would be decoration.
+//!
+//! ## The `Demo/` contract namespace is reserved
+//!
+//! Receipts whose `contract` starts with `Demo/` come from the convention demo and the doc examples
+//! below — they emit skips *on purpose*, to show the mechanism. The aggregator counts them
+//! separately and never treats them as gate signal, because a banner that is permanently yellow for
+//! staged reasons teaches readers to ignore it. Every honesty rule still applies to them in full: a
+//! `Demo/` skip without a reason fails the gate like any other. **Production ladders never use this
+//! namespace** — a real rung that skipped must be visible.
 //!
 //! ## (e) Test names encode the contract
 //!
@@ -172,7 +193,8 @@ macro_rules! require_model {
 
 /// Asserts two `f32` slices agree within tolerance, emitting a receipt and localizing any failure.
 ///
-/// Named arguments, `shape` optional:
+/// Named arguments. `contract` and `shape` are optional; supply `contract` on any check that is a
+/// ladder rung, since that is how the aggregator attributes the receipt.
 ///
 /// ```
 /// use ftts_conformance::assert_close;
@@ -180,6 +202,7 @@ macro_rules! require_model {
 /// let expected = [0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6];
 /// let actual = [0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6];
 /// assert_close!(
+///     contract = "Demo/Observability",
 ///     seam = "codec.upsample.stage0",
 ///     expected = &expected,
 ///     actual = &actual,
@@ -200,14 +223,13 @@ macro_rules! assert_close {
         tolerance = $tolerance:expr,
         source = $source:expr $(,)?
     ) => {
-        $crate::macro_support::assert_close(
-            $crate::test_name!(),
-            $seam,
-            $expected,
-            $actual,
-            $tolerance,
-            $source,
-            ::core::option::Option::None,
+        $crate::assert_close!(
+            contract = ::core::option::Option::<&str>::None,
+            seam = $seam,
+            expected = $expected,
+            actual = $actual,
+            tolerance = $tolerance,
+            source = $source,
         )
     };
     (
@@ -218,8 +240,47 @@ macro_rules! assert_close {
         source = $source:expr,
         shape = $shape:expr $(,)?
     ) => {
+        $crate::assert_close!(
+            contract = ::core::option::Option::<&str>::None,
+            seam = $seam,
+            expected = $expected,
+            actual = $actual,
+            tolerance = $tolerance,
+            source = $source,
+            shape = $shape,
+        )
+    };
+    (
+        contract = $contract:expr,
+        seam = $seam:expr,
+        expected = $expected:expr,
+        actual = $actual:expr,
+        tolerance = $tolerance:expr,
+        source = $source:expr $(,)?
+    ) => {
         $crate::macro_support::assert_close(
             $crate::test_name!(),
+            $crate::macro_support::IntoContract::into_contract($contract),
+            $seam,
+            $expected,
+            $actual,
+            $tolerance,
+            $source,
+            ::core::option::Option::None,
+        )
+    };
+    (
+        contract = $contract:expr,
+        seam = $seam:expr,
+        expected = $expected:expr,
+        actual = $actual:expr,
+        tolerance = $tolerance:expr,
+        source = $source:expr,
+        shape = $shape:expr $(,)?
+    ) => {
+        $crate::macro_support::assert_close(
+            $crate::test_name!(),
+            $crate::macro_support::IntoContract::into_contract($contract),
             $seam,
             $expected,
             $actual,
@@ -237,7 +298,12 @@ macro_rules! assert_close {
 ///
 /// let expected = [11_u32, 22, 33];
 /// let actual = [11_u32, 22, 33];
-/// assert_exact!(seam = "tokenizer.encode", expected = &expected, actual = &actual);
+/// assert_exact!(
+///     contract = "Demo/Observability",
+///     seam = "tokenizer.encode",
+///     expected = &expected,
+///     actual = &actual,
+/// );
 /// ```
 #[macro_export]
 macro_rules! assert_exact {
@@ -246,7 +312,26 @@ macro_rules! assert_exact {
         expected = $expected:expr,
         actual = $actual:expr $(,)?
     ) => {
-        $crate::macro_support::assert_exact($crate::test_name!(), $seam, $expected, $actual)
+        $crate::assert_exact!(
+            contract = ::core::option::Option::<&str>::None,
+            seam = $seam,
+            expected = $expected,
+            actual = $actual,
+        )
+    };
+    (
+        contract = $contract:expr,
+        seam = $seam:expr,
+        expected = $expected:expr,
+        actual = $actual:expr $(,)?
+    ) => {
+        $crate::macro_support::assert_exact(
+            $crate::test_name!(),
+            $crate::macro_support::IntoContract::into_contract($contract),
+            $seam,
+            $expected,
+            $actual,
+        )
     };
 }
 
@@ -261,6 +346,33 @@ pub mod macro_support {
         report::{Outcome, Receipt},
     };
 
+    /// Lets the macros' `contract` argument accept either a `&str` or an already-optional value,
+    /// so the no-contract arms can forward `None` through the same call shape.
+    pub trait IntoContract {
+        /// Normalizes to an optional contract name.
+        fn into_contract(self) -> Option<&'static str>;
+    }
+
+    impl IntoContract for &'static str {
+        fn into_contract(self) -> Option<&'static str> {
+            Some(self)
+        }
+    }
+
+    impl IntoContract for Option<&'static str> {
+        fn into_contract(self) -> Option<&'static str> {
+            self
+        }
+    }
+
+    /// Applies an optional contract name to a receipt.
+    fn with_contract(receipt: Receipt, contract: Option<&str>) -> Receipt {
+        match contract {
+            Some(name) => receipt.contract(name),
+            None => receipt,
+        }
+    }
+
     /// Backs [`crate::assert_close!`].
     ///
     /// # Panics
@@ -268,6 +380,7 @@ pub mod macro_support {
     /// Panics with the self-localizing report when the comparison does not hold.
     pub fn assert_close(
         test: &str,
+        contract: Option<&str>,
         seam: &str,
         expected: &[f32],
         actual: &[f32],
@@ -281,7 +394,7 @@ pub mod macro_support {
         } else {
             Outcome::Failed
         };
-        Receipt::new(test, outcome)
+        with_contract(Receipt::new(test, outcome), contract)
             .seam(seam)
             .tolerance(tolerance, tolerance_source)
             .detail(comparison.to_json())
@@ -299,7 +412,13 @@ pub mod macro_support {
     /// # Panics
     ///
     /// Panics with the self-localizing report when the sequences are not identical.
-    pub fn assert_exact<T>(test: &str, seam: &str, expected: &[T], actual: &[T]) -> ExactComparison
+    pub fn assert_exact<T>(
+        test: &str,
+        contract: Option<&str>,
+        seam: &str,
+        expected: &[T],
+        actual: &[T],
+    ) -> ExactComparison
     where
         T: PartialEq + std::fmt::Debug,
     {
@@ -309,7 +428,7 @@ pub mod macro_support {
         } else {
             Outcome::Failed
         };
-        Receipt::new(test, outcome)
+        with_contract(Receipt::new(test, outcome), contract)
             .seam(seam)
             .detail(comparison.to_json())
             .emit();
@@ -336,8 +455,8 @@ pub mod macro_support {
 /// use ftts_conformance::xfail;
 ///
 /// let still_diverging = xfail(
-///     "contract_a_l0_tokenizer_regex_class",
-///     "ConformanceExact/L0",
+///     "doc_example_tokenizer_regex_class",
+///     "Demo/XFAIL",
 ///     "docs/DISCREPANCIES.md#tokenizer-regex",
 ///     || Err("upstream splits \\p{N} runs; we split per digit".to_owned()),
 /// );
@@ -391,7 +510,7 @@ where
 /// use ftts_conformance::{gated, gate::ModelGate};
 ///
 /// // With no model present this records a skip and returns false.
-/// let ran = gated("contract_a_l4_codec_token_stream", "ConformanceExact/L4", |artifact| {
+/// let ran = gated("doc_example_codec_token_stream", "Demo/ModelGate", |artifact| {
 ///     assert!(artifact.exists());
 /// });
 /// assert_eq!(ran, ModelGate::resolve().is_present());

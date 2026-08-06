@@ -200,6 +200,8 @@ Each module includes unit tests for happy path, edge cases, error handling. Beyo
 - **Differential / metamorphic / golden-artifact** suites; **model-gated e2e** (skip-with-SUCCESS without the weights; prove the native path ran by pointing fallbacks at `/nonexistent`).
 - **`many_utterances_without_deadlock`** concurrency watchdog.
 
+**The test observability convention is defined once, in the `ftts-conformance` crate docs** (`cargo doc -p ftts-conformance --open`; bead `frankentts-p0-model-gated-77h`), and every bead's "unit tests" clause inherits it — no other bead restates it. In short: structured NDJSON receipts carrying seam, fixture provenance, seed, and tolerance **with its source**; comparator failures that name the first divergent element with coordinates plus summary stats, never a bare assertion; stage events with wall-clock and intermediate hashes; test names that encode the contract. The harness is one import away — `require_model!`, `assert_close!`, `assert_exact!`, `xfail`, `Stage`. `skipped` and `xfail` are distinct from `passed` and never collapse into it; set `FTTS_RECEIPTS=<path>` to capture the stream past `libtest`'s stdout capture.
+
 ---
 
 ## Agent Ergonomics Requirements
