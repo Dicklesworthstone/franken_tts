@@ -199,7 +199,7 @@ impl MappedFile {
 
         #[cfg(not(all(feature = "native-mmap", unix)))]
         {
-            let _ = advice;
+            let _ = (offset, advice);
             Ok(MemoryAdviceOutcome::Unsupported)
         }
     }
@@ -215,20 +215,20 @@ impl MappedFile {
     /// Returns `InvalidInput` for a range outside this mapping, or the native `mincore` error.
     pub fn resident_pages(&self, offset: u64, length: u64) -> io::Result<MemoryResidency> {
         let (offset, length) = self.validated_range(offset, length)?;
-        if length == 0 {
-            return Ok(MemoryResidency::Measured {
-                resident_pages: 0,
-                total_pages: 0,
-            });
-        }
-
         #[cfg(all(feature = "native-mmap", unix))]
         {
+            if length == 0 {
+                return Ok(MemoryResidency::Measured {
+                    resident_pages: 0,
+                    total_pages: 0,
+                });
+            }
             self.resident_pages_native(offset, length)
         }
 
         #[cfg(not(all(feature = "native-mmap", unix)))]
         {
+            let _ = offset;
             Ok(MemoryResidency::Unsupported)
         }
     }
@@ -307,7 +307,7 @@ impl MappedFile {
                     .cast_mut()
                     .cast::<libc::c_void>(),
                 observed_length,
-                residency.as_mut_ptr().cast::<libc::c_uchar>(),
+                residency.as_mut_ptr().cast(),
             )
         };
         if result == -1 {
