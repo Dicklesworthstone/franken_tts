@@ -308,11 +308,14 @@ fn exact_token_stream_divergence_is_fully_self_localizing() {
         );
     }
 
-    Receipt::new("demo_exact_stream_divergence_is_self_localizing", Outcome::Passed)
-        .contract("Demo/Observability")
-        .seam("demo.talker.token_stream")
-        .detail(comparison.to_json())
-        .emit();
+    Receipt::new(
+        "demo_exact_stream_divergence_is_self_localizing",
+        Outcome::Passed,
+    )
+    .contract("Demo/Observability")
+    .seam("demo.talker.token_stream")
+    .detail(comparison.to_json())
+    .emit();
 }
 
 /// Receipts must reach CI even though `libtest` swallows stdout on green runs.
@@ -326,7 +329,11 @@ fn receipts_reach_the_sink_file_despite_libtest_capturing_stdout() {
     let _ = fs::remove_file(&sink);
 
     let status = process::Command::new(std::env::current_exe().expect("test binary path"))
-        .args(["--exact", "--nocapture", "receipt_sink_child_emits_two_events"])
+        .args([
+            "--exact",
+            "--nocapture",
+            "receipt_sink_child_emits_two_events",
+        ])
         .env(ftts_conformance::report::RECEIPTS_ENV, &sink)
         .status()
         .expect("the test binary re-runs");
