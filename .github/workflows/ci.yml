@@ -14,6 +14,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Carries the advisory 5-target cross-check, which no longer runs on main pushes (see the
+  # `cross` job). Nightly keeps target rot surfacing early without competing with the gate.
+  schedule:
+    - cron: '0 7 * * *'
 
 # Superseded PR pushes are worth cancelling; superseded MAIN pushes are not. With several
 # agents committing to main at once, cancel-in-progress there means the gate result is never
@@ -121,6 +125,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     continue-on-error: true
+    # NOT on main pushes. This account is on the free plan, whose 20-concurrent-job cap is shared
+    # across every Dicklesworthstone repository. Requesting six slots per push (gate + five
+    # targets) while a swarm commits every few minutes starves the one job that actually blocks:
+    # measured 2026-08-06, run 31123043545 sat `queued` 9m+ with all six jobs waiting, whereas the
+    # 05:42Z run got runners in one second during a quiet window.
+    #
+    # The matrix exists so target rot surfaces early, and nightly is early for an ADVISORY check.
+    # PRs still get it per-push, since that is where a target break should be caught before merge.
+    if: github.event_name != 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -182,7 +195,7 @@ jobs:
     # schedules this job after `cross` was CANCELLED, which is how run 31074936630 ended up with
     # a summary job queued for 11 hours that no API call could kill. Report on success/failure,
     # and stand down when the run was cancelled and there is nothing left to report on.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.cross.result != 'skipped' }}
     timeout-minutes: 5
     steps:
       # `cross` is advisory, so its result must be visible without being able to block a merge.
