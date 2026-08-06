@@ -15,9 +15,11 @@ Line citations are to the pinned truth-pack snapshots
 `docs/truth-pack/snapshots/gh/qwen_tts/inference/qwen3_tts_model.py` (`I:`), plus
 `docs/truth-pack/snapshots/hf/{config,tokenizer_config}.json`.
 
-Status: **[VERIFIED-STATIC]** — line-level reading of the pinned source. No oracle run (no torch/
-weights on this host); token-exact confirmation against the reference tokenizer is owed to
-`frankentts-p1-prompt-igr` and the oracle fixtures bead.
+Status: **[VERIFIED-STATIC]** for the prompt-assembly structure (line-level reading of the pinned
+source; no model weights on this host, so nothing was executed through the model) — and
+**[VERIFIED-MEASURED]** for the tokenizer-facing claims in §0.1 and §7, which were run against the
+pinned tokenizer bytes with the pinned oracle (`transformers==4.57.3` / `tokenizers==0.22.2`,
+`fix_mistral_regex=True`).
 
 ---
 
@@ -31,10 +33,10 @@ def _build_ref_text(self, text):        return f"<|im_start|>assistant\n{text}<|
 def _build_instruct_text(self, instruct):return f"<|im_start|>user\n{instruct}<|im_end|>\n"
 ```
 
-The wrapper tokenizes to a **3-token prefix** (`<|im_start|>`, `assistant`, `\n`) and, for the
-assistant form, a **5-token suffix** (`<|im_end|>`, `\n`, `<|im_start|>`, `assistant`, `\n`); the ref
-form has a **2-token suffix** (`<|im_end|>`, `\n`). That is the whole explanation for the asymmetric
-slicing in `generate`:
+The wrapper tokenizes to a **3-token prefix** `[151644, 77091, 198]` = (`<|im_start|>`, `assistant`,
+`\n`) and, for the assistant form, a **5-token suffix** `[151645, 198, 151644, 77091, 198]` =
+(`<|im_end|>`, `\n`, `<|im_start|>`, `assistant`, `\n`); the ref form has a **2-token suffix**
+`[151645, 198]`. That is the whole explanation for the asymmetric slicing in `generate`:
 
 | slice | meaning |
 |---|---|
@@ -45,8 +47,31 @@ slicing in `generate`:
 | `ref_ids[index][:, 3:-2]` (`M:2191`) | **exactly the reference transcript tokens** |
 
 These indices are hard-coded and assume that wrapper tokenization. A tokenizer that splits
-`<|im_start|>assistant\n` differently silently corrupts every prompt — this is a Contract-A L0 gate
-and must be asserted, not assumed (owed to `frankentts-oq11-tokenizer-p94` / `p1-tokenizer-2uf`).
+`<|im_start|>assistant\n` differently silently corrupts every prompt — a Contract-A L0 concern.
+
+**MEASURED, not assumed.** Run against the pinned tokenizer bytes
+(`docs/truth-pack/snapshots/hf/`) with the pinned oracle (`transformers==4.57.3`,
+`tokenizers==0.22.2`) using **`fix_mistral_regex=True`** — the flag the official stack loads with
+(`I:118`, per cc_1's OQ-11 finding):
+
+```
+<|im_start|>assistant\nHello there, friend.<|im_end|>\n<|im_start|>assistant\n
+  -> [151644, 77091, 198,  9707, 1052, 11, 4238, 13,  151645, 198, 151644, 77091, 198]
+     |<-- [:3] -->|        |<------ [3:-5] ------>|   |<--------- [-5:] ----------->|
+     [3:-5] == tokenize("Hello there, friend.")  ✓
+
+<|im_start|>assistant\nThis is the reference recording.<|im_end|>\n
+  -> [151644, 77091, 198,  1986, 374, 279, 5785, 14633, 13,  151645, 198]
+     [3:-2] == tokenize("This is the reference recording.")  ✓
+```
+
+Verified to hold for ASCII, CJK, digits/punctuation, leading whitespace, **empty text**, embedded
+newlines, and emoji — 7/7 classes, under both the default and `fix_mistral_regex=True` regexes (the
+wrapper boundary is regex-independent because `<|im_start|>`/`<|im_end|>` are *added tokens*, split
+before BPE runs; only the inner text ids are regex-sensitive, which is OQ-11's territory).
+
+⇒ **The 3 / 5 / 2 wrapper structure is CONFIRMED**, and the slice arithmetic in §1–§3 rests on
+measured ground.
 
 ### 0.2 Special token ids (`config.json`, `tokenizer_config.json`)
 
@@ -351,16 +376,46 @@ frames. Flagged rather than solved here.
 
 ---
 
-## 7. What is NOT established here (honest gap)
+## 7. Worked example (concrete, token-exact)
 
-- **No token-exact verification.** Every claim is structural, read off the pinned source. The
-  assertion that `_build_assistant_text` tokenizes to a 3-token prefix and 5-token suffix is
-  **inferred from the slice indices the code itself uses**, not measured against the reference
-  tokenizer. If that tokenization differs, §0.1's table and every slice in this document shift.
-  Owed to `frankentts-oq11-tokenizer-p94`; must be asserted as a Contract-A L0 test in
-  `frankentts-p1-prompt-igr`.
-- **No worked numeric example.** The bead asks for worked examples; §2–§3 give exact symbolic
-  templates with lengths, but no concrete token-id sequence, because that needs the tokenizer.
+Reference transcript `"This is the reference recording."` → **6** tokens; target text
+`"Hello there, friend."` → **5** tokens (ids in §0.1). A 3 s reference at 12.5 fps → **38** codec
+frames. Language given and a speaker embedding present ⇒ `|P| = 4`, `S = 1`, `L_c = 7`, **`H = 9`**.
+
+```
+|ref_id| = 6      |text_id| = 5      ref_frames = 38
+T1 = 6 + 5 + 1 = 12                  T2 = 1 + 38 = 39
+```
+
+| mode | prompt positions | trailing | target-independent prefix |
+|---|---:|---:|---:|
+| ICL × streaming | `H + T2` = **48** | 1 (`tts_pad`; text fits under the codec stream) | `H + min(39, 6)` = **15** |
+| ICL × non-streaming | `H + T1 + T2` = **60** | 1 (`tts_pad`) | `H + 6` = **15** |
+| x-vector × streaming | `H + 1` = **10** | 5 (4 remaining text tokens + `eos`) | **9** |
+| x-vector × non-streaming | `H + 5 + 2` = **16** | 1 (`tts_pad`) | **9** |
+
+Reading the ICL × streaming prompt position by position:
+
+```
+pos 0..2    role: <|im_start|> assistant \n                      (text only, no codec added)
+pos 3..8    tts_pad ×4, tts_bos  +  think tags, language_id, speaker_embed, codec_pad
+pos 9..14   ref_id[0..5]  +  (codec_bos, ref frame 0..4)         <-- CACHEABLE ends here (pos 14)
+pos 15..47  text_id[0..4], eos, tts_pad×27  +  ref frames 5..37  <-- target text enters at pos 15
+trailing    tts_pad_embed, fed once per generated frame
+```
+
+The cacheable prefix is 15 of 48 positions (**31 %**), and it contains `codec_bos` plus only the
+**first 5** of the 38 reference codec frames. That is the concrete shape of the §5.1 verdict.
+
+## 8. What is NOT established here (honest gap)
+
 - **`instruct_ids`** (`M:2094-2098`) prepends an instruct block for the VoiceDesign/CustomVoice
   paths. Out of scope for the Base checkpoint and not analyzed. If a future bead brings those models
   in, the prefix analysis must be redone — the instruct block precedes `H`.
+- **No end-to-end prompt was built through the real model**, only through the real tokenizer: the
+  embedding/projection arithmetic in §1–§3 is read off the source, not executed (that needs weights,
+  which are absent). The *shapes* are asserted executably by `scripts/oq10_prompt_shapes.py`; the
+  *values* are owed to the oracle fixtures bead and to `p1-prompt-igr`'s conformance tests.
+- **`T_ref` is assumed to be `ceil(ref_seconds × 12.5)`** in the worked example. The exact
+  reference-frame count comes from the codec encoder's framing, which is OQ-7's territory; it scales
+  the numbers above but changes no structural conclusion.
