@@ -871,3 +871,84 @@ mod tests {
         assert!(index.view("missing", &buffer).is_none());
     }
 }
+
+/// A checkpoint held open as a read-only memory mapping, with its directory parsed.
+///
+/// This is the loading entry point the engine uses. It pairs the mapping with the index so callers
+/// cannot accidentally pass a different buffer to [`SafetensorsIndex::view`], and it keeps the
+/// zero-copy property end to end: the bytes are never read into an owned buffer, only addressed.
+///
+/// The `unsafe` needed to map a file lives in `ftts-kernels`; this crate stays `forbid(unsafe_code)`
+/// and only ever sees the `&[u8]` that mapping hands out.
+#[derive(Debug)]
+pub struct SafetensorsFile {
+    mapping: ftts_kernels::mmap::MappedFile,
+    index: SafetensorsIndex,
+}
+
+impl SafetensorsFile {
+    /// Map a checkpoint and parse its directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenError::Io`] if the file cannot be opened or mapped, or [`OpenError::Weights`]
+    /// if the directory is malformed — the latter naming the offending tensor.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, OpenError> {
+        let mapping = ftts_kernels::mmap::MappedFile::open(path).map_err(OpenError::Io)?;
+        let index = SafetensorsIndex::parse(mapping.as_slice()).map_err(OpenError::Weights)?;
+        Ok(Self { mapping, index })
+    }
+
+    /// Advise the kernel that access to this checkpoint is sparse and random.
+    ///
+    /// Appropriate for a checkpoint dominated by the cold text embedding, where prefill touches a
+    /// few hundred scattered rows out of 151 936 and read-ahead would fault in pages we never read.
+    pub fn advise_random(&self) {
+        self.mapping.advise_random();
+    }
+
+    /// The parsed directory.
+    #[must_use]
+    pub const fn index(&self) -> &SafetensorsIndex {
+        &self.index
+    }
+
+    /// Mapped size in bytes.
+    #[must_use]
+    pub const fn mapped_len(&self) -> usize {
+        self.mapping.len()
+    }
+
+    /// Borrow one tensor for reading.
+    #[must_use]
+    pub fn view(&self, name: &str) -> Option<TensorView<'_>> {
+        self.index.view(name, self.mapping.as_slice())
+    }
+}
+
+/// Why opening a checkpoint failed.
+#[derive(Debug)]
+pub enum OpenError {
+    /// The file could not be opened or mapped.
+    Io(std::io::Error),
+    /// The file mapped but its directory is not a valid safetensors header.
+    Weights(WeightsError),
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "cannot open checkpoint: {error}"),
+            Self::Weights(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Weights(error) => Some(error),
+        }
+    }
+}

@@ -792,6 +792,7 @@ name = "ftts-artifacts"
 version = "0.1.0"
 dependencies = [
  "ftts-core",
+ "ftts-kernels",
  "serde_json",
 ]
 
@@ -830,6 +831,7 @@ dependencies = [
  "ft-core",
  "ft-kernel-cpu",
  "ft-serialize",
+ "libc",
 ]
 
 [[package]]

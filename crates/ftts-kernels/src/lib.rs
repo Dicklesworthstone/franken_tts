@@ -5,5 +5,7 @@
 //! Every future unsafe kernel must be feature-gated, carry a `SAFETY:` comment,
 //! and retain a bit-identical safe scalar fallback.
 
+pub mod mmap;
+
 /// Identifies this crate's scaffold revision.
 pub const SCAFFOLD_REVISION: u8 = 1;

@@ -10,3 +10,4 @@ repository.workspace = true
 ft-core.workspace = true
 ft-kernel-cpu.workspace = true
 ft-serialize.workspace = true
+libc = "0.2"
