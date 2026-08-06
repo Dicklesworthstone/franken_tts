@@ -257,6 +257,74 @@ pub fn talker_kv_bytes(
         })
 }
 
+/// The engine-held half of an admission decision: everything known before the text arrives.
+///
+/// Split from [`AdmissionRequest`] because the two halves are known at different times. The budget,
+/// frame cap, and resident footprint are properties of the *engine*; only `prompt_tokens` depends on
+/// the request, and it is not known until after tokenization. Keeping them apart is what lets the
+/// engine run admission at the one correct seam — after `prepare`, before any allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionPolicy {
+    /// Ceiling on predicted peak memory for one utterance.
+    pub budget_bytes: u64,
+    /// Frame cap applied to every request.
+    pub max_new_tokens: u64,
+    /// Precision the KV cache is held at.
+    pub kv_dtype: KvDtype,
+    /// Codec conv ring buffers.
+    pub ring_buffer_bytes: u64,
+    /// Resident model weights.
+    pub weights_resident_bytes: u64,
+}
+
+/// Default utterance memory budget: 2 GiB.
+///
+/// Chosen so the common 8,192-frame cap (952 MiB of talker KV at a 512-token prompt) fits with
+/// room for weights, rather than as a round number. Override with `FTTS_MEMORY_BUDGET_MB`.
+pub const DEFAULT_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Default frame cap: 8,192 frames ≈ 655 seconds at 12.5 frames/s.
+pub const DEFAULT_MAX_NEW_TOKENS: u64 = 8_192;
+
+impl Default for AdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            budget_bytes: DEFAULT_BUDGET_BYTES,
+            max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
+            kv_dtype: KvDtype::Bf16,
+            // Phase 0 has no codec rings and no resident weights yet. Zero is the honest value:
+            // an invented placeholder would make the prediction look complete while being wrong,
+            // and these terms are bounded, so they are added when the components that own them land.
+            ring_buffer_bytes: 0,
+            weights_resident_bytes: 0,
+        }
+    }
+}
+
+impl AdmissionPolicy {
+    /// Completes the policy into a decidable request, given the tokenized prompt length.
+    #[must_use]
+    pub const fn request_for(&self, prompt_tokens: u64) -> AdmissionRequest {
+        AdmissionRequest {
+            prompt_tokens,
+            max_new_tokens: self.max_new_tokens,
+            kv_dtype: self.kv_dtype,
+            ring_buffer_bytes: self.ring_buffer_bytes,
+            weights_resident_bytes: self.weights_resident_bytes,
+            budget_bytes: self.budget_bytes,
+        }
+    }
+
+    /// Runs admission for a tokenized prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`AdmissionRejection`]; the caller must then allocate nothing.
+    pub fn admit(&self, prompt_tokens: u64) -> Result<AdmissionPlan, AdmissionRejection> {
+        admit(&self.request_for(prompt_tokens))
+    }
+}
+
 /// Decides whether a request may proceed, computing the full prediction either way.
 ///
 /// # Errors

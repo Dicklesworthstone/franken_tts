@@ -50,6 +50,8 @@ pub struct EngineConfig {
     pub synthesis_stage_budget: Duration,
     /// Maximum wall time for one enrollment CPU stage.
     pub enroll_stage_budget: Duration,
+    /// Predicted-peak-memory policy applied to every synthesis request.
+    pub admission: admission::AdmissionPolicy,
 }
 
 impl Default for EngineConfig {
@@ -58,6 +60,7 @@ impl Default for EngineConfig {
             stream_queue_capacity: DEFAULT_QUEUE_CAPACITY,
             synthesis_stage_budget: DEFAULT_SYNTHESIS_BUDGET,
             enroll_stage_budget: DEFAULT_ENROLL_BUDGET,
+            admission: admission::AdmissionPolicy::default(),
         }
     }
 }
@@ -73,6 +76,14 @@ impl EngineConfig {
             "FTTS_STAGE_BUDGET_ENROLL_MS",
             config.enroll_stage_budget,
         );
+        // An unparseable or zero value keeps the documented default rather than creating an
+        // unbounded budget, matching the stage-budget policy above: a configuration mistake must
+        // never silently remove a limit.
+        config.admission.budget_bytes = positive_u64_from_environment("FTTS_MEMORY_BUDGET_MB")
+            .and_then(|megabytes| megabytes.checked_mul(1024 * 1024))
+            .unwrap_or(config.admission.budget_bytes);
+        config.admission.max_new_tokens = positive_u64_from_environment("FTTS_MAX_FRAMES")
+            .unwrap_or(config.admission.max_new_tokens);
         config
     }
 
@@ -89,6 +100,14 @@ impl EngineConfig {
         }
         Ok(())
     }
+}
+
+/// Reads a strictly positive `u64` from the environment, or `None` when unset or unusable.
+fn positive_u64_from_environment(name: &str) -> Option<u64> {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn stage_budget_from_environment(name: &str, fallback: Duration) -> Duration {
@@ -489,8 +508,23 @@ pub enum HealthEvent {
 /// Lifecycle information delivered to a caller-owned observer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SynthesisEvent {
-    /// Admission outcome before model work begins.
+    /// Concurrency admission outcome before model work begins.
     Admission { accepted: bool },
+    /// Resource admission outcome: the predicted peak memory for this utterance.
+    ///
+    /// Distinct from [`SynthesisEvent::Admission`], which is the one-live-synthesis lease. Emitted
+    /// for accepted and rejected requests alike, so a capacity problem is visible in the event
+    /// stream rather than only in an error string.
+    ResourceAdmission {
+        /// Whether the request was admitted.
+        admitted: bool,
+        /// Frames the request may generate.
+        predicted_max_frames: u64,
+        /// Predicted peak bytes for the utterance.
+        predicted_peak_bytes: u64,
+        /// The budget it was measured against.
+        budget_bytes: u64,
+    },
     /// A CPU stage started.
     StageStarted { stage: EngineStage },
     /// A CPU stage completed within its budget.
@@ -549,6 +583,11 @@ pub enum EngineError {
     QueueTimeout,
     /// The model-specific text preparer rejected the request.
     TextPreparation(TextPreparationError),
+    /// Predicted peak memory for this utterance exceeded the budget.
+    ///
+    /// Raised **before** any KV or codec state is allocated, so a rejected request has committed
+    /// nothing and the caller can retry with shorter text or a different cap.
+    ResourceAdmission(admission::AdmissionRejection),
     /// Engine construction received an invalid setting.
     InvalidConfiguration(&'static str),
     /// The owned runtime could not be constructed.
@@ -564,6 +603,12 @@ impl fmt::Display for EngineError {
             Self::StreamDisconnected(kind) => write!(formatter, "{kind:?} stream disconnected"),
             Self::QueueTimeout => formatter.write_str("bounded queue receive timed out"),
             Self::TextPreparation(error) => write!(formatter, "text preparation failed: {error}"),
+            Self::ResourceAdmission(rejection) => {
+                write!(
+                    formatter,
+                    "resource admission refused the request: {rejection}"
+                )
+            }
             Self::InvalidConfiguration(message) => formatter.write_str(message),
             Self::Runtime(message) => write!(formatter, "runtime initialization failed: {message}"),
         }
@@ -626,6 +671,32 @@ impl TtsEngine {
                 normalization: prepared.normalization_trace.summary(),
             });
         }
+
+        // Resource admission sits exactly here, and the position is the point: after tokenization
+        // (the prompt length is not knowable before it) and before any stage runs. A request that
+        // cannot fit is refused having allocated nothing — never discovered halfway through a long
+        // generation. See `admission` for the OQ-6 rule.
+        let prompt_tokens = prepared.token_ids.len() as u64;
+        match self.config.admission.admit(prompt_tokens) {
+            Ok(plan) => observer.on_event(SynthesisEvent::ResourceAdmission {
+                admitted: true,
+                predicted_max_frames: plan.predicted_max_frames,
+                predicted_peak_bytes: plan.predicted_peak_bytes,
+                budget_bytes: plan.budget_bytes,
+            }),
+            Err(rejection) => {
+                if let admission::AdmissionRejection::BudgetExceeded { plan } = rejection {
+                    observer.on_event(SynthesisEvent::ResourceAdmission {
+                        admitted: false,
+                        predicted_max_frames: plan.predicted_max_frames,
+                        predicted_peak_bytes: plan.predicted_peak_bytes,
+                        budget_bytes: plan.budget_bytes,
+                    });
+                }
+                return Err(EngineError::ResourceAdmission(rejection));
+            }
+        }
+
         self.run_stage(
             EngineStage::Synthesis,
             self.config.synthesis_stage_budget,
@@ -824,20 +895,99 @@ mod tests {
         assert_eq!(result.generated_frames, 0);
         assert_eq!(result.prepared_token_count, 2);
         let events = observer.events();
-        assert!(matches!(
-            events.as_slice(),
-            [
-                SynthesisEvent::Admission { accepted: true },
-                SynthesisEvent::StageStarted {
-                    stage: EngineStage::Synthesis,
-                },
-                SynthesisEvent::StageFinished {
-                    stage: EngineStage::Synthesis,
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    SynthesisEvent::Admission { accepted: true },
+                    // Resource admission runs after tokenization and before the first stage.
+                    SynthesisEvent::ResourceAdmission { admitted: true, .. },
+                    SynthesisEvent::StageStarted {
+                        stage: EngineStage::Synthesis,
+                    },
+                    SynthesisEvent::StageFinished {
+                        stage: EngineStage::Synthesis,
+                        ..
+                    },
+                    SynthesisEvent::FrameProgress { frame: 0 },
+                ]
+            ),
+            "unexpected event sequence: {events:?}"
+        );
+    }
+
+    /// The load-bearing promise: an unaffordable request is refused having allocated nothing.
+    ///
+    /// Proven by the *absence* of any stage event — if a stage had started, work would already have
+    /// been committed, which is the "died halfway through" failure admission exists to prevent.
+    #[test]
+    fn an_unaffordable_request_is_refused_before_any_stage_runs() {
+        let mut config = EngineConfig {
+            synthesis_stage_budget: Duration::from_secs(1),
+            ..EngineConfig::default()
+        };
+        // A budget far below even the bounded per-utterance state.
+        config.admission.budget_bytes = 1;
+        let engine = TtsEngine::new(config).expect("engine builds");
+        let cancellation = CancellationToken::new();
+        let observer = RecordingObserver::default();
+
+        let error = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &cancellation,
+                &observer,
+            )
+            .expect_err("an unaffordable request must be refused");
+
+        assert!(
+            matches!(error, EngineError::ResourceAdmission(_)),
+            "got {error}"
+        );
+
+        let events = observer.events();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                SynthesisEvent::StageStarted { .. }
+                    | SynthesisEvent::StageFinished { .. }
+                    | SynthesisEvent::FrameProgress { .. }
+            )),
+            "a refused request must not start any stage; got {events:?}"
+        );
+        // The rejection is visible in the stream, not only in the error string.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SynthesisEvent::ResourceAdmission {
+                    admitted: false,
                     ..
-                },
-                SynthesisEvent::FrameProgress { frame: 0 },
-            ]
-        ));
+                }
+            )),
+            "a capacity refusal must appear in the event stream: {events:?}"
+        );
+    }
+
+    #[test]
+    fn the_admission_policy_is_configurable_and_defaults_are_documented() {
+        let config = EngineConfig::default();
+        assert_eq!(
+            config.admission.budget_bytes,
+            admission::DEFAULT_BUDGET_BYTES
+        );
+        assert_eq!(
+            config.admission.max_new_tokens,
+            admission::DEFAULT_MAX_NEW_TOKENS
+        );
+        // The default policy must admit the ordinary case it was sized for: an 8192-frame cap at a
+        // 512-token prompt is 952 MiB of talker KV, which has to fit inside the 2 GiB default.
+        let plan = config
+            .admission
+            .admit(512)
+            .expect("the documented default must admit its own worked case");
+        assert_eq!(plan.predicted_max_frames, admission::DEFAULT_MAX_NEW_TOKENS);
+        assert!(plan.fits());
     }
 
     #[test]
