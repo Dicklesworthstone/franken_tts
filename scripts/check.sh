@@ -13,7 +13,7 @@
 # a skipped check is never presented as passing).
 #
 # Environment:
-#   FTTS_CHECK_NO_RCH=1     bypass the remote compilation helper, run cargo locally
+#   FTTS_CHECK_USE_RCH=1    offload cargo to remote workers — SEE THE WARNING BELOW
 #   FTTS_CHECK_UBS_TIMEOUT  seconds to bound `ubs --diff` (default 300)
 #
 # Exit 0 = every required stage passed. Exit 1 = a stage failed.
@@ -56,13 +56,22 @@ stage_fail() {
     exit 1
 }
 
-# Heavy cargo work is offloaded to remote workers when the helper is available; rch fails open
-# to a local build, so this is transparent either way.
+# The gate runs cargo LOCALLY by default, and that is a deliberate correctness call.
+#
+# This workspace consumes `../asupersync` and `/dp/frankentorch/crates/*` as PATH dependencies,
+# which live outside the repository. rch syncs the repo to a worker but the worker resolves
+# those out-of-tree paths against its OWN checkouts — observed 2026-08-06: a remote gate run
+# compiled `/data/projects/asupersync` on the worker while the developer's tree pointed at a
+# newer local copy, so the remote reported on source that was never in front of anyone.
+#
+# A gate that validates different source than you have is worse than a slow gate (G1 > G2), so
+# remote offload is opt-in. Use it for exploratory builds, not for the gate, until rch can pin
+# out-of-tree path deps.
 CARGO_RUNNER=(cargo)
 CARGO_MODE="local cargo"
-if [[ -z "${FTTS_CHECK_NO_RCH:-}" ]] && command -v rch >/dev/null 2>&1; then
+if [[ -n "${FTTS_CHECK_USE_RCH:-}" ]] && command -v rch >/dev/null 2>&1; then
     CARGO_RUNNER=(rch exec -- cargo)
-    CARGO_MODE="rch exec (falls open to local)"
+    CARGO_MODE="rch exec (OPT-IN: worker resolves out-of-tree path deps against ITS OWN checkouts)"
 fi
 
 run_cargo() { "${CARGO_RUNNER[@]}" "$@"; }

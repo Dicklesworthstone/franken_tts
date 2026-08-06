@@ -336,7 +336,10 @@ mod tests {
                     *slot = 5.0;
                 }
                 let comparison = compare_f32(&expected, &actual, 1e-6);
-                assert!(!comparison.holds(), "len={len} divergent={divergent} should fail");
+                assert!(
+                    !comparison.holds(),
+                    "len={len} divergent={divergent} should fail"
+                );
                 let report = describe_failure("seam", &comparison, 1e-6, "test", None);
                 assert!(
                     report.contains("hint:"),

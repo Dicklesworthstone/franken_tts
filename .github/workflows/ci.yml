@@ -89,10 +89,10 @@ jobs:
       # ubs is not available on a hosted runner. check.sh reports that stage as SKIP and closes
       # with GREEN WITH SKIPS rather than pretending the scan ran — see AGENTS.md Doctrine #0.4.
       # ubs is enforced locally before every commit.
+      # check.sh runs cargo locally by default (rch offload is opt-in, and rch is not present on
+      # a hosted runner anyway).
       - name: Run the gate
         working-directory: frankentts
-        env:
-          FTTS_CHECK_NO_RCH: "1"
         run: ./scripts/check.sh
 
   cross:

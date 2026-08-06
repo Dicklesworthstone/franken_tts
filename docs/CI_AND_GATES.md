@@ -131,6 +131,36 @@ If either sibling repository is private, CI needs a `SIBLING_REPO_TOKEN` secret 
 The workflow falls back to `github.token`, which only works while the repos are public — and it
 fails loudly at the mount step rather than proceeding with a broken tree.
 
+### Why the pinning matters — a worked example
+
+On 2026-08-06 the shared local checkout of `../asupersync` moved from `385347d0a` to `801c94251`
+mid-session. The newer commit does not compile (`E0282: type annotations needed` in
+`src/config.rs`), so **every** franken_tts cargo stage went red at once, with no diff in this
+repository to explain it. Nothing here changed; the ground moved.
+
+CI is immune to that class of failure precisely because it pins. The local developer workflow is
+not: `../asupersync` and `/dp/frankentorch` are whatever is on your disk right now. When the
+cargo stages fail on code you did not touch, check the siblings first:
+
+```bash
+git -C ../asupersync log --oneline -1
+git -C /dp/frankentorch log --oneline -1
+```
+
+and compare against `ASUPERSYNC_REF` / `FRANKENTORCH_REF` in the workflow.
+
+### Do not run the gate through rch
+
+`scripts/check.sh` runs cargo **locally** by default. rch offload is opt-in via
+`FTTS_CHECK_USE_RCH=1`, and should not be used for the gate.
+
+rch syncs this repository to a worker, but the worker resolves the out-of-tree path dependencies
+against **its own** checkouts. Observed 2026-08-06: a remote gate run compiled
+`/data/projects/asupersync` on worker `ovh-a` while the developer's tree pointed at a different
+local copy — so the remote passed and failed on source nobody was looking at. A gate that
+validates different source than you have is worse than a slow gate (G1 > G2). Use rch for
+exploratory builds; run the gate locally until rch can pin out-of-tree path deps.
+
 ### Status: not yet observed running
 
 > The workflow is committed and its YAML parses, and `scripts/check.sh` is verified green
