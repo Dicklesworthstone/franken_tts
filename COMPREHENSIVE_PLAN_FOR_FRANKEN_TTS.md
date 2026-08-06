@@ -785,7 +785,7 @@ The v2 review recommends splitting the plan; we adopt it as **generated delivera
 
 ### 16.4 The path to beads — evidence gates, not round counts (v2)
 
-**Not yet — but the review-round condition is now satisfied** (round 2, the Grok hardness patch, is integrated as v2.1; further prose rounds are optional). Beads conversion happens after the evidence gates below, which replace v1's arbitrary "≥4 review rounds / 4–6 polish rounds":
+**STATUS UPDATE (2026-08-05): the conversion has been executed** — by owner decision, the full graph now lives in `.beads/` (15 epics + 106 tasks, slug-embedded IDs prefixed `frankentts-`, multiple polish rounds applied; start with `br ready`). The evidence gates below therefore now gate the **execution of kernel-implementation beads**, not the conversion itself — a kernel bead may be *picked up* only when its component's gates are green (the graph encodes this as dependencies on the −1A/−1B beads):
 
 - model graph reconciled with pinned source (−1A green for the component);
 - cost model generated (−1B);

@@ -242,7 +242,7 @@ br dep add <issue> <depends-on>
 br sync --flush-only     # export to JSONL (NO git ops)
 ```
 
-Conventions: use the bead ID (e.g. `br-123`) as the Agent-Mail `thread_id` and prefix subjects with `[br-123]`; put the issue ID in the file-reservation `reason`; include `br-###` in commit messages.
+Conventions: this project's bead IDs are slug-embedded with prefix `frankentts-` (e.g. `frankentts-k-rcd-engine-6e3`). Use the full bead ID as the Agent-Mail `thread_id` and prefix subjects with it in brackets; put the issue ID in the file-reservation `reason`; include the bead ID in commit messages.
 
 ---
 

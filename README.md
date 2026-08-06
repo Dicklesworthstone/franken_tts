@@ -16,7 +16,7 @@ This repository currently contains the engineering plan and its full work graph:
 
 - **[COMPREHENSIVE_PLAN_FOR_FRANKEN_TTS.md](COMPREHENSIVE_PLAN_FOR_FRANKEN_TTS.md)** — the master plan (v2.1, two external review rounds integrated)
 - **[AGENTS.md](AGENTS.md)** — the engineering doctrine for AI coding agents working here
-- **`.beads/`** — 121 dependency-wired issues (15 epics, 106 tasks, 372 edges) tracked with [beads_rust](https://github.com/Dicklesworthstone/beads_rust); start with `br ready`
+- **`.beads/`** — the full dependency-wired work graph (15 epics + 106 granular tasks, self-documenting) tracked with [beads_rust](https://github.com/Dicklesworthstone/beads_rust); start with `br ready`
 
 Planned shape: a `ftts` single binary + embeddable Rust library; `.fttsq` portable quantized weights + `.fttspack` per-machine kernel caches; `.ftvoice` voice packs with consent/provenance metadata; two conformance contracts (bit-exact vs. production-quality with blind-listening gates); execution profiles from interactive laptop latency to continuous-batching server throughput.
 
