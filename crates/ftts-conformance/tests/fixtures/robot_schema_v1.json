@@ -1,0 +1,709 @@
+{
+  "environment_variables": [
+    "FTTS_MODEL_DIR",
+    "FTTS_THREADS",
+    "FTTS_PROFILE",
+    "FTTS_PACKET_FRAMES",
+    "FTTS_MATH_MODE",
+    "FTTS_QUANT",
+    "FTTS_FORCE_ARCH",
+    "FTTS_NUMA",
+    "FTTS_STAGE_BUDGET_SYNTHESIS_MS",
+    "FTTS_STAGE_BUDGET_ENROLL_MS"
+  ],
+  "event": "robot_schema",
+  "events": [
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "run_id",
+          "required": true,
+          "summary": "correlates the events of one run",
+          "type": "string"
+        },
+        {
+          "name": "command",
+          "required": true,
+          "summary": "subcommand being run",
+          "type": "string"
+        },
+        {
+          "name": "profile",
+          "required": true,
+          "summary": "execution profile in force",
+          "type": "string"
+        },
+        {
+          "name": "packet_frames",
+          "required": true,
+          "summary": "streaming packet size",
+          "type": "string"
+        },
+        {
+          "name": "math_mode",
+          "required": true,
+          "summary": "strict or fast",
+          "type": "string"
+        },
+        {
+          "name": "stateless",
+          "required": true,
+          "summary": "true unless durable tracing was opted into",
+          "type": "bool"
+        },
+        {
+          "name": "seed",
+          "required": true,
+          "summary": "sampler seed, null when unset",
+          "type": "u64|null"
+        },
+        {
+          "name": "model",
+          "required": true,
+          "summary": "resolved model artifact, null before resolution",
+          "type": "string|null"
+        },
+        {
+          "name": "voice",
+          "required": true,
+          "summary": "resolved voice pack, null when none",
+          "type": "string|null"
+        }
+      ],
+      "kind": "stream",
+      "name": "run_start",
+      "stream": "events",
+      "summary": "opens every run; every later event in the run repeats its run_id"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "run_id",
+          "required": true,
+          "summary": "owning run",
+          "type": "string"
+        },
+        {
+          "name": "name",
+          "required": true,
+          "summary": "stage name",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonic index within the run",
+          "type": "u64"
+        },
+        {
+          "name": "state",
+          "required": true,
+          "summary": "started or finished",
+          "type": "string"
+        },
+        {
+          "name": "elapsed_ms",
+          "required": true,
+          "summary": "milliseconds since run_start",
+          "type": "u64"
+        },
+        {
+          "name": "budget_ms",
+          "required": true,
+          "summary": "stage budget, null when unbounded",
+          "type": "u64|null"
+        }
+      ],
+      "kind": "stream",
+      "name": "stage",
+      "stream": "events",
+      "summary": "one pipeline stage began or ended"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "run_id",
+          "required": true,
+          "summary": "owning run",
+          "type": "string"
+        },
+        {
+          "name": "index",
+          "required": true,
+          "summary": "frames emitted so far",
+          "type": "u64"
+        },
+        {
+          "name": "total_estimate",
+          "required": true,
+          "summary": "predicted total, null when unknown",
+          "type": "u64|null"
+        },
+        {
+          "name": "elapsed_ms",
+          "required": true,
+          "summary": "milliseconds since run_start",
+          "type": "u64"
+        }
+      ],
+      "kind": "stream",
+      "name": "frame",
+      "stream": "events",
+      "summary": "coarse decode progress; throttled, never one per frame"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "run_id",
+          "required": true,
+          "summary": "owning run",
+          "type": "string"
+        },
+        {
+          "name": "byte_offset",
+          "required": true,
+          "summary": "offset of this chunk within the stream",
+          "type": "u64"
+        },
+        {
+          "name": "bytes",
+          "required": true,
+          "summary": "chunk length in bytes",
+          "type": "u64"
+        },
+        {
+          "name": "duration_ms",
+          "required": true,
+          "summary": "audio duration of this chunk",
+          "type": "u64"
+        },
+        {
+          "name": "packet_frames",
+          "required": true,
+          "summary": "packet size that produced it",
+          "type": "string"
+        },
+        {
+          "name": "sink",
+          "required": true,
+          "summary": "where the PCM went: file, fd, or stdout",
+          "type": "string"
+        }
+      ],
+      "kind": "stream",
+      "name": "audio_chunk",
+      "stream": "events",
+      "summary": "PCM was written to the sink; the bytes themselves never appear here"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "status",
+          "required": true,
+          "summary": "coarse readiness state",
+          "type": "string"
+        },
+        {
+          "name": "model_loaded",
+          "required": true,
+          "summary": "whether a model artifact is resident",
+          "type": "bool"
+        },
+        {
+          "name": "model_present",
+          "required": true,
+          "summary": "artifact found by magic-bytes sniff, never a tensor load",
+          "type": "bool"
+        },
+        {
+          "name": "model_path",
+          "required": true,
+          "summary": "resolved artifact path when present",
+          "type": "string|null"
+        },
+        {
+          "name": "model_dir",
+          "required": true,
+          "summary": "FTTS_MODEL_DIR as configured, null when unset",
+          "type": "string|null"
+        },
+        {
+          "name": "searched",
+          "required": true,
+          "summary": "every directory consulted; makes resolution failures actionable",
+          "type": "array"
+        },
+        {
+          "name": "stateless_default",
+          "required": true,
+          "summary": "no synthesis history is persisted by default",
+          "type": "bool"
+        },
+        {
+          "name": "threads",
+          "required": true,
+          "summary": "configured worker count, null when unset",
+          "type": "u64|null"
+        },
+        {
+          "name": "recommended_command",
+          "required": true,
+          "summary": "next actionable command",
+          "type": "string"
+        }
+      ],
+      "kind": "reply",
+      "name": "health",
+      "stream": "events",
+      "summary": "readiness snapshot; also answers `robot health`"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "run_id",
+          "required": true,
+          "summary": "owning run",
+          "type": "string"
+        },
+        {
+          "name": "exit_code",
+          "required": true,
+          "summary": "process exit code this run will produce",
+          "type": "u8"
+        },
+        {
+          "name": "elapsed_ms",
+          "required": true,
+          "summary": "total run duration",
+          "type": "u64"
+        },
+        {
+          "name": "frames",
+          "required": true,
+          "summary": "frames produced",
+          "type": "u64"
+        },
+        {
+          "name": "audio_bytes",
+          "required": true,
+          "summary": "PCM bytes written",
+          "type": "u64"
+        }
+      ],
+      "kind": "stream",
+      "name": "run_complete",
+      "stream": "events",
+      "summary": "closes a successful run"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "run_id",
+          "required": true,
+          "summary": "owning run",
+          "type": "string"
+        },
+        {
+          "name": "exit_code",
+          "required": true,
+          "summary": "process exit code; matches the stable table in `robot schema`",
+          "type": "u8"
+        },
+        {
+          "name": "kind",
+          "required": true,
+          "summary": "stable error class",
+          "type": "string"
+        },
+        {
+          "name": "message",
+          "required": true,
+          "summary": "what went wrong",
+          "type": "string"
+        },
+        {
+          "name": "remediation",
+          "required": true,
+          "summary": "the concrete next command to try",
+          "type": "string"
+        },
+        {
+          "name": "elapsed_ms",
+          "required": true,
+          "summary": "run duration before the failure",
+          "type": "u64"
+        }
+      ],
+      "kind": "stream",
+      "name": "run_error",
+      "stream": "stderr",
+      "summary": "closes a failed run and carries the exit code the process will return"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "run_id",
+          "required": true,
+          "summary": "owning run",
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "required": true,
+          "summary": "resolved model artifact",
+          "type": "string"
+        },
+        {
+          "name": "voice",
+          "required": true,
+          "summary": "resolved voice pack",
+          "type": "string|null"
+        },
+        {
+          "name": "profile",
+          "required": true,
+          "summary": "execution profile",
+          "type": "string"
+        },
+        {
+          "name": "packet_frames",
+          "required": true,
+          "summary": "streaming packet size",
+          "type": "string"
+        },
+        {
+          "name": "math_mode",
+          "required": true,
+          "summary": "strict or fast",
+          "type": "string"
+        },
+        {
+          "name": "voice_pack",
+          "required": true,
+          "summary": "voice-pack privacy profile",
+          "type": "string"
+        },
+        {
+          "name": "normalize",
+          "required": true,
+          "summary": "text-transformation mode",
+          "type": "string"
+        },
+        {
+          "name": "seed",
+          "required": true,
+          "summary": "sampler seed",
+          "type": "u64|null"
+        },
+        {
+          "name": "trace",
+          "required": true,
+          "summary": "opt-in trace path",
+          "type": "string|null"
+        },
+        {
+          "name": "output",
+          "required": true,
+          "summary": "audio sink path",
+          "type": "string|null"
+        },
+        {
+          "name": "admission",
+          "required": true,
+          "summary": "resource-admission decision",
+          "type": "object"
+        }
+      ],
+      "kind": "reply",
+      "name": "check_complete",
+      "stream": "events",
+      "summary": "answers `say --check`: resolution and admission without synthesis"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "events",
+          "required": true,
+          "summary": "every object type this binary can emit",
+          "type": "array"
+        },
+        {
+          "name": "stdout_contract",
+          "required": true,
+          "summary": "what owns stdout",
+          "type": "string"
+        },
+        {
+          "name": "raw_stream_contract",
+          "required": true,
+          "summary": "stream split under --stream raw",
+          "type": "string"
+        },
+        {
+          "name": "environment_variables",
+          "required": true,
+          "summary": "recognised environment",
+          "type": "array"
+        },
+        {
+          "name": "exit_codes",
+          "required": true,
+          "summary": "stable exit-code table",
+          "type": "object"
+        }
+      ],
+      "kind": "reply",
+      "name": "robot_schema",
+      "stream": "events",
+      "summary": "answers `robot schema`: this catalogue, machine-readably"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "available",
+          "required": true,
+          "summary": "kernel tiers this build can dispatch",
+          "type": "array"
+        },
+        {
+          "name": "dispatched",
+          "required": true,
+          "summary": "tier actually selected, null before selection",
+          "type": "string|null"
+        },
+        {
+          "name": "isa_features",
+          "required": true,
+          "summary": "CPU features detected at runtime",
+          "type": "array"
+        },
+        {
+          "name": "kernel_plan",
+          "required": true,
+          "summary": "autotuned plan identity, null when unpacked",
+          "type": "string|null"
+        },
+        {
+          "name": "pool_sizing",
+          "required": true,
+          "summary": "USL-derived worker counts, null when unmeasured",
+          "type": "object|null"
+        },
+        {
+          "name": "force_arch",
+          "required": true,
+          "summary": "FTTS_FORCE_ARCH override",
+          "type": "string|null"
+        }
+      ],
+      "kind": "reply",
+      "name": "backends",
+      "stream": "events",
+      "summary": "answers `robot backends`: detected ISA tier, kernel plan, pool sizing"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "status",
+          "required": true,
+          "summary": "passed, failed, or skipped",
+          "type": "string"
+        },
+        {
+          "name": "reason",
+          "required": true,
+          "summary": "why it skipped; null when it ran",
+          "type": "string|null"
+        },
+        {
+          "name": "checks",
+          "required": true,
+          "summary": "per-check outcomes",
+          "type": "array"
+        }
+      ],
+      "kind": "reply",
+      "name": "selftest",
+      "stream": "events",
+      "summary": "answers `robot selftest`: shipped kernel proofs, including the i32-overflow rows"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "path",
+          "required": true,
+          "summary": "voice pack inspected",
+          "type": "string"
+        },
+        {
+          "name": "status",
+          "required": true,
+          "summary": "inspection outcome",
+          "type": "string"
+        }
+      ],
+      "kind": "reply",
+      "name": "voice_inspect",
+      "stream": "events",
+      "summary": "answers `voice inspect`"
+    }
+  ],
+  "exit_codes": {
+    "0": "success",
+    "1": "generic error",
+    "2": "usage or CLI error",
+    "3": "model not found or not resolvable",
+    "4": "input error",
+    "5": "budget or timeout exceeded",
+    "6": "cancelled",
+    "7": "artifact format or version mismatch",
+    "8": "enrollment-quality refusal"
+  },
+  "raw_stream_contract": "under `say --stream raw`, PCM owns stdout and every event goes to stderr; the two are never interleaved on one stream",
+  "schema_version": 1,
+  "stdout_contract": "one JSON object per line; stdout carries events unless `say --stream raw` gives stdout to PCM"
+}

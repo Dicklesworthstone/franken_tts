@@ -26,6 +26,24 @@ use crate::error::FttsExitCode;
 /// Version carried by every emitted object. Bump deliberately; the frozen fixture will fail.
 pub const SCHEMA_VERSION: u8 = 1;
 
+/// Environment recognised by the CLI, as reported by `robot schema`.
+///
+/// It lives beside the catalogue rather than in `lib.rs` because it is part of the promised
+/// agent-facing contract, and the frozen fixture pins it: adding a variable without documenting
+/// it here fails the contract test.
+pub const DOCUMENTED_ENVIRONMENT: &[&str] = &[
+    "FTTS_MODEL_DIR",
+    "FTTS_THREADS",
+    "FTTS_PROFILE",
+    "FTTS_PACKET_FRAMES",
+    "FTTS_MATH_MODE",
+    "FTTS_QUANT",
+    "FTTS_FORCE_ARCH",
+    "FTTS_NUMA",
+    "FTTS_STAGE_BUDGET_SYNTHESIS_MS",
+    "FTTS_STAGE_BUDGET_ENROLL_MS",
+];
+
 /// Which stream an object is written to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stream {
