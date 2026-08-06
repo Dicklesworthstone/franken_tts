@@ -5,7 +5,7 @@
 //! that Mistral pre-tokenizer, not the Qwen-native expression.  Keep the
 //! native expression available only as an explicit, visible experiment.
 
-use std::{cmp::Reverse, collections::HashMap, env, fmt, str::FromStr};
+use std::{cmp::Reverse, collections::HashMap, env, fmt, ops::Range, str::FromStr};
 
 use fancy_regex::Regex;
 pub use ftts_core::{
