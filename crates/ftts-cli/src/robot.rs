@@ -397,6 +397,50 @@ pub const EVENTS: &[EventSpec] = &[
         ],
     },
     EventSpec {
+        name: "health_violation",
+        kind: Kind::Stream,
+        stream: Stream::Events,
+        summary: "a runtime-health detector fired mid-run (ftts_core::health)",
+        fields: &[
+            FieldSpec {
+                name: "run_id",
+                ty: "string",
+                required: true,
+                summary: "owning run",
+            },
+            FieldSpec {
+                name: "violation",
+                ty: "string",
+                required: true,
+                summary: "stable violation class, e.g. non_finite or output_silent",
+            },
+            FieldSpec {
+                name: "detail",
+                ty: "string",
+                required: true,
+                summary: "the specific occurrence, including the locating scalars",
+            },
+            FieldSpec {
+                name: "remedy",
+                ty: "string",
+                required: true,
+                summary: "the concrete next action, not a restatement of the problem",
+            },
+            FieldSpec {
+                name: "invalidates_output",
+                ty: "bool",
+                required: true,
+                summary: "false for a kernel demotion or thermal report — those runs are still correct",
+            },
+            FieldSpec {
+                name: "elapsed_ms",
+                ty: "u64",
+                required: true,
+                summary: "milliseconds since run_start",
+            },
+        ],
+    },
+    EventSpec {
         name: "run_error",
         kind: Kind::Stream,
         stream: Stream::Stderr,
@@ -714,6 +758,7 @@ pub enum EventType {
     Health,
     RunComplete,
     RunError,
+    HealthViolation,
     CheckComplete,
     TextPrepared,
     Backends,
@@ -731,6 +776,7 @@ impl EventType {
             Self::Health => "health",
             Self::RunComplete => "run_complete",
             Self::RunError => "run_error",
+            Self::HealthViolation => "health_violation",
             Self::CheckComplete => "check_complete",
             Self::TextPrepared => "text_prepared",
             Self::Backends => "backends",
@@ -932,6 +978,48 @@ fn exit_codes_json() -> BTreeMap<String, String> {
 }
 
 /// The machine-readable self-description emitted by `ftts robot schema`.
+/// Render an engine health signal as its robot event.
+///
+/// The single conversion point between `ftts_core::health` and the wire, so the two crates cannot
+/// disagree about what a violation is called or whether it invalidates the run. The wire strings
+/// and the `invalidates_output` predicate come from the engine types rather than being restated
+/// here — restating them is how a detector and its report drift apart.
+///
+/// `detail` is the violation's `Display`, which carries the locating scalars (which seam, which
+/// index, how many milliseconds), and `remedy` is the action. An agent needs both: the class tells
+/// it what happened, the remedy tells it what to do, and neither substitutes for the other.
+#[must_use]
+pub fn health_violation_event(
+    run_id: &str,
+    event: ftts_core::HealthEvent,
+    elapsed_ms: u64,
+) -> Value {
+    let mut object = EventType::HealthViolation.event();
+    object.insert("run_id".to_owned(), json!(run_id));
+    object.insert("violation".to_owned(), json!(event.as_str()));
+    object.insert(
+        "invalidates_output".to_owned(),
+        json!(event.invalidates_output()),
+    );
+    object.insert("elapsed_ms".to_owned(), json!(elapsed_ms));
+    let (detail, remedy) = match event {
+        ftts_core::HealthEvent::Violation(violation) => (violation.to_string(), violation.remedy()),
+        ftts_core::HealthEvent::BudgetExceeded => (
+            "a stage exceeded its configured budget".to_owned(),
+            "raise FTTS_STAGE_BUDGET_SYNTHESIS_MS or shorten the request; the partial result is \
+             not a completed utterance",
+        ),
+        ftts_core::HealthEvent::Cancelled => (
+            "the run observed cooperative cancellation".to_owned(),
+            "this is the caller's own cancellation taking effect; the audio stops at a frame \
+             boundary and is truncated, not finished",
+        ),
+    };
+    object.insert("detail".to_owned(), json!(detail));
+    object.insert("remedy".to_owned(), json!(remedy));
+    Value::Object(object)
+}
+
 pub fn schema_document(environment_variables: &[&str]) -> Value {
     let events: Vec<Value> = EVENTS
         .iter()

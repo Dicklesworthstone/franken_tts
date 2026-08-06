@@ -717,6 +717,18 @@ fn resolve_existing_file<'a>(path: &'a Path, label: &str) -> Result<&'a Path, Ft
     }
 }
 
+/// Preflight admission for `say --check`, computed by the **engine**, not by the CLI.
+///
+/// This used to be a CLI-local heuristic whose own text said "model-specific KV and memory
+/// admission is pending the V_REL engine". That engine now exists, so the preflight calls
+/// [`ftts_core::admission`] directly. The point is not code reuse: it is that `--check` and the
+/// synthesis that follows it must reach the *same* verdict for the same request. A preflight that
+/// says yes and an engine that then says no is worse than no preflight, because the caller
+/// budgeted on the first answer.
+///
+/// Prompt length is not knowable before tokenization, so `--check` reports the admission decision
+/// for an *estimated* prompt length and labels it as such. The binding decision remains the
+/// engine's, taken after real tokenization.
 fn admission_plan(text: &str, settings: &EffectiveSettings) -> Result<Value, FttsError> {
     if text.len() > SCAFFOLD_ADMISSION_TEXT_LIMIT_BYTES {
         return Err(FttsError::BudgetTimeout(format!(
@@ -727,16 +739,34 @@ fn admission_plan(text: &str, settings: &EffectiveSettings) -> Result<Value, Ftt
     }
 
     let characters = text.chars().count();
-    let predicted_frames_upper_bound = characters.div_ceil(4).max(1);
-    Ok(json!({
-        "status": "scaffold_accepted",
-        "scope": "input bound only; model-specific KV and memory admission is pending the V_REL engine",
-        "text_bytes": text.len(),
-        "text_characters": characters,
-        "predicted_frames_upper_bound": predicted_frames_upper_bound,
-        "packet_frames": settings.packet_frames.as_str(),
-        "profile": settings.profile.as_str(),
-    }))
+    // A deliberately conservative stand-in until the tokenizer is on this path: over-estimating
+    // the prompt can only make the preflight refuse something the engine would admit, which is the
+    // safe direction. Under-estimating would promise capacity that is not there.
+    let estimated_prompt_tokens = u64::try_from(characters).unwrap_or(u64::MAX);
+    // The engine's own env-resolved policy (FTTS_MEMORY_BUDGET_MB / FTTS_MAX_FRAMES), not a copy
+    // of it — a second parse of the same variables is a second thing to drift.
+    let policy = ftts_core::process_engine_config().admission;
+
+    match policy.admit(estimated_prompt_tokens) {
+        Ok(plan) => Ok(json!({
+            "status": "accepted",
+            "scope": "preflight on an ESTIMATED prompt length; the binding decision is the \
+                      engine's, taken after tokenization",
+            "text_bytes": text.len(),
+            "text_characters": characters,
+            "estimated_prompt_tokens": estimated_prompt_tokens,
+            "predicted_max_frames": plan.predicted_max_frames,
+            "predicted_peak_bytes": plan.predicted_peak_bytes,
+            "budget_bytes": plan.budget_bytes,
+            "binding_constraint": plan.binding_constraint.as_str(),
+            "packet_frames": settings.packet_frames.as_str(),
+            "profile": settings.profile.as_str(),
+        })),
+        // AdmissionRejection's Display already carries the shortfall, the binding constraint and
+        // what to do about it, so it is passed through rather than re-summarised into something
+        // less specific.
+        Err(rejection) => Err(FttsError::BudgetTimeout(rejection.to_string())),
+    }
 }
 
 fn run_voice_inspect(path: &Path, stdout: &mut dyn Write) -> Result<(), FttsError> {
@@ -1036,13 +1066,85 @@ mod tests {
         let first = admission_plan("hello", &settings).expect("admission plan");
         let second = admission_plan("hello", &settings).expect("admission plan");
         assert_eq!(first, second);
-        assert_eq!(first["status"], "scaffold_accepted");
+        assert_eq!(first["status"], "accepted");
+        // The preflight is explicit that it estimates the prompt and that the engine decides.
         assert!(
             first["scope"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("pending")
+                .contains("ESTIMATED")
         );
+    }
+
+    #[test]
+    fn the_cli_preflight_and_the_engine_agree_on_the_same_request() {
+        // The property that matters: `--check` saying yes and the engine then saying no is worse
+        // than no preflight, because the caller budgeted on the first answer. Both must be the
+        // same computation, not two implementations of the same rule.
+        let settings = EffectiveSettings {
+            profile: ExecutionProfile::Balanced,
+            packet_frames: PacketFrames::Four,
+            math_mode: MathMode::Strict,
+            voice_pack: VoicePackProfile::Portable,
+            normalize: NormalizeMode::Verbatim,
+        };
+        let text = "a moderately sized utterance for admission";
+        let plan = admission_plan(text, &settings).expect("preflight admits");
+
+        let policy = ftts_core::process_engine_config().admission;
+        let engine = policy
+            .admit(text.chars().count() as u64)
+            .expect("engine admits the same request");
+
+        assert_eq!(plan["predicted_peak_bytes"], engine.predicted_peak_bytes);
+        assert_eq!(plan["predicted_max_frames"], engine.predicted_max_frames);
+        assert_eq!(plan["budget_bytes"], engine.budget_bytes);
+        assert_eq!(
+            plan["binding_constraint"],
+            engine.binding_constraint.as_str()
+        );
+    }
+
+    #[test]
+    fn a_health_violation_renders_as_a_contract_conforming_robot_event() {
+        // The engine-to-wire seam: the violation's class, remedy and invalidates_output must
+        // survive the crossing, and the result must satisfy the frozen robot contract.
+        let silent =
+            ftts_core::HealthEvent::Violation(ftts_core::health::HealthViolation::OutputSilent {
+                silent_millis: 1_500,
+            });
+        let event = robot::health_violation_event("run-1", silent, 42);
+        assert!(
+            robot::validate_event(&event).is_empty(),
+            "{:?}",
+            robot::validate_event(&event)
+        );
+        assert_eq!(event["event"], "health_violation");
+        assert_eq!(event["violation"], "output_silent");
+        assert_eq!(event["invalidates_output"], true);
+        assert!(event["detail"].as_str().expect("detail").contains("1500"));
+        assert!(event["remedy"].as_str().expect("remedy").len() > 40);
+
+        // A kernel demotion is informational: the run stayed correct, just slower. If this were
+        // reported as invalidating, an agent would discard good audio.
+        let demoted =
+            ftts_core::HealthEvent::Violation(ftts_core::health::HealthViolation::KernelDemoted {
+                from: ftts_core::health::KernelTier::Optimized("i8mm"),
+                to: ftts_core::health::KernelTier::Scalar,
+            });
+        let event = robot::health_violation_event("run-1", demoted, 43);
+        assert!(robot::validate_event(&event).is_empty());
+        assert_eq!(event["invalidates_output"], false);
+
+        // Budget and cancellation are health signals too, and both truncate the audio.
+        for event in [
+            ftts_core::HealthEvent::BudgetExceeded,
+            ftts_core::HealthEvent::Cancelled,
+        ] {
+            let rendered = robot::health_violation_event("run-1", event, 44);
+            assert!(robot::validate_event(&rendered).is_empty());
+            assert_eq!(rendered["invalidates_output"], true);
+        }
     }
 
     #[test]
