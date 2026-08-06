@@ -174,14 +174,23 @@ pub fn describe_failure(
         comparison.max_abs_diff, comparison.max_rel_diff, comparison.cosine, comparison.non_finite
     ));
     // The shape of the error is the diagnosis: read these before touching a tolerance.
+    //
+    // This chain is deliberately TOTAL — every divergence gets a hint. An earlier version tested
+    // `over_tolerance <= len / 64`, whose integer division is 0 for any slice under 64 elements, so
+    // small tensors fell through the whole chain and got no diagnosis at all. Integer ratios only
+    // here; a usize->f64 cast would trip `clippy::cast_precision_loss`.
+    let sparse = comparison.over_tolerance == 1
+        || comparison.over_tolerance.saturating_mul(64) <= comparison.len;
     if comparison.non_finite > 0 {
         out.push_str("  hint: non-finite values present — suspect uninitialized memory or a divide-by-zero, not precision\n");
     } else if comparison.cosine > 0.999_999 && comparison.max_rel_diff > 1e-3 {
         out.push_str("  hint: cosine ~1 with large relative error — suspect a SCALE/dequant factor, not wiring\n");
-    } else if comparison.over_tolerance <= comparison.len / 64 {
-        out.push_str("  hint: few divergent elements — suspect a lane/tail bug in a SIMD path, not the whole kernel\n");
     } else if comparison.cosine < 0.9 {
         out.push_str("  hint: low cosine — suspect WIRING (wrong tensor, transposed layout, off-by-one index), not precision\n");
+    } else if sparse {
+        out.push_str("  hint: few divergent elements — suspect a lane/tail bug in a SIMD path, not the whole kernel\n");
+    } else {
+        out.push_str("  hint: widespread small divergence — suspect accumulation order or precision; justify against the tolerance source before widening it\n");
     }
     out
 }
@@ -309,5 +318,41 @@ mod tests {
     #[should_panic(expected = "shape mismatch")]
     fn length_mismatch_is_a_wiring_bug_not_a_tolerance_question() {
         let _ = compare_f32(&[1.0, 2.0], &[1.0], 1.0);
+    }
+
+    /// Every divergence must get a diagnosis, at every size.
+    ///
+    /// Regression guard: the first version of the hint chain gated the sparse case on
+    /// `over_tolerance <= len / 64`, which is `<= 0` for any slice shorter than 64 elements. Small
+    /// tensors fell through every branch and the report carried no hint at all.
+    #[test]
+    fn every_failing_comparison_gets_a_hint_at_every_size() {
+        for len in [1_usize, 2, 6, 63, 64, 65, 200] {
+            for divergent in [1_usize, len / 2 + 1, len] {
+                let divergent = divergent.min(len).max(1);
+                let expected = vec![1.0_f32; len];
+                let mut actual = expected.clone();
+                for slot in actual.iter_mut().take(divergent) {
+                    *slot = 5.0;
+                }
+                let comparison = compare_f32(&expected, &actual, 1e-6);
+                assert!(!comparison.holds(), "len={len} divergent={divergent} should fail");
+                let report = describe_failure("seam", &comparison, 1e-6, "test", None);
+                assert!(
+                    report.contains("hint:"),
+                    "no diagnosis for len={len} divergent={divergent}:\n{report}"
+                );
+            }
+        }
+        // A NaN must be diagnosed too, at the smallest possible size.
+        let nan_report = describe_failure(
+            "seam",
+            &compare_f32(&[1.0], &[f32::NAN], 1e9),
+            1e9,
+            "test",
+            None,
+        );
+        assert!(nan_report.contains("hint:"), "{nan_report}");
+        assert!(nan_report.contains("non-finite"), "{nan_report}");
     }
 }
