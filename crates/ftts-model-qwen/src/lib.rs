@@ -2,6 +2,8 @@
 
 //! Safe Qwen3-TTS model orchestration.
 
+pub mod prompt;
+pub mod sampler;
 pub mod tokenizer;
 
 /// Identifies this crate's scaffold revision.
