@@ -8,6 +8,7 @@
 //! later model stages cannot introduce a second orchestration path.
 
 pub mod admission;
+pub mod audio;
 pub mod health;
 
 use std::{

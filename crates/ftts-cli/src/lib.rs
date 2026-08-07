@@ -1029,6 +1029,165 @@ fn run_say_events(
     ))
 }
 
+/// Where synthesised PCM goes, and the `audio_chunk` events that describe it.
+///
+/// The two destinations are mutually exclusive by contract (AGENTS.md agent ergonomics): either
+/// events own stdout and audio goes to `-o PATH`, or `--stream raw` gives stdout to PCM and every
+/// event goes to stderr. Raw bytes and NDJSON are never interleaved on one stream, so this type
+/// owns the decision once instead of leaving it to each call site.
+///
+/// `audio_chunk` reports the bytes written, never the bytes themselves.
+pub enum AudioSink {
+    /// A WAV file. The header is finalised on [`AudioSink::finish`], so a run cut short still
+    /// leaves a playable file describing the samples that landed.
+    Wav(Box<ftts_core::audio::WavWriter<fs::File>>),
+    /// Raw little-endian 16-bit PCM on a caller-supplied stream (`--stream raw`).
+    RawPcm,
+    /// `--check` and other non-synthesising paths.
+    None,
+}
+
+/// Accumulating state for the `audio_chunk` event stream.
+pub struct AudioOutput {
+    sink: AudioSink,
+    byte_offset: u64,
+    samples_written: u64,
+}
+
+impl AudioOutput {
+    /// Open a WAV file sink.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be created or the provisional header cannot be written.
+    pub fn wav(path: &Path) -> Result<Self, FttsError> {
+        let file = fs::File::create(path).map_err(|error| {
+            FttsError::Generic(format!(
+                "cannot create audio output {}: {error}",
+                path.display()
+            ))
+        })?;
+        let writer = ftts_core::audio::WavWriter::new(file, ftts_core::audio::SAMPLE_RATE_HZ)
+            .map_err(|error| {
+                FttsError::Generic(format!(
+                    "cannot write WAV header to {}: {error}",
+                    path.display()
+                ))
+            })?;
+        Ok(Self {
+            sink: AudioSink::Wav(Box::new(writer)),
+            byte_offset: 0,
+            samples_written: 0,
+        })
+    }
+
+    /// A raw-PCM sink; the caller supplies the stream on each write.
+    #[must_use]
+    pub const fn raw() -> Self {
+        Self {
+            sink: AudioSink::RawPcm,
+            byte_offset: 0,
+            samples_written: 0,
+        }
+    }
+
+    /// A sink that discards audio, for paths that synthesise nothing.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            sink: AudioSink::None,
+            byte_offset: 0,
+            samples_written: 0,
+        }
+    }
+
+    /// The stable `sink` string reported in `audio_chunk`.
+    #[must_use]
+    pub const fn sink_name(&self) -> &'static str {
+        match self.sink {
+            AudioSink::Wav(_) => "file",
+            AudioSink::RawPcm => "stdout",
+            AudioSink::None => "none",
+        }
+    }
+
+    /// Bytes of audio emitted so far.
+    #[must_use]
+    pub const fn byte_offset(&self) -> u64 {
+        self.byte_offset
+    }
+
+    /// Write one packet and return its `audio_chunk` event.
+    ///
+    /// `raw` is where PCM goes under `--stream raw`; it is ignored by the other sinks. The event's
+    /// `byte_offset` is the offset *before* this packet, so a consumer can seek with it.
+    ///
+    /// `duration_ms` is derived from the sample count rather than taken from a caller-supplied
+    /// clock: it describes how much *audio* this packet holds, which is a property of the samples,
+    /// not of how long the run took to produce them.
+    ///
+    /// # Errors
+    ///
+    /// If the sink rejects the write.
+    pub fn write_packet(
+        &mut self,
+        pcm: &[f32],
+        raw: &mut dyn Write,
+        run_id: &str,
+        frame_count: u8,
+    ) -> Result<Value, FttsError> {
+        let offset_before = self.byte_offset;
+        let bytes = (pcm.len() * 2) as u64;
+
+        match &mut self.sink {
+            AudioSink::Wav(writer) => writer.write_samples(pcm).map_err(|error| {
+                FttsError::Generic(format!("cannot write audio samples: {error}"))
+            })?,
+            AudioSink::RawPcm => {
+                let mut buffer = Vec::with_capacity(pcm.len() * 2);
+                for sample in pcm {
+                    buffer
+                        .extend_from_slice(&ftts_core::audio::sample_to_i16(*sample).to_le_bytes());
+                }
+                raw.write_all(&buffer).map_err(|error| {
+                    FttsError::Generic(format!("cannot write raw PCM: {error}"))
+                })?;
+            }
+            AudioSink::None => {}
+        }
+
+        self.byte_offset += bytes;
+        self.samples_written += pcm.len() as u64;
+
+        let mut event = robot::EventType::AudioChunk.event();
+        event.insert("run_id".to_owned(), json!(run_id));
+        event.insert("byte_offset".to_owned(), json!(offset_before));
+        event.insert("bytes".to_owned(), json!(bytes));
+        event.insert(
+            "duration_ms".to_owned(),
+            json!((pcm.len() as u64) * 1000 / u64::from(ftts_core::audio::SAMPLE_RATE_HZ.max(1))),
+        );
+        event.insert("packet_frames".to_owned(), json!(frame_count.to_string()));
+        event.insert("sink".to_owned(), json!(self.sink_name()));
+        Ok(Value::Object(event))
+    }
+
+    /// Finalise the sink, patching the WAV header to the real length.
+    ///
+    /// # Errors
+    ///
+    /// If the header cannot be rewritten.
+    pub fn finish(self) -> Result<u64, FttsError> {
+        let samples = self.samples_written;
+        if let AudioSink::Wav(writer) = self.sink {
+            writer.finish().map_err(|error| {
+                FttsError::Generic(format!("cannot finalize the WAV header: {error}"))
+            })?;
+        }
+        Ok(samples)
+    }
+}
+
 fn read_text(args: &SayArgs, stdin: &mut dyn Read) -> Result<String, FttsError> {
     let text = match (&args.text, &args.file) {
         (Some(text), None) if text == "-" => read_utf8(stdin, "stdin")?,
@@ -1494,6 +1653,88 @@ mod tests {
             plan["binding_constraint"],
             engine.binding_constraint.as_str()
         );
+    }
+
+    #[test]
+    fn a_wav_sink_writes_a_playable_file_and_conforming_audio_chunk_events() {
+        let dir = std::env::temp_dir().join(format!("ftts-wav-sink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("out.wav");
+
+        let frame: Vec<f32> = (0..1_920)
+            .map(|i| (i as f32 / 1_920.0 * std::f32::consts::TAU).sin() * 0.5)
+            .collect();
+        let mut sink = AudioOutput::wav(&path).expect("wav sink");
+        let mut discard = Vec::new();
+
+        let first = sink
+            .write_packet(&frame, &mut discard, "run-1", 1)
+            .expect("packet 1");
+        let second = sink
+            .write_packet(&frame, &mut discard, "run-1", 1)
+            .expect("packet 2");
+
+        // Every emitted object must satisfy the frozen robot contract, not merely look plausible.
+        assert!(robot::validate_event(&first).is_empty(), "{first:?}");
+        assert!(robot::validate_event(&second).is_empty(), "{second:?}");
+        assert_eq!(first["sink"], "file");
+        assert_eq!(first["byte_offset"], 0);
+        assert_eq!(first["bytes"], 1_920 * 2);
+        assert_eq!(first["duration_ms"], 80, "1,920 samples at 24 kHz is 80 ms");
+        // The offset is cumulative, so a consumer can seek with it.
+        assert_eq!(second["byte_offset"], 1_920 * 2);
+
+        let samples = sink.finish().expect("finish");
+        assert_eq!(samples, 1_920 * 2);
+
+        // The file on disk must describe exactly what it holds.
+        let bytes = std::fs::read(&path).expect("read wav");
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        let declared = u32::from_le_bytes(bytes[40..44].try_into().expect("data size"));
+        assert_eq!(declared as usize, 1_920 * 2 * 2);
+        assert_eq!(bytes.len(), 44 + 1_920 * 2 * 2);
+        assert!(
+            discard.is_empty(),
+            "a file sink must not also emit raw PCM to the stream"
+        );
+    }
+
+    #[test]
+    fn a_raw_sink_writes_pcm_to_the_stream_and_never_mixes_it_with_events() {
+        // The stream contract: under --stream raw, stdout carries PCM only. An event object landing
+        // in the same buffer would corrupt both — the audio and the NDJSON.
+        let mut sink = AudioOutput::raw();
+        let mut raw = Vec::new();
+        let pcm = vec![0.5f32; 4];
+        let event = sink
+            .write_packet(&pcm, &mut raw, "run-1", 1)
+            .expect("packet");
+
+        assert!(robot::validate_event(&event).is_empty(), "{event:?}");
+        assert_eq!(event["sink"], "stdout");
+        assert_eq!(raw.len(), 8, "four 16-bit samples");
+        let first = i16::from_le_bytes([raw[0], raw[1]]);
+        assert_eq!(first, ftts_core::audio::sample_to_i16(0.5));
+        // The PCM buffer must contain no JSON.
+        assert!(
+            !raw.windows(2).any(|w| w == b"{\""),
+            "raw PCM stream must never contain an event object"
+        );
+    }
+
+    #[test]
+    fn a_none_sink_still_reports_conforming_events() {
+        let mut sink = AudioOutput::none();
+        let mut discard = Vec::new();
+        let event = sink
+            .write_packet(&[0.0f32; 960], &mut discard, "run-1", 2)
+            .expect("packet");
+        assert!(robot::validate_event(&event).is_empty(), "{event:?}");
+        assert_eq!(event["sink"], "none");
+        assert_eq!(event["packet_frames"], "2");
+        assert!(discard.is_empty());
+        assert_eq!(sink.finish().expect("finish"), 960);
     }
 
     #[test]
