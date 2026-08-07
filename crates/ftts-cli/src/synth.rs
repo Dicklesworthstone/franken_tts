@@ -46,6 +46,7 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use symphonia::core::audio::{SampleBuffer, Signal};
 use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
@@ -341,7 +342,21 @@ fn decode_reference_audio(path: &Path) -> Result<Vec<f32>, FttsError> {
         })?;
     let mut sample_rate = None;
     let mut mono = Vec::new();
-    while let Ok(packet) = format.next_packet() {
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(error) => {
+                return Err(FttsError::Input(format!(
+                    "cannot read reference audio {}: {error}",
+                    path.display()
+                )));
+            }
+        };
         if packet.track_id() != track_id {
             continue;
         }
@@ -601,6 +616,52 @@ mod tests {
         }
         fs::write(&path, &bytes).expect("write");
         assert_eq!(read_speaker_vector(&path).expect("read"), expected);
+    }
+
+    #[test]
+    fn enrollment_writer_refuses_overwrite_and_preserves_the_vector() {
+        let path = std::env::temp_dir().join(format!(
+            "ftts-enroll-{}-{}.spk",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let expected: Vec<f32> = (0..TALKER_HIDDEN)
+            .map(|index| index as f32 * 0.125)
+            .collect();
+        write_speaker_vector_new(&path, &expected).expect("initial enrollment write");
+        assert_eq!(
+            read_speaker_vector(&path).expect("read enrolled vector"),
+            expected
+        );
+        let error = write_speaker_vector_new(&path, &[0.0; TALKER_HIDDEN])
+            .expect_err("an enrollment must never replace an existing voice");
+        assert!(error.to_string().contains("without overwriting"), "{error}");
+    }
+
+    #[test]
+    fn wav_reference_decodes_to_mono_24khz_pcm() {
+        let path = std::env::temp_dir().join(format!(
+            "ftts-reference-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let pcm: Vec<f32> = (0..1_920)
+            .map(|index| (index as f32 / 1_920.0 * std::f32::consts::TAU).sin() * 0.25)
+            .collect();
+        fs::write(
+            &path,
+            ftts_core::audio::encode_wav(&pcm, SPEAKER_SAMPLE_RATE_HZ),
+        )
+        .expect("write reference WAV");
+        let decoded = decode_reference_audio(&path).expect("decode reference WAV");
+        assert_eq!(decoded.len(), pcm.len());
+        assert!(decoded.iter().all(|sample| sample.is_finite()));
     }
 
     #[test]

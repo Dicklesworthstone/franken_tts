@@ -1163,22 +1163,10 @@ mod tests {
             .map(|depth| (depth * 137 + 11) % RESIDUAL_VOCAB)
             .collect();
 
-        let expected = sequential_draft_logits(
-            &config,
-            &rope,
-            &weights,
-            &talker_hidden,
-            17,
-            &drafted_codes,
-        );
-        let verified = verify_frame_draft(
-            &config,
-            &rope,
-            &weights,
-            &talker_hidden,
-            17,
-            &drafted_codes,
-        );
+        let expected =
+            sequential_draft_logits(&config, &rope, &weights, &talker_hidden, 17, &drafted_codes);
+        let verified =
+            verify_frame_draft(&config, &rope, &weights, &talker_hidden, 17, &drafted_codes);
 
         assert_eq!(
             verified.logits(),
@@ -1196,22 +1184,10 @@ mod tests {
         let weights = bundle.weights(&layers, &embeddings, &heads);
         let talker_hidden = weights_of(config.hidden_size, 34);
         let mut state = FrameState::new(&config);
-        let sequential = decode_frame_greedy(
-            &config,
-            &rope,
-            &weights,
-            &mut state,
-            &talker_hidden,
-            19,
-        );
-        let verified = verify_frame_draft(
-            &config,
-            &rope,
-            &weights,
-            &talker_hidden,
-            19,
-            &sequential,
-        );
+        let sequential =
+            decode_frame_greedy(&config, &rope, &weights, &mut state, &talker_hidden, 19);
+        let verified =
+            verify_frame_draft(&config, &rope, &weights, &talker_hidden, 19, &sequential);
 
         assert_eq!(verified.greedy_codes(), sequential);
         assert_eq!(
