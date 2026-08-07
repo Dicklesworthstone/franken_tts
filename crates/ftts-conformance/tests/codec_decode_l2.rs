@@ -512,10 +512,14 @@ fn seam<'a>(mode: &'a str, name: &'a str) -> SeamRef<'a> {
     }
 }
 
-fn check(name: &str, expected: &NpyArray, actual: &[f32]) {
+/// Compare one seam, recording rather than panicking, so a single run localizes every stage.
+fn check(failures: &mut Vec<String>, name: &str, expected: &NpyArray, actual: &[f32]) {
     match compare_exactly(name, expected, actual) {
         Ok(comparison) => eprintln!("codec L2 parity: {name} — {} elements, exact", comparison.len),
-        Err(report) => panic!("{report}"),
+        Err(report) => {
+            eprintln!("codec L2 parity: {name} — DIVERGED\n{report}");
+            failures.push(name.to_owned());
+        }
     }
 }
 
@@ -539,6 +543,7 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
         return;
     }
 
+    let mut failures: Vec<String> = Vec::new();
     let file = SafetensorsFile::open(&checkpoint).expect("pinned speech tokenizer opens");
     let owned = OwnedCodec::load(&file);
     let layer_weights: Vec<CodecTransformerLayerWeights<'_>> =
@@ -578,7 +583,7 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
     let layer_00_input = fixtures
         .seam(&seam(mode, "codec_decoder.transformer_layer_00.input"), "args.0", 0)
         .expect("layer 00 input");
-    check("rvq+pre_conv+input_proj", &layer_00_input, &projected);
+    check(&mut failures, "rvq+pre_conv+input_proj", &layer_00_input, &projected);
 
     // Stage: our plain theta-10000 RoPE against the oracle's captured tables.
     let rope_cos = fixtures
@@ -606,8 +611,8 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
             &mut our_sin[frame * head_dim..(frame + 1) * head_dim],
         );
     }
-    check("codec_rope.cos", &rope_cos, &our_cos);
-    check("codec_rope.sin", &rope_sin, &our_sin);
+    check(&mut failures, "codec_rope.cos", &rope_cos, &our_cos);
+    check(&mut failures, "codec_rope.sin", &rope_sin, &our_sin);
 
     // Stage: each pre-transformer layer, stepwise, from the oracle's own layer input.
     for layer in 0..8 {
@@ -630,7 +635,7 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
                 &mut cache,
             );
         }
-        check(&output_name, &expected, &state);
+        check(&mut failures, &output_name, &expected, &state);
     }
 
     // Stage: final norm + output projection, gated at the first upsample stage's input.
@@ -659,7 +664,7 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
     let upsample_0_input = fixtures
         .seam(&seam(mode, "codec_decoder.upsample_0_0.input"), "args.0", 0)
         .expect("upsample 0 input");
-    check(
+    check(&mut failures, 
         "final_norm+output_proj",
         &upsample_0_input,
         &to_channel_major(&transformer_out, frames, 1_024),
@@ -687,7 +692,7 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
             2,
             &mut out,
         );
-        check(
+        check(&mut failures, 
             &tconv_name,
             &expected,
             &to_channel_major(&out, in_frames * 2, 1_024),
@@ -707,7 +712,7 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
             channels,
             owned.upsample[stage].borrow_convnext(),
         );
-        check(
+        check(&mut failures, 
             &convnext_name,
             &expected,
             &to_channel_major(&out, in_frames, channels),
@@ -734,7 +739,7 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
         1,
         &mut decoder_in,
     );
-    check(
+    check(&mut failures, 
         "codec_decoder.block_00",
         &block_00_output,
         &to_channel_major(&decoder_in, latent_frames, 1_536),
@@ -753,7 +758,7 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
         let (time_major, channels, in_frames) = to_time_major(&input);
         let (out, out_frames) =
             forward_decoder_block(&time_major, in_frames, channels, owned.blocks[block].borrow());
-        check(
+        check(&mut failures, 
             &output_name,
             &expected,
             &to_channel_major(&out, out_frames, owned.blocks[block].output_channels),
@@ -774,7 +779,7 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
         &owned.final_alpha,
         &owned.final_beta,
     );
-    check(
+    check(&mut failures, 
         "codec_decoder.block_05",
         &block_05_output,
         &to_channel_major(&time_major, pcm_frames, channels),
@@ -800,7 +805,7 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
         1,
         &mut mono,
     );
-    check("codec_decoder.block_06", &block_06_output, &mono);
+    check(&mut failures, "codec_decoder.block_06", &block_06_output, &mono);
 
     // Whole-graph: the oracle's own codes through `decode_codec_offline`, against the decoder's
     // captured waveform output.
@@ -824,7 +829,7 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
         frames,
     )
     .expect("oracle codes decode");
-    check("decode_codec_offline[icl]", &expected_waveform, &waveform);
+    check(&mut failures, "decode_codec_offline[icl]", &expected_waveform, &waveform);
 
     // Whole-graph again on the x-vector capture, against the final generated waveform.
     let xvector = "xvector_non_streaming";
@@ -840,5 +845,10 @@ fn codec_decoder_stages_match_the_cpu_oracle_seams() {
         frames,
     )
     .expect("oracle codes decode");
-    check("decode_codec_offline[xvector]", &expected_waveform, &waveform);
+    check(&mut failures, "decode_codec_offline[xvector]", &expected_waveform, &waveform);
+
+    assert!(
+        failures.is_empty(),
+        "codec decoder seams diverged from the CPU-fp32 oracle: {failures:?} — full reports above"
+    );
 }
