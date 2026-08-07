@@ -20,7 +20,9 @@
 //! unpack path, codec convolution, verifier, and batched variant extends that same surface before
 //! it may be selected.
 
+pub mod f32ref;
 pub mod mmap;
+pub mod reference;
 pub mod selftest;
 
 /// Identifies this crate's scaffold revision.

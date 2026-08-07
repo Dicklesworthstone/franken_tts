@@ -4,6 +4,7 @@
 
 pub mod prompt;
 pub mod sampler;
+pub mod talker;
 pub mod tokenizer;
 
 /// Identifies this crate's scaffold revision.
