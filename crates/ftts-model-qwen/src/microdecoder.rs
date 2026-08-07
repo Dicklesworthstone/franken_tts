@@ -54,7 +54,7 @@ pub const TALKER_CODEC_VOCAB: usize = 3072;
 pub const RESIDUAL_VOCAB: usize = 2048;
 
 /// Microdecoder geometry, from `code_predictor_config` in the pinned `config.json`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MicrodecoderConfig {
     /// Model width.
     pub hidden_size: usize,
@@ -219,8 +219,10 @@ impl RopeTable {
         let mut sin = vec![0.0_f32; FRAME_POSITIONS * config.head_dim];
         for position in 0..FRAME_POSITIONS {
             for i in 0..half {
-                let freq =
-                    1.0 / config.rope_theta.powf(2.0 * i as f32 / config.head_dim as f32);
+                let freq = 1.0
+                    / config
+                        .rope_theta
+                        .powf(2.0 * i as f32 / config.head_dim as f32);
                 let angle = position as f32 * freq;
                 let base = position * config.head_dim;
                 // `cat(freqs, freqs)`: the second half repeats the first.
@@ -349,6 +351,54 @@ impl FrameKvState {
     }
 }
 
+/// Per-layer KV state for one frame.
+///
+/// **Each layer keeps its own keys and values.** Sharing one buffer across the five layers is a
+/// bug that does not crash: every layer would attend over its predecessors' keys, the cache would
+/// grow by `layers * positions`, and the audio would merely be wrong.
+/// `the_loop_leaves_exactly_one_frame_cached_per_layer` pins this.
+#[derive(Clone, Debug)]
+pub struct FrameState {
+    layers: Vec<FrameKvState>,
+}
+
+impl FrameState {
+    /// Allocates one cache per layer.
+    #[must_use]
+    pub fn new(config: &MicrodecoderConfig) -> Self {
+        Self {
+            layers: (0..config.num_layers)
+                .map(|_| FrameKvState::new(config))
+                .collect(),
+        }
+    }
+
+    /// Clears every layer's cache. Called at each frame boundary.
+    pub fn reset(&mut self) {
+        for layer in &mut self.layers {
+            layer.reset();
+        }
+    }
+
+    /// Cached positions in one layer.
+    #[must_use]
+    pub fn len(&self, layer: usize) -> usize {
+        self.layers[layer].len()
+    }
+
+    /// Whether a layer has nothing cached.
+    #[must_use]
+    pub fn is_empty(&self, layer: usize) -> bool {
+        self.layers[layer].is_empty()
+    }
+
+    /// Number of layers this state covers.
+    #[must_use]
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+}
+
 /// Runs one layer over a single position, appending to the frame's KV state.
 ///
 /// The 16×16 causal mask is expressed structurally: a position attends to the cache as it stands
@@ -402,7 +452,12 @@ pub fn layer_step(
         let mut scores = vec![0.0_f32; positions];
         for (p, score) in scores.iter_mut().enumerate() {
             let key = &keys[p * config.head_dim..(p + 1) * config.head_dim];
-            *score = query.iter().zip(key.iter()).map(|(a, b)| a * b).sum::<f32>() * scale;
+            *score = query
+                .iter()
+                .zip(key.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+                * scale;
         }
         let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut total = 0.0_f32;
@@ -509,7 +564,7 @@ pub fn decode_frame_greedy(
     config: &MicrodecoderConfig,
     rope: &RopeTable,
     weights: &MicrodecoderWeights<'_>,
-    state: &mut FrameKvState,
+    state: &mut FrameState,
     talker_hidden: &[f32],
     primary_code: usize,
 ) -> Vec<usize> {
@@ -548,7 +603,11 @@ pub fn decode_frame_greedy(
             PositionRole::Conditioning => talker_hidden.to_vec(),
             PositionRole::PrimaryCodeEmbedding { .. } => {
                 // The TALKER's table (vocab 3072), not a code_predictor table.
-                embedding_row(weights.talker_codec_embedding, previous_code, config.hidden_size)
+                embedding_row(
+                    weights.talker_codec_embedding,
+                    previous_code,
+                    config.hidden_size,
+                )
             }
             PositionRole::ResidualEmbedding { table, .. } => embedding_row(
                 weights.residual_embeddings[table],
@@ -557,8 +616,15 @@ pub fn decode_frame_greedy(
             ),
         };
 
-        for layer in weights.layers {
-            hidden = layer_step(config, rope, layer, &hidden, position, state);
+        for (index, layer) in weights.layers.iter().enumerate() {
+            hidden = layer_step(
+                config,
+                rope,
+                layer,
+                &hidden,
+                position,
+                &mut state.layers[index],
+            );
         }
 
         let head = match role {
@@ -649,7 +715,10 @@ mod tests {
         );
         assert_eq!(
             position_role(15),
-            PositionRole::ResidualEmbedding { table: 13, head: 14 }
+            PositionRole::ResidualEmbedding {
+                table: 13,
+                head: 14
+            }
         );
     }
 
@@ -686,7 +755,11 @@ mod tests {
 
     #[test]
     fn argmax_takes_the_lowest_index_on_a_tie() {
-        assert_eq!(argmax(&[0.0, 1.0, 1.0]), 1, "ties resolve to the lower index");
+        assert_eq!(
+            argmax(&[0.0, 1.0, 1.0]),
+            1,
+            "ties resolve to the lower index"
+        );
         assert_eq!(argmax(&[3.0, 1.0, 2.0]), 0);
         assert_eq!(argmax(&[-5.0, -1.0]), 1);
     }
@@ -752,15 +825,15 @@ mod tests {
     }
 
     #[test]
-    fn the_loop_emits_fifteen_codes_in_range_and_resets_its_own_state() {
+    fn the_loop_leaves_exactly_one_frame_cached_per_layer() {
         let config = tiny();
         let rope = RopeTable::new(&config);
         let bundle = TestBundle::new(&config);
         let (layers, embeddings, heads) = bundle.views();
         let weights = bundle.weights(&layers, &embeddings, &heads);
-        let mut state = FrameKvState::new(&config);
-        // Pre-dirty the state to prove decode_frame_greedy resets it itself.
-        state.push(
+        let mut state = FrameState::new(&config);
+        // Pre-dirty layer 0 to prove decode_frame_greedy resets the state itself.
+        state.layers[0].push(
             &weights_of(config.kv_width(), 77),
             &weights_of(config.kv_width(), 78),
         );
@@ -770,11 +843,15 @@ mod tests {
 
         assert_eq!(codes.len(), RESIDUAL_DEPTHS, "15 residual codes per frame");
         assert!(codes.iter().all(|c| *c < RESIDUAL_VOCAB));
-        assert_eq!(
-            state.len(),
-            FRAME_POSITIONS,
-            "the frame leaves exactly its own 16 positions cached"
-        );
+        assert_eq!(state.layer_count(), config.num_layers);
+        for layer in 0..config.num_layers {
+            assert_eq!(
+                state.len(layer),
+                FRAME_POSITIONS,
+                "layer {layer} must cache exactly this frame's 16 positions — sharing one \
+                 buffer across layers silently multiplies the cache and corrupts attention"
+            );
+        }
     }
 
     /// The depths are autoregressively dependent: changing `c0` must be able to change later codes.
@@ -789,9 +866,9 @@ mod tests {
         let weights = bundle.weights(&layers, &embeddings, &heads);
         let hidden = weights_of(config.hidden_size, 31);
 
-        let mut state_a = FrameKvState::new(&config);
+        let mut state_a = FrameState::new(&config);
         let a = decode_frame_greedy(&config, &rope, &weights, &mut state_a, &hidden, 0);
-        let mut state_b = FrameKvState::new(&config);
+        let mut state_b = FrameState::new(&config);
         let b = decode_frame_greedy(&config, &rope, &weights, &mut state_b, &hidden, 11);
 
         // The conditioning differs, so the frames must not be forced to agree.
@@ -811,9 +888,9 @@ mod tests {
         let weights = bundle.weights(&layers, &embeddings, &heads);
         let hidden = weights_of(config.hidden_size, 32);
 
-        let mut first_state = FrameKvState::new(&config);
+        let mut first_state = FrameState::new(&config);
         let first = decode_frame_greedy(&config, &rope, &weights, &mut first_state, &hidden, 3);
-        let mut second_state = FrameKvState::new(&config);
+        let mut second_state = FrameState::new(&config);
         let second = decode_frame_greedy(&config, &rope, &weights, &mut second_state, &hidden, 3);
         assert_eq!(first, second, "greedy decode must be reproducible");
     }
