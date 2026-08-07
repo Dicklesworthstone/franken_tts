@@ -284,7 +284,7 @@ impl NumericGuard {
                 if every <= 1 {
                     return true;
                 }
-                let due = self.calls % every == 0;
+                let due = self.calls.is_multiple_of(every);
                 self.calls = self.calls.wrapping_add(1);
                 due
             }

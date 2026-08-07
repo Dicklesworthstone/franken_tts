@@ -162,12 +162,16 @@ pub fn read(path: &Path) -> Result<NpyArray, NpyError> {
     parse(&bytes)
 }
 
-/// Parses `.npy` bytes.
+/// Walks the magic, version, and header of a `.npy` buffer.
+///
+/// Returns the header text and the offset where the payload begins, so the f32 and i64 readers
+/// share one implementation of the structural checks and cannot drift apart on version handling
+/// or header bounds.
 ///
 /// # Errors
 ///
-/// Returns a named [`NpyError`] for any unsupported or malformed input.
-pub fn parse(bytes: &[u8]) -> Result<NpyArray, NpyError> {
+/// Returns a named [`NpyError`] for a truncated, mis-versioned, or malformed header.
+fn split_header(bytes: &[u8]) -> Result<(&str, usize), NpyError> {
     // magic(6) + version(2) + at least a u16 header length.
     if bytes.len() < 10 {
         return Err(NpyError::TooShort {
@@ -223,6 +227,17 @@ pub fn parse(bytes: &[u8]) -> Result<NpyArray, NpyError> {
             detail: format!("header is not UTF-8: {error}"),
         }
     })?;
+
+    Ok((header, payload_start))
+}
+
+/// Parses `.npy` bytes.
+///
+/// # Errors
+///
+/// Returns a named [`NpyError`] for any unsupported or malformed input.
+pub fn parse(bytes: &[u8]) -> Result<NpyArray, NpyError> {
+    let (header, payload_start) = split_header(bytes)?;
 
     let descr = dict_value(header, "descr")?;
     if descr != ACCEPTED_DESCR {
@@ -448,4 +463,97 @@ mod tests {
             Err(NpyError::UnsupportedVersion { major: 9, minor: 0 })
         );
     }
+}
+
+// ── Integer code streams ─────────────────────────────────────────────────────────────────────
+//
+// Token-id seams (`talker.codec_codes`, and every code stream after it) are captured as int64,
+// not float32. They get their own reader rather than a relaxed dtype check on [`parse`], because
+// the whole point of that check is that silently reinterpreting a dtype produces a plausible
+// tensor whose parity failure looks like a kernel bug. Two readers, each strict, keeps that.
+
+/// The dtype accepted by [`read_i64`]: little-endian signed 64-bit.
+const ACCEPTED_INT_DESCR: &str = "<i8";
+
+/// One decoded integer array: a C-order `i64` buffer plus its shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NpyInts {
+    /// Row-major shape as recorded in the header.
+    pub shape: Vec<usize>,
+    /// Elements in C order.
+    pub data: Vec<i64>,
+}
+
+impl NpyInts {
+    /// Total element count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Whether the array holds no elements.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Shape rendered for a failure message.
+    #[must_use]
+    pub fn shape_string(&self) -> String {
+        format!("{:?}", self.shape)
+    }
+}
+
+/// Reads an int64 `.npy` file from disk.
+///
+/// # Errors
+///
+/// Returns a named [`NpyError`]; see [`parse_i64`].
+pub fn read_i64(path: &Path) -> Result<NpyInts, NpyError> {
+    let bytes = fs::read(path).map_err(|error| NpyError::Io {
+        path: path.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    parse_i64(&bytes)
+}
+
+/// Parses int64 `.npy` bytes.
+///
+/// Structurally identical to [`parse`] but accepts only `<i8`, so a float seam handed to this
+/// reader fails loudly instead of being reinterpreted as enormous integers.
+///
+/// # Errors
+///
+/// Returns a named [`NpyError`] for any unsupported or malformed input.
+pub fn parse_i64(bytes: &[u8]) -> Result<NpyInts, NpyError> {
+    let (header, payload_start) = split_header(bytes)?;
+
+    let descr = dict_value(header, "descr")?;
+    if descr != ACCEPTED_INT_DESCR {
+        return Err(NpyError::UnsupportedDtype { found: descr });
+    }
+    if dict_value(header, "fortran_order")? == "True" {
+        return Err(NpyError::FortranOrder);
+    }
+    let shape = parse_shape(header)?;
+
+    let payload = &bytes[payload_start..];
+    let expected_elements: usize = shape.iter().product();
+    let found_elements = payload.len() / 8;
+    if payload.len() % 8 != 0 || found_elements != expected_elements {
+        return Err(NpyError::LengthMismatch {
+            expected_elements,
+            found_elements,
+        });
+    }
+
+    let data = payload
+        .chunks_exact(8)
+        .map(|chunk| {
+            i64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ])
+        })
+        .collect();
+    Ok(NpyInts { shape, data })
 }

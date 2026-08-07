@@ -213,7 +213,10 @@ impl RopeTable {
     /// Panics when `head_dim` is odd.
     #[must_use]
     pub fn new(config: &MicrodecoderConfig) -> Self {
-        assert!(config.head_dim % 2 == 0, "head_dim must be even for RoPE");
+        assert!(
+            config.head_dim.is_multiple_of(2),
+            "head_dim must be even for RoPE"
+        );
         let half = config.head_dim / 2;
         let mut cos = vec![0.0_f32; FRAME_POSITIONS * config.head_dim];
         let mut sin = vec![0.0_f32; FRAME_POSITIONS * config.head_dim];
