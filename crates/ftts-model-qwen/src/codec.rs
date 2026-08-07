@@ -735,27 +735,37 @@ pub fn causal_transpose_conv1d(
     assert!(kernel >= stride && stride > 0, "causal tconv geometry");
     if let Some(bias) = bias {
         assert_eq!(bias.len(), output_channels, "causal tconv bias shape");
-        for sample in output.chunks_exact_mut(output_channels) {
-            sample.copy_from_slice(bias);
-        }
-    } else {
-        output.fill(0.0);
     }
+    // `slow_conv_transpose2d` reduces in two levels: one GEMM over the input channels produces a
+    // complete column per `(output_channel, tap)`, then `col2im` sums those columns into the output
+    // in ascending tap order. Scattering each input channel's contribution directly, as a single
+    // flat accumulation, lands on different bits. Bias is added only after both levels, matching
+    // the reference's trailing `output.add_(bias)`.
     let kept_frames = frames * stride;
-    for frame in 0..frames {
-        for input_channel in 0..input_channels {
-            let value = input[frame * input_channels + input_channel];
+    for output_frame in 0..kept_frames {
+        for output_channel in 0..output_channels {
+            let mut total = 0.0f32;
             for tap in 0..kernel {
-                let output_frame = frame * stride + tap;
-                if output_frame >= kept_frames {
+                // The input frame whose `tap` lands on this output sample, when one exists.
+                let Some(shifted) = output_frame.checked_sub(tap) else {
+                    continue;
+                };
+                if !shifted.is_multiple_of(stride) {
                     continue;
                 }
-                for output_channel in 0..output_channels {
-                    let index = (input_channel * output_channels + output_channel) * kernel + tap;
-                    output[output_frame * output_channels + output_channel] +=
-                        value * weight[index];
+                let frame = shifted / stride;
+                if frame >= frames {
+                    continue;
                 }
+                let mut column = 0.0f32;
+                for input_channel in 0..input_channels {
+                    let index = (input_channel * output_channels + output_channel) * kernel + tap;
+                    column += input[frame * input_channels + input_channel] * weight[index];
+                }
+                total += column;
             }
+            output[output_frame * output_channels + output_channel] =
+                bias.map_or(total, |values| total + values[output_channel]);
         }
     }
 }
@@ -833,18 +843,20 @@ impl CausalConvStream {
 
 /// Persistent causal right-trimmed ConvTranspose1d state.
 ///
-/// The Qwen codec emits exactly `stride` finalized samples for every new input frame.  The
-/// remaining `kernel - stride` contributions belong to future samples and are retained in
-/// `tail`; at the end of an utterance that tail is deliberately discarded, matching the upstream
-/// causal wrapper's right trim.
+/// The Qwen codec emits exactly `stride` finalized samples for every new input frame.  Contributions
+/// to those samples come only from the current and earlier input frames, so the stream retains the
+/// `(kernel - 1) / stride` input frames that can still reach a future sample and recomputes each
+/// packet through [`causal_transpose_conv1d`].  Carrying *summed* partial outputs instead would
+/// finalize each sample in the opposite tap order from the offline reduction and therefore land on
+/// different bits; retaining the inputs keeps the two paths bit-identical.
 #[derive(Clone, Debug)]
 pub struct CausalTransposeConvStream {
     input_channels: usize,
     output_channels: usize,
     kernel: usize,
     stride: usize,
-    /// Unbiased contributions at offsets relative to the next input frame.
-    tail: Vec<f32>,
+    /// The retained input frames, time-major `[retained, input_channels]`.
+    history: Vec<f32>,
 }
 
 impl CausalTransposeConvStream {
@@ -865,13 +877,13 @@ impl CausalTransposeConvStream {
             output_channels,
             kernel,
             stride,
-            tail: vec![0.0; (kernel - stride) * output_channels],
+            history: Vec::with_capacity(((kernel - 1) / stride) * input_channels),
         }
     }
 
-    /// Discard pending right-edge contributions without releasing their allocation.
+    /// Discard retained left context without releasing its allocation.
     pub fn clear(&mut self) {
-        self.tail.fill(0.0);
+        self.history.clear();
     }
 
     /// Process a packet and write its finalized output frames to `output`.
@@ -905,53 +917,29 @@ impl CausalTransposeConvStream {
             );
         }
 
-        let tail_frames = self.kernel - self.stride;
+        let history_frames = self.history.len() / self.input_channels;
+        let mut joined = Vec::with_capacity(self.history.len() + input.len());
+        joined.extend_from_slice(&self.history);
+        joined.extend_from_slice(input);
+        let joined_frames = history_frames + frames;
+        let mut all = vec![0.0f32; joined_frames * self.stride * self.output_channels];
+        causal_transpose_conv1d(
+            &joined,
+            joined_frames,
+            self.input_channels,
+            weight,
+            bias,
+            self.output_channels,
+            self.kernel,
+            self.stride,
+            &mut all,
+        );
         output.clear();
-        output.reserve(frames * self.stride * self.output_channels);
-        for frame in 0..frames {
-            let mut immediate = vec![0.0f32; self.stride * self.output_channels];
-            for offset in 0..self.stride {
-                for channel in 0..self.output_channels {
-                    let index = offset * self.output_channels + channel;
-                    immediate[index] = bias.map_or(0.0, |values| values[channel]);
-                    if offset < tail_frames {
-                        immediate[index] += self.tail[index];
-                    }
-                }
-            }
-
-            let mut next_tail = vec![0.0f32; self.tail.len()];
-            for offset in self.stride..tail_frames {
-                let source = offset * self.output_channels;
-                let target = (offset - self.stride) * self.output_channels;
-                next_tail[target..target + self.output_channels]
-                    .copy_from_slice(&self.tail[source..source + self.output_channels]);
-            }
-
-            for input_channel in 0..self.input_channels {
-                let value = input[frame * self.input_channels + input_channel];
-                for tap in 0..self.kernel {
-                    for output_channel in 0..self.output_channels {
-                        let weight_index = (input_channel * self.output_channels + output_channel)
-                            * self.kernel
-                            + tap;
-                        let contribution = value * weight[weight_index];
-                        if tap < self.stride {
-                            immediate[tap * self.output_channels + output_channel] += contribution;
-                        } else {
-                            let offset = tap - self.stride;
-                            if offset < tail_frames {
-                                next_tail[offset * self.output_channels + output_channel] +=
-                                    contribution;
-                            }
-                        }
-                    }
-                }
-            }
-
-            output.extend_from_slice(&immediate);
-            self.tail = next_tail;
-        }
+        output.extend_from_slice(&all[history_frames * self.stride * self.output_channels..]);
+        let retain = ((self.kernel - 1) / self.stride).min(joined_frames);
+        self.history.clear();
+        self.history
+            .extend_from_slice(&joined[(joined_frames - retain) * self.input_channels..]);
     }
 }
 
@@ -1150,9 +1138,12 @@ pub struct CodecDecoderWeights<'a> {
 }
 
 /// Exact f32 GELU (`approximate='none'`), used by codec ConvNeXt blocks.
+///
+/// The reference scales by the constant `M_SQRT1_2` rather than dividing by `sqrt(2)`; the two land
+/// on different bits because `1/sqrt(2)` is not exactly representable.
 #[must_use]
 pub fn gelu(x: f32) -> f32 {
-    0.5 * x * (1.0 + (x / core::f32::consts::SQRT_2).erf())
+    0.5 * x * (1.0 + (x * core::f32::consts::FRAC_1_SQRT_2).erf())
 }
 
 fn causal_depthwise_conv1d(
