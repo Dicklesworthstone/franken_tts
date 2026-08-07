@@ -1865,7 +1865,14 @@ mod tests {
         assert_eq!(seqs, vec![0, 1, 2, 3]);
 
         let check = &events[6];
-        assert_eq!(check["admission"]["status"], "scaffold_accepted");
+        // "accepted", not "scaffold_accepted": the preflight is now the engine's own
+        // ftts_core::admission computation rather than a CLI-local heuristic, so `--check` and the
+        // synthesis that follows it cannot reach different verdicts for the same request.
+        assert_eq!(check["admission"]["status"], "accepted");
+        assert!(
+            check["admission"]["predicted_peak_bytes"].is_u64(),
+            "the engine-backed plan reports a real predicted peak"
+        );
         assert_eq!(check["normalization_trace_requested"], false);
 
         // text_prepared reports shape and provenance only; the input text must never appear.
