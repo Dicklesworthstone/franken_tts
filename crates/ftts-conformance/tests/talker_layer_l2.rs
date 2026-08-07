@@ -30,6 +30,21 @@ const TEST_NAME: &str = "contract_a_l2_talker_layer_00_cpu_fp32_exact";
 const FIRST_OBSERVED_MAX_ABS: f64 = 9.536_743_164_062_5e-6;
 const FIRST_OBSERVED_OVER_TOLERANCE: usize = 27_166;
 
+/// Largest magnitude in the oracle's `talker.layer_00.output`, so `max_abs` can be read against
+/// the scale it belongs to instead of as a bare number.
+const OUTPUT_SCALE: f64 = 16.365_345;
+
+/// Scale-relative acceptance. Measured rounding sits near 6e-7 relative; a transposed projection,
+/// a dropped QK-Norm or a wrong mask is O(1), so this separates cause from cause by decades.
+///
+/// This is the assertion that actually gates wiring. The frozen `FIRST_OBSERVED_*` equalities
+/// below pin the exact arithmetic against silent change; they do not, on their own, distinguish a
+/// rounding difference from a broken layer.
+const RELATIVE_BOUND: f64 = 1e-4;
+
+/// Rounding does not move cosine; wiring collapses it.
+const COSINE_FLOOR: f64 = 0.999_999;
+
 /// The pinned talker checkpoint, alongside the truth-pack snapshots.
 fn checkpoint_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -459,12 +474,41 @@ fn contract_a_l2_talker_layer_00_cpu_fp32_exact() {
         );
     }
 
+    // The real gate: rounding-scale divergence is acceptable, wiring-scale divergence is not.
+    // Without this the test only froze two numbers and would have passed a transposed projection
+    // that happened to reproduce them, or failed loudly for a harmless last-bit change.
+    let relative = comparison.max_abs_diff / OUTPUT_SCALE;
+    assert!(
+        relative < RELATIVE_BOUND,
+        "talker layer 00 diverges beyond rounding: max_abs {:.3e} against scale {OUTPUT_SCALE} \
+         = {relative:.3e} relative, bound {RELATIVE_BOUND:.0e}. At this magnitude suspect wiring \
+         (transposed projection, missing QK-Norm, wrong mask), not precision.",
+        comparison.max_abs_diff
+    );
+    assert!(
+        comparison.cosine > COSINE_FLOOR,
+        "talker layer 00 cosine {:.12} is below {COSINE_FLOOR} — f32 rounding does not move \
+         cosine, so this is a wiring error, not an arithmetic one",
+        comparison.cosine
+    );
+
     let report = compare_exactly(&output_seam.describe(), &expected, &hidden)
         .expect_err("a nonzero exact comparison must return its localized report");
+    // The divergence is attributed, not left open: 9.54e-6 against a scale of 16.37 is 5.83e-7
+    // relative, i.e. 4.9 ULP of f32 and 0.15x the sqrt(K)*eps a K=1024 accumulation costs. The
+    // same cause, at the same scale, is measured at the microdecoder head seam (0.72x budget) and
+    // across microdecoder layers 00..04 (0.05x budget) — three independent seams, all rounding.
+    // `over_tolerance = 27166` is an artefact of comparing against a tolerance of exactly 0.0,
+    // not evidence of breadth.
     Receipt::new(TEST_NAME, Outcome::ExpectedFailure)
         .contract("ConformanceExact/L2")
         .seam(output_seam.describe())
-        .reason("observed CPU-fp32 arithmetic divergence; exact parity remains open")
+        .reason(
+            "CPU-fp32 accumulation rounding: max_abs 9.54e-6 / scale 16.37 = 5.83e-7 relative \
+             (4.9 ULP, 0.15x the sqrt(1024)*eps budget), cosine 0.9999999999999. Exact compare is \
+             not achievable in f32 at this tier; the scale-relative bound and cosine floor are \
+             the acceptance criteria that gate wiring.",
+        )
         .tolerance(CPU_TIER_TOLERANCE, CPU_TIER_TOLERANCE_SOURCE)
         .oracle_tier(OracleTier::CpuFp32Fallback)
         .detail(comparison.to_json())
