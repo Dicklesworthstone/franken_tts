@@ -39,32 +39,103 @@ const TEST_NAME: &str = "contract_a_l2_codec_decoder_stages_cpu_fp32_exact";
 /// Observed CPU-fp32 arithmetic divergence per seam, pinned exactly like the talker L2 ratchet:
 /// exact parity remains open, so each seam's `(max_abs_diff, over_tolerance)` is frozen and any
 /// arithmetic change that moves it — better or worse — must be reviewed before the pin moves.
+///
+/// Ratchet round 4 (the convolution GEMM). `codec_gemm_bisect` measured `block_00` — one causal
+/// Conv1d, oracle-fed, no activation or norm anywhere near it — five ways, and exactly one was
+/// exact: the platform BLAS issued over an `im2col` unfolding with the bias seeded as a `beta = 1`
+/// accumulator, which is the call `slow_conv2d` itself makes. Scalar left-to-right was 1.240e-5,
+/// 4-lane and 8-lane 3.815e-5, and the same BLAS with the bias added after a `beta = 0` product
+/// 1.335e-5 — so the seeding is load-bearing, not incidental. Rewriting `causal_conv1d` and
+/// `causal_transpose_conv1d` into that form retired three seams from this table outright:
+///
+///   codec_decoder.block_00       2.861e-6 -> EXACT
+///   codec_decoder.upsample_0_0   2.384e-7 -> EXACT
+///   codec_decoder.upsample_1_0   2.861e-6 -> EXACT
+///
+/// Every remaining entry below is a seam that is still downstream of something un-retired, so most
+/// moved by a ulp or two as their inputs changed. Two moved the wrong way and are recorded rather
+/// than smoothed over: `block_02`/`block_03` gained a ulp of `max_abs`, and `block_06` holds its
+/// `max_abs` but diverges over more elements (9_110 -> 15_125). The end-to-end waveform improved
+/// (`decode_codec_offline[icl]` 2.384e-7 -> 2.198e-7).
+///
+/// The dense projections were tried the same way and REJECTED — see the negative-evidence note in
+/// `ftts-model-qwen/src/codec.rs`; `nn.Linear` does not land on the convolution's blocking, so the
+/// transformer seams here are unchanged in form and only shifted by their inputs.
 const PINNED_DIVERGENCE: &[(&str, f64, usize)] = &[
-    ("rvq+pre_conv+input_proj", 1.4901161193847656e-7, 6_680),
-    ("codec_rope.cos", 5.9604644775390625e-8, 78),
-    ("codec_rope.sin", 5.9604644775390625e-8, 30),
-    ("codec_decoder.transformer_layer_00.output", 5.9604644775390625e-8, 4_594),
-    ("codec_decoder.transformer_layer_01.output", 3.7252902984619141e-8, 4_485),
-    ("codec_decoder.transformer_layer_02.output", 2.8610229492187500e-6, 4_676),
-    ("codec_decoder.transformer_layer_03.output", 2.3841857910156250e-7, 4_970),
-    ("codec_decoder.transformer_layer_04.output", 3.5762786865234375e-7, 4_826),
-    ("codec_decoder.transformer_layer_05.output", 1.1920928955078125e-7, 4_741),
-    ("codec_decoder.transformer_layer_06.output", 7.4505805969238281e-8, 3_567),
-    ("codec_decoder.transformer_layer_07.output", 8.9406967163085938e-8, 4_570),
+    ("rvq+pre_conv+input_proj", 1.6391277313232422e-7, 6_674),
+    ("codec_rope.cos", 5.9604644775390625e-8, 80),
+    ("codec_rope.sin", 5.9604644775390625e-8, 24),
+    (
+        "codec_decoder.transformer_layer_00.output",
+        5.9604644775390625e-8,
+        4_614,
+    ),
+    (
+        "codec_decoder.transformer_layer_01.output",
+        3.7252902984619141e-8,
+        4_451,
+    ),
+    (
+        "codec_decoder.transformer_layer_02.output",
+        2.8610229492187500e-6,
+        4_680,
+    ),
+    (
+        "codec_decoder.transformer_layer_03.output",
+        2.3841857910156250e-7,
+        4_973,
+    ),
+    (
+        "codec_decoder.transformer_layer_04.output",
+        3.5762786865234375e-7,
+        4_832,
+    ),
+    (
+        "codec_decoder.transformer_layer_05.output",
+        1.1920928955078125e-7,
+        4_767,
+    ),
+    (
+        "codec_decoder.transformer_layer_06.output",
+        7.4505805969238281e-8,
+        3_560,
+    ),
+    (
+        "codec_decoder.transformer_layer_07.output",
+        8.9406967163085938e-8,
+        4_578,
+    ),
     ("final_norm+output_proj", 8.9406967163085938e-8, 13_462),
-    ("codec_decoder.upsample_0_0", 2.3841857910156250e-7, 22_170),
     ("codec_decoder.upsample_0_1", 1.6987323760986328e-6, 24_932),
-    ("codec_decoder.upsample_1_0", 2.8610229492187500e-6, 47_748),
     ("codec_decoder.upsample_1_1", 2.4795532226562500e-5, 49_986),
-    ("codec_decoder.block_00", 2.8610229492187500e-6, 73_956),
-    ("codec_decoder.block_01.output", 4.5299530029296875e-6, 321_415),
-    ("codec_decoder.block_02.output", 4.0531158447265625e-6, 800_727),
-    ("codec_decoder.block_03.output", 2.3841857910156250e-6, 1_521_686),
-    ("codec_decoder.block_04.output", 1.3351440429687500e-5, 2_473_655),
+    (
+        "codec_decoder.block_01.output",
+        4.7683715820312500e-6,
+        319_209,
+    ),
+    (
+        "codec_decoder.block_02.output",
+        4.0531158447265625e-6,
+        791_259,
+    ),
+    (
+        "codec_decoder.block_03.output",
+        2.5033950805664062e-6,
+        1_495_609,
+    ),
+    (
+        "codec_decoder.block_04.output",
+        1.3351440429687500e-5,
+        2_463_507,
+    ),
     ("codec_decoder.block_05", 7.6293945312500000e-6, 42_042),
-    ("codec_decoder.block_06", 2.2351741790771484e-8, 9_110),
-    ("decode_codec_offline[icl]", 2.3841857910156250e-7, 26_245),
-    ("decode_codec_offline[xvector]", 3.6437995731830597e-8, 1_902),
+    ("codec_decoder.block_06", 2.2351741790771484e-8, 15_125),
+    ("decode_codec_offline[icl]", 2.1979212760925293e-7, 26_194),
+    (
+        "decode_codec_offline[xvector]",
+        4.0046870708465576e-8,
+        1_901,
+    ),
 ];
 
 /// The pinned speech-tokenizer checkpoint, alongside the truth-pack snapshots.
@@ -572,7 +643,10 @@ fn check(failures: &mut Vec<String>, name: &str, expected: &NpyArray, actual: &[
     if comparison.holds() {
         compare_exactly(name, expected, actual)
             .expect("a zero-difference summary must satisfy the exact comparator");
-        if PINNED_DIVERGENCE.iter().any(|(pinned, _, _)| *pinned == name) {
+        if PINNED_DIVERGENCE
+            .iter()
+            .any(|(pinned, _, _)| *pinned == name)
+        {
             Receipt::new(TEST_NAME, Outcome::Failed)
                 .contract("ConformanceExact/L2")
                 .seam(name)
@@ -584,9 +658,14 @@ fn check(failures: &mut Vec<String>, name: &str, expected: &NpyArray, actual: &[
                 .oracle_tier(OracleTier::CpuFp32Fallback)
                 .detail(comparison.to_json())
                 .emit();
-            failures.push(format!("{name}: unexpectedly exact — review, then move the pin"));
+            failures.push(format!(
+                "{name}: unexpectedly exact — review, then move the pin"
+            ));
         } else {
-            eprintln!("codec L2 parity: {name} — {} elements, exact", comparison.len);
+            eprintln!(
+                "codec L2 parity: {name} — {} elements, exact",
+                comparison.len
+            );
         }
         return;
     }

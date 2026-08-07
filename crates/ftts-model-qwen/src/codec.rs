@@ -647,6 +647,33 @@ pub fn snake_beta_in_place(values: &mut [f32], frames: usize, alpha_log: &[f32],
     }
 }
 
+// NEGATIVE EVIDENCE — the platform-BLAS reduction does NOT generalize from the convolutions to the
+// codec's dense projections, and the difference is op-shaped rather than bias-shaped.
+//
+// The two convolutions below reach exact by issuing the reference's own GEMM (see `causal_conv1d`).
+// The obvious next step is to route every `f32ref::linear` here the same way, on the reasoning that
+// a biased `nn.Linear` lowers to `addmm` — also a `beta = 1` bias-seeded BLAS call. That was tried
+// against the pinned oracle and REJECTED; it moved seams the wrong way:
+//
+//   bias-free projections (transformer q/k/v/o, gate/up/down), routed at `beta = 0`:
+//     transformer_layer_02   2.861e-6 -> 3.815e-6
+//     transformer_layer_03   2.384e-7 -> 7.749e-7
+//     transformer_layer_05   1.192e-7 -> 8.941e-7
+//   biased `nn.Linear` (ConvNeXt pwconv1/pwconv2), routed bias-seeded at `beta = 1`:
+//     upsample_1_1           2.480e-5 -> 2.861e-5
+//
+// So "carries a bias" is the wrong discriminator. `Conv1d`/`ConvTranspose1d` go through
+// `slow_conv2d`/`slow_conv_transpose2d`, whose GEMM shape and blocking the convolutions below now
+// reproduce exactly; `nn.Linear` does not land on that same blocking, and why is still open — a
+// batched 3-D `baddbmm` lowering is the leading suspect. Until that is measured, the dense
+// projections keep the scalar reduction, which is the closer of the two.
+//
+// One measurement is deliberately still missing: the `k = 1` `Conv1d` projections (RVQ
+// `input_proj`/`output_proj`, and the transformer's `input_proj`/`output_proj`) ARE convolutions and
+// so should follow the conv rule, but the only run that touched them moved them together with the
+// `nn.Linear` sites, so their contribution was never isolated. `rvq+pre_conv+input_proj` did improve
+// in that run (1.639e-7 -> 5.960e-8), which is suggestive; it is not yet evidence.
+
 /// Reference causal Conv1d for time-major `[frames, channels]` data.
 ///
 /// Weights retain PyTorch's `[out_channel, in_channel, kernel]` checkpoint layout.
@@ -683,27 +710,51 @@ pub fn causal_conv1d(
     if let Some(bias) = bias {
         assert_eq!(bias.len(), output_channels, "causal conv bias shape");
     }
-    // The reference unfolds into an `[in_channel, tap]`-major column and reduces it with one GEMM,
-    // which is this loop order. The bias reaches that GEMM as its `beta = 1` accumulator seed, not
-    // as a trailing add: moving it after the reduction was measured against the pinned oracle and
-    // made every convolution seam worse (`block_00` 2.86e-6 -> 1.24e-5), so it stays seeded here.
+    // `slow_conv2d_update_output_frame` issues this convolution as ONE GEMM over an `im2col`
+    // unfolding: columns ordered `[in_channel, tap]`-major and zero-padded on the left, with the
+    // bias reaching the GEMM as its `beta = 1` accumulator seed rather than as a trailing add.
+    //
+    // Reproducing that call is what takes this seam to exact. Measured on the pinned oracle at
+    // `codec_decoder.block_00` (1024 -> 1536, kernel 7, K = 7168, the codec's binding worst case),
+    // over 86_016 elements:
+    //
+    //   scalar left-to-right dot           max_abs 1.240e-5   83_663 over tolerance
+    //   4-lane / 8-lane partial sums       max_abs 3.815e-5  ~84_300 over tolerance
+    //   BLAS, bias added after `beta = 0`  max_abs 1.335e-5   83_351 over tolerance
+    //   BLAS, bias seeded under `beta = 1` max_abs 0.0             0 over tolerance
+    //
+    // Only the last is exact, and the `beta = 0` row is what rules out "any BLAS will do": the
+    // seeding is load-bearing, not incidental. The reduction order therefore belongs to the
+    // platform BLAS, so `linear_with_accumulation` is asked for it by name. Off macOS that request
+    // degrades to the scalar reduction, which is the first row above — correct, not exact. See
+    // `ftts-conformance/tests/codec_gemm_bisect.rs`, which is the probe that measured this.
+    let reduction = input_channels * kernel;
+    let mut columns = vec![0.0f32; frames * reduction];
     for frame in 0..frames {
-        for output_channel in 0..output_channels {
-            let mut total = bias.map_or(0.0, |values| values[output_channel]);
-            for input_channel in 0..input_channels {
-                for tap in 0..kernel {
-                    let past = (kernel - 1 - tap) * dilation;
-                    if let Some(source_frame) = frame.checked_sub(past) {
-                        let weight_index =
-                            (output_channel * input_channels + input_channel) * kernel + tap;
-                        total += input[source_frame * input_channels + input_channel]
-                            * weight[weight_index];
-                    }
-                }
+        for tap in 0..kernel {
+            let past = (kernel - 1 - tap) * dilation;
+            let Some(source_frame) = frame.checked_sub(past) else {
+                // Left padding. The zero column must be materialized, not skipped: the reference's
+                // GEMM reduces over the full `K`, and a shortened reduction blocks differently.
+                continue;
+            };
+            let source = &input[source_frame * input_channels..][..input_channels];
+            let target = &mut columns[frame * reduction..][..reduction];
+            for (input_channel, &value) in source.iter().enumerate() {
+                target[input_channel * kernel + tap] = value;
             }
-            output[frame * output_channels + output_channel] = total;
         }
     }
+    f32ref::linear_with_accumulation(
+        &columns,
+        weight,
+        bias,
+        frames,
+        reduction,
+        output_channels,
+        f32ref::F32LinearAccumulation::AccelerateBiasSeeded,
+        output,
+    );
 }
 
 /// Reference causal ConvTranspose1d for time-major data.
@@ -740,11 +791,42 @@ pub fn causal_transpose_conv1d(
     if let Some(bias) = bias {
         assert_eq!(bias.len(), output_channels, "causal tconv bias shape");
     }
-    // `slow_conv_transpose2d` reduces in two levels: one GEMM over the input channels produces a
-    // complete column per `(output_channel, tap)`, then `col2im` sums those columns into the output
-    // in ascending tap order. Scattering each input channel's contribution directly, as a single
-    // flat accumulation, lands on different bits. Bias is added only after both levels, matching
-    // the reference's trailing `output.add_(bias)`.
+    // `slow_conv_transpose2d` reduces in two levels: ONE GEMM over the input channels materializes
+    // the whole `[frames, output_channel * tap]` column tensor, then `col2im` sums those columns
+    // into the output in ascending tap order. Bias is added only after both levels, matching the
+    // reference's trailing `output.add_(bias)` — unlike the forward convolution above, this GEMM
+    // runs at `beta = 0` with no bias in it.
+    //
+    // The column GEMM's reduction order belongs to the platform BLAS for the same measured reason
+    // the forward convolution's does (see `causal_conv1d`); a scalar left-to-right sum over the
+    // input channels is correct but not bit-exact. Off macOS this degrades to that scalar sum.
+    //
+    // The reference's weight is `[in_channel, out_channel, tap]`, which is `[k, n]`; the GEMM
+    // helper wants `[n, k]`, so the columns' operand is transposed once up front.
+    let column_width = output_channels * kernel;
+    let mut column_weight = vec![0.0f32; column_width * input_channels];
+    for input_channel in 0..input_channels {
+        for output_channel in 0..output_channels {
+            for tap in 0..kernel {
+                let source = (input_channel * output_channels + output_channel) * kernel + tap;
+                let target = (output_channel * kernel + tap) * input_channels + input_channel;
+                column_weight[target] = weight[source];
+            }
+        }
+    }
+    let mut columns = vec![0.0f32; frames * column_width];
+    f32ref::linear_with_accumulation(
+        input,
+        &column_weight,
+        None,
+        frames,
+        input_channels,
+        column_width,
+        f32ref::F32LinearAccumulation::Accelerate,
+        &mut columns,
+    );
+
+    // `col2im`: sum each input frame's column into the output samples its taps land on, ascending.
     let kept_frames = frames * stride;
     for output_frame in 0..kept_frames {
         for output_channel in 0..output_channels {
@@ -761,12 +843,7 @@ pub fn causal_transpose_conv1d(
                 if frame >= frames {
                     continue;
                 }
-                let mut column = 0.0f32;
-                for input_channel in 0..input_channels {
-                    let index = (input_channel * output_channels + output_channel) * kernel + tap;
-                    column += input[frame * input_channels + input_channel] * weight[index];
-                }
-                total += column;
+                total += columns[frame * column_width + output_channel * kernel + tap];
             }
             output[output_frame * output_channels + output_channel] =
                 bias.map_or(total, |values| total + values[output_channel]);
