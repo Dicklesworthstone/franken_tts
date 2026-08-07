@@ -58,6 +58,32 @@ const OUTPUT_SCALE: f64 = 16.365_345;
 const CARRIER_SHARE: f64 = 0.5;
 const BYSTANDER_SHARE: f64 = 0.1;
 
+/// Candidate f32 reduction orders for the carrier, phase two.
+///
+/// The flat lane interleaves are the naive guesses; the cascade entries are the reference stack's
+/// own `SumKernel.cpp` shape at the two vector widths an ARM build can have.
+const RMSNORM_ORDERS: [(&str, F32RmsNormArithmetic); 8] = [
+    ("scalar", F32RmsNormArithmetic::ScalarReciprocalSqrt),
+    ("lanes4", F32RmsNormArithmetic::Lanes4ReciprocalSqrt),
+    ("lanes8", F32RmsNormArithmetic::Lanes8ReciprocalSqrt),
+    ("lanes16", F32RmsNormArithmetic::Lanes16ReciprocalSqrt),
+    ("lanes32", F32RmsNormArithmetic::Lanes32ReciprocalSqrt),
+    (
+        "torch-cascade-vec4",
+        F32RmsNormArithmetic::TorchCascade4ReciprocalSqrt,
+    ),
+    (
+        "torch-cascade-vec8",
+        F32RmsNormArithmetic::TorchCascade8ReciprocalSqrt,
+    ),
+    ("f64", F32RmsNormArithmetic::F64ReciprocalSqrt),
+];
+
+/// The smallest residual any known RMSNorm reduction order leaves at this seam.
+///
+/// A ratchet, not a target: the sweep may find better, but it must never quietly find worse.
+const BEST_RMSNORM_ORDER_MAX_ABS: f64 = 9.536_743_164_062_5e-7;
+
 fn checkpoint_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/truth-pack/snapshots/hf/model.safetensors")
@@ -403,6 +429,51 @@ fn contract_a_l2_talker_layer_00_residual_attribution() {
          the sweep must be extended before anything here can be called attributed"
     );
 
+    // ── Phase two: which f32 order the carrier actually used ───────────────────────────────────
+    //
+    // Phase one proves RMSNorm carries the residual, but promoting it to f64 only removes our
+    // rounding — it does not adopt the oracle's. The oracle reduced in f32 too, so the order that
+    // reproduces it is an f32 order, and `f64` landing *worse* than a candidate is the evidence
+    // that the candidate is the right shape rather than merely the more accurate one.
+    let mut orders = Vec::new();
+    for (label, rms) in RMSNORM_ORDERS {
+        let candidate = run(
+            &inputs,
+            &weights,
+            Promotion {
+                family: label,
+                rms,
+                ..ALL_F32
+            },
+        );
+        let comparison = compare_f32(&inputs.expected, &candidate, f64::INFINITY);
+        eprintln!(
+            "ft7 CPU fp32 RMSNORM_ORDER order={label:<28} max_abs={:.6e} relative={:.3e} \
+             non_exact={}/{}",
+            comparison.max_abs_diff,
+            comparison.max_abs_diff / OUTPUT_SCALE,
+            comparison.over_tolerance,
+            comparison.len,
+        );
+        orders.push((label, comparison.max_abs_diff, comparison.over_tolerance));
+    }
+    let best = orders
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).expect("finite residuals"))
+        .expect("the order sweep is not empty");
+    eprintln!(
+        "ft7 CPU fp32 RMSNORM_ORDER best={} max_abs={:.6e}",
+        best.0, best.1
+    );
+    assert!(
+        best.1 <= BEST_RMSNORM_ORDER_MAX_ABS,
+        "the closest RMSNorm reduction order now leaves {:.6e}, worse than the {BEST_RMSNORM_ORDER_MAX_ABS:.6e} \
+         already reached by `{}`. A reduction order was changed or removed; the carrier's best \
+         known order must not regress",
+        best.1,
+        best.0,
+    );
+
     Receipt::new(TEST_NAME, Outcome::Passed)
         .contract(CONTRACT)
         .seam(SEAM)
@@ -421,6 +492,13 @@ fn contract_a_l2_talker_layer_00_residual_attribution() {
                 "family": family,
                 "residual_removed": removed,
             })).collect::<Vec<_>>(),
+            "carrier_reduction_orders": orders.iter().map(|(label, max_abs, non_exact)| serde_json::json!({
+                "order": label,
+                "max_abs_vs_oracle": max_abs,
+                "non_exact_elements": non_exact,
+            })).collect::<Vec<_>>(),
+            "carrier_best_order": best.0,
+            "carrier_best_max_abs": best.1,
         }))
         .emit();
 }

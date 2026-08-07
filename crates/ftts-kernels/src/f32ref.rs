@@ -63,6 +63,16 @@ pub enum F32RmsNormArithmetic {
     Lanes4ReciprocalSqrt,
     /// Eight f32 partial sums, then `sqrt(value).recip()`.
     Lanes8ReciprocalSqrt,
+    /// Sixteen f32 partial sums, then `sqrt(value).recip()`.
+    Lanes16ReciprocalSqrt,
+    /// Thirty-two f32 partial sums, then `sqrt(value).recip()`.
+    Lanes32ReciprocalSqrt,
+    /// The reference stack's own cascade reduction over a **4-wide** vector, then
+    /// `sqrt(value).recip()`. See [`torch_cascade_sum`].
+    TorchCascade4ReciprocalSqrt,
+    /// The reference stack's cascade reduction over an **8-wide** vector — the width an ARM build
+    /// with `AT_BUILD_ARM_VEC256_WITH_SLEEF` uses, which the pinned oracle reports.
+    TorchCascade8ReciprocalSqrt,
     /// f64 reduction and scale calculation, narrowed only at the final scale.
     F64ReciprocalSqrt,
 }
@@ -337,6 +347,12 @@ pub enum F32Transcendental {
     ///
     /// On every other target this deliberately falls back to [`Self::ScalarLibm`].
     AccelerateVForce,
+    /// SLEEF's 1-ulp `Sleef_sinf_u10` / `Sleef_expf_u10`, ported to safe Rust in [`crate::sleef`].
+    ///
+    /// This is the routine an AArch64 `Vectorized<float>` actually dispatches to, so it is the
+    /// candidate the vForce probe was only ever standing in for — and unlike vForce it is portable
+    /// and could therefore be adopted into production if it measures exact.
+    SleefU10,
 }
 
 /// Fills `out` with `sin(x)` under the selected implementation.
@@ -347,6 +363,12 @@ pub enum F32Transcendental {
 pub fn sin_with(x: &[f32], implementation: F32Transcendental, out: &mut [f32]) {
     assert_eq!(x.len(), out.len(), "sin output must match its input");
     if implementation == F32Transcendental::AccelerateVForce && vforce_sin(x, out) {
+        return;
+    }
+    if implementation == F32Transcendental::SleefU10 {
+        for (value, target) in x.iter().zip(out.iter_mut()) {
+            *target = crate::sleef::sinf_u10(*value);
+        }
         return;
     }
     for (value, target) in x.iter().zip(out.iter_mut()) {
@@ -362,6 +384,12 @@ pub fn sin_with(x: &[f32], implementation: F32Transcendental, out: &mut [f32]) {
 pub fn exp_with(x: &[f32], implementation: F32Transcendental, out: &mut [f32]) {
     assert_eq!(x.len(), out.len(), "exp output must match its input");
     if implementation == F32Transcendental::AccelerateVForce && vforce_exp(x, out) {
+        return;
+    }
+    if implementation == F32Transcendental::SleefU10 {
+        for (value, target) in x.iter().zip(out.iter_mut()) {
+            *target = crate::sleef::expf_u10(*value);
+        }
         return;
     }
     for (value, target) in x.iter().zip(out.iter_mut()) {
@@ -464,6 +492,22 @@ fn rms_scale(src: &[f32], eps: f32, arithmetic: F32RmsNormArithmetic) -> f32 {
             let sum = sum_squares_f32(src, 8);
             (sum / src.len() as f32 + eps).sqrt().recip()
         }
+        F32RmsNormArithmetic::Lanes16ReciprocalSqrt => {
+            let sum = sum_squares_f32(src, 16);
+            (sum / src.len() as f32 + eps).sqrt().recip()
+        }
+        F32RmsNormArithmetic::Lanes32ReciprocalSqrt => {
+            let sum = sum_squares_f32(src, 32);
+            (sum / src.len() as f32 + eps).sqrt().recip()
+        }
+        F32RmsNormArithmetic::TorchCascade4ReciprocalSqrt => {
+            let sum = torch_cascade_sum(src, 4, |value| value * value);
+            (sum / src.len() as f32 + eps).sqrt().recip()
+        }
+        F32RmsNormArithmetic::TorchCascade8ReciprocalSqrt => {
+            let sum = torch_cascade_sum(src, 8, |value| value * value);
+            (sum / src.len() as f32 + eps).sqrt().recip()
+        }
         F32RmsNormArithmetic::F64ReciprocalSqrt => {
             let mut sum = 0.0f64;
             for value in src {
@@ -476,7 +520,7 @@ fn rms_scale(src: &[f32], eps: f32, arithmetic: F32RmsNormArithmetic) -> f32 {
 }
 
 fn sum_squares_f32(src: &[f32], lanes: usize) -> f32 {
-    let mut partial = [0.0f32; 8];
+    let mut partial = [0.0f32; 32];
     for (index, value) in src.iter().enumerate() {
         partial[index % lanes] += *value * *value;
     }
@@ -485,6 +529,122 @@ fn sum_squares_f32(src: &[f32], lanes: usize) -> f32 {
         sum += *value;
     }
     sum
+}
+
+/// The reference stack's contiguous-inner-dimension f32 sum, transcribed operation for operation.
+///
+/// Every other reduction offered here is a *guess* at the oracle's order — "four accumulators
+/// landed closer, so perhaps it used four". This one is not a guess: it is the shape PyTorch's
+/// `SumKernel.cpp` actually reduces with, and it is materially different from any flat lane
+/// interleave, so a flat lane order that lands close can still never land on it.
+///
+/// Three nested structures, outermost first:
+///
+/// 1. **Vector lanes.** The row is walked `width` elements at a time and each lane keeps its own
+///    running sum. `width` is `Vectorized<float>::size()`, 8 on an ARM build with
+///    `AT_BUILD_ARM_VEC256_WITH_SLEEF` and 4 without, which is why it is a parameter here rather
+///    than a constant: it is the one part of the shape the provenance does not pin.
+/// 2. **Instruction-level parallelism.** `row_sum` splits the vector stream into `ILP = 4`
+///    independent chains, reduced `p0 += p1; p0 += p2; p0 += p3` at the end.
+/// 3. **Cascade.** Each chain is not a flat running sum but a `LEVELS = 4` deep cascade: level 0
+///    absorbs `level_step` vectors and is then drained into level 1, level 1 into level 2 when its
+///    own counter wraps, and so on. This is what bounds the reduction's error growth, and it makes
+///    the partial-sum magnitudes — and therefore the rounding — differ from a flat sum even at
+///    identical lane counts.
+///
+/// The final horizontal fold is left-to-right over the lanes, as `vectorized_inner_sum` does when
+/// it stores the accumulator and sums the array.
+///
+/// `transform` is applied to each element before accumulation, so RMSNorm's `pow(2).mean(-1)` can
+/// square in the same pass the reference's separate `pow(2)` tensor would have.
+///
+/// # Panics
+///
+/// Panics if `width` is zero.
+pub fn torch_cascade_sum(src: &[f32], width: usize, transform: impl Fn(f32) -> f32) -> f32 {
+    assert!(width > 0, "vector width must be positive");
+    const ILP: usize = 4;
+    const LEVELS: usize = 4;
+
+    let vector_count = src.len() / width;
+    let vector = |index: usize, lane: usize| transform(src[index * width + lane]);
+
+    // `multi_row_sum(in_data, row_stride = col_stride * ILP, col_stride, size = vector_count / ILP)`
+    let size = vector_count / ILP;
+    let level_power = ceil_log2(size).div_euclid(LEVELS).max(4);
+    let level_step = 1usize << level_power;
+    let level_mask = level_step - 1;
+
+    let mut acc = vec![[0.0f32; ILP].map(|_| vec![0.0f32; width]); LEVELS];
+    let mut index = 0usize;
+    while index + level_step <= size {
+        for _ in 0..level_step {
+            for chain in 0..ILP {
+                for lane in 0..width {
+                    acc[0][chain][lane] += vector(index * ILP + chain, lane);
+                }
+            }
+            index += 1;
+        }
+        for level in 1..LEVELS {
+            for chain in 0..ILP {
+                for lane in 0..width {
+                    acc[level][chain][lane] += acc[level - 1][chain][lane];
+                    acc[level - 1][chain][lane] = 0.0;
+                }
+            }
+            if index & (level_mask << (level * level_power)) != 0 {
+                break;
+            }
+        }
+    }
+    while index < size {
+        for chain in 0..ILP {
+            for lane in 0..width {
+                acc[0][chain][lane] += vector(index * ILP + chain, lane);
+            }
+        }
+        index += 1;
+    }
+    for level in 1..LEVELS {
+        for chain in 0..ILP {
+            for lane in 0..width {
+                acc[level][chain][lane] += acc[level - 1][chain][lane];
+            }
+        }
+    }
+
+    // `row_sum`: absorb the vectors `multi_row_sum` could not group, then fold the ILP chains.
+    let mut partial = acc.swap_remove(LEVELS - 1);
+    for leftover in size * ILP..vector_count {
+        for lane in 0..width {
+            partial[0][lane] += vector(leftover, lane);
+        }
+    }
+    for chain in 1..ILP {
+        for lane in 0..width {
+            partial[0][lane] += partial[chain][lane];
+        }
+    }
+
+    // `vectorized_inner_sum`: the elements past the last whole vector are summed first, then the
+    // lanes are folded into that running total left to right.
+    let mut sum = 0.0f32;
+    for index in vector_count * width..src.len() {
+        sum += transform(src[index]);
+    }
+    for lane in 0..width {
+        sum += partial[0][lane];
+    }
+    sum
+}
+
+/// `c10::llvm::CeilLog2` for the sizes this reduction sees: `ceil(log2(value))`, zero for `0` and `1`.
+fn ceil_log2(value: usize) -> usize {
+    if value <= 1 {
+        return 0;
+    }
+    usize::BITS as usize - (value - 1).leading_zeros() as usize
 }
 
 /// SwiGLU's elementwise half: `silu(gate) * up`, written into `gate`.
@@ -973,6 +1133,52 @@ mod tests {
         let mut biased = [0.0; 2];
         linear(&x, &weight, Some(&[10.0, -12.0]), 1, 3, 2, &mut biased);
         assert_eq!(biased, [8.0, 0.0]);
+    }
+
+    #[test]
+    fn torch_cascade_sum_agrees_with_the_flat_sum_when_rounding_cannot_intervene() {
+        // Powers of two below 2^24 add without rounding, so every reduction order must produce the
+        // same total. This proves the cascade's bookkeeping — its drains, its ILP chains, its tail
+        // handling — visits each element exactly once, independently of any parity claim.
+        for length in [1usize, 7, 8, 15, 16, 31, 128, 1024, 3072] {
+            for width in [4usize, 8] {
+                let values: Vec<f32> = (0..length).map(|index| (index % 8) as f32).collect();
+                let flat: f32 = values.iter().sum();
+                assert_eq!(
+                    torch_cascade_sum(&values, width, |value| value),
+                    flat,
+                    "length {length}, width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn torch_cascade_sum_applies_its_transform_before_accumulating() {
+        let values = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(torch_cascade_sum(&values, 4, |value| value * value), 55.0);
+    }
+
+    #[test]
+    fn torch_cascade_sum_differs_from_a_flat_sum_once_rounding_matters() {
+        // A large leading term followed by many small ones is exactly the case a cascade exists to
+        // improve: the flat sum loses every small term into the large accumulator, the cascade does
+        // not. If these ever agreed, the transcription would have collapsed into a flat sum and the
+        // parity sweep would be comparing one order against itself.
+        let mut values = vec![1.0f32; 1024];
+        values[0] = 1.0e8;
+        let flat = values.iter().fold(0.0f32, |sum, value| sum + value);
+        assert_ne!(torch_cascade_sum(&values, 8, |value| value), flat);
+    }
+
+    #[test]
+    fn ceil_log2_matches_its_definition() {
+        assert_eq!(ceil_log2(0), 0);
+        assert_eq!(ceil_log2(1), 0);
+        assert_eq!(ceil_log2(2), 1);
+        assert_eq!(ceil_log2(3), 2);
+        assert_eq!(ceil_log2(32), 5);
+        assert_eq!(ceil_log2(33), 6);
     }
 
     #[test]

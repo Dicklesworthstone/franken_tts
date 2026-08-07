@@ -23,6 +23,7 @@
 pub mod f32ref;
 pub mod mmap;
 pub mod selftest;
+pub mod sleef;
 
 /// Identifies this crate's scaffold revision.
 pub const SCAFFOLD_REVISION: u8 = 1;
