@@ -182,7 +182,10 @@ pub fn parse(bytes: &[u8]) -> Result<NpyArray, NpyError> {
     // v1 uses a u16 header length, v2 a u32. Both are little-endian and both are otherwise
     // identical for our purposes.
     let (header_len, header_start) = match major {
-        1 => (usize::from(u16::from_le_bytes([bytes[8], bytes[9]])), 10),
+        1 => (
+            usize::from(u16::from_le_bytes([bytes[8], bytes[9]])),
+            10_usize,
+        ),
         2 => {
             if bytes.len() < 12 {
                 return Err(NpyError::TooShort {
@@ -190,7 +193,7 @@ pub fn parse(bytes: &[u8]) -> Result<NpyArray, NpyError> {
                 });
             }
             let raw = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-            (raw as usize, 12)
+            (raw as usize, 12_usize)
         }
         _ => return Err(NpyError::UnsupportedVersion { major, minor }),
     };
