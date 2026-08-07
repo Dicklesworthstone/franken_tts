@@ -22,7 +22,6 @@
 
 pub mod f32ref;
 pub mod mmap;
-pub mod reference;
 pub mod selftest;
 
 /// Identifies this crate's scaffold revision.
