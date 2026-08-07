@@ -379,13 +379,17 @@ pub fn forward_codec_transformer_step(
         "codec KV cache window"
     );
 
+    // Lanes-4 squared-sum and divide-normalized softmax measurably track the reference's CPU
+    // reductions closest on this tier (talker layer-00 bisect evidence, mirrored by the codec L2
+    // ratchet); scalar forms sit an order of magnitude further from the oracle.
     let mut normed = vec![0.0f32; hidden];
-    f32ref::rms_norm(
+    f32ref::rms_norm_with_arithmetic(
         state,
         weights.input_layernorm,
         config.rms_norm_eps,
         1,
         hidden,
+        f32ref::F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
         &mut normed,
     );
     let mut query = vec![0.0f32; attention];
@@ -451,7 +455,12 @@ pub fn forward_codec_transformer_step(
             }
             scores[cache_position] = dot * scaling;
         }
-        f32ref::softmax_rows(&mut scores, 1, cache.len());
+        f32ref::softmax_rows_with_arithmetic(
+            &mut scores,
+            1,
+            cache.len(),
+            f32ref::F32SoftmaxArithmetic::Divide,
+        );
         let target = &mut context[head_offset..head_offset + config.attention_head_dim];
         target.fill(0.0);
         for cache_position in 0..cache.len() {
@@ -477,12 +486,13 @@ pub fn forward_codec_transformer_step(
         state[index] += weights.self_attn_layer_scale[index] * attention_output[index];
     }
 
-    f32ref::rms_norm(
+    f32ref::rms_norm_with_arithmetic(
         state,
         weights.post_attention_layernorm,
         config.rms_norm_eps,
         1,
         hidden,
+        f32ref::F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
         &mut normed,
     );
     let mut gate = vec![0.0f32; intermediate];
@@ -596,12 +606,13 @@ pub fn forward_codec_pre_transformer(
         }
     }
     let mut normed = vec![0.0f32; hidden.len()];
-    f32ref::rms_norm(
+    f32ref::rms_norm_with_arithmetic(
         &hidden,
         weights.final_norm,
         config.rms_norm_eps,
         frames,
         config.transformer_hidden_dim,
+        f32ref::F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
         &mut normed,
     );
     f32ref::linear(

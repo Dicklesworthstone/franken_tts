@@ -43,15 +43,15 @@ const PINNED_DIVERGENCE: &[(&str, f64, usize)] = &[
     ("rvq+pre_conv+input_proj", 1.4901161193847656e-7, 6_680),
     ("codec_rope.cos", 5.9604644775390625e-8, 78),
     ("codec_rope.sin", 5.9604644775390625e-8, 30),
-    ("codec_decoder.transformer_layer_00.output", 1.4901161193847656e-7, 4_816),
-    ("codec_decoder.transformer_layer_01.output", 7.4505805969238281e-8, 4_707),
-    ("codec_decoder.transformer_layer_02.output", 8.5830688476562500e-6, 5_011),
-    ("codec_decoder.transformer_layer_03.output", 2.3841857910156250e-7, 5_196),
-    ("codec_decoder.transformer_layer_04.output", 2.5331974029541016e-7, 5_186),
-    ("codec_decoder.transformer_layer_05.output", 3.7252902984619141e-7, 5_056),
-    ("codec_decoder.transformer_layer_06.output", 9.6857547760009766e-8, 3_970),
-    ("codec_decoder.transformer_layer_07.output", 7.4505805969238281e-8, 4_657),
-    ("final_norm+output_proj", 1.0430812835693359e-7, 13_589),
+    ("codec_decoder.transformer_layer_00.output", 5.9604644775390625e-8, 4_594),
+    ("codec_decoder.transformer_layer_01.output", 3.7252902984619141e-8, 4_485),
+    ("codec_decoder.transformer_layer_02.output", 2.8610229492187500e-6, 4_676),
+    ("codec_decoder.transformer_layer_03.output", 2.3841857910156250e-7, 4_970),
+    ("codec_decoder.transformer_layer_04.output", 3.5762786865234375e-7, 4_826),
+    ("codec_decoder.transformer_layer_05.output", 1.1920928955078125e-7, 4_741),
+    ("codec_decoder.transformer_layer_06.output", 7.4505805969238281e-8, 3_567),
+    ("codec_decoder.transformer_layer_07.output", 8.9406967163085938e-8, 4_570),
+    ("final_norm+output_proj", 8.9406967163085938e-8, 13_462),
     ("codec_decoder.upsample_0_0", 4.5299530029296875e-6, 26_402),
     ("codec_decoder.upsample_0_1", 1.6689300537109375e-6, 24_977),
     ("codec_decoder.upsample_1_0", 1.7166137695312500e-5, 51_629),
@@ -63,8 +63,8 @@ const PINNED_DIVERGENCE: &[(&str, f64, usize)] = &[
     ("codec_decoder.block_04.output", 1.5258789062500000e-5, 2_490_179),
     ("codec_decoder.block_05", 7.6293945312500000e-6, 42_042),
     ("codec_decoder.block_06", 2.2351741790771484e-8, 9_110),
-    ("decode_codec_offline[icl]", 2.6077032089233398e-7, 26_215),
-    ("decode_codec_offline[xvector]", 4.6566128730773926e-8, 1_897),
+    ("decode_codec_offline[icl]", 2.6077032089233398e-7, 26_250),
+    ("decode_codec_offline[xvector]", 4.5634806156158447e-8, 1_896),
 ];
 
 /// The pinned speech-tokenizer checkpoint, alongside the truth-pack snapshots.
@@ -756,12 +756,13 @@ fn contract_a_l2_codec_decoder_stages_cpu_fp32_exact() {
         )
         .expect("layer 07 output");
     let mut normed = vec![0.0f32; frames * 512];
-    f32ref::rms_norm(
+    f32ref::rms_norm_with_arithmetic(
         &layer_07_output.data,
         &owned.final_norm,
         config.rms_norm_eps,
         frames,
         512,
+        f32ref::F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
         &mut normed,
     );
     let mut transformer_out = vec![0.0f32; frames * 1_024];
