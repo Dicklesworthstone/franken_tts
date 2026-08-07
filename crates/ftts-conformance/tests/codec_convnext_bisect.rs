@@ -31,13 +31,19 @@
 //!   pwconv_blas_bias_trailing     2.146e-6   24_943
 //!   pwconv_blas_bias_seeded       1.490e-6   24_695
 //!   gelu_f64_erf                  1.669e-6   24_855
+//!   layernorm_eps_1e5             1.192e-5   26_855
 //!
-//! Every candidate sits in the same 1.4e-6 – 2.1e-6 band and ~87% of the block's elements diverge
-//! under all ten. Compare round 4, where the discriminating candidate was 0.0 against 1.2e-5: there
-//! the op form WAS the answer, and it announced itself. Here nothing does, so this probe forecloses
-//! five hypotheses rather than confirming one — the depthwise bias placement, its reduction
-//! backend, the LayerNorm moment algorithm, the LayerNorm affine form, and the `erf` precision are
-//! each individually NOT what this seam is made of.
+//! Every arithmetic-form candidate sits in the same 1.4e-6 – 2.1e-6 band and ~87% of the block's
+//! elements diverge under all of them. Compare round 4, where the discriminating candidate was 0.0
+//! against 1.2e-5: there the op form WAS the answer, and it announced itself. Here nothing does, so
+//! this probe forecloses hypotheses rather than confirming one — the depthwise bias placement, its
+//! reduction backend, the LayerNorm moment algorithm, the LayerNorm affine form, and the `erf`
+//! precision are each individually NOT what this seam is made of.
+//!
+//! The one candidate that DID separate is the epsilon, and it separated the wrong way: `1e-5` — the
+//! only norm epsilon the pinned `decoder_config` actually names — is 7x worse than production's
+//! `1e-6`. So the ConvNeXt default this block was written against is now confirmed by measurement
+//! instead of assumed, and the residual is not an eps mismatch either.
 //!
 //! `layernorm_mean_of_squares` and `pwconv_blas_bias_seeded` are nominally the best two, and
 //! neither was adopted: a ulp-scale wiggle on one seam is not evidence of the right form, and
@@ -130,6 +136,11 @@ struct Variant {
     affine: Affine,
     pointwise: Pointwise,
     gelu: Gelu,
+    /// The LayerNorm epsilon. Production uses the ConvNeXt default; the pinned `decoder_config`
+    /// names only `rms_norm_eps = 1e-5` and says nothing about this block, so the alternative is
+    /// worth one measurement — an eps mismatch would show up as exactly this kind of diffuse,
+    /// few-ulp, everywhere-at-once residual.
+    eps: f32,
 }
 
 impl Variant {
@@ -141,6 +152,7 @@ impl Variant {
             affine: Affine::Centered,
             pointwise: Pointwise::Scalar,
             gelu: Gelu::F32Erf,
+            eps: LAYER_NORM_EPS,
         }
     }
 }
@@ -174,6 +186,7 @@ fn forward(input: &[f32], frames: usize, weights: &ConvNextWeights, variant: &Va
         &weights.norm_bias,
         variant.moments,
         variant.affine,
+        variant.eps,
     );
 
     let mut expanded = vec![0.0f32; frames * 4 * CHANNELS];
@@ -283,6 +296,7 @@ fn layer_norm(
     bias: &[f32],
     moments: Moments,
     affine: Affine,
+    eps: f32,
 ) {
     for frame in 0..frames {
         let row = &mut values[frame * CHANNELS..(frame + 1) * CHANNELS];
@@ -323,7 +337,7 @@ fn layer_norm(
                 (mean, squares / width - mean * mean)
             }
         };
-        let rstd = (variance + LAYER_NORM_EPS).sqrt().recip();
+        let rstd = (variance + eps).sqrt().recip();
         match affine {
             Affine::Centered => {
                 for channel in 0..CHANNELS {
@@ -532,6 +546,11 @@ fn codec_convnext_op_bisect() {
         Variant {
             name: "pwconv_blas_bias_seeded",
             pointwise: Pointwise::BlasBiasSeeded,
+            ..Variant::production()
+        },
+        Variant {
+            name: "layernorm_eps_1e5",
+            eps: 1e-5,
             ..Variant::production()
         },
         Variant {
