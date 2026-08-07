@@ -13,15 +13,15 @@
 use ftts_core::{CodeFrame, FrameGenerator, GenerationError, PreparedText};
 
 use crate::microdecoder::{
-    self, FrameState, MicrodecoderConfig, MicrodecoderWeights, RopeTable, RESIDUAL_VOCAB,
+    self, FrameState, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_VOCAB, RopeTable,
 };
 use crate::prompt::{
     self, HiddenState, PromptAssemblyInput, PromptError, PromptHeader, PromptMode,
 };
-use crate::sampler::{QwenSampler, SamplerError, SamplingMode, CODEC_EOS_TOKEN_ID};
+use crate::sampler::{CODEC_EOS_TOKEN_ID, QwenSampler, SamplingMode};
 use crate::talker::{
-    self, RotaryRows, TalkerConfig, TalkerKvCache, TalkerWeights, CODE_GROUP_COUNT,
-    PRIMARY_CODE_VOCAB_SIZE,
+    self, CODE_GROUP_COUNT, PRIMARY_CODE_VOCAB_SIZE, RotaryRows, TalkerConfig, TalkerKvCache,
+    TalkerWeights,
 };
 
 /// The talker's pinned mRoPE base. The microdecoder and codec each use a different theta; crossing
@@ -161,7 +161,11 @@ impl<'a> QwenGenerator<'a> {
         );
         assert!(
             config.text.embed_width > 0
-                && config.text.table.len().is_multiple_of(config.text.embed_width),
+                && config
+                    .text
+                    .table
+                    .len()
+                    .is_multiple_of(config.text.embed_width),
             "text embedding table must be [vocab, embed_width]"
         );
         assert_eq!(config.header.tts_pad.len(), hidden, "header width");
@@ -211,7 +215,8 @@ impl<'a> QwenGenerator<'a> {
                     "text token {id} is outside the [{vocab}, {embed_width}] embedding table"
                 )));
             }
-            embedded.extend_from_slice(&self.text.table[row * embed_width..(row + 1) * embed_width]);
+            embedded
+                .extend_from_slice(&self.text.table[row * embed_width..(row + 1) * embed_width]);
         }
 
         let hidden = self.talker_config.hidden_size;
@@ -233,7 +238,6 @@ impl<'a> QwenGenerator<'a> {
         }
         Ok(projected.chunks(hidden).map(<[f32]>::to_vec).collect())
     }
-
 }
 
 fn generation_error(error: impl std::fmt::Display) -> GenerationError {
@@ -411,7 +415,7 @@ mod tests {
     use super::*;
     use crate::microdecoder::{LayerWeights, RESIDUAL_DEPTHS};
     use crate::prompt::CloneMode;
-    use crate::talker::{TalkerLayerWeights, TALKER_LAYER_COUNT};
+    use crate::talker::{TALKER_LAYER_COUNT, TalkerLayerWeights};
     use ftts_core::{NormalizationMode, NormalizationTrace};
 
     /// Tiny but structurally complete geometry: talker width 8 with the mandatory 28 layers and
@@ -459,7 +463,6 @@ mod tests {
         micro_o: Vec<f32>,
         micro_mlp: Vec<f32>,
         micro_down: Vec<f32>,
-        micro_layers: Vec<LayerWeights<'static>>,
         talker_codec_embedding: Vec<f32>,
         residual_feedback: Vec<Vec<f32>>,
         micro_residual_embeddings: Vec<Vec<f32>>,
@@ -494,12 +497,8 @@ mod tests {
                 micro_o: vec![0.0; HIDDEN * micro.q_width()],
                 micro_mlp: vec![0.0; micro.intermediate_size * HIDDEN],
                 micro_down: vec![0.0; HIDDEN * micro.intermediate_size],
-                micro_layers: Vec::new(),
                 talker_codec_embedding: vec![0.0; PRIMARY_CODE_VOCAB_SIZE * HIDDEN],
-                residual_feedback: vec![
-                    vec![0.0; RESIDUAL_VOCAB * HIDDEN];
-                    CODE_GROUP_COUNT - 1
-                ],
+                residual_feedback: vec![vec![0.0; RESIDUAL_VOCAB * HIDDEN]; CODE_GROUP_COUNT - 1],
                 micro_residual_embeddings: vec![
                     vec![0.0; RESIDUAL_VOCAB * HIDDEN];
                     RESIDUAL_DEPTHS - 1
@@ -630,8 +629,11 @@ mod tests {
             .map(Vec::as_slice)
             .collect();
         let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
-        let residual_feedback: Vec<&[f32]> =
-            weights.residual_feedback.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
         let mut generator = generator(
             weights,
             &micro_layers,
@@ -664,8 +666,11 @@ mod tests {
             .map(Vec::as_slice)
             .collect();
         let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
-        let residual_feedback: Vec<&[f32]> =
-            weights.residual_feedback.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
         let mut generator = generator(
             &weights,
             &micro_layers,
@@ -688,8 +693,11 @@ mod tests {
             .map(Vec::as_slice)
             .collect();
         let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
-        let residual_feedback: Vec<&[f32]> =
-            weights.residual_feedback.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
         let mut generator = generator(
             &weights,
             &micro_layers,
@@ -720,8 +728,11 @@ mod tests {
             .map(Vec::as_slice)
             .collect();
         let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
-        let residual_feedback: Vec<&[f32]> =
-            weights.residual_feedback.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
         let mut generator = generator(
             &weights,
             &micro_layers,
@@ -734,9 +745,10 @@ mod tests {
         generator
             .begin_utterance(&prepared(&[1, 2]))
             .expect("valid tiny prompt");
-        // XVector streaming with a 2-token target: header (4) + one target/BOS position.
+        // XVector streaming with a 2-token target: role (3) + summed header (2) + one target/BOS
+        // position.
         let prefill_len = generator.cached_positions();
-        assert_eq!(prefill_len, 5);
+        assert_eq!(prefill_len, 6);
 
         let frame = generator
             .next_frame()
@@ -744,11 +756,13 @@ mod tests {
             .expect("all-zero heads cannot reach EOS");
         assert_eq!(frame.codes.len(), CODE_GROUP_COUNT);
         assert!((frame.codes[0] as usize) < PRIMARY_CODE_VOCAB_SIZE);
-        assert!(frame
-            .codes
-            .iter()
-            .skip(1)
-            .all(|&code| (code as usize) < RESIDUAL_VOCAB));
+        assert!(
+            frame
+                .codes
+                .iter()
+                .skip(1)
+                .all(|&code| (code as usize) < RESIDUAL_VOCAB)
+        );
         assert_eq!(generator.cached_positions(), prefill_len + 1);
     }
 
@@ -767,8 +781,11 @@ mod tests {
             .map(Vec::as_slice)
             .collect();
         let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
-        let residual_feedback: Vec<&[f32]> =
-            weights.residual_feedback.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
         let mut generator = generator(
             &weights,
             &micro_layers,
@@ -783,7 +800,9 @@ mod tests {
             .expect("valid tiny prompt");
         while generator.next_frame().expect("frames succeed").is_some() {}
         assert_eq!(
-            generator.next_frame().expect("finished utterance is stable"),
+            generator
+                .next_frame()
+                .expect("finished utterance is stable"),
             None,
             "EOS must be sticky until the next begin_utterance"
         );
@@ -808,8 +827,11 @@ mod tests {
             .map(Vec::as_slice)
             .collect();
         let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
-        let residual_feedback: Vec<&[f32]> =
-            weights.residual_feedback.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
         let mut generator = generator(
             &weights,
             &micro_layers,
@@ -832,7 +854,7 @@ mod tests {
             .expect("second utterance");
         assert_eq!(
             generator.cached_positions(),
-            5,
+            6,
             "a new utterance must not inherit the previous KV prefix"
         );
     }
