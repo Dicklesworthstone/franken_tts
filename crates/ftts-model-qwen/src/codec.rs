@@ -808,6 +808,194 @@ impl CausalConvStream {
         self.history
             .extend_from_slice(&joined[(joined_frames - retain) * self.input_channels..]);
     }
+
+    /// Discard retained left context without releasing its allocation.
+    pub fn clear(&mut self) {
+        self.history.clear();
+    }
+}
+
+/// Persistent causal right-trimmed ConvTranspose1d state.
+///
+/// The Qwen codec emits exactly `stride` finalized samples for every new input frame.  The
+/// remaining `kernel - stride` contributions belong to future samples and are retained in
+/// `tail`; at the end of an utterance that tail is deliberately discarded, matching the upstream
+/// causal wrapper's right trim.
+#[derive(Clone, Debug)]
+pub struct CausalTransposeConvStream {
+    input_channels: usize,
+    output_channels: usize,
+    kernel: usize,
+    stride: usize,
+    /// Unbiased contributions at offsets relative to the next input frame.
+    tail: Vec<f32>,
+}
+
+impl CausalTransposeConvStream {
+    /// Construct an empty stream for one causal transposed convolution.
+    #[must_use]
+    pub fn new(
+        input_channels: usize,
+        output_channels: usize,
+        kernel: usize,
+        stride: usize,
+    ) -> Self {
+        assert!(
+            input_channels > 0 && output_channels > 0 && kernel >= stride && stride > 0,
+            "causal transposed stream geometry"
+        );
+        Self {
+            input_channels,
+            output_channels,
+            kernel,
+            stride,
+            tail: vec![0.0; (kernel - stride) * output_channels],
+        }
+    }
+
+    /// Discard pending right-edge contributions without releasing their allocation.
+    pub fn clear(&mut self) {
+        self.tail.fill(0.0);
+    }
+
+    /// Process a packet and write its finalized output frames to `output`.
+    ///
+    /// Weights retain PyTorch's `[in_channel, out_channel, kernel]` layout.  `output` receives
+    /// time-major `[frames * stride, output_channels]` samples, exactly matching
+    /// [`causal_transpose_conv1d`] on the concatenation of all packets seen so far.
+    pub fn push(
+        &mut self,
+        input: &[f32],
+        frames: usize,
+        weight: &[f32],
+        bias: Option<&[f32]>,
+        output: &mut Vec<f32>,
+    ) {
+        assert_eq!(
+            input.len(),
+            frames * self.input_channels,
+            "causal transposed stream input shape"
+        );
+        assert_eq!(
+            weight.len(),
+            self.input_channels * self.output_channels * self.kernel,
+            "causal transposed stream weight shape"
+        );
+        if let Some(bias) = bias {
+            assert_eq!(
+                bias.len(),
+                self.output_channels,
+                "causal transposed stream bias shape"
+            );
+        }
+
+        let tail_frames = self.kernel - self.stride;
+        output.clear();
+        output.reserve(frames * self.stride * self.output_channels);
+        for frame in 0..frames {
+            let mut immediate = vec![0.0f32; self.stride * self.output_channels];
+            for offset in 0..self.stride {
+                for channel in 0..self.output_channels {
+                    let index = offset * self.output_channels + channel;
+                    immediate[index] = bias.map_or(0.0, |values| values[channel]);
+                    if offset < tail_frames {
+                        immediate[index] += self.tail[index];
+                    }
+                }
+            }
+
+            let mut next_tail = vec![0.0f32; self.tail.len()];
+            for offset in self.stride..tail_frames {
+                let source = offset * self.output_channels;
+                let target = (offset - self.stride) * self.output_channels;
+                next_tail[target..target + self.output_channels]
+                    .copy_from_slice(&self.tail[source..source + self.output_channels]);
+            }
+
+            for input_channel in 0..self.input_channels {
+                let value = input[frame * self.input_channels + input_channel];
+                for tap in 0..self.kernel {
+                    for output_channel in 0..self.output_channels {
+                        let weight_index = (input_channel * self.output_channels + output_channel)
+                            * self.kernel
+                            + tap;
+                        let contribution = value * weight[weight_index];
+                        if tap < self.stride {
+                            immediate[tap * self.output_channels + output_channel] += contribution;
+                        } else {
+                            let offset = tap - self.stride;
+                            if offset < tail_frames {
+                                next_tail[offset * self.output_channels + output_channel] +=
+                                    contribution;
+                            }
+                        }
+                    }
+                }
+            }
+
+            output.extend_from_slice(&immediate);
+            self.tail = next_tail;
+        }
+    }
+}
+
+/// Persistent left context for one causal depthwise Conv1d stage.
+#[derive(Clone, Debug)]
+struct CausalDepthwiseConvStream {
+    channels: usize,
+    kernel: usize,
+    history: Vec<f32>,
+}
+
+impl CausalDepthwiseConvStream {
+    fn new(channels: usize, kernel: usize) -> Self {
+        assert!(channels > 0 && kernel > 0, "depthwise stream geometry");
+        Self {
+            channels,
+            kernel,
+            history: Vec::with_capacity((kernel - 1) * channels),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.history.clear();
+    }
+
+    fn push(
+        &mut self,
+        input: &[f32],
+        frames: usize,
+        weight: &[f32],
+        bias: &[f32],
+        output: &mut Vec<f32>,
+    ) {
+        assert_eq!(
+            input.len(),
+            frames * self.channels,
+            "depthwise stream input shape"
+        );
+        let history_frames = self.history.len() / self.channels;
+        let mut joined = Vec::with_capacity(self.history.len() + input.len());
+        joined.extend_from_slice(&self.history);
+        joined.extend_from_slice(input);
+        let joined_frames = history_frames + frames;
+        let mut all = vec![0.0f32; joined_frames * self.channels];
+        causal_depthwise_conv1d(
+            &joined,
+            joined_frames,
+            self.channels,
+            weight,
+            bias,
+            self.kernel,
+            &mut all,
+        );
+        output.clear();
+        output.extend_from_slice(&all[history_frames * self.channels..]);
+        let retain = (self.kernel - 1).min(joined_frames);
+        self.history.clear();
+        self.history
+            .extend_from_slice(&joined[(joined_frames - retain) * self.channels..]);
+    }
 }
 
 /// Refuse an int8 kernel whose U8S8 accumulation cannot fit in i32.
@@ -1122,6 +1310,402 @@ pub fn forward_decoder_block(
     (hidden, output_frames)
 }
 
+/// Retained causal context for a codec ConvNeXt block.
+#[derive(Clone, Debug)]
+struct CodecConvNextStream {
+    depthwise: CausalDepthwiseConvStream,
+}
+
+impl CodecConvNextStream {
+    fn new(channels: usize) -> Self {
+        Self {
+            depthwise: CausalDepthwiseConvStream::new(channels, 7),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.depthwise.clear();
+    }
+
+    fn push(
+        &mut self,
+        input: &[f32],
+        frames: usize,
+        weights: CodecConvNextWeights<'_>,
+        output: &mut Vec<f32>,
+    ) {
+        let channels = weights.norm_weight.len();
+        assert_eq!(
+            input.len(),
+            frames * channels,
+            "streaming ConvNeXt input shape"
+        );
+        self.depthwise.push(
+            input,
+            frames,
+            weights.depthwise_weight,
+            weights.depthwise_bias,
+            output,
+        );
+        layer_norm_in_place(output, frames, weights.norm_weight, weights.norm_bias, 1e-6);
+        let mut expanded = vec![0.0f32; frames * 4 * channels];
+        f32ref::linear(
+            output,
+            weights.pwconv1,
+            Some(weights.pwconv1_bias),
+            frames,
+            channels,
+            4 * channels,
+            &mut expanded,
+        );
+        for value in &mut expanded {
+            *value = gelu(*value);
+        }
+        let mut residual = vec![0.0f32; input.len()];
+        f32ref::linear(
+            &expanded,
+            weights.pwconv2,
+            Some(weights.pwconv2_bias),
+            frames,
+            4 * channels,
+            channels,
+            &mut residual,
+        );
+        output.clear();
+        output.reserve(residual.len());
+        for index in 0..residual.len() {
+            output.push(input[index] + weights.gamma[index % channels] * residual[index]);
+        }
+    }
+}
+
+/// Retained causal context for one BigVGAN residual unit.
+#[derive(Clone, Debug)]
+struct CodecResidualUnitStream {
+    first_conv: CausalConvStream,
+    second_conv: CausalConvStream,
+}
+
+impl CodecResidualUnitStream {
+    fn new(weights: CodecResidualUnitWeights<'_>) -> Self {
+        Self {
+            first_conv: CausalConvStream::new(
+                weights.first_conv.input_channels,
+                weights.first_conv.kernel,
+                weights.first_conv.dilation,
+            ),
+            second_conv: CausalConvStream::new(
+                weights.second_conv.input_channels,
+                weights.second_conv.kernel,
+                weights.second_conv.dilation,
+            ),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.first_conv.clear();
+        self.second_conv.clear();
+    }
+
+    fn push(
+        &mut self,
+        input: &[f32],
+        frames: usize,
+        weights: CodecResidualUnitWeights<'_>,
+        output: &mut Vec<f32>,
+    ) {
+        let mut hidden = input.to_vec();
+        snake_beta_in_place(
+            &mut hidden,
+            frames,
+            weights.first_alpha_log,
+            weights.first_beta_log,
+        );
+        self.first_conv.push(
+            &hidden,
+            frames,
+            weights.first_conv.weight,
+            Some(weights.first_conv.bias),
+            weights.first_conv.output_channels,
+            output,
+        );
+        snake_beta_in_place(
+            output,
+            frames,
+            weights.second_alpha_log,
+            weights.second_beta_log,
+        );
+        hidden.clear();
+        self.second_conv.push(
+            output,
+            frames,
+            weights.second_conv.weight,
+            Some(weights.second_conv.bias),
+            weights.second_conv.output_channels,
+            &mut hidden,
+        );
+        assert_eq!(hidden.len(), input.len(), "streaming residual output shape");
+        output.clear();
+        output.reserve(hidden.len());
+        for index in 0..hidden.len() {
+            output.push(hidden[index] + input[index]);
+        }
+    }
+}
+
+/// Retained causal context for one BigVGAN transposed-convolution block.
+#[derive(Clone, Debug)]
+struct CodecDecoderBlockStream {
+    transposed: CausalTransposeConvStream,
+    residual_units: [CodecResidualUnitStream; 3],
+}
+
+impl CodecDecoderBlockStream {
+    fn new(weights: CodecDecoderBlockWeights<'_>) -> Self {
+        Self {
+            transposed: CausalTransposeConvStream::new(
+                weights.transposed.input_channels,
+                weights.transposed.output_channels,
+                weights.transposed.kernel,
+                weights.transposed.stride,
+            ),
+            residual_units: weights.residual_units.map(CodecResidualUnitStream::new),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.transposed.clear();
+        for unit in &mut self.residual_units {
+            unit.clear();
+        }
+    }
+
+    fn push(
+        &mut self,
+        input: &[f32],
+        frames: usize,
+        weights: CodecDecoderBlockWeights<'_>,
+        output: &mut Vec<f32>,
+    ) -> usize {
+        let mut hidden = input.to_vec();
+        snake_beta_in_place(&mut hidden, frames, weights.alpha_log, weights.beta_log);
+        self.transposed.push(
+            &hidden,
+            frames,
+            weights.transposed.weight,
+            Some(weights.transposed.bias),
+            output,
+        );
+        let output_frames = frames * weights.transposed.stride;
+        for (unit_state, unit_weights) in self.residual_units.iter_mut().zip(weights.residual_units)
+        {
+            hidden.clear();
+            hidden.extend_from_slice(output);
+            unit_state.push(&hidden, output_frames, unit_weights, output);
+        }
+        output_frames
+    }
+}
+
+/// Retained causal context for a latent 2× upsample plus ConvNeXt stage.
+#[derive(Clone, Debug)]
+struct CodecUpsampleStageStream {
+    transposed: CausalTransposeConvStream,
+    convnext: CodecConvNextStream,
+}
+
+impl CodecUpsampleStageStream {
+    fn new(weights: CodecUpsampleStageWeights<'_>) -> Self {
+        Self {
+            transposed: CausalTransposeConvStream::new(
+                weights.transposed.input_channels,
+                weights.transposed.output_channels,
+                weights.transposed.kernel,
+                weights.transposed.stride,
+            ),
+            convnext: CodecConvNextStream::new(weights.transposed.output_channels),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.transposed.clear();
+        self.convnext.clear();
+    }
+
+    fn push(
+        &mut self,
+        input: &[f32],
+        frames: usize,
+        weights: CodecUpsampleStageWeights<'_>,
+        output: &mut Vec<f32>,
+    ) -> usize {
+        let mut hidden = Vec::new();
+        self.transposed.push(
+            input,
+            frames,
+            weights.transposed.weight,
+            Some(weights.transposed.bias),
+            &mut hidden,
+        );
+        let output_frames = frames * weights.transposed.stride;
+        self.convnext
+            .push(&hidden, output_frames, weights.convnext, output);
+        output_frames
+    }
+}
+
+/// Stateful exact-f32 codec decoder for packeted token frames.
+///
+/// Each call emits all PCM samples made final by the supplied codec frames. The state preserves
+/// the causal convolution contexts, transposed-convolution overlap, and per-layer 72-position KV
+/// caches so concatenated packets match [`decode_codec_offline`] on the same token stream.
+#[derive(Clone, Debug)]
+pub struct CodecStreamingState {
+    config: CodecConfig,
+    frames_seen: usize,
+    pre_conv: CausalConvStream,
+    transformer_caches: Vec<CodecKvCache>,
+    latent_upsample: [CodecUpsampleStageStream; 2],
+    decoder_input: CausalConvStream,
+    decoder_blocks: [CodecDecoderBlockStream; 4],
+    final_conv: CausalConvStream,
+}
+
+impl CodecStreamingState {
+    /// Allocate persistent state for one decoder instance, retaining no checkpoint data.
+    #[must_use]
+    pub fn new(config: CodecConfig, weights: &CodecDecoderWeights<'_>) -> Self {
+        Self {
+            config,
+            frames_seen: 0,
+            pre_conv: CausalConvStream::new(
+                weights.pre_conv.input_channels,
+                weights.pre_conv.kernel,
+                weights.pre_conv.dilation,
+            ),
+            transformer_caches: vec![
+                CodecKvCache::new(config);
+                weights.pre_transformer.layers.len()
+            ],
+            latent_upsample: weights.latent_upsample.map(CodecUpsampleStageStream::new),
+            decoder_input: CausalConvStream::new(
+                weights.decoder_input.input_channels,
+                weights.decoder_input.kernel,
+                weights.decoder_input.dilation,
+            ),
+            decoder_blocks: weights.decoder_blocks.map(CodecDecoderBlockStream::new),
+            final_conv: CausalConvStream::new(
+                weights.final_conv.input_channels,
+                weights.final_conv.kernel,
+                weights.final_conv.dilation,
+            ),
+        }
+    }
+
+    /// Reset this state for a fresh utterance without releasing its retained allocations.
+    pub fn clear(&mut self) {
+        self.frames_seen = 0;
+        self.pre_conv.clear();
+        for cache in &mut self.transformer_caches {
+            cache.clear();
+        }
+        for stage in &mut self.latent_upsample {
+            stage.clear();
+        }
+        self.decoder_input.clear();
+        for block in &mut self.decoder_blocks {
+            block.clear();
+        }
+        self.final_conv.clear();
+    }
+
+    /// Decode a nonempty packet of `frames` code rows and write its finalized PCM to `output`.
+    pub fn push(
+        &mut self,
+        quantizer: SplitResidualVectorQuantizer<'_>,
+        weights: &CodecDecoderWeights<'_>,
+        codes: &[i32],
+        frames: usize,
+        output: &mut Vec<f32>,
+    ) -> Result<(), CodecError> {
+        assert!(frames > 0, "streaming codec packets must contain a frame");
+        let mut hidden = vec![0.0f32; frames * self.config.codec_latent_dim];
+        quantizer.decode(self.config, codes, frames, &mut hidden)?;
+
+        let mut next = Vec::new();
+        self.pre_conv.push(
+            &hidden,
+            frames,
+            weights.pre_conv.weight,
+            Some(weights.pre_conv.bias),
+            weights.pre_conv.output_channels,
+            &mut next,
+        );
+        hidden = next;
+        next = vec![0.0f32; frames * self.config.transformer_latent_dim];
+        forward_codec_pre_transformer(
+            self.config,
+            &weights.pre_transformer,
+            self.frames_seen,
+            &hidden,
+            frames,
+            &mut self.transformer_caches,
+            &mut next,
+        );
+        self.frames_seen += frames;
+        hidden = next;
+        next = Vec::new();
+
+        let mut current_frames = frames;
+        for (stage_state, stage_weights) in
+            self.latent_upsample.iter_mut().zip(weights.latent_upsample)
+        {
+            current_frames = stage_state.push(&hidden, current_frames, stage_weights, &mut next);
+            core::mem::swap(&mut hidden, &mut next);
+        }
+        self.decoder_input.push(
+            &hidden,
+            current_frames,
+            weights.decoder_input.weight,
+            Some(weights.decoder_input.bias),
+            weights.decoder_input.output_channels,
+            &mut next,
+        );
+        core::mem::swap(&mut hidden, &mut next);
+
+        let mut waveform_frames = current_frames;
+        for (block_state, block_weights) in
+            self.decoder_blocks.iter_mut().zip(weights.decoder_blocks)
+        {
+            waveform_frames = block_state.push(&hidden, waveform_frames, block_weights, &mut next);
+            core::mem::swap(&mut hidden, &mut next);
+        }
+        snake_beta_in_place(
+            &mut hidden,
+            waveform_frames,
+            weights.final_alpha_log,
+            weights.final_beta_log,
+        );
+        self.final_conv.push(
+            &hidden,
+            waveform_frames,
+            weights.final_conv.weight,
+            Some(weights.final_conv.bias),
+            weights.final_conv.output_channels,
+            output,
+        );
+        assert_eq!(
+            output.len(),
+            waveform_frames,
+            "streaming codec output must be mono"
+        );
+        for sample in output {
+            *sample = sample.clamp(-1.0, 1.0);
+        }
+        Ok(())
+    }
+}
+
 /// Decode an entire fixed codec-token stream to clamped PCM with the exact safe f32 graph.
 ///
 /// This is deliberately the whole-sequence reference path. The full packet-at-a-time engine will
@@ -1286,6 +1870,27 @@ mod tests {
     }
 
     #[test]
+    fn causal_transpose_streaming_equals_one_shot_with_overlap() {
+        let input = [1.0f32, 2.0, 3.0];
+        let weight = [1.0f32, 10.0, 100.0, 1_000.0];
+        let mut offline = [0.0f32; 6];
+        causal_transpose_conv1d(&input, 3, 1, &weight, None, 1, 4, 2, &mut offline);
+
+        let mut stream = CausalTransposeConvStream::new(1, 1, 4, 2);
+        let mut packet = Vec::new();
+        let mut packeted = Vec::new();
+        stream.push(&input[..1], 1, &weight, None, &mut packet);
+        packeted.extend_from_slice(&packet);
+        stream.push(&input[1..], 2, &weight, None, &mut packet);
+        packeted.extend_from_slice(&packet);
+
+        assert_eq!(packeted, offline);
+        stream.clear();
+        stream.push(&input, 3, &weight, None, &mut packet);
+        assert_eq!(packet, offline);
+    }
+
+    #[test]
     fn codec_k_7168_has_the_documented_i32_headroom() {
         require_i32_safe_u8s8_reduction(CODEC_MAX_INT8_REDUCTION_K).expect("binding K fits i32");
         assert_eq!(CODEC_MAX_U8S8_ACCUMULATOR, 232_135_680);
@@ -1393,7 +1998,7 @@ mod tests {
     #[test]
     fn offline_codec_graph_emits_exactly_1920_samples_per_frame() {
         let config = small_config();
-        let first = MaterializedCodebook::from_unnormalized(&[0.0; 4], &[1.0; 2], 2, 2)
+        let first = MaterializedCodebook::from_unnormalized(&[1.0, 0.0, 0.0, 0.0], &[1.0; 2], 2, 2)
             .expect("first codebook");
         let rest = MaterializedCodebook::from_unnormalized(&[0.0; 4], &[1.0; 2], 2, 2)
             .expect("rest codebook");
@@ -1401,14 +2006,17 @@ mod tests {
         let quantizer = SplitResidualVectorQuantizer {
             first_codebook: &first,
             rest_codebooks: &rest_codebooks,
-            first_output_proj: &[0.0; 4],
+            first_output_proj: &[1.0, 0.0, 0.0, 1.0],
             rest_output_proj: &[0.0; 4],
         };
 
         let two_channels = [0.0f32; 2];
-        let two_by_two = [0.0f32; 4];
+        let two_by_two = [1.0f32, 0.0, 0.0, 1.0];
+        let pre_conv_weight = [
+            0.0f32, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
         let pre_conv = CausalConvWeights {
-            weight: &[0.0; 12],
+            weight: &pre_conv_weight,
             bias: &two_channels,
             input_channels: 2,
             output_channels: 2,
@@ -1423,8 +2031,9 @@ mod tests {
             output_proj: &two_by_two,
             output_proj_bias: &two_channels,
         };
+        let latent_transposed_weight = [0.1f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let latent_transposed = CausalTransposeConvWeights {
-            weight: &[0.0; 8],
+            weight: &latent_transposed_weight,
             bias: &two_channels,
             input_channels: 2,
             output_channels: 2,
@@ -1452,8 +2061,11 @@ mod tests {
                 convnext,
             },
         ];
+        let decoder_input_weight = [
+            0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
         let decoder_input = CausalConvWeights {
-            weight: &[0.0; 14],
+            weight: &decoder_input_weight,
             bias: &[0.0],
             input_channels: 2,
             output_channels: 1,
@@ -1488,12 +2100,18 @@ mod tests {
             residual_at_dilation(3),
             residual_at_dilation(9),
         ];
+        let block_8_weight = [
+            0.1f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let block_5_weight = [0.1f32, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0];
+        let block_4_weight = [0.1f32, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0];
+        let block_3_weight = [0.1f32, 0.0, 0.0, 0.1, 0.0, 0.0];
         let decoder_blocks = [
             CodecDecoderBlockWeights {
                 alpha_log: &one_channel,
                 beta_log: &one_channel,
                 transposed: CausalTransposeConvWeights {
-                    weight: &[0.0; 16],
+                    weight: &block_8_weight,
                     bias: &one_channel,
                     input_channels: 1,
                     output_channels: 1,
@@ -1506,7 +2124,7 @@ mod tests {
                 alpha_log: &one_channel,
                 beta_log: &one_channel,
                 transposed: CausalTransposeConvWeights {
-                    weight: &[0.0; 10],
+                    weight: &block_5_weight,
                     bias: &one_channel,
                     input_channels: 1,
                     output_channels: 1,
@@ -1519,7 +2137,7 @@ mod tests {
                 alpha_log: &one_channel,
                 beta_log: &one_channel,
                 transposed: CausalTransposeConvWeights {
-                    weight: &[0.0; 8],
+                    weight: &block_4_weight,
                     bias: &one_channel,
                     input_channels: 1,
                     output_channels: 1,
@@ -1532,7 +2150,7 @@ mod tests {
                 alpha_log: &one_channel,
                 beta_log: &one_channel,
                 transposed: CausalTransposeConvWeights {
-                    weight: &[0.0; 6],
+                    weight: &block_3_weight,
                     bias: &one_channel,
                     input_channels: 1,
                     output_channels: 1,
@@ -1551,7 +2169,7 @@ mod tests {
             final_alpha_log: &one_channel,
             final_beta_log: &one_channel,
             final_conv: CausalConvWeights {
-                weight: &[0.0; 7],
+                weight: &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1],
                 bias: &one_channel,
                 input_channels: 1,
                 output_channels: 1,
@@ -1560,9 +2178,34 @@ mod tests {
             },
         };
 
-        let waveform = decode_codec_offline(config, quantizer, &weights, &[0, 0], 1)
+        let codes = [0, 0, 0, 0];
+        let waveform = decode_codec_offline(config, quantizer, &weights, &codes, 2)
             .expect("well-shaped model graph");
-        assert_eq!(waveform.len(), 1_920);
-        assert!(waveform.iter().all(|sample| *sample == 0.0));
+        assert_eq!(waveform.len(), 3_840);
+        assert!(waveform.iter().all(|sample| sample.is_finite()));
+        assert!(
+            waveform
+                .iter()
+                .any(|sample| sample.is_normal() || sample.is_subnormal())
+        );
+
+        let mut stream = CodecStreamingState::new(config, &weights);
+        let mut packet = Vec::new();
+        let mut packeted = Vec::new();
+        stream
+            .push(quantizer, &weights, &codes[..2], 1, &mut packet)
+            .expect("first codec packet");
+        packeted.extend_from_slice(&packet);
+        stream
+            .push(quantizer, &weights, &codes[2..], 1, &mut packet)
+            .expect("second codec packet");
+        packeted.extend_from_slice(&packet);
+        assert_eq!(packeted, waveform);
+
+        stream.clear();
+        stream
+            .push(quantizer, &weights, &codes, 2, &mut packet)
+            .expect("reset codec stream");
+        assert_eq!(packet, waveform);
     }
 }
