@@ -1041,6 +1041,142 @@ mod tests {
     }
 
     #[test]
+    fn left_padded_prompt_reproduces_the_unpadded_rows_bit_exactly() {
+        // The resolved OQ-4 addendum's mandated padded-prompt test: an unpadded-only port passes
+        // every fixture and then fails batched/padded production. Left pads receive position 1 and
+        // an additive -inf mask column; with `exp(-inf) = 0` contributing exactly nothing to the
+        // attention sums, the real rows of a left-padded prompt must be BIT-IDENTICAL to the same
+        // prompt run unpadded — any drift here means the mask or the position schedule leaks pad
+        // state into real positions.
+        let config = TalkerConfig {
+            hidden_size: 4,
+            intermediate_size: 3,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            rms_norm_eps: 1e-6,
+            qk_norm_eps: 1e-6,
+        };
+        let patterned = |len: usize, scale: f32| {
+            (0..len)
+                .map(|index| (index as f32 % 5.0 - 2.0) * scale)
+                .collect::<Vec<_>>()
+        };
+        let norm = vec![1.0f32; config.hidden_size];
+        let q = patterned(config.query_width() * config.hidden_size, 0.07);
+        let k = patterned(config.kv_width() * config.hidden_size, 0.05);
+        let v = patterned(config.kv_width() * config.hidden_size, 0.09);
+        let head_norm = vec![1.0f32; config.head_dim];
+        let o = patterned(config.hidden_size * config.query_width(), 0.06);
+        let mlp = patterned(config.intermediate_size * config.hidden_size, 0.04);
+        let down = patterned(config.hidden_size * config.intermediate_size, 0.03);
+        let layer = TalkerLayerWeights {
+            input_layernorm: &norm,
+            q_proj: &q,
+            k_proj: &k,
+            v_proj: &v,
+            q_norm: &head_norm,
+            k_norm: &head_norm,
+            o_proj: &o,
+            post_attention_layernorm: &norm,
+            gate_proj: &mlp,
+            up_proj: &mlp,
+            down_proj: &down,
+        };
+        let head = patterned(PRIMARY_CODE_VOCAB_SIZE * config.hidden_size, 0.02);
+        let weights = TalkerWeights {
+            layers: vec![layer; TALKER_LAYER_COUNT],
+            final_norm: &norm,
+            codec_head: &head,
+        };
+
+        let real = 3usize;
+        let pads = 2usize;
+        let padded_seq = pads + real;
+        let real_input = vec![
+            0.5_f32, -1.0, 2.0, 0.25, 1.5, 0.75, -0.5, 2.5, -0.25, 1.0, 0.5, -2.0,
+        ];
+
+        // Unpadded run: positions 0..real, plain causal mask.
+        let attention_flags: Vec<bool> = vec![true; real];
+        let unpadded_positions = left_padded_positions(&attention_flags);
+        assert_eq!(unpadded_positions, vec![0, 1, 2]);
+        let (cos, sin) = mrope_rows(&unpadded_positions, config.head_dim, 1.0e6);
+        let mut unpadded_mask = vec![0.0f32; real * real];
+        for query in 0..real {
+            for key in query + 1..real {
+                unpadded_mask[query * real + key] = f32::NEG_INFINITY;
+            }
+        }
+        let mut unpadded_hidden = real_input.clone();
+        let mut unpadded_logits = vec![0.0f32; real * PRIMARY_CODE_VOCAB_SIZE];
+        let mut unpadded_cache = TalkerKvCache::new();
+        forward_talker(
+            &config,
+            &weights,
+            RotaryRows {
+                cos: &cos,
+                sin: &sin,
+            },
+            &unpadded_mask,
+            &mut unpadded_hidden,
+            real,
+            &mut unpadded_cache,
+            &mut unpadded_logits,
+        );
+
+        // Left-padded run: pad rows first, the resolved position rule, and -inf pad columns.
+        let padded_flags: Vec<bool> = [vec![false; pads], vec![true; real]].concat();
+        let padded_positions = left_padded_positions(&padded_flags);
+        assert_eq!(
+            padded_positions,
+            vec![1, 1, 0, 1, 2],
+            "pads take position 1; real elements restart the causal stream at 0"
+        );
+        assert_eq!(rope_delta_for_left_padding(&padded_flags), -(pads as i64));
+        let (padded_cos, padded_sin) = mrope_rows(&padded_positions, config.head_dim, 1.0e6);
+        let mut padded_mask = vec![0.0f32; padded_seq * padded_seq];
+        for query in 0..padded_seq {
+            for key in 0..padded_seq {
+                let causal_future = key > query;
+                let pad_column = key < pads;
+                // Pads may see themselves (softmax needs one finite row entry); real queries
+                // must never see a pad.
+                if (causal_future || pad_column) && !(query < pads && key == query) {
+                    padded_mask[query * padded_seq + key] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let mut padded_hidden = [patterned(pads * config.hidden_size, 0.11), real_input].concat();
+        let mut padded_logits = vec![0.0f32; padded_seq * PRIMARY_CODE_VOCAB_SIZE];
+        let mut padded_cache = TalkerKvCache::new();
+        forward_talker(
+            &config,
+            &weights,
+            RotaryRows {
+                cos: &padded_cos,
+                sin: &padded_sin,
+            },
+            &padded_mask,
+            &mut padded_hidden,
+            padded_seq,
+            &mut padded_cache,
+            &mut padded_logits,
+        );
+
+        assert_eq!(
+            &padded_hidden[pads * config.hidden_size..],
+            &unpadded_hidden[..],
+            "real hidden rows must be bit-identical between padded and unpadded prompts"
+        );
+        assert_eq!(
+            &padded_logits[pads * PRIMARY_CODE_VOCAB_SIZE..],
+            &unpadded_logits[..],
+            "real logit rows must be bit-identical between padded and unpadded prompts"
+        );
+    }
+
+    #[test]
     fn collapse_mrope_doubles_the_half_row() {
         // head_dim 8 => half 4; the collapsed half must be repeated to refill head_dim.
         let seq = 2;
