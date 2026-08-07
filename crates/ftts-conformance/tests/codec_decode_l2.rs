@@ -61,8 +61,26 @@ const TEST_NAME: &str = "contract_a_l2_codec_decoder_stages_cpu_fp32_exact";
 /// The dense projections were tried the same way and REJECTED — see the negative-evidence note in
 /// `ftts-model-qwen/src/codec.rs`; `nn.Linear` does not land on the convolution's blocking, so the
 /// transformer seams here are unchanged in form and only shifted by their inputs.
+///
+/// Ratchet round 5 (the RVQ output projections). Round 4 left one measurement open: whether the
+/// `k = 1` projections follow the convolution rule or the `nn.Linear` rule. The pinned checkpoint
+/// answers it directly — `decoder.quantizer.rvq_{first,rest}.output_proj.weight` carry the 3-D
+/// shape `[512, 256, 1]`, so they are `Conv1d`, while `decoder.pre_transformer.{input,output}_proj`
+/// are 2-D and so are genuinely `nn.Linear`. Routing only the two RVQ projections through the
+/// convolution's BLAS (bias-free, `beta = 0`) tightened the first seam in the graph:
+///
+///   rvq+pre_conv+input_proj      1.639e-7 -> 5.960e-8   (6_674 -> 5_234 elements)
+///   decode_codec_offline[icl]    2.198e-7 -> 1.788e-7   (26_194 -> 25_749)
+///
+/// Every other seam is bit-identical, which is itself the isolation: the oracle-fed transformer
+/// stages do not see this input. One entry moved the wrong way and is recorded rather than smoothed
+/// over — `decode_codec_offline[xvector]` 4.005e-8 -> 5.402e-8 over 1_904 of 1_920 samples, a
+/// ulp-scale wobble on the shorter of the two waveforms while the longer one improved.
+///
+/// What is left in `rvq+pre_conv+input_proj` is therefore `pre_transformer.input_proj`, a real
+/// `nn.Linear`, plus the codebook accumulation order — `pre_conv` itself went exact in round 4.
 const PINNED_DIVERGENCE: &[(&str, f64, usize)] = &[
-    ("rvq+pre_conv+input_proj", 1.6391277313232422e-7, 6_674),
+    ("rvq+pre_conv+input_proj", 5.9604644775390625e-8, 5_234),
     ("codec_rope.cos", 5.9604644775390625e-8, 80),
     ("codec_rope.sin", 5.9604644775390625e-8, 24),
     (
@@ -130,11 +148,11 @@ const PINNED_DIVERGENCE: &[(&str, f64, usize)] = &[
     ),
     ("codec_decoder.block_05", 7.6293945312500000e-6, 42_042),
     ("codec_decoder.block_06", 2.2351741790771484e-8, 15_125),
-    ("decode_codec_offline[icl]", 2.1979212760925293e-7, 26_194),
+    ("decode_codec_offline[icl]", 1.7881393432617188e-7, 25_749),
     (
         "decode_codec_offline[xvector]",
-        4.0046870708465576e-8,
-        1_901,
+        5.4016709327697754e-8,
+        1_904,
     ),
 ];
 

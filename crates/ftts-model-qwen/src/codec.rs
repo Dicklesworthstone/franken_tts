@@ -231,24 +231,33 @@ impl SplitResidualVectorQuantizer<'_> {
             }
         }
 
+        // Both `output_proj` are `Conv1d` with kernel 1 in the checkpoint —
+        // `decoder.quantizer.rvq_{first,rest}.output_proj.weight` carry the 3-D shape
+        // `[512, 256, 1]`, not the 2-D shape an `nn.Linear` would. So they follow the convolution
+        // rule measured in `causal_conv1d`: the reduction belongs to the platform BLAS. At kernel 1
+        // the `im2col` unfolding is the identity, so the GEMM is issued directly on the codebook
+        // sums; both are bias-free, so it runs at `beta = 0`. Off macOS this degrades to the scalar
+        // reduction, which is what these calls did before.
         let mut first_projected = vec![0.0f32; output.len()];
         let mut rest_projected = vec![0.0f32; output.len()];
-        f32ref::linear(
+        f32ref::linear_with_accumulation(
             &first,
             self.first_output_proj,
             None,
             frames,
             config.codebook_dim,
             config.codec_latent_dim,
+            f32ref::F32LinearAccumulation::Accelerate,
             &mut first_projected,
         );
-        f32ref::linear(
+        f32ref::linear_with_accumulation(
             &rest,
             self.rest_output_proj,
             None,
             frames,
             config.codebook_dim,
             config.codec_latent_dim,
+            f32ref::F32LinearAccumulation::Accelerate,
             &mut rest_projected,
         );
         for index in 0..output.len() {
@@ -668,11 +677,15 @@ pub fn snake_beta_in_place(values: &mut [f32], frames: usize, alpha_log: &[f32],
 // batched 3-D `baddbmm` lowering is the leading suspect. Until that is measured, the dense
 // projections keep the scalar reduction, which is the closer of the two.
 //
-// One measurement is deliberately still missing: the `k = 1` `Conv1d` projections (RVQ
-// `input_proj`/`output_proj`, and the transformer's `input_proj`/`output_proj`) ARE convolutions and
-// so should follow the conv rule, but the only run that touched them moved them together with the
-// `nn.Linear` sites, so their contribution was never isolated. `rvq+pre_conv+input_proj` did improve
-// in that run (1.639e-7 -> 5.960e-8), which is suggestive; it is not yet evidence.
+// That earlier run left one question open — whether the `k = 1` projections follow the conv rule or
+// the `nn.Linear` rule — because it moved them together with the dense sites. The pinned checkpoint
+// settles which is which: `decoder.quantizer.rvq_{first,rest}.output_proj.weight` carry the 3-D
+// shape `[512, 256, 1]` and so are `Conv1d`, whereas `decoder.pre_transformer.{input,output}_proj`
+// are 2-D and so are genuinely `nn.Linear`. Routing ONLY the two RVQ projections at `beta = 0`
+// (below, in `SplitResidualVectorQuantizer::decode`) took `rvq+pre_conv+input_proj` from 1.639e-7 to
+// 5.960e-8 and left every other seam bit-identical, which is the isolation the earlier run lacked.
+// `decode_codec_offline[xvector]` moved the wrong way by a ulp (4.005e-8 -> 5.402e-8) while
+// `[icl]` improved (2.198e-7 -> 1.788e-7); both are pinned.
 
 /// Reference causal Conv1d for time-major `[frames, channels]` data.
 ///
