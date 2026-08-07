@@ -39,6 +39,13 @@ pub enum F32LinearAccumulation {
     /// the CPU-fp32 fixture can attribute a convolution's divergence; it falls back to
     /// [`Self::Scalar`] with a trailing bias on every non-macOS target.
     AccelerateBiasSeeded,
+    /// One f64 accumulator, narrowed to f32 only at the store.
+    ///
+    /// Not a candidate for what the oracle did — it is an *attribution probe*. Every f32 lane
+    /// order above is one guess at the oracle's reduction; this one removes the reduction's
+    /// rounding entirely, so the residual it leaves at a seam is the part of that seam's
+    /// divergence that a reduction order cannot explain. See `talker_layer_attribution`.
+    WidenedF64,
 }
 
 /// Arithmetic used by [`rms_norm_with_arithmetic`] to form RMSNorm's scale.
@@ -60,6 +67,11 @@ pub enum F32RmsNormArithmetic {
     F64ReciprocalSqrt,
 }
 
+impl F32RmsNormArithmetic {
+    /// The variant that removes this operation's f32 reduction rounding, for attribution probes.
+    pub const WIDENED_F64: Self = Self::F64ReciprocalSqrt;
+}
+
 /// Association used by [`silu_mul_in_place_with_arithmetic`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum F32SiluArithmetic {
@@ -67,6 +79,9 @@ pub enum F32SiluArithmetic {
     Divide,
     /// `x * (1 / (1 + exp(-x)))`, matching `x * sigmoid(x)` association.
     MultiplyReciprocal,
+    /// The whole expression in f64, narrowed only at the store — an attribution probe, not a
+    /// candidate for what the oracle did.
+    WidenedF64,
 }
 
 /// Normalization form used by [`softmax_rows_with_arithmetic`].
@@ -76,6 +91,9 @@ pub enum F32SoftmaxArithmetic {
     ReciprocalMultiply,
     /// Divide every exponent by the sum directly.
     Divide,
+    /// Exponentiate, sum and normalize in f64, narrowing only at the store — an attribution
+    /// probe, not a candidate for what the oracle did.
+    WidenedF64,
 }
 
 /// Row-major matrix-vector/matrix-matrix product in the layout PyTorch `Linear` stores.
@@ -171,6 +189,13 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
             }
             sum
         }
+        F32LinearAccumulation::WidenedF64 => {
+            let mut sum = 0.0f64;
+            for index in 0..x.len() {
+                sum += f64::from(x[index]) * f64::from(weight[index]);
+            }
+            sum as f32
+        }
         F32LinearAccumulation::Lanes4
         | F32LinearAccumulation::Lanes8
         | F32LinearAccumulation::FusedLanes4
@@ -185,7 +210,9 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
                 F32LinearAccumulation::Accelerate | F32LinearAccumulation::AccelerateBiasSeeded => {
                     1
                 }
-                F32LinearAccumulation::Scalar => unreachable!("scalar handled above"),
+                F32LinearAccumulation::Scalar | F32LinearAccumulation::WidenedF64 => {
+                    unreachable!("scalar and widened orders are handled above")
+                }
             };
             let mut partial = [0.0f32; 8];
             for index in 0..x.len() {
@@ -198,9 +225,8 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
                     | F32LinearAccumulation::Lanes4
                     | F32LinearAccumulation::Lanes8
                     | F32LinearAccumulation::Accelerate
-                    | F32LinearAccumulation::AccelerateBiasSeeded => {
-                        partial[lane] + x[index] * weight[index]
-                    }
+                    | F32LinearAccumulation::AccelerateBiasSeeded
+                    | F32LinearAccumulation::WidenedF64 => partial[lane] + x[index] * weight[index],
                 };
             }
             let mut sum = 0.0f32;
@@ -475,10 +501,16 @@ pub fn silu_mul_in_place_with_arithmetic(
     assert_eq!(gate.len(), up.len(), "gate and up must match");
     for (g, u) in gate.iter_mut().zip(up) {
         let x = *g;
+        if arithmetic == F32SiluArithmetic::WidenedF64 {
+            let wide = f64::from(x);
+            *g = (wide / (1.0 + (-wide).exp()) * f64::from(*u)) as f32;
+            continue;
+        }
         let denominator = 1.0 + (-x).exp();
         let silu = match arithmetic {
             F32SiluArithmetic::Divide => x / denominator,
             F32SiluArithmetic::MultiplyReciprocal => x * denominator.recip(),
+            F32SiluArithmetic::WidenedF64 => unreachable!("handled above"),
         };
         *g = silu * u;
     }
@@ -505,6 +537,20 @@ pub fn softmax_rows_with_arithmetic(
                 max = *value;
             }
         }
+        if arithmetic == F32SoftmaxArithmetic::WidenedF64 {
+            let max = f64::from(max);
+            let mut wide = Vec::with_capacity(slice.len());
+            let mut sum = 0.0f64;
+            for value in slice.iter() {
+                let exponent = (f64::from(*value) - max).exp();
+                sum += exponent;
+                wide.push(exponent);
+            }
+            for (value, exponent) in slice.iter_mut().zip(wide) {
+                *value = (exponent / sum) as f32;
+            }
+            continue;
+        }
         let mut sum = 0.0f32;
         for value in slice.iter_mut() {
             *value = (*value - max).exp();
@@ -514,6 +560,7 @@ pub fn softmax_rows_with_arithmetic(
             *value = match arithmetic {
                 F32SoftmaxArithmetic::ReciprocalMultiply => *value * sum.recip(),
                 F32SoftmaxArithmetic::Divide => *value / sum,
+                F32SoftmaxArithmetic::WidenedF64 => unreachable!("handled above"),
             };
         }
     }
@@ -803,11 +850,23 @@ fn attention_weighted_sum(
     accumulation: F32LinearAccumulation,
     out: &mut [f32],
 ) {
+    if accumulation == F32LinearAccumulation::WidenedF64 {
+        for lane in 0..head_dim {
+            let mut sum = 0.0f64;
+            for (key_position, weight) in scores.iter().copied().enumerate() {
+                let value = values[(key_position * kv_heads + kv_head) * head_dim + lane];
+                sum += f64::from(weight) * f64::from(value);
+            }
+            out[lane] = sum as f32;
+        }
+        return;
+    }
     let lanes = match accumulation {
         F32LinearAccumulation::Scalar => 1,
         F32LinearAccumulation::Lanes4 | F32LinearAccumulation::FusedLanes4 => 4,
         F32LinearAccumulation::Lanes8 | F32LinearAccumulation::FusedLanes8 => 8,
         F32LinearAccumulation::Accelerate | F32LinearAccumulation::AccelerateBiasSeeded => 1,
+        F32LinearAccumulation::WidenedF64 => unreachable!("handled above"),
     };
     for lane in 0..head_dim {
         let mut partial = [0.0f32; 8];
@@ -822,9 +881,8 @@ fn attention_weighted_sum(
                 | F32LinearAccumulation::Lanes4
                 | F32LinearAccumulation::Lanes8
                 | F32LinearAccumulation::Accelerate
-                | F32LinearAccumulation::AccelerateBiasSeeded => {
-                    partial[partial_index] + weight * value
-                }
+                | F32LinearAccumulation::AccelerateBiasSeeded
+                | F32LinearAccumulation::WidenedF64 => partial[partial_index] + weight * value,
             };
         }
         let mut sum = 0.0f32;

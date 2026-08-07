@@ -870,6 +870,37 @@ mod tests {
     }
 
     #[test]
+    fn log_mel_uses_the_pinned_frame_geometry_and_stays_finite() {
+        let pcm: Vec<f32> = (0..SPEAKER_SAMPLE_RATE_HZ as usize)
+            .map(|sample| {
+                (std::f32::consts::TAU * 440.0 * sample as f32 / SPEAKER_SAMPLE_RATE_HZ as f32)
+                    .sin()
+                    * 0.25
+            })
+            .collect();
+        let mel = log_mel_from_24khz_pcm(&pcm).expect("24 kHz reference should yield log-mel");
+        assert_eq!(mel.frames, 93);
+        assert_eq!(mel.values.len(), mel.frames * MEL_DIM);
+        assert!(mel.values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn log_mel_refuses_invalid_reflect_padding_and_non_finite_pcm() {
+        assert_eq!(
+            log_mel_from_24khz_pcm(&[0.0; SPEAKER_REFLECT_PAD_SAMPLES]),
+            Err(FeatureError::TooShort {
+                samples: SPEAKER_REFLECT_PAD_SAMPLES
+            })
+        );
+        let mut pcm = vec![0.0f32; SPEAKER_MIN_AUDIO_SAMPLES];
+        pcm[17] = f32::NAN;
+        assert_eq!(
+            log_mel_from_24khz_pcm(&pcm),
+            Err(FeatureError::NonFinite { index: 17 })
+        );
+    }
+
+    #[test]
     fn same_padding_preserves_length_for_every_block_geometry() {
         let frames = 16;
         for (kernel, dilation) in ENC_KERNEL_SIZES.iter().zip(ENC_DILATIONS.iter()) {
