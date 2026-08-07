@@ -1,5 +1,9 @@
 //! L2 parity: every captured codec-decoder seam against the CPU-fp32 oracle.
 //!
+// The float literals in this file are pinned observed divergences; truncating them to clippy's
+// taste would un-pin the measurements (AGENTS.md doctrine #8: no silent numerics changes).
+#![allow(clippy::excessive_precision)]
+//!
 //! The ft7 pack captures the codec decoder at stage granularity: the SplitRVQ input codes, each of
 //! the eight pre-transformer layers, both latent upsample stages, all seven `decoder.*` children,
 //! and the decoder's own waveform output. Each stage here is fed the oracle's *captured input* —
@@ -222,8 +226,10 @@ fn read_i64_npy(path: &Path) -> (Vec<usize>, Vec<i64>) {
         .filter_map(|piece| piece.trim().parse::<usize>().ok())
         .collect();
     let data: Vec<i64> = bytes[body_start + header_len..]
-        .chunks_exact(8)
-        .map(|chunk| i64::from_le_bytes(chunk.try_into().expect("eight bytes")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| i64::from_le_bytes(*chunk))
         .collect();
     assert_eq!(
         data.len(),
@@ -821,7 +827,7 @@ fn contract_a_l2_codec_decoder_stages_cpu_fp32_exact() {
     check(&mut failures, "codec_rope.sin", &rope_sin, &our_sin);
 
     // Stage: each pre-transformer layer, stepwise, from the oracle's own layer input.
-    for layer in 0..8 {
+    for (layer, &weights) in layer_weights.iter().enumerate() {
         let input_name = format!("codec_decoder.transformer_layer_{layer:02}.input");
         let output_name = format!("codec_decoder.transformer_layer_{layer:02}.output");
         let input = fixtures
@@ -835,7 +841,7 @@ fn contract_a_l2_codec_decoder_stages_cpu_fp32_exact() {
         for frame in 0..frames {
             forward_codec_transformer_step(
                 config,
-                layer_weights[layer],
+                weights,
                 frame,
                 &mut state[frame * 512..(frame + 1) * 512],
                 &mut cache,

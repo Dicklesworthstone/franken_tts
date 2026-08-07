@@ -143,7 +143,13 @@ fn prompt_header_derives_the_reference_prefill() {
         let expected = fixtures
             .seam(&input_seam, "kwargs.inputs_embeds", 0)
             .expect("reference prefill");
-        let expected_rows: Vec<&[f32]> = expected.data.chunks_exact(TALKER_HIDDEN).collect();
+        let expected_rows: Vec<&[f32]> = expected
+            .data
+            .as_chunks::<TALKER_HIDDEN>()
+            .0
+            .iter()
+            .map(<[f32; TALKER_HIDDEN]>::as_slice)
+            .collect();
 
         // --- our derivation ---------------------------------------------------------------
         let table = checkpoint
@@ -203,8 +209,13 @@ fn prompt_header_derives_the_reference_prefill() {
         let expected_trailing = fixtures
             .seam(&input_seam, "kwargs.trailing_text_hidden", 0)
             .expect("reference trailing text hidden");
-        let trailing_rows: Vec<&[f32]> =
-            expected_trailing.data.chunks_exact(TALKER_HIDDEN).collect();
+        let trailing_rows: Vec<&[f32]> = expected_trailing
+            .data
+            .as_chunks::<TALKER_HIDDEN>()
+            .0
+            .iter()
+            .map(<[f32; TALKER_HIDDEN]>::as_slice)
+            .collect();
         assert_eq!(
             assembly.trailing_text_hidden.len(),
             trailing_rows.len(),
@@ -239,7 +250,7 @@ fn prompt_header_derives_the_reference_prefill() {
     Receipt::new(TEST_NAME, Outcome::Passed)
         .contract("PromptAssembly")
         .seam("talker.input.input")
-        .reason(&summaries.join("; "))
+        .reason(summaries.join("; "))
         .tolerance(f64::from(ROW_TOLERANCE), CPU_TIER_TOLERANCE_SOURCE)
         .oracle_tier(OracleTier::CpuFp32Fallback)
         .emit();

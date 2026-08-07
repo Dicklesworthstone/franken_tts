@@ -163,8 +163,10 @@ fn audio_codes_decode_to_a_playable_wav() {
 
     let quantised = pcm_f32_to_i16(&pcm);
     let decoded: Vec<i16> = wav[WAV_HEADER_BYTES..]
-        .chunks_exact(2)
-        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| i16::from_le_bytes(*pair))
         .collect();
     assert_eq!(decoded, quantised, "WAV payload must round-trip exactly");
     assert!(
@@ -194,7 +196,7 @@ fn audio_codes_decode_to_a_playable_wav() {
     Receipt::new(TEST_NAME, Outcome::Passed)
         .contract("AudioTail")
         .seam("codec_decoder.input.input")
-        .reason(&format!(
+        .reason(format!(
             "{frames} frame(s) of codes -> {} samples at {SAMPLE_RATE_HZ} Hz through our codec, \
              mean square energy {energy:e}, {} WAV bytes{level}",
             pcm.len(),

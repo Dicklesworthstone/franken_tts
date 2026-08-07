@@ -134,8 +134,10 @@ fn audio_tail_fixture_pcm_to_wav() {
     // --- the payload round-trips: no sample is lost or reordered ------------------------------
     let expected: Vec<i16> = pcm_f32_to_i16(&pcm);
     let decoded: Vec<i16> = wav[WAV_HEADER_BYTES..]
-        .chunks_exact(2)
-        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| i16::from_le_bytes(*pair))
         .collect();
     assert_eq!(decoded, expected, "WAV payload must round-trip exactly");
     assert!(
@@ -160,7 +162,7 @@ fn audio_tail_fixture_pcm_to_wav() {
     Receipt::new(TEST_NAME, Outcome::Passed)
         .contract("AudioTail")
         .seam("codec.generated_waveform")
-        .reason(&format!(
+        .reason(format!(
             "{frames} frame(s) -> {} samples at {SAMPLE_RATE_HZ} Hz, mean square energy {energy:e}",
             pcm.len()
         ))

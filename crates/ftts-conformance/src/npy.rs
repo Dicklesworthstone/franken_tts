@@ -208,13 +208,12 @@ fn split_header(bytes: &[u8]) -> Result<(&str, usize), NpyError> {
             limit: MAX_HEADER_BYTES,
         });
     }
-    let payload_start =
-        header_start
-            .checked_add(header_len)
-            .ok_or_else(|| NpyError::HeaderLength {
-                declared: header_len,
-                limit: usize::MAX,
-            })?;
+    let payload_start = header_start
+        .checked_add(header_len)
+        .ok_or(NpyError::HeaderLength {
+            declared: header_len,
+            limit: usize::MAX,
+        })?;
     if payload_start > bytes.len() {
         return Err(NpyError::HeaderLength {
             declared: header_len,
@@ -251,7 +250,7 @@ pub fn parse(bytes: &[u8]) -> Result<NpyArray, NpyError> {
     let payload = &bytes[payload_start..];
     let expected_elements: usize = shape.iter().product();
     let found_elements = payload.len() / 4;
-    if payload.len() % 4 != 0 || found_elements != expected_elements {
+    if !payload.len().is_multiple_of(4) || found_elements != expected_elements {
         return Err(NpyError::LengthMismatch {
             expected_elements,
             found_elements,
@@ -259,8 +258,10 @@ pub fn parse(bytes: &[u8]) -> Result<NpyArray, NpyError> {
     }
 
     let data = payload
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect();
 
     Ok(NpyArray { shape, data })
@@ -540,7 +541,7 @@ pub fn parse_i64(bytes: &[u8]) -> Result<NpyInts, NpyError> {
     let payload = &bytes[payload_start..];
     let expected_elements: usize = shape.iter().product();
     let found_elements = payload.len() / 8;
-    if payload.len() % 8 != 0 || found_elements != expected_elements {
+    if !payload.len().is_multiple_of(8) || found_elements != expected_elements {
         return Err(NpyError::LengthMismatch {
             expected_elements,
             found_elements,
@@ -548,12 +549,10 @@ pub fn parse_i64(bytes: &[u8]) -> Result<NpyInts, NpyError> {
     }
 
     let data = payload
-        .chunks_exact(8)
-        .map(|chunk| {
-            i64::from_le_bytes([
-                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-            ])
-        })
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| i64::from_le_bytes(*chunk))
         .collect();
     Ok(NpyInts { shape, data })
 }

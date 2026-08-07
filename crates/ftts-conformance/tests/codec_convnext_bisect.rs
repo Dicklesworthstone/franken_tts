@@ -77,6 +77,9 @@ const SEAM: &str = "codec_decoder.upsample_0_1";
 const LAYER_NORM_EPS: f32 = 1e-6;
 
 /// How the depthwise convolution reduces and where its bias lands.
+// The `Bias` prefix is the taxonomy: every variant is named by where the bias enters the
+// reduction, which is the whole question this bisect asks.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Depthwise {
     /// Bias seeds the accumulator, then the taps are added left to right. Production.

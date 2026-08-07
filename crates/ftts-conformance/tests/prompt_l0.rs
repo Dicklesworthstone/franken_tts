@@ -60,12 +60,11 @@ fn read_npy_i64(path: &Path) -> Result<Vec<u32>, String> {
         return Err(format!("{} has a non-i64 payload", path.display()));
     }
     payload
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|chunk| {
-            let bytes: [u8; 8] = chunk
-                .try_into()
-                .map_err(|_| format!("{} has a malformed i64 payload", path.display()))?;
-            let id = i64::from_le_bytes(bytes);
+            let id = i64::from_le_bytes(*chunk);
             u32::try_from(id).map_err(|_| format!("{} contains token id {id}", path.display()))
         })
         .collect()

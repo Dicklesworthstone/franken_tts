@@ -183,7 +183,6 @@ fn sweep() -> Vec<Promotion> {
             silu: F32SiluArithmetic::WidenedF64,
             softmax: F32SoftmaxArithmetic::WidenedF64,
             attention: F32LinearAccumulation::WidenedF64,
-            ..ALL_F32
         },
     ]
 }

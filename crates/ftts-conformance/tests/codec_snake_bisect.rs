@@ -71,6 +71,7 @@ use ftts_conformance::{
     report::{OracleTier, Outcome, Receipt},
 };
 use ftts_kernels::f32ref::{self, F32Transcendental};
+use ftts_kernels::sleef;
 use std::path::{Path, PathBuf};
 
 const TEST_NAME: &str = "codec_snake_beta_bisect";
@@ -99,6 +100,12 @@ enum Widen {
     VforceSin,
     /// Both `sin` and `exp` from vForce.
     VforceSinAndExp,
+    /// `sin` from the ported `Sleef_sinf_u10`, the routine an AArch64 `Vectorized<float>` calls.
+    SleefSin,
+    /// `exp` from the ported `Sleef_expf_u10`, with `sin` left on the scalar libm.
+    SleefExp,
+    /// Both `sin` and `exp` from SLEEF — the full hypothesis this probe was pointing at.
+    SleefSinAndExp,
 }
 
 /// How the scaled square is combined with the input.
@@ -164,12 +171,16 @@ fn snake_beta(
             continue;
         }
 
-        let vforce_exp = variant.widen == Widen::VforceSinAndExp;
-        let (alpha, beta) = if vforce_exp {
+        let vectorized_exp = match variant.widen {
+            Widen::VforceSinAndExp => Some(F32Transcendental::AccelerateVForce),
+            Widen::SleefExp | Widen::SleefSinAndExp => Some(F32Transcendental::SleefU10),
+            _ => None,
+        };
+        let (alpha, beta) = if let Some(implementation) = vectorized_exp {
             let mut exponentiated = [0.0f32; 2];
             f32ref::exp_with(
                 &[alpha_log[channel], beta_log[channel]],
-                F32Transcendental::AccelerateVForce,
+                implementation,
                 &mut exponentiated,
             );
             (f64::from(exponentiated[0]), f64::from(exponentiated[1]))
@@ -179,6 +190,20 @@ fn snake_beta(
 
         let alpha = alpha as f32;
         let beta = beta as f32;
+        if matches!(variant.widen, Widen::SleefSin | Widen::SleefSinAndExp) {
+            let scale = scale_of(beta);
+            for frame in 0..frames {
+                let index = frame * CHANNELS + channel;
+                let scaled = values[index] * alpha;
+                assert!(
+                    sleef::sinf_u10_in_fast_range(scaled),
+                    "seam input {scaled} left SLEEF's Cody-Waite range, which is not ported"
+                );
+                let sine = sleef::sinf_u10(scaled);
+                out[index] = values[index] + scale * (sine * sine);
+            }
+            continue;
+        }
         if matches!(variant.widen, Widen::VforceSin | Widen::VforceSinAndExp) {
             // vForce is a whole-array call, so this candidate must materialize the channel's
             // scaled column and evaluate `sin` over all of it at once — which is also closer to
@@ -188,9 +213,8 @@ fn snake_beta(
                 .collect();
             let mut sines = vec![0.0f32; frames];
             f32ref::sin_with(&scaled, F32Transcendental::AccelerateVForce, &mut sines);
-            for frame in 0..frames {
+            for (frame, &sine) in sines.iter().enumerate() {
                 let index = frame * CHANNELS + channel;
-                let sine = sines[frame];
                 out[index] = values[index] + scale_of(beta) * (sine * sine);
             }
             continue;
@@ -388,6 +412,21 @@ fn codec_snake_beta_bisect() {
         Variant {
             name: "vforce_sin_and_exp",
             widen: Widen::VforceSinAndExp,
+            ..Variant::production()
+        },
+        Variant {
+            name: "sleef_sin",
+            widen: Widen::SleefSin,
+            ..Variant::production()
+        },
+        Variant {
+            name: "sleef_exp",
+            widen: Widen::SleefExp,
+            ..Variant::production()
+        },
+        Variant {
+            name: "sleef_sin_and_exp",
+            widen: Widen::SleefSinAndExp,
             ..Variant::production()
         },
     ];

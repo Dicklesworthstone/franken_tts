@@ -120,6 +120,31 @@ impl Outcome {
     }
 }
 
+/// Which engine produced one side of a ladder comparison.
+///
+/// Every Contract-A comparison must place the pinned reference oracle on the expected side and
+/// our implementation on the actual side. Labeling both sides and asserting them distinct is what
+/// keeps the oracle from ever being compared against itself — a comparison whose two sides carry
+/// the same identity proves nothing and is rejected outright.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineIdentity {
+    /// Our implementation under test.
+    Subject,
+    /// The pinned reference oracle that supplies expected values.
+    Oracle,
+}
+
+impl EngineIdentity {
+    /// The stable receipt wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Subject => "subject",
+            Self::Oracle => "oracle",
+        }
+    }
+}
+
 /// Where the expected values came from.
 ///
 /// A comparison whose fixture provenance is unknown cannot be debugged: "actual != expected" is

@@ -130,9 +130,12 @@ pub mod prelude {
     pub use crate::gate::{
         ExecutionPath, ModelGate, NONEXISTENT_FALLBACK, require_native_execution,
     };
+    pub use crate::ladder::{
+        EngineOutput, EvidenceBundle, LadderRung, LadderRunner, LadderScorecard,
+    };
     pub use crate::report::{
-        CaptureProvenance, FixtureProvenance, OracleTier, Outcome, Receipt, Stage, bytes_hash,
-        emit_stage, pcm_hash, token_stream_hash,
+        CaptureProvenance, EngineIdentity, FixtureProvenance, OracleTier, Outcome, Receipt, Stage,
+        bytes_hash, emit_stage, pcm_hash, token_stream_hash,
     };
     pub use crate::{gated, xfail};
 }

@@ -4,23 +4,118 @@
 //! `max_abs` envelope means exact comparison; there is deliberately no default epsilon. Each
 //! emitted rung receipt carries the oracle tier and SHA-256 digests of both artifacts needed to
 //! re-derive the decision.
+//!
+//! # Rung receipt format (stable)
+//!
+//! Every rung emits one [`Receipt`] NDJSON line (also embedded verbatim in the scorecard's
+//! `rungs` array) with these fields on top of the crate-wide convention in the crate docs:
+//!
+//! - `contract`: `"ConformanceExact/<L0..L5>"` — the rung, from [`LadderRung::as_str`].
+//! - `seam`: the compared boundary, named as `<group>.<seam>` from the fixture pack.
+//! - `oracle_tier`: [`OracleTier::as_str`] — a CPU-fallback green is never native-golden green.
+//! - `floor_sha256` / `fixture_manifest_sha256`: digests of the exact artifacts loaded, so the
+//!   decision is re-derivable.
+//! - `tolerance` + `tolerance_source`: the applied envelope and the floor artifact it came from.
+//! - `detail.comparison_policy`: `"exact"` or `"max_abs"`.
+//! - `detail.engines`: `{"expected": "oracle", "actual": "subject"}` — enforced by
+//!   [`EngineOutput`]; a comparison whose sides are not oracle-vs-subject is rejected, never
+//!   recorded.
+//! - `detail.comparison`: the comparator's numeric summary (first divergence with coordinates).
+//! - `reason`: on `skipped`, why — either the floor's own reason (`status != observed`) or the
+//!   caller's via [`LadderRunner::skip_rung`].
+//!
+//! The scorecard ([`LadderScorecard::to_json`]) wraps the rung receipts with
+//! `{"contract": "ConformanceExact", "all_green": bool, "rungs": [...]}`; `all_green` is true
+//! only when every recorded rung passed — skips and xfails force it false, and an empty
+//! scorecard is not green. [`LadderScorecard::write_evidence`] lands `scorecard.json`,
+//! `receipts.ndjson`, and a `MANIFEST.sha256` over both into an evidence directory.
 
-use std::{error::Error, fmt, fs, path::Path};
+use std::{
+    error::Error,
+    fmt, fs, io,
+    path::{Path, PathBuf},
+};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
     compare::{Comparison, ExactComparison, compare_exact, compare_f32},
-    report::{FixtureProvenance, OracleTier, Outcome, Receipt},
+    oracle,
+    report::{EngineIdentity, FixtureProvenance, OracleTier, Outcome, Receipt},
 };
 
-/// The committed CPU FP32 fallback nondeterminism floor.
+/// The committed CPU FP32 fallback nondeterminism floor, relative to the workspace root.
 pub const CPU_FP32_FLOOR_PATH: &str = "docs/truth-pack/nondeterminism-floor.json";
 
-/// The pinned CPU FP32 fallback fixture manifest supplied with the Phase-0 oracle capture.
-pub const CPU_FP32_FIXTURE_MANIFEST_PATH: &str =
-    "/Users/jemanuel/.cache/frankentts/oracle-fixtures/ft7-cpu-fp32-r1/fixture_manifest.json";
+/// The committed floor resolved against this crate's location, so the runner opens it regardless
+/// of the invoking process's working directory (integration tests run from the crate directory).
+#[must_use]
+pub fn cpu_fp32_floor_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(CPU_FP32_FLOOR_PATH)
+}
+
+/// The CPU FP32 fallback fixture manifest inside the locally cached Phase-0 oracle capture.
+///
+/// Resolution matches [`oracle::OracleFixtures::open_default`]: the [`oracle::FIXTURES_ENV`]
+/// override first, then the default cache path under `$HOME`. The manifest not existing there is
+/// the ordinary "pack absent on this machine" situation the caller turns into an honest skip.
+#[must_use]
+pub fn cpu_fp32_fixture_manifest_path() -> PathBuf {
+    let root = match std::env::var(oracle::FIXTURES_ENV) {
+        Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
+        _ => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            Path::new(&home).join(oracle::DEFAULT_RELATIVE_PATH)
+        }
+    };
+    root.join("fixture_manifest.json")
+}
+
+/// One labeled side of a ladder comparison.
+///
+/// The identity is carried with the data so the runner can refuse a comparison whose two sides
+/// came from the same engine — the oracle compared against itself is vacuously green and must be
+/// impossible to record.
+#[derive(Clone, Copy, Debug)]
+pub struct EngineOutput<'a, T> {
+    identity: EngineIdentity,
+    values: &'a [T],
+}
+
+impl<'a, T> EngineOutput<'a, T> {
+    /// Labels values produced by the pinned reference oracle (fixture captures).
+    #[must_use]
+    pub const fn oracle(values: &'a [T]) -> Self {
+        Self {
+            identity: EngineIdentity::Oracle,
+            values,
+        }
+    }
+
+    /// Labels values computed by our implementation under test.
+    #[must_use]
+    pub const fn subject(values: &'a [T]) -> Self {
+        Self {
+            identity: EngineIdentity::Subject,
+            values,
+        }
+    }
+
+    /// The engine this side came from.
+    #[must_use]
+    pub const fn identity(&self) -> EngineIdentity {
+        self.identity
+    }
+
+    /// The labeled values.
+    #[must_use]
+    pub const fn values(&self) -> &'a [T] {
+        self.values
+    }
+}
 
 /// Stable labels for Contract-A ladder rungs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +209,13 @@ pub enum LadderError {
         /// The manifest's declared oracle class.
         manifest: String,
     },
+    /// The two comparison sides do not carry the required distinct engine identities.
+    EngineIdentityViolation {
+        /// The identity supplied on the expected side (must be [`EngineIdentity::Oracle`]).
+        expected: EngineIdentity,
+        /// The identity supplied on the actual side (must be [`EngineIdentity::Subject`]).
+        actual: EngineIdentity,
+    },
 }
 
 impl fmt::Display for LadderError {
@@ -142,6 +244,13 @@ impl fmt::Display for LadderError {
                 "fixture manifest declares oracle tier `{manifest}`, not requested `{}`",
                 requested.as_str()
             ),
+            Self::EngineIdentityViolation { expected, actual } => write!(
+                formatter,
+                "ladder comparison sides must be oracle-expected vs subject-actual, got \
+                 expected={} actual={}; an engine compared against itself proves nothing",
+                expected.as_str(),
+                actual.as_str()
+            ),
         }
     }
 }
@@ -151,7 +260,9 @@ impl Error for LadderError {
         match self {
             Self::ReadArtifact { source, .. } => Some(source),
             Self::ParseArtifact { source, .. } => Some(source),
-            Self::InvalidFloor { .. } | Self::TierManifestMismatch { .. } => None,
+            Self::InvalidFloor { .. }
+            | Self::TierManifestMismatch { .. }
+            | Self::EngineIdentityViolation { .. } => None,
         }
     }
 }
@@ -205,6 +316,61 @@ impl LadderScorecard {
             "rungs": self.results.iter().map(|result| &result.receipt).collect::<Vec<_>>(),
         })
     }
+
+    /// Writes the evidence bundle: `scorecard.json`, `receipts.ndjson`, and a `MANIFEST.sha256`
+    /// hashing both, into `dir` (created if absent).
+    ///
+    /// The manifest uses the truth-pack line format (`<sha256>  <file>`), so
+    /// `shasum -a 256 -c MANIFEST.sha256` verifies the bundle from inside `dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error when the directory or any file cannot be written.
+    pub fn write_evidence(&self, dir: &Path) -> io::Result<EvidenceBundle> {
+        fs::create_dir_all(dir)?;
+        let scorecard_json =
+            serde_json::to_string_pretty(&self.to_json()).expect("scorecard JSON serializes");
+        let receipts_ndjson = self
+            .results
+            .iter()
+            .map(|result| {
+                let mut line =
+                    serde_json::to_string(&result.receipt).expect("receipt JSON serializes");
+                line.push('\n');
+                line
+            })
+            .collect::<String>();
+
+        let scorecard_path = dir.join("scorecard.json");
+        let receipts_path = dir.join("receipts.ndjson");
+        fs::write(&scorecard_path, &scorecard_json)?;
+        fs::write(&receipts_path, &receipts_ndjson)?;
+
+        let manifest = format!(
+            "{}  scorecard.json\n{}  receipts.ndjson\n",
+            sha256(scorecard_json.as_bytes()),
+            sha256(receipts_ndjson.as_bytes()),
+        );
+        let manifest_path = dir.join("MANIFEST.sha256");
+        fs::write(&manifest_path, &manifest)?;
+
+        Ok(EvidenceBundle {
+            scorecard_path,
+            receipts_path,
+            manifest_path,
+        })
+    }
+}
+
+/// Where [`LadderScorecard::write_evidence`] placed the bundle files.
+#[derive(Clone, Debug)]
+pub struct EvidenceBundle {
+    /// The pretty-printed scorecard.
+    pub scorecard_path: PathBuf,
+    /// One receipt per rung, NDJSON.
+    pub receipts_path: PathBuf,
+    /// SHA-256 manifest over the two files above.
+    pub manifest_path: PathBuf,
 }
 
 /// A hash-bound floor and fixture-manifest pair used to run Contract A.
@@ -233,8 +399,8 @@ impl LadderRunner {
     pub fn cpu_fp32_fixture() -> Result<Self, LadderError> {
         Self::from_paths(
             OracleTier::CpuFp32Fallback,
-            Path::new(CPU_FP32_FLOOR_PATH),
-            Path::new(CPU_FP32_FIXTURE_MANIFEST_PATH),
+            &cpu_fp32_floor_path(),
+            &cpu_fp32_fixture_manifest_path(),
         )
     }
 
@@ -338,26 +504,32 @@ impl LadderRunner {
 
     /// Runs one numeric rung and immediately emits its receipt.
     ///
+    /// The expected side must be labeled [`EngineIdentity::Oracle`] and the actual side
+    /// [`EngineIdentity::Subject`]; anything else — in particular the oracle on both sides — is
+    /// rejected before any numbers are read.
+    ///
     /// A floor entry with `status != observed` becomes an explicit skip using the artifact's own
     /// reason. A zero or absent `max_abs` envelope becomes an exact comparison; no fallback
     /// tolerance exists in this API.
     ///
     /// # Errors
     ///
-    /// Returns an error only when the committed floor is malformed. A missing observation is an
-    /// honest `Skipped` result, not an error and not a pass.
+    /// Returns an error when the committed floor is malformed or the engine identities are not
+    /// oracle-vs-subject. A missing observation is an honest `Skipped` result, not an error and
+    /// not a pass.
     pub fn compare_f32(
         &mut self,
         test: &str,
         rung: LadderRung,
         seam: &str,
-        expected: &[f32],
-        actual: &[f32],
+        expected: EngineOutput<'_, f32>,
+        actual: EngineOutput<'_, f32>,
     ) -> Result<&RungResult, LadderError> {
+        Self::require_distinct(expected.identity(), actual.identity())?;
         let outcome = match self.policy_for(rung)? {
             FloorDecision::Skip(reason) => self.skip(test, rung, seam, reason),
             FloorDecision::Compare(policy) => {
-                self.compare(test, rung, seam, expected, actual, policy)
+                self.compare(test, rung, seam, expected.values(), actual.values(), policy)
             }
         };
         let index = self.results.len();
@@ -379,16 +551,17 @@ impl LadderRunner {
         test: &str,
         rung: LadderRung,
         seam: &str,
-        expected: &[T],
-        actual: &[T],
+        expected: EngineOutput<'_, T>,
+        actual: EngineOutput<'_, T>,
     ) -> Result<&RungResult, LadderError>
     where
         T: PartialEq + fmt::Debug,
     {
+        Self::require_distinct(expected.identity(), actual.identity())?;
         let outcome = match self.policy_for(rung)? {
             FloorDecision::Skip(reason) => self.skip(test, rung, seam, reason),
             FloorDecision::Compare(ComparisonPolicy::Exact) => {
-                self.compare_sequence(test, rung, seam, expected, actual)
+                self.compare_sequence(test, rung, seam, expected.values(), actual.values())
             }
             FloorDecision::Compare(ComparisonPolicy::MaximumAbsolute(_)) => {
                 return Err(LadderError::InvalidFloor {
@@ -404,11 +577,39 @@ impl LadderRunner {
         Ok(&self.results[index])
     }
 
+    /// Records an explicit caller-side skip for a rung that could not run at all — model weights
+    /// absent, a seam not captured — and emits its receipt.
+    ///
+    /// This is the skip-honest alternative to leaving the rung out of the scorecard: an absent
+    /// rung is invisible, a skipped rung forces `all_green: false` and says why.
+    pub fn skip_rung(
+        &mut self,
+        test: &str,
+        rung: LadderRung,
+        seam: &str,
+        reason: &str,
+    ) -> &RungResult {
+        let outcome = self.skip(test, rung, seam, reason.to_owned());
+        let index = self.results.len();
+        self.results.push(outcome);
+        &self.results[index]
+    }
+
     /// Finalizes the current scorecard. A skipped L1 therefore forces `all_green: false`.
     #[must_use]
     pub fn scorecard(&self) -> LadderScorecard {
         LadderScorecard {
             results: self.results.clone(),
+        }
+    }
+
+    const fn require_distinct(
+        expected: EngineIdentity,
+        actual: EngineIdentity,
+    ) -> Result<(), LadderError> {
+        match (expected, actual) {
+            (EngineIdentity::Oracle, EngineIdentity::Subject) => Ok(()),
+            _ => Err(LadderError::EngineIdentityViolation { expected, actual }),
         }
     }
 
@@ -500,6 +701,10 @@ impl LadderRunner {
                     ComparisonPolicy::Exact => "exact",
                     ComparisonPolicy::MaximumAbsolute(_) => "max_abs",
                 },
+                "engines": {
+                    "expected": EngineIdentity::Oracle.as_str(),
+                    "actual": EngineIdentity::Subject.as_str(),
+                },
                 "comparison": comparison.to_json(),
             }));
         let receipt_json = receipt.to_json();
@@ -536,6 +741,10 @@ impl LadderRunner {
             .tolerance(0.0, self.floor_source.clone())
             .detail(json!({
                 "comparison_policy": "exact",
+                "engines": {
+                    "expected": EngineIdentity::Oracle.as_str(),
+                    "actual": EngineIdentity::Subject.as_str(),
+                },
                 "comparison": comparison.to_json(),
             }));
         let receipt_json = receipt.to_json();
@@ -635,8 +844,8 @@ mod tests {
                 "contract_a_l2_zero_envelope",
                 LadderRung::L2LayerAndComponentActivations,
                 "talker.layer_00.output",
-                &[1.0],
-                &[1.000_001],
+                EngineOutput::oracle(&[1.0]),
+                EngineOutput::subject(&[1.000_001]),
             )
             .expect("floor is valid");
 
@@ -647,6 +856,8 @@ mod tests {
             "no default epsilon is permitted"
         );
         assert_eq!(result.receipt["oracle_tier"], "cpu_fp32_fallback");
+        assert_eq!(result.receipt["detail"]["engines"]["expected"], "oracle");
+        assert_eq!(result.receipt["detail"]["engines"]["actual"], "subject");
         assert_eq!(result.receipt["floor_sha256"], sha256(FLOOR.as_bytes()));
         assert_eq!(
             result.receipt["fixture_manifest_sha256"],
@@ -662,8 +873,8 @@ mod tests {
                 "contract_a_l3_absent_envelope",
                 LadderRung::L3Logits,
                 "talker.codec_head.output",
-                &[1.0],
-                &[1.000_001],
+                EngineOutput::oracle(&[1.0]),
+                EngineOutput::subject(&[1.000_001]),
             )
             .expect("floor is valid");
 
@@ -679,8 +890,8 @@ mod tests {
                 "contract_a_l0_prompt_token_ids",
                 LadderRung::L0PromptTokenIds,
                 "prompt_build.text_ids",
-                &[1_u32, 2],
-                &[1_u32, 3],
+                EngineOutput::oracle(&[1_u32, 2]),
+                EngineOutput::subject(&[1_u32, 3]),
             )
             .expect("zero floor supports exact IDs");
 
@@ -697,8 +908,8 @@ mod tests {
                 "contract_a_l1_operator_seams",
                 LadderRung::L1OperatorSeams,
                 "talker.layer_00.rms_norm",
-                &[1.0],
-                &[1.0],
+                EngineOutput::oracle(&[1.0]),
+                EngineOutput::subject(&[1.0]),
             )
             .expect("not-observed L1 is a skip, not a floor parse error");
 
@@ -711,6 +922,94 @@ mod tests {
             !runner.scorecard().all_green(),
             "a skipped L1 cannot be green"
         );
+    }
+
+    #[test]
+    fn oracle_compared_against_itself_is_rejected() {
+        let mut runner = cpu_runner();
+        let error = runner
+            .compare_f32(
+                "contract_a_l2_identity_collision",
+                LadderRung::L2LayerAndComponentActivations,
+                "talker.layer_00.output",
+                EngineOutput::oracle(&[1.0]),
+                EngineOutput::oracle(&[1.0]),
+            )
+            .expect_err("two oracle sides prove nothing and must not be recordable");
+        assert!(matches!(error, LadderError::EngineIdentityViolation { .. }));
+        assert!(
+            runner.scorecard().results().is_empty(),
+            "a rejected comparison must leave no rung behind"
+        );
+
+        let swapped = runner
+            .compare_f32(
+                "contract_a_l2_identity_swapped",
+                LadderRung::L2LayerAndComponentActivations,
+                "talker.layer_00.output",
+                EngineOutput::subject(&[1.0]),
+                EngineOutput::oracle(&[1.0]),
+            )
+            .expect_err("swapped sides would invert every failure report");
+        assert!(matches!(
+            swapped,
+            LadderError::EngineIdentityViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn skip_rung_records_an_explicit_reason_and_blocks_green() {
+        let mut runner = cpu_runner();
+        let result = runner.skip_rung(
+            "contract_a_l2_weights_absent",
+            LadderRung::L2LayerAndComponentActivations,
+            "talker.layer_00.output",
+            "pinned checkpoint absent on this machine",
+        );
+        assert_eq!(result.outcome, Outcome::Skipped);
+        assert_eq!(
+            result.receipt["reason"],
+            "pinned checkpoint absent on this machine"
+        );
+        assert!(!runner.scorecard().all_green());
+    }
+
+    #[test]
+    fn evidence_bundle_hashes_exactly_what_it_wrote() {
+        let mut runner = cpu_runner();
+        runner
+            .compare_exact(
+                "contract_a_l0_evidence",
+                LadderRung::L0PromptTokenIds,
+                "prompt_build.text_ids",
+                EngineOutput::oracle(&[1_u32, 2]),
+                EngineOutput::subject(&[1_u32, 2]),
+            )
+            .expect("valid floor");
+        let dir = std::env::temp_dir().join(format!(
+            "ftts-ladder-evidence-{}-{}",
+            std::process::id(),
+            "unit"
+        ));
+        let bundle = runner
+            .scorecard()
+            .write_evidence(&dir)
+            .expect("evidence bundle writes");
+
+        let manifest = fs::read_to_string(&bundle.manifest_path).expect("manifest readable");
+        for (line, path) in manifest
+            .lines()
+            .zip([&bundle.scorecard_path, &bundle.receipts_path])
+        {
+            let (hash, name) = line.split_once("  ").expect("`<sha256>  <file>` lines");
+            let bytes = fs::read(path).expect("bundle file readable");
+            assert_eq!(hash, sha256(&bytes), "manifest hash must match `{name}`");
+        }
+        let scorecard: Value =
+            serde_json::from_slice(&fs::read(&bundle.scorecard_path).expect("scorecard readable"))
+                .expect("scorecard parses");
+        assert_eq!(scorecard["contract"], "ConformanceExact");
+        assert_eq!(scorecard["all_green"], true);
     }
 
     #[test]

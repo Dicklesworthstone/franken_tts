@@ -90,6 +90,8 @@ fn split_axes(array: &NpyArray, seq: usize, head_dim: usize) -> [Vec<f32>; 3] {
     ]
 }
 
+// One argument per arithmetic-mode axis the sweep varies; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn run_layer(
     config: &TalkerConfig,
     weights: &TalkerLayerWeights<'_>,

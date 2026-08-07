@@ -209,8 +209,10 @@ fn say_pipeline_writes_audible_wav() {
         audio.pcm.len() * 2
     );
     let loudest = bytes[WAV_HEADER_BYTES..]
-        .chunks_exact(2)
-        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]).abs())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| i16::from_le_bytes(*pair).abs())
         .max()
         .unwrap_or(0);
     assert!(
@@ -222,7 +224,7 @@ fn say_pipeline_writes_audible_wav() {
     Receipt::new(TEST_NAME, Outcome::Passed)
         .contract("SayPipeline")
         .seam("say.text_to_wav")
-        .reason(&format!(
+        .reason(format!(
             "{TEXT:?} -> {} frames, {duration_ms} ms, {} voiced of {} frames, peak frame rms \
              {peak:.5}, peak sample {loudest}/32767, {} WAV bytes at {}",
             audio.frames,
