@@ -629,6 +629,169 @@ impl DraftVerification {
     }
 }
 
+const TRANSITION_BUCKETS: usize = 64;
+const EMPTY_TRANSITION_CODE: u16 = u16::MAX;
+
+/// One bounded counter for the previous-frame residual drafter.
+///
+/// The draft engine intentionally uses a fixed direct-mapped sketch rather than an unbounded
+/// token-pair table. Collisions only make its proposals worse; they cannot alter strict output,
+/// because every proposal is checked by [`verify_frame_draft`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransitionBucket {
+    source: u16,
+    target: u16,
+    count: u32,
+}
+
+impl TransitionBucket {
+    const EMPTY: Self = Self {
+        source: EMPTY_TRANSITION_CODE,
+        target: EMPTY_TRANSITION_CODE,
+        count: 0,
+    };
+}
+
+/// Fixed-memory drafter #1 for greedy FrankenMTP decoding.
+///
+/// It first proposes the prior frame's residuals. A 64-entry, direct-mapped transition sketch per
+/// residual depth learns recurring `previous_frame_code -> next_frame_code` transitions as exact
+/// sequential outputs arrive. The sketch is strictly a proposal source: a collision, cold start,
+/// or bad guess can only cause verifier rejection and repair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrankenMtpDrafter {
+    previous_frame: Option<[usize; RESIDUAL_DEPTHS]>,
+    transitions: [[TransitionBucket; TRANSITION_BUCKETS]; RESIDUAL_DEPTHS],
+}
+
+impl FrankenMtpDrafter {
+    /// Starts cold; the first draft is all-zero and is expected to be verified or repaired.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            previous_frame: None,
+            transitions: [[TransitionBucket::EMPTY; TRANSITION_BUCKETS]; RESIDUAL_DEPTHS],
+        }
+    }
+
+    /// Proposes one residual code at each of the fifteen depths without allocating.
+    #[must_use]
+    pub fn draft(&self) -> [usize; RESIDUAL_DEPTHS] {
+        let Some(previous) = self.previous_frame else {
+            return [0; RESIDUAL_DEPTHS];
+        };
+        std::array::from_fn(|depth| {
+            let source = previous[depth];
+            let bucket = &self.transitions[depth][source % TRANSITION_BUCKETS];
+            if usize::from(bucket.source) == source && bucket.count > 0 {
+                usize::from(bucket.target)
+            } else {
+                source
+            }
+        })
+    }
+
+    /// Learns from a repaired or fully verified strict output before the next frame is drafted.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless every supplied residual id is in the pinned 2,048-token vocabulary.
+    pub fn observe(&mut self, codes: &[usize; RESIDUAL_DEPTHS]) {
+        for (depth, &code) in codes.iter().enumerate() {
+            assert!(
+                code < RESIDUAL_VOCAB,
+                "observed c{}={code} is outside residual vocab {RESIDUAL_VOCAB}",
+                depth + 1
+            );
+        }
+        if let Some(previous) = self.previous_frame {
+            for depth in 0..RESIDUAL_DEPTHS {
+                let source = previous[depth];
+                let target = codes[depth];
+                let bucket = &mut self.transitions[depth][source % TRANSITION_BUCKETS];
+                if usize::from(bucket.source) == source && usize::from(bucket.target) == target {
+                    bucket.count = bucket.count.saturating_add(1);
+                } else if bucket.count == 0 {
+                    *bucket = TransitionBucket {
+                        source: u16::try_from(source).expect("residual source fits u16"),
+                        target: u16::try_from(target).expect("residual target fits u16"),
+                        count: 1,
+                    };
+                } else {
+                    bucket.count -= 1;
+                }
+            }
+        }
+        self.previous_frame = Some(*codes);
+    }
+}
+
+impl Default for FrankenMtpDrafter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result of one strict greedy FrankenMTP proposal, verification, and possible repair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GreedySpeculativeFrame {
+    /// The drafter proposal, ordered `c1..=c15`.
+    pub drafted_codes: [usize; RESIDUAL_DEPTHS],
+    /// The verified strict output, ordered `c1..=c15`.
+    pub codes: [usize; RESIDUAL_DEPTHS],
+    /// Number of leading proposal ids accepted by the verifier.
+    pub accepted_prefix_len: usize,
+    /// Whether a rejection required the authoritative sequential repair path.
+    pub repaired: bool,
+}
+
+/// Runs drafter #1 with strict greedy verification and an exact sequential fallback.
+///
+/// A complete accepted proposal is returned directly. At the first mismatch the entire
+/// authoritative sequential frame is regenerated; this conservative v1 repair never emits a
+/// stale verified suffix after the causal context changes. A later suffix-only repair may reuse
+/// the accepted prefix, but must preserve these exact output semantics.
+#[must_use]
+pub fn decode_frame_greedy_speculative(
+    config: &MicrodecoderConfig,
+    rope: &RopeTable,
+    weights: &MicrodecoderWeights<'_>,
+    state: &mut FrameState,
+    drafter: &mut FrankenMtpDrafter,
+    talker_hidden: &[f32],
+    primary_code: usize,
+) -> GreedySpeculativeFrame {
+    let drafted_codes = drafter.draft();
+    let verification = verify_frame_draft(
+        config,
+        rope,
+        weights,
+        talker_hidden,
+        primary_code,
+        &drafted_codes,
+    );
+    let accepted_prefix_len = verification.accepted_greedy_prefix_len(&drafted_codes);
+    let (codes, repaired) = if accepted_prefix_len == RESIDUAL_DEPTHS {
+        (drafted_codes, false)
+    } else {
+        let sequential =
+            decode_frame_greedy(config, rope, weights, state, talker_hidden, primary_code);
+        (
+            sequential
+                .try_into()
+                .expect("sequential microdecoder emits exactly 15 residual codes"),
+            true,
+        )
+    };
+    drafter.observe(&codes);
+    GreedySpeculativeFrame {
+        drafted_codes,
+        codes,
+        accepted_prefix_len,
+        repaired,
+    }
+}
+
 /// Reads one row of a row-major `[vocab, hidden]` embedding table.
 ///
 /// # Panics
@@ -1225,6 +1388,114 @@ mod tests {
             verified.accepted_greedy_prefix_len(&mismatched),
             FIRST_MISMATCH,
             "a rejected id must invalidate its causal suffix rather than being accepted out of order"
+        );
+    }
+
+    #[test]
+    fn drafter_uses_previous_frame_then_learns_bounded_transitions() {
+        let mut drafter = FrankenMtpDrafter::new();
+        assert_eq!(drafter.draft(), [0; RESIDUAL_DEPTHS], "cold draft");
+
+        let first = [10; RESIDUAL_DEPTHS];
+        let second = [20; RESIDUAL_DEPTHS];
+        drafter.observe(&first);
+        assert_eq!(drafter.draft(), first, "previous-frame proposal");
+        drafter.observe(&second);
+        drafter.observe(&first);
+
+        assert_eq!(
+            drafter.draft(),
+            second,
+            "the bounded sketch must prefer its observed 10-to-20 transition over a raw copy"
+        );
+    }
+
+    #[test]
+    fn speculative_greedy_full_accept_matches_the_authoritative_frame() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
+        let talker_hidden = weights_of(config.hidden_size, 37);
+        let mut sequential_state = FrameState::new(&config);
+        let sequential: [usize; RESIDUAL_DEPTHS] = decode_frame_greedy(
+            &config,
+            &rope,
+            &weights,
+            &mut sequential_state,
+            &talker_hidden,
+            31,
+        )
+        .try_into()
+        .expect("sequential decode has fifteen residuals");
+
+        let mut drafter = FrankenMtpDrafter::new();
+        drafter.observe(&sequential);
+        let mut speculative_state = FrameState::new(&config);
+        let result = decode_frame_greedy_speculative(
+            &config,
+            &rope,
+            &weights,
+            &mut speculative_state,
+            &mut drafter,
+            &talker_hidden,
+            31,
+        );
+
+        assert_eq!(result.drafted_codes, sequential);
+        assert_eq!(result.accepted_prefix_len, RESIDUAL_DEPTHS);
+        assert!(!result.repaired, "a fully accepted draft needs no repair");
+        assert_eq!(result.codes, sequential, "strict output must be exact");
+    }
+
+    #[test]
+    fn speculative_greedy_repair_discards_a_stale_rejected_suffix() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
+        let talker_hidden = weights_of(config.hidden_size, 38);
+        let mut sequential_state = FrameState::new(&config);
+        let sequential: [usize; RESIDUAL_DEPTHS] = decode_frame_greedy(
+            &config,
+            &rope,
+            &weights,
+            &mut sequential_state,
+            &talker_hidden,
+            41,
+        )
+        .try_into()
+        .expect("sequential decode has fifteen residuals");
+
+        const FIRST_MISMATCH: usize = 6;
+        let mut stale_draft = sequential;
+        stale_draft[FIRST_MISMATCH] = (stale_draft[FIRST_MISMATCH] + 1) % RESIDUAL_VOCAB;
+        let mut drafter = FrankenMtpDrafter::new();
+        drafter.previous_frame = Some(stale_draft);
+        let mut speculative_state = FrameState::new(&config);
+        let result = decode_frame_greedy_speculative(
+            &config,
+            &rope,
+            &weights,
+            &mut speculative_state,
+            &mut drafter,
+            &talker_hidden,
+            41,
+        );
+
+        assert_eq!(result.drafted_codes, stale_draft);
+        assert_eq!(result.accepted_prefix_len, FIRST_MISMATCH);
+        assert!(result.repaired, "the mismatched draft must enter repair");
+        assert_eq!(
+            result.codes, sequential,
+            "repair must use the authoritative frame"
+        );
+        assert_ne!(
+            result.codes[FIRST_MISMATCH..],
+            stale_draft[FIRST_MISMATCH..],
+            "the rejected causal suffix must not be emitted from the stale draft"
         );
     }
 
