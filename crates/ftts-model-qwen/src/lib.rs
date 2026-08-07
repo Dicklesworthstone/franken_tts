@@ -3,6 +3,7 @@
 
 //! Safe Qwen3-TTS model orchestration.
 
+pub mod checkpoint;
 pub mod codec;
 pub mod generate;
 pub mod microdecoder;

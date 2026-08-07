@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 fancy-regex = "0.18"
+ftts-artifacts = { path = "../ftts-artifacts" }
 ftts-core = { path = "../ftts-core" }
 ftts-kernels = { path = "../ftts-kernels" }
 serde_json = "1.0"

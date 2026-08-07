@@ -682,6 +682,7 @@ name = "ftts-model-qwen"
 version = "0.1.0"
 dependencies = [
  "fancy-regex",
+ "ftts-artifacts",
  "ftts-core",
  "ftts-kernels",
  "serde_json",
