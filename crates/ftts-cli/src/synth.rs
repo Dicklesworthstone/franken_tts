@@ -687,7 +687,6 @@ mod tests {
         fs::create_dir_all(dir.join("speech_tokenizer")).expect("create bundle sidecar directory");
         for name in [
             CANONICAL_MODEL_BASENAME,
-            "model.safetensors",
             "speech_tokenizer/model.safetensors",
             "vocab.json",
             "merges.txt",
@@ -702,7 +701,10 @@ mod tests {
             bundle.canonical_main.as_deref(),
             Some(expected_artifact.as_path())
         );
-        assert_eq!(bundle.main, dir.join("model.safetensors"));
+        assert!(
+            !bundle.main.exists(),
+            "canonical synthesis must not require the raw main checkpoint"
+        );
 
         let explicit = ModelBundle::resolve(&expected_artifact)
             .expect("an explicit canonical artifact resolves against its sidecars");
