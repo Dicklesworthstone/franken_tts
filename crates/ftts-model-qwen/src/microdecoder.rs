@@ -706,6 +706,13 @@ pub fn verify_frame_draft(
         RESIDUAL_DEPTHS,
         "expected {RESIDUAL_DEPTHS} drafted residual codes"
     );
+    for (depth, code) in drafted_codes.iter().enumerate() {
+        assert!(
+            *code < RESIDUAL_VOCAB,
+            "drafted c{}={code} is outside residual vocab {RESIDUAL_VOCAB}",
+            depth + 1
+        );
+    }
 
     // Flattened [position, hidden] storage is the fixed seq-16 interface the packed verifier will
     // replace. Keeping it contiguous here prevents the scalar reference from defining a different
@@ -1219,6 +1226,21 @@ mod tests {
             FIRST_MISMATCH,
             "a rejected id must invalidate its causal suffix rather than being accepted out of order"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "drafted c15=2048 is outside residual vocab 2048")]
+    fn block_verifier_rejects_an_out_of_range_last_draft_id() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
+        let talker_hidden = weights_of(config.hidden_size, 36);
+        let mut drafted_codes = vec![0; RESIDUAL_DEPTHS];
+        drafted_codes[RESIDUAL_DEPTHS - 1] = RESIDUAL_VOCAB;
+
+        let _ = verify_frame_draft(&config, &rope, &weights, &talker_hidden, 29, &drafted_codes);
     }
 
     struct TestLayer {
