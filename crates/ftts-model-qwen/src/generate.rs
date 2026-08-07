@@ -898,6 +898,9 @@ mod tests {
         let mut weights = TinyWeights::new(1.0);
         weights.talker_q.fill(0.05);
         weights.talker_kv.fill(0.1);
+        // Keep attention observable: a zero output projection would still compare the cached
+        // key/value buffers, but would not prove that later positions consume them.
+        weights.talker_o.fill(0.025);
         let micro_layers = vec![weights.micro_layer(); 2];
         let micro_residual: Vec<&[f32]> = weights
             .micro_residual_embeddings
