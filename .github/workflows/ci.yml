@@ -12,6 +12,11 @@ name: CI
 on:
   push:
     branches: [main]
+    # Beads-tracker-only pushes are frequent (a dozen agents sync .beads/ constantly) and prove
+    # nothing about the code; on an account whose runner capacity is the scarce resource
+    # (frankentts-nlb), each one would still queue a full gate run ahead of a real commit's.
+    paths-ignore:
+      - '.beads/**'
   pull_request:
   workflow_dispatch:
   # Carries the advisory 5-target cross-check, which no longer runs on main pushes (see the
