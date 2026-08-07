@@ -48,6 +48,20 @@ EVENTS = {"contract_check", "stage"}
 #  below still apply to them in full.
 DEMO_CONTRACT_PREFIX = "Demo/"
 
+#  Wire strings from `ftts_conformance::report::OracleTier::as_str`. The tiers exist because the
+#  CPU FP32 fallback and the native CUDA path are not interchangeable evidence:
+#  `report.rs` states "a CPU green is not native-golden proof", and bead frankentts-rf4 says
+#  "CPU-smoke output is explicitly non-golden". Without the checks below, a receipt could claim
+#  `native_cuda` while its own capture records `device: cpu`, and this aggregator — the thing
+#  standing between the receipt stream and a green gate — would wave it through. That is the
+#  counterfeit-green class this script exists to catch, one level deeper than skip-vs-pass.
+ORACLE_TIERS = {"cpu_fp32_fallback", "native_cuda"}
+NATIVE_TIER = "native_cuda"
+
+#  Devices that cannot substantiate a native-CUDA claim. Matched on the prefix before ':' so
+#  `cuda:0` counts as native while `cpu` does not.
+NON_NATIVE_DEVICES = {"cpu", "meta", ""}
+
 
 @dataclass
 class Violation:
@@ -66,6 +80,7 @@ class Summary:
     checks: int = 0
     by_outcome: dict = field(default_factory=dict)
     demo_checks: int = 0
+    by_tier: dict = field(default_factory=dict)
     gate_skips: list = field(default_factory=list)
     demo_skips: list = field(default_factory=list)
     xfails: list = field(default_factory=list)
@@ -83,11 +98,92 @@ class Summary:
             "checks": self.checks,
             "by_outcome": self.by_outcome,
             "demo_checks": self.demo_checks,
+            "by_tier": self.by_tier,
             "gate_skips": self.gate_skips,
             "demo_skips": self.demo_skips,
             "xfails": self.xfails,
             "violations": [v.to_dict() for v in self.violations],
         }
+
+
+def _check_oracle_tier(event: dict, test: str, where: str, summary: Summary) -> None:
+    """Rejects a receipt that claims more oracle authority than it exercised.
+
+    Silence is allowed: most receipts have no oracle at all. What is not allowed is claiming the
+    native tier over a capture that says otherwise, because that is precisely how a CPU smoke run
+    would get filed as native-golden evidence.
+    """
+    tier = event.get("oracle_tier")
+    capture = event.get("fixture", {}).get("capture") if isinstance(event.get("fixture"), dict) else None
+
+    if tier is not None:
+        if tier not in ORACLE_TIERS:
+            summary.violations.append(
+                Violation("oracle-tier-known", where, f"unknown oracle_tier {tier!r} for {test!r}")
+            )
+            return
+        summary.by_tier[tier] = summary.by_tier.get(tier, 0) + 1
+
+    if capture is None:
+        if tier == NATIVE_TIER:
+            #  The strongest claim in the stream, with nothing behind it.
+            summary.violations.append(
+                Violation(
+                    "native-claim-needs-capture",
+                    where,
+                    f"{test!r} claims oracle_tier {NATIVE_TIER!r} but carries no fixture.capture "
+                    "recording the device and dtype it actually ran on",
+                )
+            )
+        return
+
+    if not isinstance(capture, dict):
+        summary.violations.append(
+            Violation("capture-complete", where, f"fixture.capture for {test!r} is not an object")
+        )
+        return
+
+    missing = [
+        name
+        for name in ("oracle_class", "device", "dtype")
+        if not str(capture.get(name) or "").strip()
+    ]
+    if missing:
+        #  CaptureProvenance::new is all-or-nothing on the Rust side; this catches a receipt
+        #  that reached the stream by some other route with a half-filled identity.
+        summary.violations.append(
+            Violation(
+                "capture-complete",
+                where,
+                f"fixture.capture for {test!r} is missing {', '.join(missing)}",
+            )
+        )
+        return
+
+    oracle_class = str(capture["oracle_class"]).strip()
+    device = str(capture["device"]).strip().lower()
+    device_kind = device.split(":", 1)[0]
+
+    if tier is not None and oracle_class != tier:
+        summary.violations.append(
+            Violation(
+                "tier-matches-capture",
+                where,
+                f"{test!r} claims oracle_tier {tier!r} but its capture records "
+                f"oracle_class {oracle_class!r}",
+            )
+        )
+
+    claims_native = tier == NATIVE_TIER or oracle_class == NATIVE_TIER
+    if claims_native and device_kind in NON_NATIVE_DEVICES:
+        summary.violations.append(
+            Violation(
+                "native-claim-needs-native-device",
+                where,
+                f"{test!r} claims the {NATIVE_TIER!r} tier but ran on device {device!r}; "
+                "a CPU green is not native-golden proof (frankentts-rf4: CPU-smoke is non-golden)",
+            )
+        )
 
 
 def summarize(lines: list[str], origin: str = "<receipts>") -> Summary:
@@ -162,6 +258,8 @@ def summarize(lines: list[str], origin: str = "<receipts>") -> Summary:
         elif outcome == "xfail":
             summary.xfails.append(entry)
 
+        _check_oracle_tier(event, test, where, summary)
+
     if summary.checks == 0:
         #  The emission path going dead is the silent way this whole mechanism stops working:
         #  no receipts, no skips reported, a permanently reassuring green.
@@ -187,6 +285,9 @@ def render(summary: Summary) -> str:
         f"({summary.checks} contract_check, {summary.stages} stage)"
     )
     out.append(f"  {counts}")
+    if summary.by_tier:
+        tiers = " | ".join(f"{name} {count}" for name, count in sorted(summary.by_tier.items()))
+        out.append(f"  oracle tiers: {tiers}")
     if summary.demo_checks:
         out.append(
             f"  {summary.demo_checks} from the convention demo "
@@ -265,6 +366,148 @@ _SELFTEST_CASES: list[tuple[str, list[str], str | None]] = [
         "a stream with no contract checks means the emission path is dead",
         [json.dumps({"event": "stage", "stage": "codec", "elapsed_ms": 1.0})],
         "stream-not-empty",
+    ),
+    (
+        "an honest cpu-fallback receipt passes",
+        [
+            json.dumps(
+                {
+                    "event": "contract_check",
+                    "test": "contract_a_l2_talker",
+                    "outcome": "passed",
+                    "oracle_tier": "cpu_fp32_fallback",
+                    "fixture": {
+                        "source": "fixtures/l2.npz",
+                        "capture": {
+                            "oracle_class": "cpu_fp32_fallback",
+                            "device": "cpu",
+                            "dtype": "float32",
+                        },
+                    },
+                }
+            )
+        ],
+        None,
+    ),
+    (
+        "an honest native receipt on cuda:0 passes",
+        [
+            json.dumps(
+                {
+                    "event": "contract_check",
+                    "test": "contract_a_l2_talker",
+                    "outcome": "passed",
+                    "oracle_tier": "native_cuda",
+                    "fixture": {
+                        "source": "fixtures/l2.npz",
+                        "capture": {
+                            "oracle_class": "native_cuda",
+                            "device": "cuda:0",
+                            "dtype": "bfloat16",
+                        },
+                    },
+                }
+            )
+        ],
+        None,
+    ),
+    (
+        "a native claim executed on the CPU is not native-golden proof",
+        [
+            json.dumps(
+                {
+                    "event": "contract_check",
+                    "test": "contract_a_l2_talker",
+                    "outcome": "passed",
+                    "oracle_tier": "native_cuda",
+                    "fixture": {
+                        "source": "fixtures/l2.npz",
+                        "capture": {
+                            "oracle_class": "native_cuda",
+                            "device": "cpu",
+                            "dtype": "float32",
+                        },
+                    },
+                }
+            )
+        ],
+        "native-claim-needs-native-device",
+    ),
+    (
+        "a tier that disagrees with its own capture is rejected",
+        [
+            json.dumps(
+                {
+                    "event": "contract_check",
+                    "test": "contract_a_l2_talker",
+                    "outcome": "passed",
+                    "oracle_tier": "native_cuda",
+                    "fixture": {
+                        "source": "fixtures/l2.npz",
+                        "capture": {
+                            "oracle_class": "cpu_fp32_fallback",
+                            "device": "cuda:0",
+                            "dtype": "float32",
+                        },
+                    },
+                }
+            )
+        ],
+        "tier-matches-capture",
+    ),
+    (
+        "a native claim with no capture at all is rejected",
+        [
+            json.dumps(
+                {
+                    "event": "contract_check",
+                    "test": "contract_a_l2_talker",
+                    "outcome": "passed",
+                    "oracle_tier": "native_cuda",
+                }
+            )
+        ],
+        "native-claim-needs-capture",
+    ),
+    (
+        "a half-filled capture identity is rejected",
+        [
+            json.dumps(
+                {
+                    "event": "contract_check",
+                    "test": "contract_a_l2_talker",
+                    "outcome": "passed",
+                    "fixture": {
+                        "source": "fixtures/l2.npz",
+                        "capture": {"oracle_class": "native_cuda", "device": "", "dtype": ""},
+                    },
+                }
+            )
+        ],
+        "capture-complete",
+    ),
+    (
+        "an unknown oracle tier cannot sneak past the tally",
+        [
+            json.dumps(
+                {
+                    "event": "contract_check",
+                    "test": "contract_a_l2_talker",
+                    "outcome": "passed",
+                    "oracle_tier": "native_metal",
+                }
+            )
+        ],
+        "oracle-tier-known",
+    ),
+    (
+        "a receipt with no oracle claim at all is fine",
+        [
+            json.dumps(
+                {"event": "contract_check", "test": "contract_a_l0_tok", "outcome": "passed"}
+            )
+        ],
+        None,
     ),
     (
         "an empty file means the emission path is dead",
