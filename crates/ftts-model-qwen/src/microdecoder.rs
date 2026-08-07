@@ -756,6 +756,8 @@ mod tests {
         let config = tiny();
         let rope = RopeTable::new(&config);
         let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
         let mut state = FrameKvState::new(&config);
         // Pre-dirty the state to prove decode_frame_greedy resets it itself.
         state.push(
@@ -764,7 +766,7 @@ mod tests {
         );
 
         let hidden = weights_of(config.hidden_size, 30);
-        let codes = decode_frame_greedy(&config, &rope, &bundle.borrow(), &mut state, &hidden, 5);
+        let codes = decode_frame_greedy(&config, &rope, &weights, &mut state, &hidden, 5);
 
         assert_eq!(codes.len(), RESIDUAL_DEPTHS, "15 residual codes per frame");
         assert!(codes.iter().all(|c| *c < RESIDUAL_VOCAB));
@@ -783,12 +785,14 @@ mod tests {
         let config = tiny();
         let rope = RopeTable::new(&config);
         let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
         let hidden = weights_of(config.hidden_size, 31);
 
         let mut state_a = FrameKvState::new(&config);
-        let a = decode_frame_greedy(&config, &rope, &bundle.borrow(), &mut state_a, &hidden, 0);
+        let a = decode_frame_greedy(&config, &rope, &weights, &mut state_a, &hidden, 0);
         let mut state_b = FrameKvState::new(&config);
-        let b = decode_frame_greedy(&config, &rope, &bundle.borrow(), &mut state_b, &hidden, 11);
+        let b = decode_frame_greedy(&config, &rope, &weights, &mut state_b, &hidden, 11);
 
         // The conditioning differs, so the frames must not be forced to agree.
         assert_eq!(a.len(), b.len());
@@ -803,13 +807,14 @@ mod tests {
         let config = tiny();
         let rope = RopeTable::new(&config);
         let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
         let hidden = weights_of(config.hidden_size, 32);
 
         let mut first_state = FrameKvState::new(&config);
-        let first = decode_frame_greedy(&config, &rope, &bundle.borrow(), &mut first_state, &hidden, 3);
+        let first = decode_frame_greedy(&config, &rope, &weights, &mut first_state, &hidden, 3);
         let mut second_state = FrameKvState::new(&config);
-        let second =
-            decode_frame_greedy(&config, &rope, &bundle.borrow(), &mut second_state, &hidden, 3);
+        let second = decode_frame_greedy(&config, &rope, &weights, &mut second_state, &hidden, 3);
         assert_eq!(first, second, "greedy decode must be reproducible");
     }
 
@@ -892,31 +897,27 @@ mod tests {
             }
         }
 
-        fn borrow(&self) -> MicrodecoderWeights<'_> {
-            // These temporaries must outlive the borrow, so they are rebuilt per call.
+        /// Borrowed views the caller must keep alive; assembled into [`MicrodecoderWeights`]
+        /// by [`TestBundle::weights`].
+        fn views(&self) -> (Vec<LayerWeights<'_>>, Vec<&[f32]>, Vec<&[f32]>) {
+            (
+                self.layers_owned.iter().map(TestLayer::borrow).collect(),
+                self.residual_embeddings.iter().map(Vec::as_slice).collect(),
+                self.heads.iter().map(Vec::as_slice).collect(),
+            )
+        }
+
+        fn weights<'a>(
+            &'a self,
+            layers: &'a [LayerWeights<'a>],
+            embeddings: &'a [&'a [f32]],
+            heads: &'a [&'a [f32]],
+        ) -> MicrodecoderWeights<'a> {
             MicrodecoderWeights {
-                layers: Box::leak(
-                    self.layers_owned
-                        .iter()
-                        .map(TestLayer::borrow)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                ),
+                layers,
                 talker_codec_embedding: &self.talker_codec_embedding,
-                residual_embeddings: Box::leak(
-                    self.residual_embeddings
-                        .iter()
-                        .map(Vec::as_slice)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                ),
-                heads: Box::leak(
-                    self.heads
-                        .iter()
-                        .map(Vec::as_slice)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                ),
+                residual_embeddings: embeddings,
+                heads,
                 final_norm: &self.final_norm,
             }
         }

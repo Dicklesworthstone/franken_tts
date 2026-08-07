@@ -632,4 +632,88 @@ mod tests {
             assert_eq!(out[base..base + 4], axis[base..base + 4]);
         }
     }
+
+    #[test]
+    fn left_padding_positions_and_rope_delta_are_exact() {
+        let mask = [false, false, true, true, true];
+        assert_eq!(left_padded_positions(&mask), vec![1, 1, 0, 1, 2]);
+        assert_eq!(rope_delta_for_left_padding(&mask), -2);
+
+        let (cos, sin) = mrope_rows(&[0, 1], 4, 1_000_000.0);
+        assert_eq!(cos.len(), 8);
+        assert_eq!(sin.len(), 8);
+        // Position zero has identity rotary rows, and every full row repeats its half because
+        // the upstream transform applies rotate_half after the doubled-half construction.
+        assert_eq!(cos[..4], [1.0; 4]);
+        assert_eq!(sin[..4], [0.0; 4]);
+        assert_eq!(cos[4], cos[6]);
+        assert_eq!(cos[5], cos[7]);
+        assert_eq!(sin[4], sin[6]);
+        assert_eq!(sin[5], sin[7]);
+    }
+
+    #[test]
+    fn complete_talker_executes_all_28_layers_and_primary_head() {
+        // Small geometry keeps this structural test fast while exercising the real 28-layer
+        // schedule, per-layer KV ownership, final norm, and 3,072-way primary-code head.
+        let config = TalkerConfig {
+            hidden_size: 4,
+            intermediate_size: 3,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            rms_norm_eps: 1e-6,
+            qk_norm_eps: 1e-6,
+        };
+        let norm = vec![1.0f32; config.hidden_size];
+        let q = vec![0.0f32; config.query_width() * config.hidden_size];
+        let kv = vec![0.0f32; config.kv_width() * config.hidden_size];
+        let head_norm = vec![1.0f32; config.head_dim];
+        let o = vec![0.0f32; config.hidden_size * config.query_width()];
+        let mlp = vec![0.0f32; config.intermediate_size * config.hidden_size];
+        let down = vec![0.0f32; config.hidden_size * config.intermediate_size];
+        let layer = TalkerLayerWeights {
+            input_layernorm: &norm,
+            q_proj: &q,
+            k_proj: &kv,
+            v_proj: &kv,
+            q_norm: &head_norm,
+            k_norm: &head_norm,
+            o_proj: &o,
+            post_attention_layernorm: &norm,
+            gate_proj: &mlp,
+            up_proj: &mlp,
+            down_proj: &down,
+        };
+        let head = vec![0.0f32; PRIMARY_CODE_VOCAB_SIZE * config.hidden_size];
+        let weights = TalkerWeights {
+            layers: vec![layer; TALKER_LAYER_COUNT],
+            final_norm: &norm,
+            codec_head: &head,
+        };
+        let mut hidden = vec![1.0f32, 2.0, 3.0, 4.0];
+        let (cos, sin) = mrope_rows(&[0], config.head_dim, 1_000_000.0);
+        let mut cache = TalkerKvCache::new();
+        let mut logits = vec![0.0f32; PRIMARY_CODE_VOCAB_SIZE];
+
+        forward_talker(
+            &config,
+            &weights,
+            RotaryRows {
+                cos: &cos,
+                sin: &sin,
+            },
+            &[0.0],
+            &mut hidden,
+            1,
+            &mut cache,
+            &mut logits,
+        );
+
+        let mean = (1.0f32 + 4.0 + 9.0 + 16.0) / 4.0;
+        let scale = (mean + config.rms_norm_eps).sqrt().recip();
+        assert_eq!(hidden, vec![scale, 2.0 * scale, 3.0 * scale, 4.0 * scale]);
+        assert!(logits.iter().all(|value| *value == 0.0));
+        assert_eq!(cache.len(), 1);
+    }
 }

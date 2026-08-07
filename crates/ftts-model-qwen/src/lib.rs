@@ -2,6 +2,7 @@
 
 //! Safe Qwen3-TTS model orchestration.
 
+pub mod microdecoder;
 pub mod prompt;
 pub mod sampler;
 pub mod talker;
