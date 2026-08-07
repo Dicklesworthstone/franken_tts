@@ -683,6 +683,10 @@ pub fn causal_conv1d(
     if let Some(bias) = bias {
         assert_eq!(bias.len(), output_channels, "causal conv bias shape");
     }
+    // The reference unfolds into an `[in_channel, tap]`-major column and reduces it with one GEMM,
+    // which is this loop order. The bias reaches that GEMM as its `beta = 1` accumulator seed, not
+    // as a trailing add: moving it after the reduction was measured against the pinned oracle and
+    // made every convolution seam worse (`block_00` 2.86e-6 -> 1.24e-5), so it stays seeded here.
     for frame in 0..frames {
         for output_channel in 0..output_channels {
             let mut total = bias.map_or(0.0, |values| values[output_channel]);

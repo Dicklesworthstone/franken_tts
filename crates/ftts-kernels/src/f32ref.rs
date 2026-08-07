@@ -31,6 +31,14 @@ pub enum F32LinearAccumulation {
     ///
     /// On every other target, this deliberately falls back to [`Self::Scalar`].
     Accelerate,
+    /// macOS Accelerate SGEMM over a bias-seeded output, issued with `beta = 1`.
+    ///
+    /// This is the exact call `slow_conv2d_update_output_frame` makes for a convolution with a
+    /// bias, and it differs from [`Self::Accelerate`] — which adds the bias after a `beta = 0`
+    /// product — whenever the BLAS blocks its reduction. Like the other lane orders, it exists so
+    /// the CPU-fp32 fixture can attribute a convolution's divergence; it falls back to
+    /// [`Self::Scalar`] with a trailing bias on every non-macOS target.
+    AccelerateBiasSeeded,
 }
 
 /// Arithmetic used by [`rms_norm_with_arithmetic`] to form RMSNorm's scale.
@@ -113,8 +121,25 @@ pub fn linear_with_accumulation(
         assert_eq!(bias.len(), n, "bias must be [n]");
     }
 
+    if accumulation == F32LinearAccumulation::AccelerateBiasSeeded {
+        // Seed `out` with the bias and let the BLAS accumulate onto it, exactly as the reference
+        // convolution's `beta = 1` GEMM does.
+        match bias {
+            Some(bias) => {
+                for row in out.chunks_exact_mut(n) {
+                    row.copy_from_slice(bias);
+                }
+            }
+            None => out.fill(0.0),
+        }
+        if accelerate_sgemm(x, weight, m, k, n, 1.0, out) {
+            return;
+        }
+        out.fill(0.0);
+    }
+
     if accumulation == F32LinearAccumulation::Accelerate
-        && accelerate_sgemm(x, weight, m, k, n, out)
+        && accelerate_sgemm(x, weight, m, k, n, 0.0, out)
     {
         if let Some(bias) = bias {
             for row in out.chunks_exact_mut(n) {
@@ -150,13 +175,15 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
         | F32LinearAccumulation::Lanes8
         | F32LinearAccumulation::FusedLanes4
         | F32LinearAccumulation::FusedLanes8
-        | F32LinearAccumulation::Accelerate => {
+        | F32LinearAccumulation::Accelerate
+        | F32LinearAccumulation::AccelerateBiasSeeded => {
             let lanes = match accumulation {
                 F32LinearAccumulation::Lanes4 => 4,
                 F32LinearAccumulation::Lanes8 => 8,
                 F32LinearAccumulation::FusedLanes4 => 4,
                 F32LinearAccumulation::FusedLanes8 => 8,
-                F32LinearAccumulation::Accelerate => 1,
+                F32LinearAccumulation::Accelerate
+                | F32LinearAccumulation::AccelerateBiasSeeded => 1,
                 F32LinearAccumulation::Scalar => unreachable!("scalar handled above"),
             };
             let mut partial = [0.0f32; 8];
@@ -169,7 +196,10 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
                     F32LinearAccumulation::Scalar
                     | F32LinearAccumulation::Lanes4
                     | F32LinearAccumulation::Lanes8
-                    | F32LinearAccumulation::Accelerate => partial[lane] + x[index] * weight[index],
+                    | F32LinearAccumulation::Accelerate
+                    | F32LinearAccumulation::AccelerateBiasSeeded => {
+                        partial[lane] + x[index] * weight[index]
+                    }
                 };
             }
             let mut sum = 0.0f32;
@@ -193,6 +223,7 @@ fn accelerate_sgemm(
     m: usize,
     k: usize,
     n: usize,
+    beta: f32,
     out: &mut [f32],
 ) -> bool {
     let m = i32::try_from(m).expect("SGEMM rows fit CBLAS i32 dimensions");
@@ -214,7 +245,7 @@ fn accelerate_sgemm(
             k,
             weight.as_ptr(),
             k,
-            0.0,
+            beta,
             out.as_mut_ptr(),
             n,
         );
@@ -229,6 +260,7 @@ fn accelerate_sgemm(
     _m: usize,
     _k: usize,
     _n: usize,
+    _beta: f32,
     _out: &mut [f32],
 ) -> bool {
     false
@@ -624,6 +656,7 @@ fn accelerate_gqa_attention(
             query_positions,
             head_dim,
             key_positions,
+            0.0,
             &mut scores,
         ) {
             return false;
@@ -644,6 +677,7 @@ fn accelerate_gqa_attention(
             query_positions,
             key_positions,
             head_dim,
+            0.0,
             &mut context,
         ) {
             return false;
@@ -690,7 +724,7 @@ fn attention_weighted_sum(
         F32LinearAccumulation::Scalar => 1,
         F32LinearAccumulation::Lanes4 | F32LinearAccumulation::FusedLanes4 => 4,
         F32LinearAccumulation::Lanes8 | F32LinearAccumulation::FusedLanes8 => 8,
-        F32LinearAccumulation::Accelerate => 1,
+        F32LinearAccumulation::Accelerate | F32LinearAccumulation::AccelerateBiasSeeded => 1,
     };
     for lane in 0..head_dim {
         let mut partial = [0.0f32; 8];
@@ -704,7 +738,10 @@ fn attention_weighted_sum(
                 F32LinearAccumulation::Scalar
                 | F32LinearAccumulation::Lanes4
                 | F32LinearAccumulation::Lanes8
-                | F32LinearAccumulation::Accelerate => partial[partial_index] + weight * value,
+                | F32LinearAccumulation::Accelerate
+                | F32LinearAccumulation::AccelerateBiasSeeded => {
+                    partial[partial_index] + weight * value
+                }
             };
         }
         let mut sum = 0.0f32;
