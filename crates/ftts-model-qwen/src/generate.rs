@@ -238,6 +238,63 @@ impl<'a> QwenGenerator<'a> {
         }
         Ok(projected.chunks(hidden).map(<[f32]>::to_vec).collect())
     }
+
+    /// Begins an utterance from an externally assembled prefill.
+    ///
+    /// This is the conformance seam for the exact ladder: the oracle fixtures capture the fully
+    /// assembled `[seq, hidden]` talker input (`kwargs.inputs_embeds`) and the trailing text
+    /// stream, so parity tests can drive the real prefill/decode path from the oracle's own
+    /// prompt without re-deriving header construction. `prefill` is row-major `[seq, hidden]`,
+    /// consumed at positions `0..seq`. Production callers use [`FrameGenerator::begin_utterance`].
+    pub fn begin_with_prefill(
+        &mut self,
+        prefill: &[f32],
+        seq: usize,
+        trailing_text_hidden: Vec<HiddenState>,
+    ) -> Result<(), GenerationError> {
+        let hidden_size = self.talker_config.hidden_size;
+        if seq == 0 || prefill.len() != seq * hidden_size {
+            return Err(GenerationError::new(format!(
+                "prefill must be a non-empty [seq, {hidden_size}] buffer; got {} values for seq {seq}",
+                prefill.len()
+            )));
+        }
+        self.run_prefill(prefill.to_vec(), seq, trailing_text_hidden);
+        Ok(())
+    }
+
+    /// Runs the talker over an assembled prefill and parks the newest position's state.
+    fn run_prefill(&mut self, mut hidden: Vec<f32>, seq: usize, trailing: Vec<HiddenState>) {
+        self.utterance = None;
+        self.kv.clear();
+        let hidden_size = self.talker_config.hidden_size;
+        let positions: Vec<i64> = (0..seq as i64).collect();
+        let (cos, sin) = talker::mrope_rows(&positions, self.talker_config.head_dim, MROPE_THETA);
+        let mask = causal_mask(seq);
+        let mut logits = vec![0.0_f32; seq * PRIMARY_CODE_VOCAB_SIZE];
+        talker::forward_talker(
+            &self.talker_config,
+            &self.talker_weights,
+            RotaryRows {
+                cos: &cos,
+                sin: &sin,
+            },
+            &mask,
+            &mut hidden,
+            seq,
+            &mut self.kv,
+            &mut logits,
+        );
+        self.utterance = Some(UtteranceState {
+            pending_hidden: hidden[(seq - 1) * hidden_size..].to_vec(),
+            pending_logits: logits[(seq - 1) * PRIMARY_CODE_VOCAB_SIZE..].to_vec(),
+            trailing_text_hidden: trailing,
+            next_position: seq,
+            frames_emitted: 0,
+            group_zero_history: Vec::new(),
+            finished: false,
+        });
+    }
 }
 
 fn generation_error(error: impl std::fmt::Display) -> GenerationError {
@@ -258,7 +315,6 @@ fn causal_mask(seq: usize) -> Vec<f32> {
 impl FrameGenerator for QwenGenerator<'_> {
     fn begin_utterance(&mut self, prepared: &PreparedText) -> Result<(), GenerationError> {
         self.utterance = None;
-        self.kv.clear();
 
         let ids = prompt::extract_prompt_text_ids(
             &prepared.token_ids,
@@ -297,33 +353,7 @@ impl FrameGenerator for QwenGenerator<'_> {
             hidden.extend_from_slice(state);
         }
 
-        let positions: Vec<i64> = (0..seq as i64).collect();
-        let (cos, sin) = talker::mrope_rows(&positions, self.talker_config.head_dim, MROPE_THETA);
-        let mask = causal_mask(seq);
-        let mut logits = vec![0.0_f32; seq * PRIMARY_CODE_VOCAB_SIZE];
-        talker::forward_talker(
-            &self.talker_config,
-            &self.talker_weights,
-            RotaryRows {
-                cos: &cos,
-                sin: &sin,
-            },
-            &mask,
-            &mut hidden,
-            seq,
-            &mut self.kv,
-            &mut logits,
-        );
-
-        self.utterance = Some(UtteranceState {
-            pending_hidden: hidden[(seq - 1) * hidden_size..].to_vec(),
-            pending_logits: logits[(seq - 1) * PRIMARY_CODE_VOCAB_SIZE..].to_vec(),
-            trailing_text_hidden: assembly.trailing_text_hidden,
-            next_position: seq,
-            frames_emitted: 0,
-            group_zero_history: Vec::new(),
-            finished: false,
-        });
+        self.run_prefill(hidden, seq, assembly.trailing_text_hidden);
         Ok(())
     }
 
