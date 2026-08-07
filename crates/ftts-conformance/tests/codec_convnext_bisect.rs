@@ -202,7 +202,9 @@ fn forward(input: &[f32], frames: usize, weights: &ConvNextWeights, variant: &Va
     );
     for value in &mut expanded {
         *value = match variant.gelu {
-            Gelu::F32Erf => 0.5 * *value * (1.0 + (*value * core::f32::consts::FRAC_1_SQRT_2).erf()),
+            Gelu::F32Erf => {
+                0.5 * *value * (1.0 + (*value * core::f32::consts::FRAC_1_SQRT_2).erf())
+            }
             Gelu::F64Erf => {
                 let wide = f64::from(*value);
                 (0.5 * wide * (1.0 + (wide * core::f64::consts::FRAC_1_SQRT_2).erf())) as f32
