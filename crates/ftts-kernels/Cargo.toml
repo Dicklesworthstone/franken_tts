@@ -7,10 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["native-mmap"]
+default = ["native-mmap", "accelerate-sgemm"]
 # The only audited OS-memory interface in this crate. Disabling it preserves correctness through
 # the owned-byte fallback, which is useful for targets without a supported mmap implementation.
 native-mmap = []
+# macOS-only f32 SGEMM probe for reproducing the pinned CPU-fp32 Torch backend. The normal
+# safe-Rust reference path remains selected unless the parity harness explicitly asks for it.
+accelerate-sgemm = []
 
 [dependencies]
 [target.'cfg(unix)'.dependencies]

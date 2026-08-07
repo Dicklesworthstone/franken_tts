@@ -269,6 +269,60 @@ fn contract_a_l2_talker_layer_00_cpu_fp32_exact() {
             comparison.max_abs_diff, comparison.over_tolerance, comparison.len, comparison.cosine,
         );
     }
+    let candidate = run_layer(
+        &config,
+        &weights,
+        rotary,
+        &mask.data,
+        &hidden_in.data,
+        seq,
+        F32LinearAccumulation::Accelerate,
+        F32RmsNormArithmetic::ScalarReciprocalSqrt,
+        F32SiluArithmetic::Divide,
+        F32SoftmaxArithmetic::ReciprocalMultiply,
+        F32LinearAccumulation::Scalar,
+    );
+    let comparison = compare_f32(&expected.data, &candidate, CPU_TIER_TOLERANCE);
+    eprintln!(
+        "ft7 CPU fp32 ACCELERATE_SGEMM_BISECT max_abs={:.16e} over_tolerance={}/{} cosine={:.12}",
+        comparison.max_abs_diff, comparison.over_tolerance, comparison.len, comparison.cosine,
+    );
+    let candidate = run_layer(
+        &config,
+        &weights,
+        rotary,
+        &mask.data,
+        &hidden_in.data,
+        seq,
+        F32LinearAccumulation::Accelerate,
+        F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
+        F32SiluArithmetic::Divide,
+        F32SoftmaxArithmetic::Divide,
+        F32LinearAccumulation::Scalar,
+    );
+    let comparison = compare_f32(&expected.data, &candidate, CPU_TIER_TOLERANCE);
+    eprintln!(
+        "ft7 CPU fp32 ACCELERATE_GEMM_RMSNORM_SOFTMAX_BISECT max_abs={:.16e} over_tolerance={}/{} cosine={:.12}",
+        comparison.max_abs_diff, comparison.over_tolerance, comparison.len, comparison.cosine,
+    );
+    let candidate = run_layer(
+        &config,
+        &weights,
+        rotary,
+        &mask.data,
+        &hidden_in.data,
+        seq,
+        F32LinearAccumulation::Accelerate,
+        F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
+        F32SiluArithmetic::Divide,
+        F32SoftmaxArithmetic::Divide,
+        F32LinearAccumulation::Accelerate,
+    );
+    let comparison = compare_f32(&expected.data, &candidate, CPU_TIER_TOLERANCE);
+    eprintln!(
+        "ft7 CPU fp32 ACCELERATE_FULL_ATTENTION_BISECT max_abs={:.16e} over_tolerance={}/{} cosine={:.12}",
+        comparison.max_abs_diff, comparison.over_tolerance, comparison.len, comparison.cosine,
+    );
     for accumulation in [
         F32LinearAccumulation::FusedLanes4,
         F32LinearAccumulation::FusedLanes8,

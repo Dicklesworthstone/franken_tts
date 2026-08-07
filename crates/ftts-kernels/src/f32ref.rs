@@ -27,6 +27,10 @@ pub enum F32LinearAccumulation {
     FusedLanes4,
     /// Eight FMA partial accumulators, reduced in lane order.
     FusedLanes8,
+    /// macOS Accelerate SGEMM, selected only by the CPU-fp32 parity harness.
+    ///
+    /// On every other target, this deliberately falls back to [`Self::Scalar`].
+    Accelerate,
 }
 
 /// Arithmetic used by [`rms_norm_with_arithmetic`] to form RMSNorm's scale.
@@ -109,6 +113,19 @@ pub fn linear_with_accumulation(
         assert_eq!(bias.len(), n, "bias must be [n]");
     }
 
+    if accumulation == F32LinearAccumulation::Accelerate
+        && accelerate_sgemm(x, weight, m, k, n, out)
+    {
+        if let Some(bias) = bias {
+            for row in out.chunks_exact_mut(n) {
+                for (value, offset) in row.iter_mut().zip(bias) {
+                    *value += offset;
+                }
+            }
+        }
+        return;
+    }
+
     for row in 0..m {
         let x_row = &x[row * k..row * k + k];
         for col in 0..n {
@@ -132,12 +149,14 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
         F32LinearAccumulation::Lanes4
         | F32LinearAccumulation::Lanes8
         | F32LinearAccumulation::FusedLanes4
-        | F32LinearAccumulation::FusedLanes8 => {
+        | F32LinearAccumulation::FusedLanes8
+        | F32LinearAccumulation::Accelerate => {
             let lanes = match accumulation {
                 F32LinearAccumulation::Lanes4 => 4,
                 F32LinearAccumulation::Lanes8 => 8,
                 F32LinearAccumulation::FusedLanes4 => 4,
                 F32LinearAccumulation::FusedLanes8 => 8,
+                F32LinearAccumulation::Accelerate => 1,
                 F32LinearAccumulation::Scalar => unreachable!("scalar handled above"),
             };
             let mut partial = [0.0f32; 8];
@@ -149,7 +168,8 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
                     }
                     F32LinearAccumulation::Scalar
                     | F32LinearAccumulation::Lanes4
-                    | F32LinearAccumulation::Lanes8 => partial[lane] + x[index] * weight[index],
+                    | F32LinearAccumulation::Lanes8
+                    | F32LinearAccumulation::Accelerate => partial[lane] + x[index] * weight[index],
                 };
             }
             let mut sum = 0.0f32;
@@ -159,6 +179,87 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
             sum
         }
     }
+}
+
+/// Attempts the same row-major SGEMM backend recorded by the pinned macOS CPU-fp32 oracle.
+///
+/// The test-only [`F32LinearAccumulation::Accelerate`] selector keeps this foreign call out of the
+/// normal safe-Rust reference path. Targets without the opt-in macOS backend return `false`, so
+/// their scalar fallback remains bit-for-bit the ordinary reference implementation.
+#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+fn accelerate_sgemm(
+    x: &[f32],
+    weight: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) -> bool {
+    let m = i32::try_from(m).expect("SGEMM rows fit CBLAS i32 dimensions");
+    let k = i32::try_from(k).expect("SGEMM reduction fits CBLAS i32 dimensions");
+    let n = i32::try_from(n).expect("SGEMM columns fit CBLAS i32 dimensions");
+    // SAFETY: `linear_with_accumulation` proves the row-major slice lengths before this call.
+    // `x` is M×K, `weight` is N×K and is passed transposed, and `out` is M×N. All pointers remain
+    // valid and non-overlapping for the full synchronous CBLAS call.
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANSPOSE,
+            CBLAS_TRANSPOSE,
+            m,
+            n,
+            k,
+            1.0,
+            x.as_ptr(),
+            k,
+            weight.as_ptr(),
+            k,
+            0.0,
+            out.as_mut_ptr(),
+            n,
+        );
+    }
+    true
+}
+
+#[cfg(not(all(feature = "accelerate-sgemm", target_os = "macos")))]
+fn accelerate_sgemm(
+    _x: &[f32],
+    _weight: &[f32],
+    _m: usize,
+    _k: usize,
+    _n: usize,
+    _out: &mut [f32],
+) -> bool {
+    false
+}
+
+#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+const CBLAS_ROW_MAJOR: i32 = 101;
+#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+const CBLAS_NO_TRANSPOSE: i32 = 111;
+#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+const CBLAS_TRANSPOSE: i32 = 112;
+
+#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
 }
 
 /// Qwen3 RMSNorm: `x * rsqrt(mean(x^2) + eps) * weight`, weight-only, no centering.
@@ -421,6 +522,24 @@ pub fn gqa_attention_with_arithmetic(
         "out must be [query_positions, q_heads, head_dim]"
     );
 
+    if accumulation == F32LinearAccumulation::Accelerate
+        && accelerate_gqa_attention(
+            queries,
+            keys,
+            values,
+            additive_mask,
+            query_positions,
+            key_positions,
+            q_heads,
+            kv_heads,
+            head_dim,
+            softmax_arithmetic,
+            out,
+        )
+    {
+        return;
+    }
+
     let scale = (head_dim as f32).sqrt().recip();
     let kv_group = q_heads / kv_heads;
     let mut scores = vec![0.0f32; key_positions];
@@ -455,6 +574,108 @@ pub fn gqa_attention_with_arithmetic(
     }
 }
 
+/// Executes the two attention matrix products through the exact macOS SGEMM candidate.
+///
+/// This is intentionally an L2-parity probe rather than the normal attention route. The gather
+/// buffers present the strided GQA heads as the row-major matrices consumed by CBLAS; the scalar
+/// path above remains the cross-platform reference and the fallback when this candidate is off.
+#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn accelerate_gqa_attention(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    additive_mask: &[f32],
+    query_positions: usize,
+    key_positions: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    softmax_arithmetic: F32SoftmaxArithmetic,
+    out: &mut [f32],
+) -> bool {
+    let scale = (head_dim as f32).sqrt().recip();
+    let kv_group = q_heads / kv_heads;
+    let mut query_matrix = vec![0.0f32; query_positions * head_dim];
+    let mut key_matrix = vec![0.0f32; key_positions * head_dim];
+    let mut value_transpose = vec![0.0f32; head_dim * key_positions];
+    let mut scores = vec![0.0f32; query_positions * key_positions];
+    let mut context = vec![0.0f32; query_positions * head_dim];
+
+    for q_head in 0..q_heads {
+        let kv_head = q_head / kv_group;
+        for query_position in 0..query_positions {
+            let query_base = (query_position * q_heads + q_head) * head_dim;
+            query_matrix[query_position * head_dim..(query_position + 1) * head_dim]
+                .copy_from_slice(&queries[query_base..query_base + head_dim]);
+        }
+        for key_position in 0..key_positions {
+            let key_base = (key_position * kv_heads + kv_head) * head_dim;
+            key_matrix[key_position * head_dim..(key_position + 1) * head_dim]
+                .copy_from_slice(&keys[key_base..key_base + head_dim]);
+            for lane in 0..head_dim {
+                value_transpose[lane * key_positions + key_position] = values[key_base + lane];
+            }
+        }
+
+        if !accelerate_sgemm(
+            &query_matrix,
+            &key_matrix,
+            query_positions,
+            head_dim,
+            key_positions,
+            &mut scores,
+        ) {
+            return false;
+        }
+        for query_position in 0..query_positions {
+            let score_row =
+                &mut scores[query_position * key_positions..(query_position + 1) * key_positions];
+            let mask = &additive_mask
+                [query_position * key_positions..(query_position + 1) * key_positions];
+            for (score, mask_value) in score_row.iter_mut().zip(mask) {
+                *score = *score * scale + mask_value;
+            }
+            softmax_rows_with_arithmetic(score_row, 1, key_positions, softmax_arithmetic);
+        }
+        if !accelerate_sgemm(
+            &scores,
+            &value_transpose,
+            query_positions,
+            key_positions,
+            head_dim,
+            &mut context,
+        ) {
+            return false;
+        }
+        for query_position in 0..query_positions {
+            let out_base = (query_position * q_heads + q_head) * head_dim;
+            out[out_base..out_base + head_dim].copy_from_slice(
+                &context[query_position * head_dim..(query_position + 1) * head_dim],
+            );
+        }
+    }
+    true
+}
+
+#[cfg(not(all(feature = "accelerate-sgemm", target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn accelerate_gqa_attention(
+    _queries: &[f32],
+    _keys: &[f32],
+    _values: &[f32],
+    _additive_mask: &[f32],
+    _query_positions: usize,
+    _key_positions: usize,
+    _q_heads: usize,
+    _kv_heads: usize,
+    _head_dim: usize,
+    _softmax_arithmetic: F32SoftmaxArithmetic,
+    _out: &mut [f32],
+) -> bool {
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attention_weighted_sum(
     scores: &[f32],
@@ -469,6 +690,7 @@ fn attention_weighted_sum(
         F32LinearAccumulation::Scalar => 1,
         F32LinearAccumulation::Lanes4 | F32LinearAccumulation::FusedLanes4 => 4,
         F32LinearAccumulation::Lanes8 | F32LinearAccumulation::FusedLanes8 => 8,
+        F32LinearAccumulation::Accelerate => 1,
     };
     for lane in 0..head_dim {
         let mut partial = [0.0f32; 8];
@@ -481,7 +703,8 @@ fn attention_weighted_sum(
                 }
                 F32LinearAccumulation::Scalar
                 | F32LinearAccumulation::Lanes4
-                | F32LinearAccumulation::Lanes8 => partial[partial_index] + weight * value,
+                | F32LinearAccumulation::Lanes8
+                | F32LinearAccumulation::Accelerate => partial[partial_index] + weight * value,
             };
         }
         let mut sum = 0.0f32;
