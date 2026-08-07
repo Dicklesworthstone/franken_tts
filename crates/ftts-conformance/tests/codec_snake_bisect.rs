@@ -27,6 +27,8 @@
 //!   sin_and_exp_f64           7.629e-6    56_807
 //!   sin_input_product_f64     7.629e-6   108_673
 //!   all_f64                   3.815e-6   201_833
+//!   vforce_sin                7.629e-6    36_650
+//!   vforce_sin_and_exp        3.815e-6    65_110
 //!
 //! Production is the best candidate and every widening is worse, which is a stronger statement than
 //! it looks. This seam is fed the oracle's own input, so nothing is inherited; and `*`, `+` and `/`
@@ -42,10 +44,19 @@
 //! the divergent count is the same story from the other side: computing more accurately moves us
 //! away from the target, because the target is not accuracy.
 //!
-//! So `block_05` is exactly reachable, but only by reproducing `Sleef_sinf_u10` and `Sleef_expf_u10`
-//! bit-for-bit rather than by any rearrangement of the surrounding f32 algebra. That is worth doing
-//! beyond this seam: the same SnakeBeta runs inside every residual unit of `block_01`–`block_04`,
-//! which are four of the five largest open seams in the codec.
+//! The two vForce rows then split the two functions apart, and they split differently. Swapping
+//! `sin` for Accelerate's `vvsinf` is the FIRST candidate to beat production — 36_650 divergent
+//! elements against 42_042, 13% fewer, at unchanged `max_abs` — so the reference's `sin` is nearer
+//! to a vectorized routine than to Apple's scalar `sinf`. Swapping `exp` as well goes the other way
+//! (65_110), which agrees with `exp_f64`: the reference's `exp` is the one our scalar libm already
+//! matches best. Neither reaches exact, so the target is a third implementation that vForce merely
+//! resembles — consistent with the Sleef routines PyTorch's ARM NEON `Vectorized<float>` calls.
+//!
+//! `vforce_sin` was deliberately NOT adopted despite winning. It would put a macOS-only FFI on the
+//! production elementwise path for a partial gain, and it is a detour: a pure-Rust `Sleef_sinf_u10`
+//! would be exact AND portable, which an Accelerate call can never be. That is the work this probe
+//! is pointing at, and it is worth more than one seam — the same SnakeBeta runs inside every
+//! residual unit of `block_01`–`block_04`, four of the five largest open seams in the codec.
 //!
 //! Two smaller results also land here. `division_not_recip` is bit-identical to production, so
 //! `f32::recip` and `1.0 / x` are confirmed interchangeable and the production comment's choice is
@@ -59,6 +70,7 @@ use ftts_conformance::{
     oracle::{CPU_TIER_TOLERANCE, CPU_TIER_TOLERANCE_SOURCE, OracleFixtures, SeamRef},
     report::{OracleTier, Outcome, Receipt},
 };
+use ftts_kernels::f32ref::{self, F32Transcendental};
 use std::path::{Path, PathBuf};
 
 const TEST_NAME: &str = "codec_snake_beta_bisect";
@@ -83,6 +95,10 @@ enum Widen {
     SinExpAndProduct,
     /// The whole expression, including the reciprocal and the residual add.
     All,
+    /// `sin` from macOS Accelerate's vForce (`vvsinf`) instead of the scalar libm.
+    VforceSin,
+    /// Both `sin` and `exp` from vForce.
+    VforceSinAndExp,
 }
 
 /// How the scaled square is combined with the input.
@@ -148,8 +164,37 @@ fn snake_beta(
             continue;
         }
 
+        let vforce_exp = variant.widen == Widen::VforceSinAndExp;
+        let (alpha, beta) = if vforce_exp {
+            let mut exponentiated = [0.0f32; 2];
+            f32ref::exp_with(
+                &[alpha_log[channel], beta_log[channel]],
+                F32Transcendental::AccelerateVForce,
+                &mut exponentiated,
+            );
+            (f64::from(exponentiated[0]), f64::from(exponentiated[1]))
+        } else {
+            (alpha, beta)
+        };
+
         let alpha = alpha as f32;
         let beta = beta as f32;
+        if matches!(variant.widen, Widen::VforceSin | Widen::VforceSinAndExp) {
+            // vForce is a whole-array call, so this candidate must materialize the channel's
+            // scaled column and evaluate `sin` over all of it at once — which is also closer to
+            // how the reference actually reaches its vectorized kernel.
+            let scaled: Vec<f32> = (0..frames)
+                .map(|frame| values[frame * CHANNELS + channel] * alpha)
+                .collect();
+            let mut sines = vec![0.0f32; frames];
+            f32ref::sin_with(&scaled, F32Transcendental::AccelerateVForce, &mut sines);
+            for frame in 0..frames {
+                let index = frame * CHANNELS + channel;
+                let sine = sines[frame];
+                out[index] = values[index] + scale_of(beta) * (sine * sine);
+            }
+            continue;
+        }
         let scale = match variant.combine {
             Combine::DivisionThenMultiply => 1.0f32 / (beta + BETA_FLOOR),
             _ => (beta + BETA_FLOOR).recip(),
@@ -178,6 +223,10 @@ fn snake_beta(
         }
     }
     out
+}
+
+fn scale_of(beta: f32) -> f32 {
+    (beta + BETA_FLOOR).recip()
 }
 
 fn checkpoint_path() -> PathBuf {
@@ -329,6 +378,16 @@ fn codec_snake_beta_bisect() {
         Variant {
             name: "all_f64",
             widen: Widen::All,
+            ..Variant::production()
+        },
+        Variant {
+            name: "vforce_sin",
+            widen: Widen::VforceSin,
+            ..Variant::production()
+        },
+        Variant {
+            name: "vforce_sin_and_exp",
+            widen: Widen::VforceSinAndExp,
             ..Variant::production()
         },
     ];

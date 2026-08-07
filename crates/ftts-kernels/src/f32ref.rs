@@ -182,8 +182,9 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
                 F32LinearAccumulation::Lanes8 => 8,
                 F32LinearAccumulation::FusedLanes4 => 4,
                 F32LinearAccumulation::FusedLanes8 => 8,
-                F32LinearAccumulation::Accelerate
-                | F32LinearAccumulation::AccelerateBiasSeeded => 1,
+                F32LinearAccumulation::Accelerate | F32LinearAccumulation::AccelerateBiasSeeded => {
+                    1
+                }
                 F32LinearAccumulation::Scalar => unreachable!("scalar handled above"),
             };
             let mut partial = [0.0f32; 8];
@@ -292,6 +293,88 @@ unsafe extern "C" {
         c: *mut f32,
         ldc: i32,
     );
+}
+
+/// Which `sin`/`exp` implementation an elementwise parity probe evaluates.
+///
+/// The reference stack does not call the scalar libm for large tensors: its CPU elementwise kernels
+/// dispatch through a vectorized `Vectorized<float>`, whose transcendentals are ~1-ulp routines
+/// rather than correctly-rounded ones. `codec_snake_bisect` established that the SnakeBeta seam's
+/// entire residual divergence lives in exactly these two functions — every other operation in that
+/// expression is a correctly-rounded f32 `*`, `+` or `/` with no freedom at all — so identifying
+/// *which* vectorized routine the pinned oracle used is the whole remaining question there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum F32Transcendental {
+    /// Rust's scalar `f32::sin` / `f32::exp`, i.e. the platform libm. The production reference.
+    ScalarLibm,
+    /// macOS Accelerate vForce (`vvsinf` / `vvexpf`), selected only by the parity harness.
+    ///
+    /// On every other target this deliberately falls back to [`Self::ScalarLibm`].
+    AccelerateVForce,
+}
+
+/// Fills `out` with `sin(x)` under the selected implementation.
+///
+/// # Panics
+///
+/// Panics if `out` is not the same length as `x`.
+pub fn sin_with(x: &[f32], implementation: F32Transcendental, out: &mut [f32]) {
+    assert_eq!(x.len(), out.len(), "sin output must match its input");
+    if implementation == F32Transcendental::AccelerateVForce && vforce_sin(x, out) {
+        return;
+    }
+    for (value, target) in x.iter().zip(out.iter_mut()) {
+        *target = value.sin();
+    }
+}
+
+/// Fills `out` with `exp(x)` under the selected implementation.
+///
+/// # Panics
+///
+/// Panics if `out` is not the same length as `x`.
+pub fn exp_with(x: &[f32], implementation: F32Transcendental, out: &mut [f32]) {
+    assert_eq!(x.len(), out.len(), "exp output must match its input");
+    if implementation == F32Transcendental::AccelerateVForce && vforce_exp(x, out) {
+        return;
+    }
+    for (value, target) in x.iter().zip(out.iter_mut()) {
+        *target = value.exp();
+    }
+}
+
+#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+fn vforce_sin(x: &[f32], out: &mut [f32]) -> bool {
+    let count = i32::try_from(x.len()).expect("vForce length fits i32");
+    // SAFETY: `sin_with` proved the two slices have equal length, and they are distinct live
+    // allocations for the duration of this synchronous call.
+    unsafe { vvsinf(out.as_mut_ptr(), x.as_ptr(), &raw const count) };
+    true
+}
+
+#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+fn vforce_exp(x: &[f32], out: &mut [f32]) -> bool {
+    let count = i32::try_from(x.len()).expect("vForce length fits i32");
+    // SAFETY: as in `vforce_sin`.
+    unsafe { vvexpf(out.as_mut_ptr(), x.as_ptr(), &raw const count) };
+    true
+}
+
+#[cfg(not(all(feature = "accelerate-sgemm", target_os = "macos")))]
+fn vforce_sin(_x: &[f32], _out: &mut [f32]) -> bool {
+    false
+}
+
+#[cfg(not(all(feature = "accelerate-sgemm", target_os = "macos")))]
+fn vforce_exp(_x: &[f32], _out: &mut [f32]) -> bool {
+    false
+}
+
+#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn vvsinf(out: *mut f32, x: *const f32, count: *const i32);
+    fn vvexpf(out: *mut f32, x: *const f32, count: *const i32);
 }
 
 /// Qwen3 RMSNorm: `x * rsqrt(mean(x^2) + eps) * weight`, weight-only, no centering.
