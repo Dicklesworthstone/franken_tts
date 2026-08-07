@@ -315,36 +315,19 @@ pub fn forward_layer(
         );
     }
 
-    let scaling = (head_dim as f32).sqrt().recip();
     let mut context = vec![0.0f32; seq * query_width];
-    let mut scores = vec![0.0f32; total];
-    for position in 0..seq {
-        for head in 0..config.num_attention_heads {
-            let kv_head = head / config.kv_group();
-            let query = &queries[position * query_width + head * head_dim..][..head_dim];
-
-            for key_position in 0..total {
-                let key = &cache.keys[key_position * kv_width + kv_head * head_dim..][..head_dim];
-                let mut dot = 0.0f32;
-                for index in 0..head_dim {
-                    dot += query[index] * key[index];
-                }
-                scores[key_position] = dot * scaling + mask[position * total + key_position];
-            }
-            f32ref::softmax_rows(&mut scores, 1, total);
-
-            let out = &mut context[position * query_width + head * head_dim..][..head_dim];
-            out.fill(0.0);
-            for key_position in 0..total {
-                let weight = scores[key_position];
-                let value =
-                    &cache.values[key_position * kv_width + kv_head * head_dim..][..head_dim];
-                for index in 0..head_dim {
-                    out[index] += weight * value[index];
-                }
-            }
-        }
-    }
+    f32ref::gqa_attention(
+        &queries,
+        &cache.keys,
+        &cache.values,
+        mask,
+        seq,
+        total,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        head_dim,
+        &mut context,
+    );
 
     let mut attention = vec![0.0f32; seq * hidden_size];
     f32ref::linear(
@@ -491,6 +474,7 @@ impl Default for TalkerKvCache {
 ///
 /// This is intentionally the f32 correctness baseline. It has no quantization, packing, or
 /// scheduler assumptions, so a future kernel route can be compared against this complete graph.
+#[allow(clippy::too_many_arguments)]
 pub fn forward_talker(
     config: &TalkerConfig,
     weights: &TalkerWeights<'_>,
