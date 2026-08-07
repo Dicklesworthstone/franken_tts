@@ -83,7 +83,10 @@ impl fmt::Display for NpyError {
         match self {
             Self::Io { path, detail } => write!(f, "cannot read `{path}`: {detail}"),
             Self::TooShort { length } => {
-                write!(f, "not a .npy file: {length} bytes is too short for a header")
+                write!(
+                    f,
+                    "not a .npy file: {length} bytes is too short for a header"
+                )
             }
             Self::BadMagic => f.write_str("not a .npy file: magic prefix is absent"),
             Self::UnsupportedVersion { major, minor } => write!(
@@ -404,10 +407,7 @@ mod tests {
             Err(NpyError::FortranOrder)
         );
         assert_eq!(parse(b"not an npy file at all"), Err(NpyError::BadMagic));
-        assert!(matches!(
-            parse(&[]),
-            Err(NpyError::TooShort { length: 0 })
-        ));
+        assert!(matches!(parse(&[]), Err(NpyError::TooShort { length: 0 })));
     }
 
     #[test]
@@ -423,7 +423,10 @@ mod tests {
         ));
         // A truncated payload mid-element is caught too, rather than dropping a partial float.
         bytes.push(0x00);
-        assert!(matches!(parse(&bytes), Err(NpyError::LengthMismatch { .. })));
+        assert!(matches!(
+            parse(&bytes),
+            Err(NpyError::LengthMismatch { .. })
+        ));
     }
 
     #[test]

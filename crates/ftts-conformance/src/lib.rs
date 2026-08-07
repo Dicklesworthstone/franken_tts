@@ -114,6 +114,8 @@
 pub mod compare;
 pub mod gate;
 pub mod ladder;
+pub mod npy;
+pub mod oracle;
 pub mod report;
 
 /// The imports a conformance test almost always wants.
