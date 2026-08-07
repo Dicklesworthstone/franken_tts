@@ -349,7 +349,7 @@ def install_hooks(model: Any, recorder: HookRecorder) -> None:
         recorder.hook(f"codec_decoder.block_{index:02d}", block)
 
 
-def load_corpus(path: Path) -> list[dict[str, Any]]:
+def load_corpus(path: Path, max_new_tokens_override: int | None) -> list[dict[str, Any]]:
     data = load_json(path)
     if data.get("schema_version") != 1 or not isinstance(data.get("cases"), list):
         fail("corpus must contain schema_version=1 and a cases array")
@@ -370,8 +370,13 @@ def load_corpus(path: Path) -> list[dict[str, Any]]:
         normalized["reference_audio"] = reference
         normalized.setdefault("language", "Auto")
         normalized.setdefault("max_new_tokens", 2)
-        if int(normalized["max_new_tokens"]) < 2:
+        corpus_max_new_tokens = int(normalized["max_new_tokens"])
+        if corpus_max_new_tokens < 2:
             fail(f"{case_id}: max_new_tokens must be at least 2 (upstream minimum)")
+        normalized["corpus_max_new_tokens"] = corpus_max_new_tokens
+        normalized["max_new_tokens"] = (
+            max_new_tokens_override if max_new_tokens_override is not None else corpus_max_new_tokens
+        )
         cases.append(normalized)
     return cases
 
@@ -433,7 +438,7 @@ def run_case(wrapper: Any, case: dict[str, Any], output_dir: Path, recorder: Hoo
                 top_k=1,
                 top_p=1.0,
                 temperature=1.0,
-                repetition_penalty=1.0,
+                repetition_penalty=1.05,
                 subtalker_dosample=False,
                 subtalker_top_k=1,
                 subtalker_top_p=1.0,
@@ -471,8 +476,11 @@ def run_case(wrapper: Any, case: dict[str, Any], output_dir: Path, recorder: Hoo
             "mode": mode_name,
             "x_vector_only_mode": xvector_only,
             "non_streaming_mode": non_streaming,
+            "corpus_max_new_tokens": int(case["corpus_max_new_tokens"]),
+            "requested_max_new_tokens": int(case["max_new_tokens"]),
             "sample_rate": int(sample_rate),
             "generated_frames": int(codes.shape[0]),
+            "stopped_before_max_new_tokens": int(codes.shape[0]) < int(case["max_new_tokens"]),
             "generated_codes_sha256": hashlib.sha256(codes.detach().cpu().numpy().tobytes()).hexdigest(),
             "files": files,
         }
@@ -492,11 +500,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--corpus", type=Path, required=True, help="versioned JSON corpus definition")
     parser.add_argument("--output", type=Path, required=True, help="new fixture directory; it must not already exist")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        help=(
+            "override the frozen corpus's per-case generation cap for this capture; "
+            "recorded separately in every manifest"
+        ),
+    )
+    parser.add_argument(
+        "--torch-threads",
+        type=int,
+        help="explicit PyTorch intra-op thread count, recorded in provenance for repeatability studies",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.torch_threads is not None and args.torch_threads < 1:
+        fail("--torch-threads must be at least 1")
+    if args.max_new_tokens is not None and args.max_new_tokens < 2:
+        fail("--max-new-tokens must be at least 2 (upstream minimum)")
     profile = capture_profile(args.device)
     if args.output.exists():
         fail(f"output already exists; choose a new directory rather than overwriting {args.output}")
@@ -517,11 +542,14 @@ def main() -> int:
     assert_source_pin(source_dir)
     runtime = assert_runtime(source_dir)
     weight_hashes = assert_model_pin(model_dir)
-    cases = load_corpus(corpus_path)
+    cases = load_corpus(corpus_path, args.max_new_tokens)
 
     sys.path.insert(0, str(source_dir))
     import torch
     from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
+    if args.torch_threads is not None:
+        torch.set_num_threads(args.torch_threads)
 
     imported_from = Path(sys.modules["qwen_tts"].__file__).resolve()
     if source_dir not in imported_from.parents:
@@ -554,10 +582,26 @@ def main() -> int:
                 {str(parameter.dtype).removeprefix("torch.") for parameter in wrapper.model.parameters()}
             ),
             "torch_version": str(torch.__version__),
+            "torch_intraop_threads": torch.get_num_threads(),
+            "torch_interop_threads": torch.get_num_interop_threads(),
         },
         "attn_implementation": "eager",
         "dtype": profile.torch_dtype_name,
-        "generation": {"do_sample": False, "top_k": 1, "top_p": 1.0, "temperature": 1.0, "repetition_penalty": 1.0},
+        "generation": {
+            "algorithm": "canonical_greedy",
+            "talker": {
+                "do_sample": False,
+                "top_k": 1,
+                "top_p": 1.0,
+                "temperature": 1.0,
+                "repetition_penalty": 1.05,
+                "min_new_tokens": 2,
+                "suppress_tokens": "2048..3071 except 2150",
+            },
+            "microdecoder": {"do_sample": False, "selection": "raw_argmax"},
+            "max_new_tokens_override": args.max_new_tokens,
+            "max_new_tokens_source": "cli_override" if args.max_new_tokens is not None else "corpus_case",
+        },
         "weight_hashes": weight_hashes,
         "corpus_sha256": sha256(corpus_path),
         "generation_config": load_json(model_dir / "generation_config.json"),

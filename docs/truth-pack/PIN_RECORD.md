@@ -102,11 +102,18 @@ nondeterminism envelope before any native-device equivalence claim.
 
 ### Machine-local CPU fixture pointer
 
-The current CPU/FP32 capture is intentionally not committed because it is a sensitive research
-artifact. Its local root is
-`/Users/jemanuel/.cache/frankentts/oracle-fixtures/ft7-cpu-fp32-r1/`; the root
+The current CPU/FP32 multi-frame capture is intentionally not committed because it is a sensitive
+research artifact. Its local root is
+`/Users/jemanuel/.cache/frankentts/oracle-fixtures/ft8-cpu-fp32-r2/`; the root
 `fixture_manifest.json` SHA-256 is
-`5ec2bc3f3217f9e026198c0694b3993d9911f7e954ea726c69ebd95e7d5ba4dd`.
+`5987e4d2faa69588177ce5e2206c5de43d9a2b2dd1a607e2c4643e671278cdd5`.
+
+It runs the frozen corpus under canonical greedy with a capture-only `max_new_tokens=8` override
+and one PyTorch intra-op thread. Every one of the four prompt modes returned a 7-frame codec-token
+stream because the eighth attempted group-0 token was EOS and is excluded by the reference. Thus
+L4 can now compare a multi-frame (7 x 16) stream; this one CPU capture is not itself a
+repeatability floor or a native-CUDA equivalence claim. The older `ft7-cpu-fp32-r1` artifact remains
+the historical one-frame capture.
 
 Regenerate only into a **new** output directory (the generator refuses to overwrite an existing
 capture), using a full Qwen3-TTS checkout verified at the GitHub pin and the frozen CPU oracle
@@ -117,8 +124,10 @@ python3 scripts/gen_reference_fixtures.py \
   --source-dir /path/to/full/Qwen3-TTS \
   --model-dir docs/truth-pack/snapshots/hf \
   --corpus docs/conformance/oracle_corpus.json \
-  --output /Users/jemanuel/.cache/frankentts/oracle-fixtures/ft7-cpu-fp32-r2 \
-  --device cpu
+  --output /Users/jemanuel/.cache/frankentts/oracle-fixtures/ft8-cpu-fp32-r3 \
+  --device cpu \
+  --torch-threads 1 \
+  --max-new-tokens 8
 ```
 
 ## Non-pinnable reference
