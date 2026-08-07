@@ -42,8 +42,9 @@ const PINNED_TENSOR_INVENTORY: &str =
     include_str!("../../../docs/truth-pack/TENSOR_INVENTORY.json");
 const PINNED_MODEL_CONFIG: &str = include_str!("../../../docs/truth-pack/snapshots/hf/config.json");
 const APACHE_LICENSE: &str = include_str!("../../../docs/truth-pack/snapshots/gh/LICENSE");
-const ENVIRONMENT_VARIABLES: [&str; 8] = [
+const ENVIRONMENT_VARIABLES: [&str; 9] = [
     "FTTS_MODEL_DIR",
+    "FTTS_DEFAULT_VOICE",
     "FTTS_THREADS",
     "FTTS_PROFILE",
     "FTTS_PACKET_FRAMES",
@@ -175,6 +176,18 @@ struct EnrollArgs {
     /// Reference WAV or FLAC audio.
     #[arg(value_name = "REFERENCE_AUDIO")]
     reference_audio: PathBuf,
+
+    /// Explicit model directory or .fttsq model artifact. No network lookup is performed.
+    #[arg(long, value_name = "PATH")]
+    model: Option<PathBuf>,
+
+    /// Write the enrolled raw 1,024-wide x-vector here. Refuses to overwrite an existing file.
+    #[arg(short = 'o', long, value_name = "PATH", conflicts_with = "default")]
+    output: Option<PathBuf>,
+
+    /// Write MODEL_DIR/default.spk, which `ftts say` uses when `--voice` is absent.
+    #[arg(long, conflicts_with = "output")]
+    default: bool,
 
     /// Explicitly proceed after an enrollment-quality warning where safe.
     #[arg(long)]
@@ -504,11 +517,7 @@ fn dispatch(
 ) -> Result<(), FttsError> {
     match &cli.command {
         Command::Say(args) => run_say(&cli, args, environment, stdin, stdout, stderr),
-        Command::Enroll(args) => Err(FttsError::Generic(format!(
-            "enrollment is not implemented in the Phase-0 skeleton (reference: {}, force: {}); use `ftts robot health` to inspect readiness",
-            args.reference_audio.display(),
-            args.force,
-        ))),
+        Command::Enroll(args) => run_enroll(args, environment, stdout),
         Command::Voice(VoiceArgs {
             command: VoiceCommand::Inspect { path },
         }) => run_voice_inspect(path, stdout),
@@ -998,7 +1007,7 @@ fn run_say_events(
     emit_stage(run, emit, "resolve", "begin", &mut seq)?;
     let text = read_text(args, stdin)?;
     let model = resolve_model(args.model.as_deref(), environment)?;
-    let voice = resolve_optional_file(args.voice.as_deref(), "voice pack")?;
+    let voice = resolve_requested_voice(args.voice.as_deref(), environment)?;
     emit_stage(run, emit, "resolve", "end", &mut seq)?;
 
     let request = SynthesisRequest::new(text)
@@ -1071,44 +1080,26 @@ fn run_say_events(
         (Some(_), true) => unreachable!("clap enforces the conflict"),
     };
 
-    let Some(voice_path) = args.voice.as_deref() else {
-        // A refusal that only restates the requirement leaves the reader with no next action. The
-        // three things they need are: what the file is, why no default exists, and how to actually
-        // get one today — including the fixture path, which is the only speaker vector most people
-        // working in this repo currently have.
-        return Err(FttsError::Usage(format!(
-            "`ftts say` needs a speaker vector, and there is no default voice to fall back to.\n\
-             \n\
-             `--voice PATH` reads a raw 1024-dimensional x-vector: {SPEAKER_VECTOR_BYTES} bytes \
-             holding {TALKER_HIDDEN} little-endian f32, with no header.\n\
-             \n\
-             There is no default because nothing can yet derive one from reference audio. The \
-             ECAPA speaker encoder itself now exists (`ftts_model_qwen::speaker`), but it consumes \
-             a mel spectrogram and no audio-to-mel frontend is implemented, so there is still no \
-             route from a .wav to an x-vector. A zeroed or invented vector would synthesize \
-             confident nonsense rather than fail, so `say` refuses instead of guessing.\n\
-             \n\
-             To get one now, take the captured reference x-vector from the oracle pack (strip the \
-             .npy header, keep the trailing {SPEAKER_VECTOR_BYTES} bytes):\n\
-             \x20   tail -c {SPEAKER_VECTOR_BYTES} \\\n\
-             \x20     {ORACLE_PACK}/synthetic-tone-en/xvector_streaming/stages/prompt_build/prompt.speaker_embedding/tensor.000.npy \\\n\
-             \x20     > voice.spk\n\
-             \x20   ftts say 'Hello.' --model MODEL_DIR --voice voice.spk -o out.wav\n\
-             \n\
-             (that pack location is the default; FTTS_ORACLE_FIXTURES overrides it)\n\
-             \n\
-             Note this is a raw vector, not the .ftvoice pack format \
-             (frankentts-p4-ftvoice-format-x0p), which does not exist yet either.",
-            SPEAKER_VECTOR_BYTES = synth::SPEAKER_VECTOR_BYTES,
-            TALKER_HIDDEN = synth::SPEAKER_VECTOR_BYTES / 4,
-            ORACLE_PACK = "~/.cache/frankentts/oracle-fixtures/ft7-cpu-fp32-r1",
-        )));
-    };
-    let speaker = synth::read_speaker_vector(voice_path)?;
-
     // --- model load ------------------------------------------------------------------------
     emit_stage(run, emit, "load", "begin", &mut seq)?;
     let bundle = synth::ModelBundle::resolve(Path::new(&model))?;
+    let voice_path = voice
+        .as_deref()
+        .map(PathBuf::from)
+        .or_else(|| {
+            let candidate = bundle.root.join("default.spk");
+            candidate.is_file().then_some(candidate)
+        })
+        .ok_or_else(|| {
+            FttsError::Usage(
+                "`ftts say` needs a real voice source; pass --voice PATH, set \
+                 FTTS_DEFAULT_VOICE=PATH, or run `ftts enroll REF.wav --model MODEL_DIR --default`. \
+                 Qwen3-TTS Base has no preset speaker, so a missing default is refused rather than \
+                 fabricated."
+                    .to_owned(),
+            )
+        })?;
+    let speaker = synth::speaker_from_voice(&bundle, &voice_path)?;
     let loaded = synth::LoadedModel::load(&bundle)?;
     emit_stage(run, emit, "load", "end", &mut seq)?;
 
@@ -1399,6 +1390,56 @@ fn resolve_model(explicit: Option<&Path>, environment: &Environment) -> Result<S
 fn resolve_optional_file(path: Option<&Path>, label: &str) -> Result<Option<String>, FttsError> {
     path.map(|path| resolve_existing_file(path, label).map(|path| path.display().to_string()))
         .transpose()
+}
+
+fn resolve_requested_voice(
+    explicit: Option<&Path>,
+    environment: &Environment,
+) -> Result<Option<String>, FttsError> {
+    if let Some(path) = explicit {
+        return resolve_optional_file(Some(path), "voice source");
+    }
+    environment
+        .value("FTTS_DEFAULT_VOICE")
+        .map(Path::new)
+        .map(|path| resolve_existing_file(path, "FTTS_DEFAULT_VOICE"))
+        .transpose()
+        .map(|path| path.map(|path| path.display().to_string()))
+}
+
+fn run_enroll(
+    args: &EnrollArgs,
+    environment: &Environment,
+    stdout: &mut dyn Write,
+) -> Result<(), FttsError> {
+    let _ = args.force;
+    let model = resolve_model(args.model.as_deref(), environment)?;
+    let bundle = synth::ModelBundle::resolve(Path::new(&model))?;
+    let output = match (&args.output, args.default) {
+        (Some(path), false) => path.clone(),
+        (None, true) => bundle.root.join("default.spk"),
+        (None, false) => {
+            return Err(FttsError::Usage(
+                "`ftts enroll` needs -o PATH or --default; enrollment never overwrites a voice source"
+                    .to_owned(),
+            ));
+        }
+        (Some(_), true) => unreachable!("clap enforces the conflict"),
+    };
+    let speaker = synth::speaker_from_voice(&bundle, &args.reference_audio)?;
+    synth::write_speaker_vector_new(&output, &speaker)?;
+    writeln!(
+        stdout,
+        "enrolled x-vector from {} to {}{}",
+        args.reference_audio.display(),
+        output.display(),
+        if args.default {
+            "; `ftts say` will use it when --voice is absent"
+        } else {
+            ""
+        },
+    )
+    .map_err(|error| FttsError::Generic(format!("cannot write enrollment result: {error}")))
 }
 
 fn resolve_existing_file<'a>(path: &'a Path, label: &str) -> Result<&'a Path, FttsError> {

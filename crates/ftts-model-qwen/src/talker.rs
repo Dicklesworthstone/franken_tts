@@ -891,6 +891,153 @@ mod tests {
     }
 
     #[test]
+    fn cached_prefill_is_bit_exact_to_position_by_position_replay() {
+        // The usual cache-length checks cannot detect a cache whose values were appended in a
+        // different order, or a prefill path that computes a subtly different causal row from
+        // decode. Use non-zero attention projections and distinct inputs so the last row really
+        // depends on its prefix, then compare every final row, logit, and per-layer KV buffer.
+        let config = TalkerConfig {
+            hidden_size: 4,
+            intermediate_size: 3,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            rms_norm_eps: 1e-6,
+            qk_norm_eps: 1e-6,
+        };
+        let patterned = |len: usize, scale: f32| {
+            (0..len)
+                .map(|index| (index as f32 % 5.0 - 2.0) * scale)
+                .collect::<Vec<_>>()
+        };
+        let norm = vec![1.0f32; config.hidden_size];
+        let q = patterned(config.query_width() * config.hidden_size, 0.07);
+        let k = patterned(config.kv_width() * config.hidden_size, 0.05);
+        let v = patterned(config.kv_width() * config.hidden_size, 0.09);
+        let head_norm = vec![1.0f32; config.head_dim];
+        let o = patterned(config.hidden_size * config.query_width(), 0.06);
+        // Keep the MLP inert: this isolates a context-sensitive attention path while still
+        // exercising the complete 28-layer cache schedule and primary-code head.
+        let mlp = vec![0.0f32; config.intermediate_size * config.hidden_size];
+        let down = vec![0.0f32; config.hidden_size * config.intermediate_size];
+        let layer = TalkerLayerWeights {
+            input_layernorm: &norm,
+            q_proj: &q,
+            k_proj: &k,
+            v_proj: &v,
+            q_norm: &head_norm,
+            k_norm: &head_norm,
+            o_proj: &o,
+            post_attention_layernorm: &norm,
+            gate_proj: &mlp,
+            up_proj: &mlp,
+            down_proj: &down,
+        };
+        let head = patterned(PRIMARY_CODE_VOCAB_SIZE * config.hidden_size, 0.02);
+        let weights = TalkerWeights {
+            layers: vec![layer; TALKER_LAYER_COUNT],
+            final_norm: &norm,
+            codec_head: &head,
+        };
+        let seq = 4;
+        let input = vec![
+            0.5_f32, -1.0, 2.0, 0.25, 1.5, 0.75, -0.5, 2.5, -0.25, 1.0, 0.5, -2.0, 3.0, -1.5, 0.75,
+            0.5,
+        ];
+
+        let (batch_cos, batch_sin) = mrope_rows(&[0, 1, 2, 3], config.head_dim, 1.0e6);
+        let mut batch_mask = vec![0.0f32; seq * seq];
+        for query in 0..seq {
+            for key in query + 1..seq {
+                batch_mask[query * seq + key] = f32::NEG_INFINITY;
+            }
+        }
+        let mut batch_hidden = input.clone();
+        let mut batch_logits = vec![0.0f32; seq * PRIMARY_CODE_VOCAB_SIZE];
+        let mut batch_cache = TalkerKvCache::new();
+        forward_talker(
+            &config,
+            &weights,
+            RotaryRows {
+                cos: &batch_cos,
+                sin: &batch_sin,
+            },
+            &batch_mask,
+            &mut batch_hidden,
+            seq,
+            &mut batch_cache,
+            &mut batch_logits,
+        );
+
+        let mut replay_hidden = Vec::with_capacity(input.len());
+        let mut replay_logits = Vec::with_capacity(batch_logits.len());
+        let mut replay_cache = TalkerKvCache::new();
+        for position in 0..seq {
+            let mut row =
+                input[position * config.hidden_size..(position + 1) * config.hidden_size].to_vec();
+            let (cos, sin) = mrope_rows(&[position as i64], config.head_dim, 1.0e6);
+            let mut logits = vec![0.0f32; PRIMARY_CODE_VOCAB_SIZE];
+            let mask = vec![0.0f32; replay_cache.len() + 1];
+            forward_talker(
+                &config,
+                &weights,
+                RotaryRows {
+                    cos: &cos,
+                    sin: &sin,
+                },
+                &mask,
+                &mut row,
+                1,
+                &mut replay_cache,
+                &mut logits,
+            );
+            replay_hidden.extend_from_slice(&row);
+            replay_logits.extend_from_slice(&logits);
+        }
+
+        assert_eq!(
+            batch_hidden, replay_hidden,
+            "prefill and replay hidden states"
+        );
+        assert_eq!(batch_logits, replay_logits, "prefill and replay logits");
+        assert_eq!(batch_cache.len(), seq);
+        assert_eq!(batch_cache.len(), replay_cache.len());
+        for (layer, (batch, replay)) in batch_cache
+            .layers
+            .iter()
+            .zip(&replay_cache.layers)
+            .enumerate()
+        {
+            assert_eq!(batch.positions, replay.positions, "layer {layer} KV length");
+            assert_eq!(batch.keys, replay.keys, "layer {layer} cached keys");
+            assert_eq!(batch.values, replay.values, "layer {layer} cached values");
+        }
+
+        let mut isolated_last = input[(seq - 1) * config.hidden_size..].to_vec();
+        let (cos, sin) = mrope_rows(&[(seq - 1) as i64], config.head_dim, 1.0e6);
+        let mut isolated_logits = vec![0.0f32; PRIMARY_CODE_VOCAB_SIZE];
+        let mut isolated_cache = TalkerKvCache::new();
+        forward_talker(
+            &config,
+            &weights,
+            RotaryRows {
+                cos: &cos,
+                sin: &sin,
+            },
+            &[0.0],
+            &mut isolated_last,
+            1,
+            &mut isolated_cache,
+            &mut isolated_logits,
+        );
+        assert_ne!(
+            &batch_hidden[(seq - 1) * config.hidden_size..],
+            isolated_last,
+            "the test must remain context-sensitive rather than passing on an identity cache"
+        );
+    }
+
+    #[test]
     fn collapse_mrope_doubles_the_half_row() {
         // head_dim 8 => half 4; the collapsed half must be repeated to refill head_dim.
         let seq = 2;

@@ -14,6 +14,7 @@ ftts-core = { path = "../ftts-core" }
 ftts-kernels = { path = "../ftts-kernels" }
 ftts-model-qwen = { path = "../ftts-model-qwen" }
 serde_json = "1.0"
+symphonia = { version = "0.5.4", default-features = false, features = ["flac", "pcm", "wav"] }
 
 [[bin]]
 name = "franken_tts"

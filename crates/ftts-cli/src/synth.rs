@@ -16,15 +16,12 @@
 //! called — so the ids have to be known first. The engine still receives, verbatim, the
 //! `PreparedText` a fresh call would have produced; nothing is skipped, only ordered.
 //!
-//! # The speaker vector is required, and is not invented
+//! # Speaker conditioning is derived, never invented
 //!
-//! An x-vector prompt conditions on a 1,024-wide speaker embedding. Computing one from reference
-//! audio is the ECAPA speaker encoder (`frankentts-p1-speaker-ga6`), which is not implemented. So
-//! `--voice` here reads a **precomputed** speaker vector: 1,024 little-endian `f32`, 4,096 bytes
-//! exactly. This is not the `.ftvoice` format (`frankentts-p4-ftvoice-format-x0p`) and does not
-//! pretend to be; it is the minimum honest input that lets the rest of the pipeline run end to
-//! end today. Synthesizing with a zeroed or fabricated vector would produce confident nonsense, so
-//! there is no default.
+//! An x-vector prompt conditions on a 1,024-wide speaker embedding. A voice source may be either
+//! a precomputed raw vector (1,024 little-endian `f32`, 4,096 bytes) or reference audio decoded
+//! through the pinned 24 kHz log-mel front end and ECAPA encoder. Neither path accepts a
+//! fabricated vector.
 
 use crate::error::FttsError;
 use ftts_core::{
@@ -39,31 +36,48 @@ use ftts_model_qwen::generate::{QwenGenerator, QwenGeneratorConfig};
 use ftts_model_qwen::microdecoder::MicrodecoderConfig;
 use ftts_model_qwen::prompt::{CloneMode, PromptMode};
 use ftts_model_qwen::sampler::SamplingMode;
+use ftts_model_qwen::speaker::{
+    Encoder as SpeakerEncoder, SPEAKER_SAMPLE_RATE_HZ, log_mel_from_24khz_pcm,
+};
 use ftts_model_qwen::talker::TalkerConfig;
 use ftts_model_qwen::tokenizer::{QwenTokenizer, TokenizerFiles};
 use std::fs;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use symphonia::core::audio::{SampleBuffer, Signal};
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+use symphonia::default::{get_codecs, get_probe};
 
 /// Bytes in a speaker-vector file: 1,024 little-endian `f32`.
 pub const SPEAKER_VECTOR_BYTES: usize = TALKER_HIDDEN * 4;
+
+const CANONICAL_MODEL_BASENAME: &str = "qwen3-tts-12hz-0.6b-base.fttsq";
 
 fn checkpoint_error(error: CheckpointError) -> FttsError {
     FttsError::ArtifactFormat(error.to_string())
 }
 
-/// The four files `ftts say` needs, located relative to one model path.
+/// The model resources `ftts say` needs, located relative to one model path.
 #[derive(Clone, Debug)]
 pub struct ModelBundle {
-    /// Directory holding `model.safetensors` and the tokenizer files.
+    /// Directory holding the artifact sidecars and tokenizer files.
     pub root: PathBuf,
-    /// The talker/microdecoder checkpoint.
+    /// The raw main checkpoint, retained for enrollment-only components that have not yet gained
+    /// a canonical-artifact accessor.
     pub main: PathBuf,
+    /// The portable main-weight artifact selected for synthesis, when present.
+    pub canonical_main: Option<PathBuf>,
     /// The codec decoder checkpoint.
     pub codec: PathBuf,
 }
 
 impl ModelBundle {
-    /// Resolve a bundle from `--model`, which may name the directory or `model.safetensors`.
+    /// Resolve a bundle from `--model`, which may name the directory, a `.fttsq`, or
+    /// `model.safetensors`.
     ///
     /// # Errors
     ///
@@ -83,10 +97,26 @@ impl ModelBundle {
                 })?
                 .to_path_buf()
         };
+        let canonical_main = if model.is_dir() {
+            let canonical = root.join(CANONICAL_MODEL_BASENAME);
+            if canonical.is_file() {
+                Some(canonical)
+            } else {
+                None
+            }
+        } else if model.extension().and_then(|extension| extension.to_str()) == Some("fttsq") {
+            Some(model.to_path_buf())
+        } else {
+            None
+        };
         let main = root.join("model.safetensors");
         let codec = root.join("speech_tokenizer/model.safetensors");
+        let (main_label, main_path) = match canonical_main.as_ref() {
+            Some(path) => ("canonical talker artifact", path),
+            None => ("talker checkpoint", &main),
+        };
         for (label, path) in [
-            ("talker checkpoint", &main),
+            (main_label, main_path),
             ("codec checkpoint", &codec),
             ("tokenizer vocabulary", &root.join("vocab.json")),
             ("tokenizer merges", &root.join("merges.txt")),
@@ -94,14 +124,20 @@ impl ModelBundle {
         ] {
             if !path.is_file() {
                 return Err(FttsError::ModelNotFound(format!(
-                    "{label} is missing at {}; `ftts say` needs a complete pinned checkpoint \
-                     directory (model.safetensors, speech_tokenizer/model.safetensors, \
+                    "{label} is missing at {}; `ftts say` needs a complete model directory \
+                     ({CANONICAL_MODEL_BASENAME} or model.safetensors, \
+                     speech_tokenizer/model.safetensors, \
                      vocab.json, merges.txt, tokenizer_config.json)",
                     path.display()
                 )));
             }
         }
-        Ok(Self { root, main, codec })
+        Ok(Self {
+            root,
+            main,
+            canonical_main,
+            codec,
+        })
     }
 }
 
@@ -136,7 +172,10 @@ impl LoadedModel {
         .map_err(|error| FttsError::ArtifactFormat(format!("tokenizer unusable: {error}")))?;
 
         Ok(Self {
-            talker: TalkerCheckpoint::load(&bundle.main).map_err(checkpoint_error)?,
+            talker: match bundle.canonical_main.as_deref() {
+                Some(path) => TalkerCheckpoint::load_fttsq(path).map_err(checkpoint_error)?,
+                None => TalkerCheckpoint::load(&bundle.main).map_err(checkpoint_error)?,
+            },
             codec: CodecCheckpoint::load(&bundle.codec).map_err(checkpoint_error)?,
             tokenizer,
         })
@@ -180,6 +219,176 @@ pub fn read_speaker_vector(path: &Path) -> Result<Vec<f32>, FttsError> {
         )));
     }
     Ok(vector)
+}
+
+/// Derive an x-vector from an enrolled raw vector or a real reference recording.
+pub fn speaker_from_voice(bundle: &ModelBundle, path: &Path) -> Result<Vec<f32>, FttsError> {
+    let bytes = fs::read(path).map_err(|error| {
+        FttsError::Input(format!(
+            "cannot read voice source {}: {error}",
+            path.display()
+        ))
+    })?;
+    if bytes.len() == SPEAKER_VECTOR_BYTES {
+        return decode_speaker_vector(path, &bytes);
+    }
+    let pcm = decode_reference_audio(path)?;
+    let mel = log_mel_from_24khz_pcm(&pcm)
+        .map_err(|error| FttsError::Input(format!("cannot extract speaker features: {error}")))?;
+    let encoder = SpeakerEncoder::load(&bundle.main).map_err(checkpoint_error)?;
+    let vector = encoder.encode(&mel.values, mel.frames);
+    if vector.iter().all(|value| value.is_finite()) {
+        Ok(vector)
+    } else {
+        Err(FttsError::Input(
+            "speaker encoder produced a non-finite x-vector; refusing to condition synthesis"
+                .to_owned(),
+        ))
+    }
+}
+
+/// Write a raw x-vector without replacing an existing enrollment result.
+pub fn write_speaker_vector_new(path: &Path, vector: &[f32]) -> Result<(), FttsError> {
+    if vector.len() != TALKER_HIDDEN {
+        return Err(FttsError::Input(format!(
+            "cannot write {}-wide speaker vector; expected {TALKER_HIDDEN}",
+            vector.len()
+        )));
+    }
+    if let Some(index) = vector.iter().position(|value| !value.is_finite()) {
+        return Err(FttsError::Input(format!(
+            "cannot write speaker vector with a non-finite value at index {index}"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(SPEAKER_VECTOR_BYTES);
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    use std::io::Write;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            FttsError::Input(format!(
+                "cannot create enrolled voice {} without overwriting an existing file: {error}",
+                path.display()
+            ))
+        })?;
+    file.write_all(&bytes).map_err(|error| {
+        FttsError::Input(format!(
+            "cannot write enrolled voice {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn decode_speaker_vector(path: &Path, bytes: &[u8]) -> Result<Vec<f32>, FttsError> {
+    let vector: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|quad| f32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]))
+        .collect();
+    if let Some(index) = vector.iter().position(|value| !value.is_finite()) {
+        return Err(FttsError::Input(format!(
+            "speaker vector {} holds a non-finite value at index {index}; it would poison every \
+             prefill position it is summed into",
+            path.display()
+        )));
+    }
+    Ok(vector)
+}
+
+fn decode_reference_audio(path: &Path) -> Result<Vec<f32>, FttsError> {
+    let file = fs::File::open(path).map_err(|error| {
+        FttsError::Input(format!(
+            "cannot open reference audio {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+        hint.with_extension(extension);
+    }
+    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let probed = get_probe()
+        .format(
+            &hint,
+            stream,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|error| {
+            FttsError::Input(format!(
+                "cannot identify reference audio {}: {error}",
+                path.display()
+            ))
+        })?;
+    let mut format = probed.format;
+    let track = format.default_track().ok_or_else(|| {
+        FttsError::Input(format!(
+            "reference audio {} has no default audio track",
+            path.display()
+        ))
+    })?;
+    let track_id = track.id;
+    let mut decoder = get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|error| {
+            FttsError::Input(format!(
+                "cannot decode reference audio {}: {error}",
+                path.display()
+            ))
+        })?;
+    let mut sample_rate = None;
+    let mut mono = Vec::new();
+    while let Ok(packet) = format.next_packet() {
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = decoder.decode(&packet).map_err(|error| {
+            FttsError::Input(format!(
+                "cannot decode reference audio {}: {error}",
+                path.display()
+            ))
+        })?;
+        let spec = *decoded.spec();
+        match sample_rate {
+            Some(rate) if rate != spec.rate => {
+                return Err(FttsError::Input(format!(
+                    "reference audio {} changed sample rate mid-stream ({rate} to {} Hz)",
+                    path.display(),
+                    spec.rate
+                )));
+            }
+            None => sample_rate = Some(spec.rate),
+            Some(_) => {}
+        }
+        let channels = spec.channels.count();
+        let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        samples.copy_interleaved_ref(decoded);
+        for frame in samples.samples().chunks_exact(channels) {
+            mono.push(frame.iter().sum::<f32>() / channels as f32);
+        }
+    }
+    let rate = sample_rate.ok_or_else(|| {
+        FttsError::Input(format!(
+            "reference audio {} contains no decodable samples",
+            path.display()
+        ))
+    })?;
+    if rate != SPEAKER_SAMPLE_RATE_HZ {
+        return Err(FttsError::Input(format!(
+            "reference audio {} is {rate} Hz; the pinned speaker encoder requires {SPEAKER_SAMPLE_RATE_HZ} Hz",
+            path.display()
+        )));
+    }
+    if mono.is_empty() {
+        return Err(FttsError::Input(format!(
+            "reference audio {} contains no PCM samples",
+            path.display()
+        )));
+    }
+    Ok(mono)
 }
 
 /// Hands the engine a `PreparedText` that was computed before the weights were borrowed.

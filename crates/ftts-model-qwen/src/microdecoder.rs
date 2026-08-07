@@ -581,6 +581,54 @@ pub struct MicrodecoderWeights<'a> {
     pub final_norm: &'a [f32],
 }
 
+/// Logits from one teacher-forced FrankenMTP block verification pass.
+///
+/// Rows are ordered by residual depth: row `j` is `lm_head[j]` evaluated at sequence position
+/// `j + 1`, and predicts `c{j + 1}`. The supplied `c15` draft id has no input position in a
+/// 16-position frame; it is retained so [`accepted_greedy_prefix_len`] can compare all 15 draft
+/// ids against their verifier rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DraftVerification {
+    logits: Vec<Vec<f32>>,
+}
+
+impl DraftVerification {
+    /// One 2,048-way logit row per residual depth, ordered `c1..=c15`.
+    #[must_use]
+    pub fn logits(&self) -> &[Vec<f32>] {
+        &self.logits
+    }
+
+    /// The strict/greedy verifier ids, one per residual depth.
+    #[must_use]
+    pub fn greedy_codes(&self) -> Vec<usize> {
+        self.logits.iter().map(|row| argmax(row)).collect()
+    }
+
+    /// Number of leading draft ids accepted by strict greedy verification.
+    ///
+    /// Strict FrankenMTP accepts a draft id only when it equals the verifier's argmax at that
+    /// depth. A mismatch invalidates the entire remaining suffix because its causal context has
+    /// changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `drafted_codes` contains all 15 residual ids.
+    #[must_use]
+    pub fn accepted_greedy_prefix_len(&self, drafted_codes: &[usize]) -> usize {
+        assert_eq!(
+            drafted_codes.len(),
+            RESIDUAL_DEPTHS,
+            "expected {RESIDUAL_DEPTHS} drafted residual codes"
+        );
+        self.logits
+            .iter()
+            .zip(drafted_codes)
+            .take_while(|(logits, drafted)| argmax(logits) == **drafted)
+            .count()
+    }
+}
+
 /// Reads one row of a row-major `[vocab, hidden]` embedding table.
 ///
 /// # Panics
@@ -596,26 +644,11 @@ fn embedding_row(table: &[f32], token: usize, hidden: usize) -> Vec<f32> {
     table[start..start + hidden].to_vec()
 }
 
-/// Runs the full 15-step sequential loop for one frame under greedy decode.
-///
-/// `talker_hidden` is the talker's output for this frame and occupies position 0. `primary_code` is
-/// `c0`, already sampled by the talker. Returns the 15 residual codes `c1..=c15`.
-///
-/// The loop is autoregressive by construction: each sampled residual is embedded as the next
-/// position's input, so no depth can be computed without its predecessor.
-///
-/// # Panics
-///
-/// Panics when the weight tables do not have the expected counts, or on any shape mismatch.
-#[must_use]
-pub fn decode_frame_greedy(
+fn assert_frame_shapes(
     config: &MicrodecoderConfig,
-    rope: &RopeTable,
     weights: &MicrodecoderWeights<'_>,
-    state: &mut FrameState,
     talker_hidden: &[f32],
-    primary_code: usize,
-) -> Vec<usize> {
+) {
     assert_eq!(
         weights.layers.len(),
         config.num_layers,
@@ -638,6 +671,125 @@ pub fn decode_frame_greedy(
         config.hidden_size,
         "talker hidden width mismatch"
     );
+}
+
+/// Verifies one drafted residual block through the 16-position causal microdecoder forward.
+///
+/// This is the scalar reference schedule for the seq-16 FrankenMTP verifier: inputs are prepared
+/// for all positions, then each of the five shared body layers consumes positions 0 through 15
+/// under a fresh lower-triangular KV cache. It deliberately calls the same scalar layer primitive
+/// as [`decode_frame_greedy`], preserving its reduction order while a later packed kernel replaces
+/// this implementation. It is therefore a correctness seam, not a performance claim.
+///
+/// `drafted_codes` is the drafter's proposed `c1..=c15`. Position 0 is the frozen talker hidden
+/// state; position 1 embeds `c0` using the talker's table; positions 2 through 15 embed drafted
+/// `c1..=c14` through their own residual tables. Every position 1 through 15 is scored by its own
+/// residual head. `c15` is not embedded because no position follows it, but its verifier row is
+/// still returned and participates in acceptance.
+///
+/// # Panics
+///
+/// Panics when the draft is not exactly 15 codes, when weight-table counts differ from the pinned
+/// geometry, or on any tensor shape or token-range mismatch.
+#[must_use]
+pub fn verify_frame_draft(
+    config: &MicrodecoderConfig,
+    rope: &RopeTable,
+    weights: &MicrodecoderWeights<'_>,
+    talker_hidden: &[f32],
+    primary_code: usize,
+    drafted_codes: &[usize],
+) -> DraftVerification {
+    assert_frame_shapes(config, weights, talker_hidden);
+    assert_eq!(
+        drafted_codes.len(),
+        RESIDUAL_DEPTHS,
+        "expected {RESIDUAL_DEPTHS} drafted residual codes"
+    );
+
+    // Flattened [position, hidden] storage is the fixed seq-16 interface the packed verifier will
+    // replace. Keeping it contiguous here prevents the scalar reference from defining a different
+    // data layout or index map than the eventual kernel.
+    let mut hidden = Vec::with_capacity(FRAME_POSITIONS * config.hidden_size);
+    hidden.extend_from_slice(talker_hidden);
+    hidden.extend_from_slice(&embedding_row(
+        weights.talker_codec_embedding,
+        primary_code,
+        config.hidden_size,
+    ));
+    for position in 2..FRAME_POSITIONS {
+        let table = match position_role(position) {
+            PositionRole::ResidualEmbedding { table, .. } => table,
+            role => panic!("position {position} must use a residual embedding, got {role:?}"),
+        };
+        hidden.extend_from_slice(&embedding_row(
+            weights.residual_embeddings[table],
+            drafted_codes[position - 2],
+            config.hidden_size,
+        ));
+    }
+
+    // Layer-major order is the training-mode block forward. Each layer owns an independent
+    // 16-position causal cache, exactly as in the sequential position-major decoder.
+    for layer in weights.layers {
+        let mut state = FrameKvState::new(config);
+        let mut next = Vec::with_capacity(FRAME_POSITIONS * config.hidden_size);
+        for position in 0..FRAME_POSITIONS {
+            let start = position * config.hidden_size;
+            next.extend_from_slice(&layer_step(
+                config,
+                rope,
+                layer,
+                &hidden[start..start + config.hidden_size],
+                position,
+                &mut state,
+            ));
+        }
+        hidden = next;
+    }
+
+    let mut logits = Vec::with_capacity(RESIDUAL_DEPTHS);
+    for position in 1..FRAME_POSITIONS {
+        let head = match position_role(position) {
+            PositionRole::PrimaryCodeEmbedding { head }
+            | PositionRole::ResidualEmbedding { head, .. } => head,
+            PositionRole::Conditioning => unreachable!("position 0 is not scored"),
+        };
+        let start = position * config.hidden_size;
+        let normed = rms_norm(
+            &hidden[start..start + config.hidden_size],
+            weights.final_norm,
+            config.rms_eps,
+        );
+        let mut row = vec![0.0_f32; RESIDUAL_VOCAB];
+        matvec(weights.heads[head], &normed, &mut row);
+        logits.push(row);
+    }
+
+    DraftVerification { logits }
+}
+
+/// Runs the full 15-step sequential loop for one frame under greedy decode.
+///
+/// `talker_hidden` is the talker's output for this frame and occupies position 0. `primary_code` is
+/// `c0`, already sampled by the talker. Returns the 15 residual codes `c1..=c15`.
+///
+/// The loop is autoregressive by construction: each sampled residual is embedded as the next
+/// position's input, so no depth can be computed without its predecessor.
+///
+/// # Panics
+///
+/// Panics when the weight tables do not have the expected counts, or on any shape mismatch.
+#[must_use]
+pub fn decode_frame_greedy(
+    config: &MicrodecoderConfig,
+    rope: &RopeTable,
+    weights: &MicrodecoderWeights<'_>,
+    state: &mut FrameState,
+    talker_hidden: &[f32],
+    primary_code: usize,
+) -> Vec<usize> {
+    assert_frame_shapes(config, weights, talker_hidden);
 
     // Frame boundary: frame N must not see frame N-1's keys.
     state.reset();
@@ -718,6 +870,62 @@ mod tests {
             rope_theta: 1.0e6,
             rms_eps: 1e-6,
         }
+    }
+
+    /// Teacher-forced sequential reference: position-major, with each layer retaining its own
+    /// causal cache. The block verifier must produce precisely these rows for the same draft.
+    fn sequential_draft_logits(
+        config: &MicrodecoderConfig,
+        rope: &RopeTable,
+        weights: &MicrodecoderWeights<'_>,
+        talker_hidden: &[f32],
+        primary_code: usize,
+        drafted_codes: &[usize],
+    ) -> Vec<Vec<f32>> {
+        assert_eq!(drafted_codes.len(), RESIDUAL_DEPTHS);
+        let mut state = FrameState::new(config);
+        state.reset();
+        let mut logits = Vec::with_capacity(RESIDUAL_DEPTHS);
+
+        for position in 0..FRAME_POSITIONS {
+            let role = position_role(position);
+            let mut hidden = match role {
+                PositionRole::Conditioning => talker_hidden.to_vec(),
+                PositionRole::PrimaryCodeEmbedding { .. } => embedding_row(
+                    weights.talker_codec_embedding,
+                    primary_code,
+                    config.hidden_size,
+                ),
+                PositionRole::ResidualEmbedding { table, .. } => embedding_row(
+                    weights.residual_embeddings[table],
+                    drafted_codes[position - 2],
+                    config.hidden_size,
+                ),
+            };
+
+            for (index, layer) in weights.layers.iter().enumerate() {
+                hidden = layer_step(
+                    config,
+                    rope,
+                    layer,
+                    &hidden,
+                    position,
+                    &mut state.layers[index],
+                );
+            }
+
+            let head = match role {
+                PositionRole::Conditioning => continue,
+                PositionRole::PrimaryCodeEmbedding { head }
+                | PositionRole::ResidualEmbedding { head, .. } => head,
+            };
+            let normed = rms_norm(&hidden, weights.final_norm, config.rms_eps);
+            let mut row = vec![0.0_f32; RESIDUAL_VOCAB];
+            matvec(weights.heads[head], &normed, &mut row);
+            logits.push(row);
+        }
+
+        logits
     }
 
     #[test]
@@ -941,6 +1149,76 @@ mod tests {
         let mut second_state = FrameState::new(&config);
         let second = decode_frame_greedy(&config, &rope, &weights, &mut second_state, &hidden, 3);
         assert_eq!(first, second, "greedy decode must be reproducible");
+    }
+
+    #[test]
+    fn block_verifier_logits_match_teacher_forced_sequential_rows() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
+        let talker_hidden = weights_of(config.hidden_size, 33);
+        let drafted_codes: Vec<usize> = (0..RESIDUAL_DEPTHS)
+            .map(|depth| (depth * 137 + 11) % RESIDUAL_VOCAB)
+            .collect();
+
+        let expected = sequential_draft_logits(
+            &config,
+            &rope,
+            &weights,
+            &talker_hidden,
+            17,
+            &drafted_codes,
+        );
+        let verified = verify_frame_draft(
+            &config,
+            &rope,
+            &weights,
+            &talker_hidden,
+            17,
+            &drafted_codes,
+        );
+
+        assert_eq!(
+            verified.logits(),
+            expected.as_slice(),
+            "every verifier row must equal the sequential engine for the same causal prefix"
+        );
+    }
+
+    #[test]
+    fn block_verifier_accepts_the_complete_sequential_greedy_draft() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
+        let talker_hidden = weights_of(config.hidden_size, 34);
+        let mut state = FrameState::new(&config);
+        let sequential = decode_frame_greedy(
+            &config,
+            &rope,
+            &weights,
+            &mut state,
+            &talker_hidden,
+            19,
+        );
+        let verified = verify_frame_draft(
+            &config,
+            &rope,
+            &weights,
+            &talker_hidden,
+            19,
+            &sequential,
+        );
+
+        assert_eq!(verified.greedy_codes(), sequential);
+        assert_eq!(
+            verified.accepted_greedy_prefix_len(&sequential),
+            RESIDUAL_DEPTHS,
+            "the exact sequential greedy trajectory must be fully accepted"
+        );
     }
 
     struct TestLayer {

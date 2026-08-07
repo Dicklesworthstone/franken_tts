@@ -46,6 +46,8 @@
 use crate::checkpoint::{CheckpointError, open, widen_exact};
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_kernels::f32ref;
+use rustfft::{FftPlanner, num_complex::Complex};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Mel bins the encoder consumes. `blocks.0.conv.weight` is `[512, 128, 5]`.
@@ -80,6 +82,171 @@ pub const SE_RES2NET_BLOCKS: usize = 3;
 /// Applied to the *variance*, before the square root — `sqrt(sum.clamp(1e-12))`, not
 /// `sqrt(sum) + 1e-12`.
 pub const ASP_EPS: f32 = 1e-12;
+
+/// The only sample rate accepted by the pinned speaker encoder.
+pub const SPEAKER_SAMPLE_RATE_HZ: u32 = 24_000;
+
+const SPEAKER_FFT_SIZE: usize = 1_024;
+const SPEAKER_HOP_SAMPLES: usize = 256;
+const SPEAKER_REFLECT_PAD_SAMPLES: usize = (SPEAKER_FFT_SIZE - SPEAKER_HOP_SAMPLES) / 2;
+const SPEAKER_MIN_AUDIO_SAMPLES: usize = SPEAKER_REFLECT_PAD_SAMPLES + 1;
+const SPEAKER_MAGNITUDE_EPSILON: f32 = 1e-9;
+const SPEAKER_LOG_FLOOR: f32 = 1e-5;
+
+/// Log-mel features in the encoder's time-major `[frames, 128]` layout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogMel {
+    /// Number of complete 1,024-sample analysis windows.
+    pub frames: usize,
+    /// Time-major log-mel values.
+    pub values: Vec<f32>,
+}
+
+/// Refusals at the waveform-to-mel boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FeatureError {
+    /// Torch reflect padding requires an input longer than either padding side.
+    TooShort { samples: usize },
+    /// A non-finite PCM value would poison an entire FFT window and speaker embedding.
+    NonFinite { index: usize },
+}
+
+impl fmt::Display for FeatureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooShort { samples } => write!(
+                formatter,
+                "reference has {samples} samples; speaker mel extraction needs more than \
+                 {SPEAKER_REFLECT_PAD_SAMPLES} samples for the pinned reflect pad"
+            ),
+            Self::NonFinite { index } => write!(
+                formatter,
+                "reference PCM has a non-finite sample at index {index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FeatureError {}
+
+/// Compute the pinned ECAPA front end from mono 24 kHz PCM.
+///
+/// This preserves the upstream geometry: a manual 384-sample reflect pad followed by a
+/// centered-off 1,024-point periodic-Hann STFT, magnitude with epsilon inside the square root,
+/// Slaney-normalized mel filters, and natural-log compression after the `1e-5` floor. It is an
+/// enrollment-only path, so it deliberately favors transparent scalar arithmetic over a hot-loop
+/// specialization.
+///
+/// # Errors
+///
+/// Returns [`FeatureError::TooShort`] when the pinned reflect pad is invalid, and
+/// [`FeatureError::NonFinite`] before any FFT work when the waveform is not usable.
+pub fn log_mel_from_24khz_pcm(pcm: &[f32]) -> Result<LogMel, FeatureError> {
+    if pcm.len() < SPEAKER_MIN_AUDIO_SAMPLES {
+        return Err(FeatureError::TooShort { samples: pcm.len() });
+    }
+    if let Some(index) = pcm.iter().position(|sample| !sample.is_finite()) {
+        return Err(FeatureError::NonFinite { index });
+    }
+
+    let mut padded = Vec::with_capacity(pcm.len() + 2 * SPEAKER_REFLECT_PAD_SAMPLES);
+    for offset in
+        -(SPEAKER_REFLECT_PAD_SAMPLES as isize)..(pcm.len() + SPEAKER_REFLECT_PAD_SAMPLES) as isize
+    {
+        padded.push(pcm[reflect_index(offset, pcm.len() as isize)]);
+    }
+    let frames = (padded.len() - SPEAKER_FFT_SIZE) / SPEAKER_HOP_SAMPLES + 1;
+    let filters = slaney_mel_filterbank();
+    let window = periodic_hann();
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(SPEAKER_FFT_SIZE);
+    let mut spectrum = vec![Complex::new(0.0f32, 0.0); SPEAKER_FFT_SIZE];
+    let mut magnitudes = vec![0.0f32; SPEAKER_FFT_SIZE / 2 + 1];
+    let mut values = vec![0.0f32; frames * MEL_DIM];
+
+    for frame in 0..frames {
+        let start = frame * SPEAKER_HOP_SAMPLES;
+        for (index, slot) in spectrum.iter_mut().enumerate() {
+            *slot = Complex::new(padded[start + index] * window[index], 0.0);
+        }
+        fft.process(&mut spectrum);
+        for (magnitude, value) in magnitudes.iter_mut().zip(&spectrum) {
+            *magnitude = (value.re.mul_add(value.re, value.im * value.im)
+                + SPEAKER_MAGNITUDE_EPSILON)
+                .sqrt();
+        }
+        let output = &mut values[frame * MEL_DIM..][..MEL_DIM];
+        for (mel, destination) in output.iter_mut().enumerate() {
+            let energy = filters[mel]
+                .iter()
+                .zip(&magnitudes)
+                .map(|(&weight, &magnitude)| weight * magnitude)
+                .sum::<f32>();
+            *destination = energy.max(SPEAKER_LOG_FLOOR).ln();
+        }
+    }
+
+    Ok(LogMel { frames, values })
+}
+
+fn periodic_hann() -> [f32; SPEAKER_FFT_SIZE] {
+    std::array::from_fn(|index| {
+        0.5 - 0.5 * (std::f32::consts::TAU * index as f32 / SPEAKER_FFT_SIZE as f32).cos()
+    })
+}
+
+fn slaney_mel_filterbank() -> Vec<Vec<f32>> {
+    let min_mel = hz_to_slaney_mel(0.0);
+    let max_mel = hz_to_slaney_mel(SPEAKER_SAMPLE_RATE_HZ as f32 / 2.0);
+    let mut mel_points = Vec::with_capacity(MEL_DIM + 2);
+    for index in 0..MEL_DIM + 2 {
+        let fraction = index as f32 / (MEL_DIM + 1) as f32;
+        mel_points.push(slaney_mel_to_hz(min_mel + (max_mel - min_mel) * fraction));
+    }
+    let frequencies: Vec<f32> = (0..=SPEAKER_FFT_SIZE / 2)
+        .map(|bin| SPEAKER_SAMPLE_RATE_HZ as f32 * bin as f32 / SPEAKER_FFT_SIZE as f32)
+        .collect();
+    (0..MEL_DIM)
+        .map(|mel| {
+            let lower = mel_points[mel];
+            let center = mel_points[mel + 1];
+            let upper = mel_points[mel + 2];
+            let normalization = 2.0 / (upper - lower);
+            frequencies
+                .iter()
+                .map(|&frequency| {
+                    let rising = (frequency - lower) / (center - lower);
+                    let falling = (upper - frequency) / (upper - center);
+                    rising.min(falling).max(0.0) * normalization
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn hz_to_slaney_mel(hz: f32) -> f32 {
+    const LINEAR_HZ_PER_MEL: f32 = 200.0 / 3.0;
+    const LOG_START_HZ: f32 = 1_000.0;
+    const LOG_START_MEL: f32 = LOG_START_HZ / LINEAR_HZ_PER_MEL;
+    const LOG_STEP: f32 = 0.068_751_78;
+    if hz >= LOG_START_HZ {
+        LOG_START_MEL + (hz / LOG_START_HZ).ln() / LOG_STEP
+    } else {
+        hz / LINEAR_HZ_PER_MEL
+    }
+}
+
+fn slaney_mel_to_hz(mel: f32) -> f32 {
+    const LINEAR_HZ_PER_MEL: f32 = 200.0 / 3.0;
+    const LOG_START_HZ: f32 = 1_000.0;
+    const LOG_START_MEL: f32 = LOG_START_HZ / LINEAR_HZ_PER_MEL;
+    const LOG_STEP: f32 = 0.068_751_78;
+    if mel >= LOG_START_MEL {
+        LOG_START_HZ * (LOG_STEP * (mel - LOG_START_MEL)).exp()
+    } else {
+        mel * LINEAR_HZ_PER_MEL
+    }
+}
 
 /// One `nn.Conv1d`: weight in PyTorch's `[out_channels, in_channels, kernel]` order, plus a bias.
 ///

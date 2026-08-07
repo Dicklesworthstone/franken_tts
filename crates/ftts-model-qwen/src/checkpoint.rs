@@ -40,9 +40,13 @@ use crate::generate::{FeedbackTables, TextEmbeddingWeights};
 use crate::microdecoder::{LayerWeights, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_DEPTHS};
 use crate::prompt::{HiddenState, PromptHeader, ROLE_PREFIX_IDS};
 use crate::talker::{TalkerLayerWeights, TalkerWeights};
-use ftts_artifacts::safetensors::SafetensorsFile;
+use ftts_artifacts::{
+    fttsq::{MappedFttsq, StoredDtype},
+    safetensors::SafetensorsFile,
+};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Talker decoder layers in the pinned Base checkpoint.
 pub const TALKER_LAYER_COUNT: usize = 28;
@@ -121,6 +125,13 @@ pub enum CheckpointError {
         expected: usize,
         actual: usize,
     },
+    /// A digest-verified canonical artifact carries a tensor representation this f32 engine
+    /// cannot hydrate safely.
+    ArtifactTensor {
+        path: PathBuf,
+        tensor: String,
+        detail: String,
+    },
     /// A speaker vector was supplied at the wrong width.
     SpeakerWidth { expected: usize, actual: usize },
     /// The codec refused to decode.
@@ -149,6 +160,15 @@ impl fmt::Display for CheckpointError {
             } => write!(
                 formatter,
                 "tensor `{tensor}` holds {actual} elements, expected {expected}"
+            ),
+            Self::ArtifactTensor {
+                path,
+                tensor,
+                detail,
+            } => write!(
+                formatter,
+                "canonical artifact {} cannot hydrate tensor `{tensor}`: {detail}",
+                path.display()
             ),
             Self::SpeakerWidth { expected, actual } => write!(
                 formatter,
@@ -197,11 +217,190 @@ pub(crate) fn widen_exact(
     Ok(values)
 }
 
+fn widen_exact_with(
+    widen_tensor: &mut dyn FnMut(&str) -> Result<Vec<f32>, CheckpointError>,
+    name: &str,
+    expected: usize,
+) -> Result<Vec<f32>, CheckpointError> {
+    let values = widen_tensor(name)?;
+    if values.len() != expected {
+        return Err(CheckpointError::TensorShape {
+            tensor: name.to_owned(),
+            expected,
+            actual: values.len(),
+        });
+    }
+    Ok(values)
+}
+
 pub(crate) fn open(path: &Path) -> Result<SafetensorsFile, CheckpointError> {
     SafetensorsFile::open(path).map_err(|error| CheckpointError::Open {
         path: path.to_path_buf(),
         detail: format!("{error:?}"),
     })
+}
+
+fn artifact_tensor_error(path: &Path, tensor: &str, detail: impl Into<String>) -> CheckpointError {
+    CheckpointError::ArtifactTensor {
+        path: path.to_path_buf(),
+        tensor: tensor.to_owned(),
+        detail: detail.into(),
+    }
+}
+
+fn artifact_element_count(
+    artifact: &MappedFttsq,
+    path: &Path,
+    name: &str,
+) -> Result<usize, CheckpointError> {
+    let entry = artifact
+        .reader()
+        .tensor(name)
+        .ok_or_else(|| CheckpointError::MissingTensor {
+            path: path.to_path_buf(),
+            tensor: name.to_owned(),
+        })?;
+    entry
+        .elements()
+        .and_then(|elements| usize::try_from(elements).ok())
+        .ok_or_else(|| artifact_tensor_error(path, name, "logical element count exceeds usize"))
+}
+
+fn artifact_f32_values(
+    artifact: &MappedFttsq,
+    path: &Path,
+    name: &str,
+) -> Result<Vec<f32>, CheckpointError> {
+    let entry = artifact
+        .reader()
+        .tensor(name)
+        .ok_or_else(|| CheckpointError::MissingTensor {
+            path: path.to_path_buf(),
+            tensor: name.to_owned(),
+        })?;
+    if entry.dtype != StoredDtype::F32 {
+        return Err(artifact_tensor_error(
+            path,
+            name,
+            format!("expected f32 scales, found {}", entry.dtype),
+        ));
+    }
+    let elements = artifact_element_count(artifact, path, name)?;
+    let bytes = artifact
+        .tensor_bytes(name)
+        .map_err(|error| artifact_tensor_error(path, name, error.to_string()))?;
+    if bytes.len() != elements.saturating_mul(std::mem::size_of::<f32>()) {
+        return Err(artifact_tensor_error(
+            path,
+            name,
+            "f32 payload length does not match its logical element count",
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+/// Widen one canonical-artifact tensor for the f32 baseline engine.
+///
+/// Q8 matrices use the converter's exact row-major layout: signed payload bytes followed by an
+/// f32 scale for every output channel. Keeping this reconstruction at the accessor boundary lets
+/// the current f32 engine execute canonical artifacts without acquiring a second quantization
+/// recipe or materializing the cold text embedding.
+fn widen_fttsq(
+    artifact: &MappedFttsq,
+    path: &Path,
+    name: &str,
+) -> Result<Vec<f32>, CheckpointError> {
+    let entry = artifact
+        .reader()
+        .tensor(name)
+        .ok_or_else(|| CheckpointError::MissingTensor {
+            path: path.to_path_buf(),
+            tensor: name.to_owned(),
+        })?;
+    let dtype = entry.dtype;
+    let shape = entry.shape.clone();
+    let scales_name = entry.scales.clone();
+    let elements = artifact_element_count(artifact, path, name)?;
+    let bytes = artifact
+        .tensor_bytes(name)
+        .map_err(|error| artifact_tensor_error(path, name, error.to_string()))?;
+
+    match dtype {
+        StoredDtype::Bf16 => {
+            if bytes.len() != elements.saturating_mul(2) {
+                return Err(artifact_tensor_error(
+                    path,
+                    name,
+                    "bf16 payload length does not match its logical element count",
+                ));
+            }
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|chunk| {
+                    let bits = u32::from(u16::from_le_bytes([chunk[0], chunk[1]])) << 16;
+                    f32::from_bits(bits)
+                })
+                .collect())
+        }
+        StoredDtype::F32 => artifact_f32_values(artifact, path, name),
+        StoredDtype::Q8 => {
+            let rows = shape
+                .first()
+                .copied()
+                .and_then(|rows| usize::try_from(rows).ok())
+                .filter(|rows| *rows > 0)
+                .ok_or_else(|| {
+                    artifact_tensor_error(path, name, "q8 tensor must have a non-empty row axis")
+                })?;
+            let width = elements
+                .checked_div(rows)
+                .filter(|width| *width > 0)
+                .ok_or_else(|| {
+                    artifact_tensor_error(
+                        path,
+                        name,
+                        "q8 tensor shape has zero-width output channels",
+                    )
+                })?;
+            if width.checked_mul(rows) != Some(elements) || bytes.len() != elements {
+                return Err(artifact_tensor_error(
+                    path,
+                    name,
+                    "q8 payload length does not match its logical matrix shape",
+                ));
+            }
+            let scales_name = scales_name.ok_or_else(|| {
+                artifact_tensor_error(path, name, "q8 tensor is missing its per-row scales")
+            })?;
+            let scales = artifact_f32_values(artifact, path, &scales_name)?;
+            if scales.len() != rows {
+                return Err(artifact_tensor_error(
+                    path,
+                    name,
+                    format!(
+                        "q8 tensor has {} output rows but {} scales",
+                        rows,
+                        scales.len()
+                    ),
+                ));
+            }
+            Ok(bytes
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    f32::from(i8::from_ne_bytes([*value])) * scales[index / width]
+                })
+                .collect())
+        }
+        StoredDtype::Q4 => Err(artifact_tensor_error(
+            path,
+            name,
+            "q4 storage is not admitted by the f32 baseline loader",
+        )),
+    }
 }
 
 /// The eleven per-layer tensors shared by the talker and the microdecoder, in field order.
@@ -210,7 +409,10 @@ struct OwnedAttentionLayer {
 }
 
 impl OwnedAttentionLayer {
-    fn load(file: &SafetensorsFile, path: &Path, prefix: &str) -> Result<Self, CheckpointError> {
+    fn load_with(
+        prefix: &str,
+        widen_tensor: &mut dyn FnMut(&str) -> Result<Vec<f32>, CheckpointError>,
+    ) -> Result<Self, CheckpointError> {
         let names = [
             "input_layernorm.weight",
             "self_attn.q_proj.weight",
@@ -226,7 +428,7 @@ impl OwnedAttentionLayer {
         ];
         let mut tensors: [Vec<f32>; 11] = Default::default();
         for (slot, suffix) in tensors.iter_mut().zip(names) {
-            *slot = widen(file, path, &format!("{prefix}.{suffix}"))?;
+            *slot = widen_tensor(&format!("{prefix}.{suffix}"))?;
         }
         Ok(Self { tensors })
     }
@@ -276,6 +478,11 @@ impl OwnedAttentionLayer {
 pub struct TextEmbeddingTable {
     rows: Vec<f32>,
     gathered: Vec<u32>,
+}
+
+enum TextEmbeddingSource {
+    Safetensors,
+    Fttsq(Arc<MappedFttsq>),
 }
 
 impl TextEmbeddingTable {
@@ -331,6 +538,128 @@ impl TextEmbeddingTable {
         Ok(Self { rows, gathered })
     }
 
+    fn gather_fttsq(
+        artifact: &MappedFttsq,
+        path: &Path,
+        ids: &[u32],
+    ) -> Result<Self, CheckpointError> {
+        let name = "talker.model.text_embedding.weight";
+        let entry =
+            artifact
+                .reader()
+                .tensor(name)
+                .ok_or_else(|| CheckpointError::MissingTensor {
+                    path: path.to_path_buf(),
+                    tensor: name.to_owned(),
+                })?;
+        let expected_shape = [TEXT_VOCAB as u64, TEXT_EMBED_WIDTH as u64];
+        if entry.shape.as_slice() != expected_shape {
+            return Err(artifact_tensor_error(
+                path,
+                name,
+                format!(
+                    "expected cold embedding shape {expected_shape:?}, found {:?}",
+                    entry.shape
+                ),
+            ));
+        }
+        let dtype = entry.dtype;
+        let scales_name = entry.scales.clone();
+        let bytes = artifact
+            .tensor_bytes(name)
+            .map_err(|error| artifact_tensor_error(path, name, error.to_string()))?;
+        let bytes_per_row = match dtype {
+            StoredDtype::Bf16 => TEXT_EMBED_WIDTH * 2,
+            StoredDtype::F32 => TEXT_EMBED_WIDTH * 4,
+            StoredDtype::Q8 => TEXT_EMBED_WIDTH,
+            StoredDtype::Q4 => {
+                return Err(artifact_tensor_error(
+                    path,
+                    name,
+                    "q4 cold embeddings are not admitted by the f32 baseline loader",
+                ));
+            }
+        };
+        if bytes.len() != TEXT_VOCAB * bytes_per_row {
+            return Err(artifact_tensor_error(
+                path,
+                name,
+                "cold embedding payload length does not match its declared shape",
+            ));
+        }
+        let q8_scales = if dtype == StoredDtype::Q8 {
+            let scales_name = scales_name.ok_or_else(|| {
+                artifact_tensor_error(
+                    path,
+                    name,
+                    "q8 cold embedding is missing its per-row scales",
+                )
+            })?;
+            let scales = artifact_f32_values(artifact, path, &scales_name)?;
+            if scales.len() != TEXT_VOCAB {
+                return Err(artifact_tensor_error(
+                    path,
+                    name,
+                    format!(
+                        "q8 cold embedding has {TEXT_VOCAB} rows but {} scales",
+                        scales.len()
+                    ),
+                ));
+            }
+            Some(scales)
+        } else {
+            None
+        };
+
+        let mut rows = vec![0.0f32; TEXT_VOCAB * TEXT_EMBED_WIDTH];
+        let mut gathered: Vec<u32> = ids.to_vec();
+        gathered.sort_unstable();
+        gathered.dedup();
+        for id in &gathered {
+            let row = *id as usize;
+            if row >= TEXT_VOCAB {
+                return Err(CheckpointError::TensorShape {
+                    tensor: name.to_owned(),
+                    expected: TEXT_VOCAB,
+                    actual: row + 1,
+                });
+            }
+            let source = &bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
+            let destination = &mut rows[row * TEXT_EMBED_WIDTH..(row + 1) * TEXT_EMBED_WIDTH];
+            match dtype {
+                StoredDtype::Bf16 => {
+                    for (slot, bytes) in destination.iter_mut().zip(source.chunks_exact(2)) {
+                        let bits = u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16;
+                        *slot = f32::from_bits(bits);
+                    }
+                }
+                StoredDtype::F32 => {
+                    for (slot, bytes) in destination.iter_mut().zip(source.chunks_exact(4)) {
+                        *slot = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    }
+                }
+                StoredDtype::Q8 => {
+                    let scale = q8_scales
+                        .as_ref()
+                        .and_then(|scales| scales.get(row))
+                        .copied()
+                        .ok_or_else(|| {
+                            artifact_tensor_error(
+                                path,
+                                name,
+                                "q8 cold-embedding scale lookup failed",
+                            )
+                        })?;
+                    for (slot, value) in destination.iter_mut().zip(source) {
+                        *slot = f32::from(i8::from_ne_bytes([*value])) * scale;
+                    }
+                }
+                StoredDtype::Q4 => unreachable!("q4 cold embeddings returned above"),
+            }
+        }
+        Ok(Self { rows, gathered })
+    }
+
     /// Whether every id in `ids` was materialized.
     #[must_use]
     pub fn covers(&self, ids: &[u32]) -> bool {
@@ -353,6 +682,7 @@ impl TextEmbeddingTable {
 /// The talker, microdecoder, feedback tables, and text projection from `model.safetensors`.
 pub struct TalkerCheckpoint {
     path: PathBuf,
+    text_embedding_source: TextEmbeddingSource,
     talker_layers: Vec<OwnedAttentionLayer>,
     talker_final_norm: Vec<f32>,
     codec_head: Vec<f32>,
@@ -375,77 +705,99 @@ impl TalkerCheckpoint {
     /// If the file cannot be opened or a required tensor is missing or misshapen.
     pub fn load(path: &Path) -> Result<Self, CheckpointError> {
         let file = open(path)?;
+        Self::load_with(path, TextEmbeddingSource::Safetensors, |name| {
+            widen(&file, path, name)
+        })
+    }
+
+    /// Hydrate the talker and residual-code microdecoder from a canonical `.fttsq` artifact.
+    ///
+    /// The digest-verified mapping remains alive for sparse cold-embedding gathers. Every hot
+    /// Q8 matrix is reconstructed through the converter's per-output-channel scales for the f32
+    /// baseline; the native int8 kernels can replace that reconstruction once their parity gate is
+    /// green without changing the artifact contract.
+    pub fn load_fttsq(path: &Path) -> Result<Self, CheckpointError> {
+        let artifact =
+            Arc::new(
+                MappedFttsq::open(path).map_err(|error| CheckpointError::Open {
+                    path: path.to_path_buf(),
+                    detail: error.to_string(),
+                })?,
+            );
+        let source = TextEmbeddingSource::Fttsq(Arc::clone(&artifact));
+        Self::load_with(path, source, |name| widen_fttsq(&artifact, path, name))
+    }
+
+    fn load_with(
+        path: &Path,
+        text_embedding_source: TextEmbeddingSource,
+        mut widen_tensor: impl FnMut(&str) -> Result<Vec<f32>, CheckpointError>,
+    ) -> Result<Self, CheckpointError> {
         let hidden = TALKER_HIDDEN;
         let mut talker_layers = Vec::with_capacity(TALKER_LAYER_COUNT);
         for layer in 0..TALKER_LAYER_COUNT {
-            talker_layers.push(OwnedAttentionLayer::load(
-                &file,
-                path,
+            talker_layers.push(OwnedAttentionLayer::load_with(
                 &format!("talker.model.layers.{layer}"),
+                &mut widen_tensor,
             )?);
         }
         let micro_layer_count = MicrodecoderConfig::default().num_layers;
         let mut micro_layers = Vec::with_capacity(micro_layer_count);
         for layer in 0..micro_layer_count {
-            micro_layers.push(OwnedAttentionLayer::load(
-                &file,
-                path,
+            micro_layers.push(OwnedAttentionLayer::load_with(
                 &format!("talker.code_predictor.model.layers.{layer}"),
+                &mut widen_tensor,
             )?);
         }
         let mut residual_embeddings = Vec::with_capacity(CODE_GROUP_COUNT - 1);
         for table in 0..CODE_GROUP_COUNT - 1 {
-            residual_embeddings.push(widen(
-                &file,
-                path,
-                &format!("talker.code_predictor.model.codec_embedding.{table}.weight"),
-            )?);
+            residual_embeddings.push(widen_tensor(&format!(
+                "talker.code_predictor.model.codec_embedding.{table}.weight"
+            ))?);
         }
         let mut micro_heads = Vec::with_capacity(RESIDUAL_DEPTHS);
         for head in 0..RESIDUAL_DEPTHS {
-            micro_heads.push(widen(
-                &file,
-                path,
-                &format!("talker.code_predictor.lm_head.{head}.weight"),
-            )?);
+            micro_heads.push(widen_tensor(&format!(
+                "talker.code_predictor.lm_head.{head}.weight"
+            ))?);
         }
 
         Ok(Self {
             path: path.to_path_buf(),
+            text_embedding_source,
             talker_layers,
-            talker_final_norm: widen_exact(&file, path, "talker.model.norm.weight", hidden)?,
-            codec_head: widen(&file, path, "talker.codec_head.weight")?,
-            codec_embedding: widen(&file, path, "talker.model.codec_embedding.weight")?,
+            talker_final_norm: widen_exact_with(
+                &mut widen_tensor,
+                "talker.model.norm.weight",
+                hidden,
+            )?,
+            codec_head: widen_tensor("talker.codec_head.weight")?,
+            codec_embedding: widen_tensor("talker.model.codec_embedding.weight")?,
             residual_embeddings,
             micro_layers,
-            micro_final_norm: widen_exact(
-                &file,
-                path,
+            micro_final_norm: widen_exact_with(
+                &mut widen_tensor,
                 "talker.code_predictor.model.norm.weight",
                 hidden,
             )?,
             micro_heads,
-            fc1_weight: widen_exact(
-                &file,
-                path,
+            fc1_weight: widen_exact_with(
+                &mut widen_tensor,
                 "talker.text_projection.linear_fc1.weight",
                 TEXT_EMBED_WIDTH * TEXT_EMBED_WIDTH,
             )?,
-            fc1_bias: widen_exact(
-                &file,
-                path,
+            fc1_bias: widen_exact_with(
+                &mut widen_tensor,
                 "talker.text_projection.linear_fc1.bias",
                 TEXT_EMBED_WIDTH,
             )?,
-            fc2_weight: widen_exact(
-                &file,
-                path,
+            fc2_weight: widen_exact_with(
+                &mut widen_tensor,
                 "talker.text_projection.linear_fc2.weight",
                 hidden * TEXT_EMBED_WIDTH,
             )?,
-            fc2_bias: widen_exact(
-                &file,
-                path,
+            fc2_bias: widen_exact_with(
+                &mut widen_tensor,
                 "talker.text_projection.linear_fc2.bias",
                 hidden,
             )?,
@@ -467,8 +819,15 @@ impl TalkerCheckpoint {
     ///
     /// If the embedding tensor is missing or misshapen.
     pub fn gather_text_rows(&self, ids: &[u32]) -> Result<TextEmbeddingTable, CheckpointError> {
-        let file = open(&self.path)?;
-        TextEmbeddingTable::gather(&file, &self.path, ids)
+        match &self.text_embedding_source {
+            TextEmbeddingSource::Safetensors => {
+                let file = open(&self.path)?;
+                TextEmbeddingTable::gather(&file, &self.path, ids)
+            }
+            TextEmbeddingSource::Fttsq(artifact) => {
+                TextEmbeddingTable::gather_fttsq(artifact, &self.path, ids)
+            }
+        }
     }
 
     /// Every text id one utterance can reach: the wrapped target plus the TTS specials.
@@ -1059,6 +1418,8 @@ impl CodecCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ftts_artifacts::fttsq::{AccessClass, FttsqWriter, TensorEntry};
+    use std::io::Write as _;
 
     #[test]
     fn the_wrapper_written_here_is_the_wrapper_prompt_strips() {
@@ -1094,5 +1455,72 @@ mod tests {
         };
         assert!(error.to_string().contains("512"));
         assert!(error.to_string().contains("1024"));
+    }
+
+    #[test]
+    fn q8_artifact_tensor_widens_with_its_per_output_channel_scales() {
+        let values = [
+            i8::to_ne_bytes(-2)[0],
+            i8::to_ne_bytes(1)[0],
+            i8::to_ne_bytes(127)[0],
+            i8::to_ne_bytes(3)[0],
+            i8::to_ne_bytes(-4)[0],
+            i8::to_ne_bytes(0)[0],
+        ];
+        let mut payload = values.to_vec();
+        payload.extend_from_slice(&0.25_f32.to_le_bytes());
+        payload.extend_from_slice(&0.5_f32.to_le_bytes());
+        let tensor = "test.q8.weight";
+        let scales = "test.q8.weight.scales";
+        let artifact = FttsqWriter::new("test-model", "a".repeat(64))
+            .license_notice("Apache-2.0")
+            .section(
+                "tensor:test.q8.weight",
+                AccessClass::HotRecurrentTalker,
+                payload,
+            )
+            .tensor(TensorEntry {
+                name: tensor.to_owned(),
+                section: "tensor:test.q8.weight".to_owned(),
+                dtype: StoredDtype::Q8,
+                shape: vec![2, 3],
+                offset: 0,
+                length: 6,
+                scales: Some(scales.to_owned()),
+            })
+            .tensor(TensorEntry {
+                name: scales.to_owned(),
+                section: "tensor:test.q8.weight".to_owned(),
+                dtype: StoredDtype::F32,
+                shape: vec![2],
+                offset: 6,
+                length: 8,
+                scales: None,
+            })
+            .finish()
+            .expect("a valid q8 artifact");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ftts-checkpoint-q8-{}-{nonce}.fttsq",
+            std::process::id()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("a fresh test artifact path");
+        file.write_all(&artifact).expect("write test artifact");
+        file.sync_all().expect("sync test artifact");
+        drop(file);
+
+        let artifact = MappedFttsq::open(&path).expect("mapped artifact verifies");
+        assert_eq!(
+            widen_fttsq(&artifact, &path, tensor).expect("q8 tensor widens"),
+            vec![-0.5, 0.25, 31.75, 1.5, -2.0, 0.0]
+        );
     }
 }
