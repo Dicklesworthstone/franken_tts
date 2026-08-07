@@ -1,5 +1,10 @@
 //! SLEEF's 1-ulp `sinf` and `expf`, ported to safe scalar Rust.
 //!
+// The coefficient literals below are bit-faithful copies of upstream SLEEF's. Truncating them to
+// clippy's taste or substituting `std::f32::consts` values would silently change the arithmetic
+// this module exists to reproduce exactly (AGENTS.md doctrine #8: no silent numerics changes).
+#![allow(clippy::excessive_precision, clippy::approx_constant)]
+//!
 //! # Why this exists
 //!
 //! The pinned CPU-fp32 oracle does not evaluate elementwise transcendentals with the platform's
@@ -211,10 +216,17 @@ mod tests {
     /// parity harness can say whether SLEEF is what the oracle ran.
     fn ulp_distance(candidate: f32, exact: f64) -> i64 {
         let rounded = exact as f32;
-        assert!(candidate.is_finite() && rounded.is_finite(), "finite inputs");
+        assert!(
+            candidate.is_finite() && rounded.is_finite(),
+            "finite inputs"
+        );
         let ordered = |value: f32| -> i64 {
             let bits = i64::from(value.to_bits() as i32);
-            if bits < 0 { i64::from(i32::MIN) - bits } else { bits }
+            if bits < 0 {
+                i64::from(i32::MIN) - bits
+            } else {
+                bits
+            }
         };
         (ordered(candidate) - ordered(rounded)).abs()
     }

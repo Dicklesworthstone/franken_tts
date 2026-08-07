@@ -346,6 +346,12 @@ impl CodecKvCache {
         self.positions
     }
 
+    /// Whether no attention positions are live yet.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.positions == 0
+    }
+
     /// Drop all positions while retaining allocation for the next utterance.
     pub fn clear(&mut self) {
         self.keys.clear();
@@ -455,14 +461,14 @@ pub fn forward_codec_transformer_step(
     let scaling = (config.attention_head_dim as f32).sqrt().recip();
     for head in 0..config.attention_heads {
         let head_offset = head * config.attention_head_dim;
-        for cache_position in 0..cache.len() {
+        for (cache_position, score) in scores.iter_mut().enumerate() {
             let cached_key = &cache.keys[cache_position * attention + head_offset..]
                 [..config.attention_head_dim];
             let mut dot = 0.0f32;
             for lane in 0..config.attention_head_dim {
                 dot += query[head_offset + lane] * cached_key[lane];
             }
-            scores[cache_position] = dot * scaling;
+            *score = dot * scaling;
         }
         f32ref::softmax_rows_with_arithmetic(
             &mut scores,
@@ -472,11 +478,11 @@ pub fn forward_codec_transformer_step(
         );
         let target = &mut context[head_offset..head_offset + config.attention_head_dim];
         target.fill(0.0);
-        for cache_position in 0..cache.len() {
+        for (cache_position, &score) in scores.iter().enumerate() {
             let cached_value = &cache.values[cache_position * attention + head_offset..]
                 [..config.attention_head_dim];
             for lane in 0..config.attention_head_dim {
-                target[lane] += scores[cache_position] * cached_value[lane];
+                target[lane] += score * cached_value[lane];
             }
         }
     }
@@ -690,6 +696,9 @@ pub fn snake_beta_in_place(values: &mut [f32], frames: usize, alpha_log: &[f32],
 /// Reference causal Conv1d for time-major `[frames, channels]` data.
 ///
 /// Weights retain PyTorch's `[out_channel, in_channel, kernel]` checkpoint layout.
+// The argument list mirrors the reference convolution's checkpoint-facing signature; bundling
+// them into a struct is a refactor for the codec engine bead, not the parity reference.
+#[allow(clippy::too_many_arguments)]
 pub fn causal_conv1d(
     input: &[f32],
     frames: usize,
@@ -774,6 +783,7 @@ pub fn causal_conv1d(
 ///
 /// PyTorch stores transposed-convolution weights `[in_channel, out_channel, kernel]`. The Qwen
 /// causal wrapper trims exactly `kernel - stride` samples from the right, leaving `frames * stride`.
+#[allow(clippy::too_many_arguments)]
 pub fn causal_transpose_conv1d(
     input: &[f32],
     frames: usize,

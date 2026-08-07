@@ -44,7 +44,7 @@ use ftts_model_qwen::tokenizer::{QwenTokenizer, TokenizerFiles};
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use symphonia::core::audio::{SampleBuffer, Signal};
+use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
@@ -209,8 +209,10 @@ pub fn read_speaker_vector(path: &Path) -> Result<Vec<f32>, FttsError> {
         )));
     }
     let vector: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|quad| f32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|quad| f32::from_le_bytes(*quad))
         .collect();
     if let Some(index) = vector.iter().position(|value| !value.is_finite()) {
         return Err(FttsError::Input(format!(
@@ -286,8 +288,10 @@ pub fn write_speaker_vector_new(path: &Path, vector: &[f32]) -> Result<(), FttsE
 
 fn decode_speaker_vector(path: &Path, bytes: &[u8]) -> Result<Vec<f32>, FttsError> {
     let vector: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|quad| f32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|quad| f32::from_le_bytes(*quad))
         .collect();
     if let Some(index) = vector.iter().position(|value| !value.is_finite()) {
         return Err(FttsError::Input(format!(

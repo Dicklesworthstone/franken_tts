@@ -561,6 +561,9 @@ fn sum_squares_f32(src: &[f32], lanes: usize) -> f32 {
 /// # Panics
 ///
 /// Panics if `width` is zero.
+// Index loops keep the reference's exact accumulation order (level, chain, lane) visible;
+// iterator rewrites would obscure the summation-order argument this port is documenting.
+#[allow(clippy::needless_range_loop)]
 pub fn torch_cascade_sum(src: &[f32], width: usize, transform: impl Fn(f32) -> f32) -> f32 {
     assert!(width > 0, "vector width must be positive");
     const ILP: usize = 4;

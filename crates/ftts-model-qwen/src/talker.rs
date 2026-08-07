@@ -757,8 +757,11 @@ pub fn form_frame_input(
 mod tests {
     use super::*;
 
+    /// Norm, query, key/value, output, and MLP buffers for one probe layer.
+    type ProbeWeights = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
     /// Weights that make the layer an identity-ish probe: zeroed projections leave the residual.
-    fn zero_weights(config: &TalkerConfig) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    fn zero_weights(config: &TalkerConfig) -> ProbeWeights {
         (
             vec![1.0; config.hidden_size],
             vec![0.0; config.query_width() * config.hidden_size],

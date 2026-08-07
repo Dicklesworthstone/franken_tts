@@ -297,8 +297,10 @@ fn artifact_f32_values(
         ));
     }
     Ok(bytes
-        .chunks_exact(std::mem::size_of::<f32>())
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<{ std::mem::size_of::<f32>() }>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -338,9 +340,11 @@ fn widen_fttsq(
                 ));
             }
             Ok(bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| {
-                    let bits = u32::from(u16::from_le_bytes([chunk[0], chunk[1]])) << 16;
+                    let bits = u32::from(u16::from_le_bytes(*chunk)) << 16;
                     f32::from_bits(bits)
                 })
                 .collect())
@@ -628,14 +632,14 @@ impl TextEmbeddingTable {
             let destination = &mut rows[row * TEXT_EMBED_WIDTH..(row + 1) * TEXT_EMBED_WIDTH];
             match dtype {
                 StoredDtype::Bf16 => {
-                    for (slot, bytes) in destination.iter_mut().zip(source.chunks_exact(2)) {
-                        let bits = u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16;
+                    for (slot, bytes) in destination.iter_mut().zip(source.as_chunks::<2>().0) {
+                        let bits = u32::from(u16::from_le_bytes(*bytes)) << 16;
                         *slot = f32::from_bits(bits);
                     }
                 }
                 StoredDtype::F32 => {
-                    for (slot, bytes) in destination.iter_mut().zip(source.chunks_exact(4)) {
-                        *slot = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    for (slot, bytes) in destination.iter_mut().zip(source.as_chunks::<4>().0) {
+                        *slot = f32::from_le_bytes(*bytes);
                     }
                 }
                 StoredDtype::Q8 => {
