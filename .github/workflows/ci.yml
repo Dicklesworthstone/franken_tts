@@ -57,7 +57,7 @@ env:
   # through path dependencies, so an upstream force-push would otherwise change what we build
   # against without any diff here. Bump these deliberately.
   FRANKENTORCH_REF: 886965dc7302165a3cfbce517eea2dcd4ef9c3b6
-  ASUPERSYNC_REF: 385347d0a31121d2b8f808357c28a45a414a3094
+  ASUPERSYNC_REF: 89b182ba40e9f0ba1262a36214e63c06d7f7b959
 
 jobs:
   gate:
