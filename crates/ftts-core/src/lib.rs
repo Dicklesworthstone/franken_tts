@@ -973,9 +973,15 @@ mod tests {
     }
 
     /// Emits a fixed number of all-zero frames, then EOS. Panics if the loop skips prefill.
+    ///
+    /// `polls` counts every `next_frame` call, which is what separates "the generator stopped" from
+    /// "the loop stopped asking": a ceiling-bound run never polls for the frame past the ceiling,
+    /// while an EOS-bound run must poll exactly once more than it received.
     struct ScriptedFrameGenerator {
         remaining: usize,
         began: bool,
+        endless: bool,
+        polls: usize,
     }
 
     impl ScriptedFrameGenerator {
@@ -983,6 +989,18 @@ mod tests {
             Self {
                 remaining: frames,
                 began: false,
+                endless: false,
+                polls: 0,
+            }
+        }
+
+        /// Never returns `None`, so only the engine's own ceiling can end the utterance.
+        fn endless() -> Self {
+            Self {
+                remaining: 0,
+                began: false,
+                endless: true,
+                polls: 0,
             }
         }
     }
@@ -995,12 +1013,45 @@ mod tests {
 
         fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError> {
             assert!(self.began, "next_frame before begin_utterance");
+            self.polls += 1;
+            if self.endless {
+                return Ok(Some(CodeFrame { codes: vec![0; 16] }));
+            }
             if self.remaining == 0 {
                 return Ok(None);
             }
             self.remaining -= 1;
             Ok(Some(CodeFrame { codes: vec![0; 16] }))
         }
+    }
+
+    /// An engine whose admitted ceiling is exactly `max_new_tokens` frames.
+    fn engine_with_frame_ceiling(max_new_tokens: u64) -> TtsEngine {
+        TtsEngine::new(EngineConfig {
+            synthesis_stage_budget: Duration::from_secs(5),
+            admission: admission::AdmissionPolicy {
+                max_new_tokens,
+                ..admission::AdmissionPolicy::default()
+            },
+            ..EngineConfig::default()
+        })
+        .expect("test engine builds")
+    }
+
+    /// The ceiling the engine admitted this request under, as the observer saw it.
+    fn admitted_ceiling(observer: &RecordingObserver) -> u64 {
+        observer
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                SynthesisEvent::ResourceAdmission {
+                    admitted: true,
+                    predicted_max_frames,
+                    ..
+                } => Some(predicted_max_frames),
+                _ => None,
+            })
+            .expect("an admitted request reports its frame ceiling")
     }
 
     struct TestTextPreparer;
@@ -1024,6 +1075,101 @@ mod tests {
                 },
             ))
         }
+    }
+
+    /// The EOS case: the generator decides, and the loop asks exactly once past the last frame.
+    ///
+    /// Frame count alone cannot make this claim — a ceiling that happened to equal the frame count
+    /// would produce the same number. Asserting the ceiling had slack *and* that the loop polled
+    /// for the frame after the last one pins the stop to the generator's `None`.
+    #[test]
+    fn the_decode_loop_stops_on_the_generators_eos_and_polls_exactly_once_past_it() {
+        let engine = engine_with_frame_ceiling(64);
+        let observer = RecordingObserver::default();
+        let mut generator = ScriptedFrameGenerator::emitting(3);
+
+        let result = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &CancellationToken::new(),
+                &observer,
+            )
+            .expect("scripted pipeline succeeds");
+
+        let ceiling = admitted_ceiling(&observer);
+        assert!(
+            ceiling > 3,
+            "ceiling {ceiling} must exceed the 3 emitted frames, or the stop is ambiguous"
+        );
+        assert_eq!(result.generated_frames, 3, "EOS bounds the utterance");
+        assert_eq!(result.code_frames.len(), 3);
+        assert_eq!(
+            generator.polls, 4,
+            "the loop must poll once past the last frame to observe EOS, and then stop"
+        );
+    }
+
+    /// The ceiling case: a generator that never stops is truncated at exactly the admitted ceiling.
+    ///
+    /// This is where an off-by-one would live, and where nothing else would catch it — a loop that
+    /// ran one frame long or short would still look like "it stopped".
+    #[test]
+    fn a_generator_that_never_stops_is_truncated_exactly_at_the_admitted_ceiling() {
+        let engine = engine_with_frame_ceiling(5);
+        let observer = RecordingObserver::default();
+        let mut generator = ScriptedFrameGenerator::endless();
+
+        let result = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &CancellationToken::new(),
+                &observer,
+            )
+            .expect("a ceiling-bound utterance still completes");
+
+        let ceiling = admitted_ceiling(&observer);
+        assert_eq!(
+            ceiling, 5,
+            "the policy's max_new_tokens is the ceiling here"
+        );
+        assert_eq!(
+            result.generated_frames, ceiling,
+            "an endless generator must be cut at the ceiling, not one frame either side"
+        );
+        assert_eq!(result.code_frames.len() as u64, ceiling);
+        assert_eq!(
+            generator.polls as u64, ceiling,
+            "once the ceiling is reached the loop must stop asking, not poll a discarded frame"
+        );
+    }
+
+    /// The boundary: EOS arriving exactly at the ceiling is still a clean stop, not an overrun.
+    #[test]
+    fn eos_landing_exactly_on_the_ceiling_yields_the_ceiling_frames() {
+        let engine = engine_with_frame_ceiling(4);
+        let observer = RecordingObserver::default();
+        let mut generator = ScriptedFrameGenerator::emitting(4);
+
+        let result = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &CancellationToken::new(),
+                &observer,
+            )
+            .expect("scripted pipeline succeeds");
+
+        assert_eq!(admitted_ceiling(&observer), 4);
+        assert_eq!(result.generated_frames, 4);
+        assert_eq!(
+            generator.polls, 4,
+            "the ceiling is reached first, so the generator is never asked for a fifth frame"
+        );
     }
 
     #[test]

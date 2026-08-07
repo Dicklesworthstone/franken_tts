@@ -1,15 +1,53 @@
 //! Engine-level e2e: `TtsEngine::synthesize` driving `QwenGenerator` with the REAL pinned weights.
 //!
-//! This is the first assembled-forward receipt for frankentts-p1-e2e-miy: the engine's admission,
+//! This is the assembled-forward receipt for frankentts-p1-e2e-miy: the engine's admission,
 //! budget, and decode loop run against the real 28-layer talker and 5-layer microdecoder hydrated
 //! from the pinned checkpoint, seeded with the ft7 oracle's own assembled prompt
-//! (`talker.input.input/kwargs.inputs_embeds`), and the first generated frame is compared
-//! code-for-code against the oracle's captured `talker.codec_codes`.
+//! (`talker.input.input/kwargs.inputs_embeds`), and the generated codes are compared
+//! code-for-code against the oracle's captured `talker.codec_codes` — for the **whole utterance**,
+//! every frame through the stop, not merely the first.
+//!
+//! # What is covered
+//!
+//! 1. **Every captured frame, not just the first.** The mode manifest's `generated_frames` sets the
+//!    length; the codes tensor must agree with it, and the engine's frames must match code for
+//!    code, with the first divergence localized by frame and depth.
+//! 2. **The capture's own digest.** The codes are hashed the way the capture hashed them
+//!    (little-endian `int64`, `[frames, 16]`) and checked against `generated_codes_sha256` — one
+//!    value no partial comparison can accidentally satisfy.
+//! 3. **One step past the codes.** Upstream drops the final step's frame, but it *kept that step's
+//!    logits*. Running our production sampler over the oracle's own `talker.codec_head.output` at
+//!    that step yields the code the reference would have emitted, and the engine must produce it.
+//!    This is what reaches the decode loop's feedback path — frame codes summed onto the next
+//!    input, KV appended, mRoPE advanced — which frame-0-only parity cannot touch.
+//!
+//! # What this pack cannot cover: the EOS stop
+//!
+//! This capture contains **no EOS**, so there is no stop here to be parity with, and the test says
+//! so in its receipt rather than manufacturing the claim. Three facts force that reading:
+//!
+//! - The pinned corpus caps generation at `max_new_tokens = 2` — the script's own minimum. The
+//!   reference's `min_new_tokens = 2` processor masks EOS while fewer than two tokens have been
+//!   generated, so EOS is *structurally unreachable* within this capture.
+//! - The captured step-1 logits put EOS (2150) at 5.5 against a winning code at 26.5. Nothing near
+//!   a stop.
+//! - Upstream truncates at the first EOS **found in the emitted codes** (`has_stop_token`); with no
+//!   EOS drawn it keeps every frame. So the codes — not the frame count — decide.
+//!
+//! In particular `generated_frames = 1` under a 2-token cap is **not** evidence of an early stop.
+//! Upstream drops the last step's frame because that step's microdecoder never runs, so an N-step
+//! capture always reports N-1 frames. A "frames < cap ⟹ stopped at EOS" heuristic reads this pack
+//! as EOS-terminated and is simply wrong; the code below checks codebook 0 for EOS instead, and
+//! only then asserts that the engine stops where the reference stopped.
+//!
+//! Closing this gap needs a recapture with a cap high enough for the utterance to end on its own,
+//! not a change here.
 //!
 //! Prompt-header construction is deliberately NOT re-derived here — it belongs to the prompt and
 //! speaker beads. Feeding the oracle's prefill through `QwenGenerator::begin_with_prefill` scopes
 //! this receipt to what it actually proves: talker prefill + canonical-greedy `c0` + the 15-step
-//! microdecoder, end-to-end under the engine, at the CPU-fp32 tier.
+//! microdecoder + the feedback step into the next frame, end-to-end under the engine, at the
+//! CPU-fp32 tier. Not the EOS stop — see above.
 //!
 //! Model-gated twice (fixtures + checkpoint); absent inputs produce a loud skip receipt, never a
 //! silent green.
@@ -30,14 +68,17 @@ use ftts_model_qwen::microdecoder::{
     LayerWeights, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_DEPTHS,
 };
 use ftts_model_qwen::prompt::{CloneMode, PromptHeader, PromptMode};
-use ftts_model_qwen::sampler::SamplingMode;
+use ftts_model_qwen::sampler::{CODEC_EOS_TOKEN_ID, QwenSampler, SamplingMode};
 use ftts_model_qwen::talker::{
-    TalkerConfig, TalkerLayerWeights, TalkerWeights, CODE_GROUP_COUNT, TALKER_LAYER_COUNT,
+    CODE_GROUP_COUNT, TALKER_LAYER_COUNT, TalkerConfig, TalkerLayerWeights, TalkerWeights,
 };
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-const TEST_NAME: &str = "contract_a_engine_e2e_first_frame_cpu_fp32_exact";
+const TEST_NAME: &str = "contract_a_engine_e2e_full_utterance_cpu_fp32_exact";
+const SEAM: &str = "engine.synthesize.full_utterance";
 const CASE: &str = "synthetic-tone-en";
 const MODE: &str = "xvector_streaming";
 const GROUP: &str = "talker_free_running";
@@ -45,16 +86,67 @@ const HIDDEN: usize = 1024;
 
 /// The pinned talker checkpoint, alongside the truth-pack snapshots.
 fn checkpoint_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/truth-pack/snapshots/hf/model.safetensors")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/truth-pack/snapshots/hf/model.safetensors")
+}
+
+/// Where the digest-pinned corpus that fixed this capture's token cap lives.
+fn corpus_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/conformance/oracle_corpus.json")
 }
 
 fn skip(reason: &str) {
     Receipt::new(TEST_NAME, Outcome::Skipped)
         .contract("ConformanceExact/e2e")
-        .seam("engine.synthesize.first_frame")
+        .seam(SEAM)
         .reason(reason)
         .oracle_tier(OracleTier::CpuFp32Fallback)
         .emit();
+}
+
+/// Records the frame ceiling the engine admitted this utterance under.
+///
+/// Without it, "the engine emitted exactly N frames" cannot distinguish a genuine EOS stop from
+/// the decode loop simply running out of its budgeted frames at N.
+#[derive(Default)]
+struct CeilingObserver {
+    predicted_max_frames: AtomicU64,
+}
+
+impl ftts_core::SynthesisObserver for CeilingObserver {
+    fn on_event(&self, event: SynthesisEvent) {
+        if let SynthesisEvent::ResourceAdmission {
+            admitted: true,
+            predicted_max_frames,
+            ..
+        } = event
+        {
+            self.predicted_max_frames
+                .store(predicted_max_frames, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The token cap recorded for `case` in the corpus, but only if the corpus is byte-identical to
+/// the one the pack was captured from.
+///
+/// Returning `None` on any mismatch is deliberate: a cap read from a corpus that has since drifted
+/// would silently turn "the oracle stopped early" into an unfounded claim.
+fn corpus_max_new_tokens(fixtures: &OracleFixtures, case: &str) -> Option<usize> {
+    let provenance = fixtures.provenance().ok()?;
+    let pinned = provenance["corpus_sha256"].as_str()?;
+    let bytes = std::fs::read(corpus_path()).ok()?;
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if actual != pinned {
+        return None;
+    }
+    let corpus: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    corpus["cases"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["id"].as_str() == Some(case))?["max_new_tokens"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 /// Widen a whole tensor to `f32` through the accessor, which is how the engine reads BF16.
@@ -161,7 +253,12 @@ impl Hydrated {
                 .collect(),
             micro_final_norm: widen(file, "talker.code_predictor.model.norm.weight"),
             micro_heads: (0..RESIDUAL_DEPTHS)
-                .map(|head| widen(file, &format!("talker.code_predictor.lm_head.{head}.weight")))
+                .map(|head| {
+                    widen(
+                        file,
+                        &format!("talker.code_predictor.lm_head.{head}.weight"),
+                    )
+                })
                 .collect(),
             // The text path is unused behind `begin_with_prefill`; minimal well-shaped stubs.
             text_stub_table: vec![0.0; 2],
@@ -270,7 +367,7 @@ impl FrameGenerator for OraclePromptGenerator<'_> {
 }
 
 #[test]
-fn engine_synthesize_reproduces_the_oracle_first_frame_exactly() {
+fn engine_synthesize_reproduces_the_whole_oracle_utterance_exactly() {
     let fixtures = match OracleFixtures::open_default() {
         Ok(fixtures) => fixtures,
         Err(FixtureError::PackAbsent { path }) => {
@@ -316,12 +413,35 @@ fn engine_synthesize_reproduces_the_oracle_first_frame_exactly() {
         "tensor",
         0,
     ))
-    .expect("oracle first-frame codes captured");
+    .expect("oracle utterance codes captured");
+
+    // The manifest is the pack's own statement of how long the utterance was; the codes tensor must
+    // agree with it, or one of the two is describing a different run.
+    let manifest = fixtures
+        .mode_manifest(CASE, MODE)
+        .expect("per-mode manifest readable");
+    let expected_frames = manifest.generated_frames;
+    assert!(expected_frames > 0, "the oracle captured no frames");
     assert_eq!(
-        expected_codes.data.len(),
-        CODE_GROUP_COUNT,
-        "the oracle frame has 16 codes"
+        expected_codes.shape,
+        vec![expected_frames, CODE_GROUP_COUNT],
+        "captured codes must be [frames, 16] and agree with the manifest's frame count"
     );
+
+    // Does this capture actually contain a stop? The upstream assembler only truncates at the
+    // first EOS *present in the emitted codes* (`is_stop_token` over codebook 0); when no EOS was
+    // drawn it keeps every frame it has. So the codes themselves — not the frame count — are the
+    // only sound witness that the utterance ended rather than ran out of budget.
+    //
+    // The frame count cannot stand in for that. Upstream drops the final step's frame (its
+    // microdecoder never runs, so `hid[-1] is None`), which makes `generated_frames` one *less*
+    // than the steps taken. A pack capped at N steps therefore reports N-1 frames and would look
+    // "stopped early" to any count-versus-cap heuristic, EOS or not.
+    let captured_eos = expected_codes
+        .data
+        .chunks(CODE_GROUP_COUNT)
+        .any(|frame| frame[0] == i64::from(CODEC_EOS_TOKEN_ID));
+    let cap = corpus_max_new_tokens(&fixtures, CASE);
     let prompt_ids = npy::read_i64(&fixtures.seam_path(
         &SeamRef {
             case: CASE,
@@ -339,8 +459,11 @@ fn engine_synthesize_reproduces_the_oracle_first_frame_exactly() {
     let hydrated = Hydrated::load(&file, tts_pad.data.clone());
     let talker_layers: Vec<TalkerLayerWeights<'_>> =
         hydrated.talker_layers.iter().map(borrow_layer).collect();
-    let micro_layers: Vec<LayerWeights<'_>> =
-        hydrated.micro_layers.iter().map(borrow_micro_layer).collect();
+    let micro_layers: Vec<LayerWeights<'_>> = hydrated
+        .micro_layers
+        .iter()
+        .map(borrow_micro_layer)
+        .collect();
     let micro_residual: Vec<&[f32]> = hydrated.residual_embeddings[..RESIDUAL_DEPTHS - 1]
         .iter()
         .map(Vec::as_slice)
@@ -364,6 +487,7 @@ fn engine_synthesize_reproduces_the_oracle_first_frame_exactly() {
     let preparer = FixtureTextPreparer {
         token_ids: prompt_ids.data.iter().map(|&id| id as u32).collect(),
     };
+    let observer = CeilingObserver::default();
     let result = engine
         .synthesize(
             SynthesisRequest {
@@ -374,27 +498,140 @@ fn engine_synthesize_reproduces_the_oracle_first_frame_exactly() {
             &preparer,
             &mut generator,
             &CancellationToken::new(),
-            &|_: SynthesisEvent| {},
+            &observer,
         )
         .expect("synthesis completes within budget");
 
+    // The ceiling must have had slack, or every count assertion below is vacuous: a loop that ran
+    // out of permitted frames is indistinguishable from one that chose to stop.
+    let ceiling = observer.predicted_max_frames.load(Ordering::Relaxed);
     assert!(
-        result.generated_frames > 0,
-        "the engine loop must emit at least the oracle-verified first frame"
-    );
-    let first: Vec<i64> = result.code_frames[0]
-        .codes
-        .iter()
-        .map(|&code| i64::from(code))
-        .collect();
-    assert_eq!(
-        first, expected_codes.data,
-        "first generated frame must match the oracle's 16 codes exactly"
+        ceiling > expected_frames as u64,
+        "admitted frame ceiling {ceiling} leaves no slack above the oracle's {expected_frames} \
+         frames, so nothing about the stop could be concluded"
     );
 
-    Receipt::new(TEST_NAME, Outcome::Passed)
-        .contract("ConformanceExact/e2e")
-        .seam("engine.synthesize.first_frame")
-        .oracle_tier(OracleTier::CpuFp32Fallback)
-        .emit();
+    // Enough frames to cover the capture. Fewer means we stopped somewhere the oracle did not.
+    assert!(
+        result.generated_frames >= expected_frames as u64,
+        "engine emitted only {} frames; the oracle captured {expected_frames}",
+        result.generated_frames
+    );
+    assert_eq!(
+        result.code_frames.len() as u64,
+        result.generated_frames,
+        "generated_frames must agree with the frames actually carried"
+    );
+
+    // Every captured frame, code for code, with the first divergence localized by frame and depth.
+    let actual: Vec<i64> = result
+        .code_frames
+        .iter()
+        .take(expected_frames)
+        .flat_map(|frame| {
+            assert_eq!(
+                frame.codes.len(),
+                CODE_GROUP_COUNT,
+                "every frame carries 16 codes"
+            );
+            frame.codes.iter().map(|&code| i64::from(code))
+        })
+        .collect();
+    if let Some((index, (&ours, &theirs))) = actual
+        .iter()
+        .zip(expected_codes.data.iter())
+        .enumerate()
+        .find(|(_, (ours, theirs))| ours != theirs)
+    {
+        panic!(
+            "code divergence at frame {} depth {}: ours {ours}, oracle {theirs}",
+            index / CODE_GROUP_COUNT,
+            index % CODE_GROUP_COUNT
+        );
+    }
+    assert_eq!(
+        actual, expected_codes.data,
+        "whole-utterance codes must match the oracle exactly"
+    );
+
+    // The capture's own digest, computed the way the capture computed it.
+    let mut hasher = Sha256::new();
+    for code in &actual {
+        hasher.update(code.to_le_bytes());
+    }
+    assert_eq!(
+        format!("{:x}", hasher.finalize()),
+        manifest.generated_codes_sha256,
+        "captured-utterance code digest must match the capture's `generated_codes_sha256`"
+    );
+
+    // One step further than the codes go. The capture kept the *logits* of the step whose frame it
+    // dropped, so the decode loop's feedback path — frame codes summed onto the next input, KV
+    // appended, mRoPE advanced — can still be judged, and that path is exactly what frame-0-only
+    // parity cannot reach.
+    let head_seam = SeamRef {
+        case: CASE,
+        mode: MODE,
+        group: GROUP,
+        seam: "talker.codec_head.output",
+    };
+    if let Ok(next_logits) = fixtures.seam(&head_seam, "tensor", expected_frames) {
+        let history: Vec<u32> = expected_codes
+            .data
+            .chunks(CODE_GROUP_COUNT)
+            .map(|frame| frame[0] as u32)
+            .collect();
+        // The production sampler on the oracle's own logits: this judges our processor stack
+        // (repetition penalty, min-new-tokens, suppression) as well as the forward.
+        let expected_next = QwenSampler::seeded(0)
+            .select_talker(&next_logits.data, &history, SamplingMode::CanonicalGreedy)
+            .expect("oracle logits are a well-formed talker row");
+        assert!(
+            result.generated_frames > expected_frames as u64,
+            "the oracle captured logits for step {expected_frames}, so the engine must have \
+             reached that step"
+        );
+        assert_eq!(
+            result.code_frames[expected_frames].codes[0], expected_next,
+            "primary code at the first post-capture step must match the oracle's own logits; \
+             a mismatch here is the decode loop's feedback path, not the prefill"
+        );
+    }
+
+    // What kind of stop this capture can and cannot witness.
+    if captured_eos {
+        // The capture really does end at EOS, so the engine must end there too — and stay ended.
+        assert_eq!(
+            result.generated_frames, expected_frames as u64,
+            "the oracle's codes end at EOS after {expected_frames} frames; the engine emitted {}",
+            result.generated_frames
+        );
+        assert!(
+            generator
+                .next_frame()
+                .expect("polling a finished generator is not an error")
+                .is_none(),
+            "after EOS the generator must stay finished, not resume"
+        );
+        Receipt::new(TEST_NAME, Outcome::Passed)
+            .contract("ConformanceExact/e2e")
+            .seam(SEAM)
+            .oracle_tier(OracleTier::CpuFp32Fallback)
+            .emit();
+    } else {
+        // No EOS was ever drawn, so this pack has no stop to be parity with. Upstream's
+        // `has_stop_token` is false and it kept every frame it had; the utterance was bounded by
+        // the corpus cap. Saying so in the receipt is the point — a green here must not be read
+        // as "the engine stops where the reference stops", which remains unproven at this tier.
+        Receipt::new(TEST_NAME, Outcome::Passed)
+            .contract("ConformanceExact/e2e")
+            .seam(SEAM)
+            .reason(&*format!(
+                "codes parity exact over all {expected_frames} captured frame(s) plus the \
+                 post-capture primary; EOS-stop parity NOT covered — this capture drew no EOS \
+                 (corpus max_new_tokens {cap:?}), so it contains no stop to compare against"
+            ))
+            .oracle_tier(OracleTier::CpuFp32Fallback)
+            .emit();
+    }
 }

@@ -244,6 +244,68 @@ impl OracleFixtures {
         })
     }
 
+    /// The per-mode manifest, which records how long the captured utterance actually was.
+    ///
+    /// A seam file only ever proves one step. Deciding whether a *whole* utterance matches needs
+    /// the frame count and the code digest the capture recorded for itself, so a Rust run that
+    /// stops early — or late — is caught rather than silently compared over the shorter prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FixtureError::Manifest`] when the manifest is missing, unreadable, or lacks the
+    /// fields a whole-utterance comparison depends on.
+    pub fn mode_manifest(&self, case: &str, mode: &str) -> Result<ModeManifest, FixtureError> {
+        let path = self.root.join(case).join(mode).join("manifest.json");
+        let bytes = fs::read(&path).map_err(|error| FixtureError::Manifest {
+            detail: format!("{}: {error}", path.display()),
+        })?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|error| FixtureError::Manifest {
+                detail: format!("{}: {error}", path.display()),
+            })?;
+
+        let missing = |field: &str| FixtureError::Manifest {
+            detail: format!("{}: no `{field}` field", path.display()),
+        };
+        Ok(ModeManifest {
+            generated_frames: usize::try_from(
+                value["generated_frames"]
+                    .as_u64()
+                    .ok_or_else(|| missing("generated_frames"))?,
+            )
+            .map_err(|error| FixtureError::Manifest {
+                detail: format!("{}: generated_frames: {error}", path.display()),
+            })?,
+            generated_codes_sha256: value["generated_codes_sha256"]
+                .as_str()
+                .ok_or_else(|| missing("generated_codes_sha256"))?
+                .to_owned(),
+            sample_rate: value["sample_rate"]
+                .as_u64()
+                .ok_or_else(|| missing("sample_rate"))?,
+            // Older packs predate these two; absent is a real answer, not a failure.
+            requested_max_new_tokens: value["requested_max_new_tokens"]
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok()),
+            stopped_before_max_new_tokens: value["stopped_before_max_new_tokens"].as_bool(),
+        })
+    }
+
+    /// The pack's `provenance.json`, for pinning what the capture was run against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FixtureError::Manifest`] when the file is missing or is not valid JSON.
+    pub fn provenance(&self) -> Result<serde_json::Value, FixtureError> {
+        let path = self.root.join("provenance.json");
+        let bytes = fs::read(&path).map_err(|error| FixtureError::Manifest {
+            detail: format!("{}: {error}", path.display()),
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| FixtureError::Manifest {
+            detail: format!("{}: {error}", path.display()),
+        })
+    }
+
     /// Whether a seam directory exists at all, for probing which layers were captured.
     #[must_use]
     pub fn has_seam(&self, seam: &SeamRef<'_>) -> bool {
@@ -256,6 +318,31 @@ impl OracleFixtures {
             .is_dir()
     }
 }
+
+/// What one mode's capture recorded about the utterance as a whole.
+///
+/// This is the only place the pack states how many frames the oracle actually produced. Without
+/// it, a whole-utterance test can compare a one-frame prefix and call it parity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModeManifest {
+    /// Frames the oracle emitted before it stopped.
+    pub generated_frames: usize,
+    /// SHA-256 over the captured code matrix as little-endian `int64`, shape `[frames, 16]`.
+    pub generated_codes_sha256: String,
+    /// Codec sample rate the capture decoded at.
+    pub sample_rate: u64,
+    /// The cap the capture ran under, when the pack records it.
+    pub requested_max_new_tokens: Option<usize>,
+    /// Whether the oracle stopped on its own rather than hitting that cap, when recorded.
+    pub stopped_before_max_new_tokens: Option<bool>,
+}
+
+// Deliberately no `stopped_at_eos()` helper here. Comparing `generated_frames` against the token
+// cap looks like it decides whether the capture ended at EOS, and it does not: upstream drops the
+// final step's frame (that step's microdecoder never runs), so a capture capped at N steps reports
+// N-1 frames and reads as "stopped early" whether or not an EOS was ever drawn. The only sound
+// witness is an EOS token in codebook 0 of the captured codes — which is what upstream's own
+// `has_stop_token` tests. Callers should check the codes.
 
 /// Names one captured seam within a pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
