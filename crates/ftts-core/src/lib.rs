@@ -425,6 +425,50 @@ pub trait TextPreparer: Send + Sync {
     ) -> Result<PreparedText, TextPreparationError>;
 }
 
+/// One generated codec frame: the talker's primary code plus the 15 residual codes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeFrame {
+    /// Group 0 is the primary code; groups 1..16 are the microdecoder residuals, in depth order.
+    pub codes: Vec<u32>,
+}
+
+/// A model-side failure while generating codec frames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationError {
+    message: String,
+}
+
+impl GenerationError {
+    /// Wraps a model-specific failure description.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for GenerationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GenerationError {}
+
+/// Model-specific autoregressive frame generation behind the blocking engine facade.
+///
+/// Like [`TextPreparer`], `ftts-core` owns only the boundary: the model crate implements the
+/// prompt assembly, talker forward, and 15-step microdecoder behind these two calls, and the
+/// engine owns admission, budgets, cancellation, and observer events around them.
+pub trait FrameGenerator {
+    /// Prepares per-utterance state (prompt assembly and talker prefill) for one request.
+    fn begin_utterance(&mut self, prepared: &PreparedText) -> Result<(), GenerationError>;
+
+    /// Produces the next 16-code frame, or `None` once the model emits codec EOS.
+    fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError>;
+}
+
 /// A synchronous synthesis request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SynthesisRequest {
@@ -472,11 +516,13 @@ pub struct EnrollmentRequest {
     pub reference_audio: Vec<u8>,
 }
 
-/// A completed empty-pipeline synthesis result.
+/// A completed synthesis result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SynthesisResult {
     /// Number of generated codec frames.
     pub generated_frames: u64,
+    /// Every generated 16-code frame, in emission order, for the codec stage.
+    pub code_frames: Vec<CodeFrame>,
     /// Number of token ids produced by the request-local text preparer.
     pub prepared_token_count: usize,
 }
@@ -612,6 +658,8 @@ pub enum EngineError {
     QueueTimeout,
     /// The model-specific text preparer rejected the request.
     TextPreparation(TextPreparationError),
+    /// The model-specific frame generator failed mid-utterance.
+    Generation(GenerationError),
     /// Predicted peak memory for this utterance exceeded the budget.
     ///
     /// Raised **before** any KV or codec state is allocated, so a rejected request has committed
@@ -632,6 +680,7 @@ impl fmt::Display for EngineError {
             Self::StreamDisconnected(kind) => write!(formatter, "{kind:?} stream disconnected"),
             Self::QueueTimeout => formatter.write_str("bounded queue receive timed out"),
             Self::TextPreparation(error) => write!(formatter, "text preparation failed: {error}"),
+            Self::Generation(error) => write!(formatter, "frame generation failed: {error}"),
             Self::ResourceAdmission(rejection) => {
                 write!(
                     formatter,
@@ -677,11 +726,16 @@ impl TtsEngine {
         Self::new(process_engine_config())
     }
 
-    /// Runs the Phase 0 empty synthesis pipeline through the owned runtime.
+    /// Runs one blocking synthesis: text preparation, admission, then the model decode loop.
+    ///
+    /// The decode loop runs on the calling thread rather than through [`Self::run_stage`]: frame
+    /// generators borrow model weights, so they cannot cross the `'static` spawn boundary, and a
+    /// per-frame deadline check is the natural budget seam for an autoregressive loop anyway.
     pub fn synthesize<P: TextPreparer + ?Sized>(
         &self,
         request: SynthesisRequest,
         text_preparer: &P,
+        frame_generator: &mut dyn FrameGenerator,
         cancellation: &CancellationToken,
         observer: &dyn SynthesisObserver,
     ) -> Result<SynthesisResult, EngineError> {
@@ -706,13 +760,16 @@ impl TtsEngine {
         // cannot fit is refused having allocated nothing — never discovered halfway through a long
         // generation. See `admission` for the OQ-6 rule.
         let prompt_tokens = prepared.token_ids.len() as u64;
-        match self.config.admission.admit(prompt_tokens) {
-            Ok(plan) => observer.on_event(SynthesisEvent::ResourceAdmission {
-                admitted: true,
-                predicted_max_frames: plan.predicted_max_frames,
-                predicted_peak_bytes: plan.predicted_peak_bytes,
-                budget_bytes: plan.budget_bytes,
-            }),
+        let plan = match self.config.admission.admit(prompt_tokens) {
+            Ok(plan) => {
+                observer.on_event(SynthesisEvent::ResourceAdmission {
+                    admitted: true,
+                    predicted_max_frames: plan.predicted_max_frames,
+                    predicted_peak_bytes: plan.predicted_peak_bytes,
+                    budget_bytes: plan.budget_bytes,
+                });
+                plan
+            }
             Err(rejection) => {
                 if let admission::AdmissionRejection::BudgetExceeded { plan } = rejection {
                     observer.on_event(SynthesisEvent::ResourceAdmission {
@@ -724,18 +781,49 @@ impl TtsEngine {
                 }
                 return Err(EngineError::ResourceAdmission(rejection));
             }
-        }
+        };
 
-        self.run_stage(
-            EngineStage::Synthesis,
-            self.config.synthesis_stage_budget,
-            cancellation,
-            observer,
-            |_| Ok(()),
-        )?;
-        observer.on_event(SynthesisEvent::FrameProgress { frame: 0 });
+        observer.on_event(SynthesisEvent::StageStarted {
+            stage: EngineStage::Synthesis,
+        });
+        let started = Instant::now();
+        let budget = self.config.synthesis_stage_budget;
+        let mut code_frames: Vec<CodeFrame> = Vec::new();
+        frame_generator
+            .begin_utterance(&prepared)
+            .map_err(EngineError::Generation)?;
+        while (code_frames.len() as u64) < plan.predicted_max_frames {
+            cancellation.checkpoint().inspect_err(|_| {
+                observer.on_event(SynthesisEvent::Health {
+                    event: HealthEvent::Cancelled,
+                });
+            })?;
+            if started.elapsed() > budget {
+                observer.on_event(SynthesisEvent::Health {
+                    event: HealthEvent::BudgetExceeded,
+                });
+                return Err(EngineError::BudgetExceeded(EngineStage::Synthesis));
+            }
+            match frame_generator
+                .next_frame()
+                .map_err(EngineError::Generation)?
+            {
+                Some(frame) => {
+                    observer.on_event(SynthesisEvent::FrameProgress {
+                        frame: code_frames.len() as u64,
+                    });
+                    code_frames.push(frame);
+                }
+                None => break,
+            }
+        }
+        observer.on_event(SynthesisEvent::StageFinished {
+            stage: EngineStage::Synthesis,
+            elapsed: started.elapsed(),
+        });
         Ok(SynthesisResult {
-            generated_frames: 0,
+            generated_frames: code_frames.len() as u64,
+            code_frames,
             prepared_token_count: prepared.token_ids.len(),
         })
     }
@@ -883,6 +971,37 @@ mod tests {
         .expect("test engine builds")
     }
 
+    /// Emits a fixed number of all-zero frames, then EOS. Panics if the loop skips prefill.
+    struct ScriptedFrameGenerator {
+        remaining: usize,
+        began: bool,
+    }
+
+    impl ScriptedFrameGenerator {
+        fn emitting(frames: usize) -> Self {
+            Self {
+                remaining: frames,
+                began: false,
+            }
+        }
+    }
+
+    impl FrameGenerator for ScriptedFrameGenerator {
+        fn begin_utterance(&mut self, _prepared: &PreparedText) -> Result<(), GenerationError> {
+            self.began = true;
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError> {
+            assert!(self.began, "next_frame before begin_utterance");
+            if self.remaining == 0 {
+                return Ok(None);
+            }
+            self.remaining -= 1;
+            Ok(Some(CodeFrame { codes: vec![0; 16] }))
+        }
+    }
+
     struct TestTextPreparer;
 
     impl TextPreparer for TestTextPreparer {
@@ -907,21 +1026,30 @@ mod tests {
     }
 
     #[test]
-    fn empty_pipeline_emits_admission_stage_and_frame_events() {
+    fn the_decode_loop_drives_the_generator_and_reports_every_frame() {
         let engine = engine_with_budget(Duration::from_secs(1));
         let cancellation = CancellationToken::new();
         let observer = RecordingObserver::default();
+        let mut generator = ScriptedFrameGenerator::emitting(2);
 
         let result = engine
             .synthesize(
                 SynthesisRequest::new(""),
                 &TestTextPreparer,
+                &mut generator,
                 &cancellation,
                 &observer,
             )
-            .expect("empty pipeline succeeds");
+            .expect("scripted pipeline succeeds");
 
-        assert_eq!(result.generated_frames, 0);
+        assert_eq!(result.generated_frames, 2);
+        assert_eq!(result.code_frames.len(), 2);
+        assert!(
+            result
+                .code_frames
+                .iter()
+                .all(|frame| frame.codes.len() == 16)
+        );
         assert_eq!(result.prepared_token_count, 2);
         let events = observer.events();
         assert!(
@@ -934,11 +1062,12 @@ mod tests {
                     SynthesisEvent::StageStarted {
                         stage: EngineStage::Synthesis,
                     },
+                    SynthesisEvent::FrameProgress { frame: 0 },
+                    SynthesisEvent::FrameProgress { frame: 1 },
                     SynthesisEvent::StageFinished {
                         stage: EngineStage::Synthesis,
                         ..
                     },
-                    SynthesisEvent::FrameProgress { frame: 0 },
                 ]
             ),
             "unexpected event sequence: {events:?}"
@@ -965,6 +1094,7 @@ mod tests {
             .synthesize(
                 SynthesisRequest::new(""),
                 &TestTextPreparer,
+                &mut ScriptedFrameGenerator::emitting(0),
                 &cancellation,
                 &observer,
             )
@@ -1030,6 +1160,7 @@ mod tests {
             .synthesize(
                 SynthesisRequest::new("cancelled"),
                 &TestTextPreparer,
+                &mut ScriptedFrameGenerator::emitting(0),
                 &cancellation,
                 &observer,
             )
@@ -1121,6 +1252,7 @@ mod tests {
             .synthesize(
                 request,
                 &TestTextPreparer,
+                &mut ScriptedFrameGenerator::emitting(0),
                 &CancellationToken::new(),
                 &observer,
             )
@@ -1196,6 +1328,7 @@ mod tests {
                     .synthesize(
                         SynthesisRequest::new("watchdog"),
                         &TestTextPreparer,
+                        &mut ScriptedFrameGenerator::emitting(1),
                         &CancellationToken::new(),
                         &observer,
                     )
