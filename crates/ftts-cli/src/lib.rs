@@ -4,6 +4,7 @@
 
 mod error;
 pub mod robot;
+pub mod synth;
 
 pub use error::{FttsError, FttsExitCode};
 pub use robot::{EventType, validate_event, validate_ndjson};
@@ -266,6 +267,24 @@ impl PacketFrames {
             Self::Four => "4",
             Self::Auto => "auto",
         }
+    }
+
+    /// Codec frames carried by one PCM packet.
+    ///
+    /// `auto` resolves to 4 here. The autotuner that will choose it per machine is
+    /// `frankentts-k-packet-tuning-28u`; until it exists, `auto` means "the balanced default"
+    /// rather than a number this call site invented on the spot.
+    const fn frames_per_packet(self) -> u8 {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+            Self::Four | Self::Auto => 4,
+        }
+    }
+
+    /// Samples in one packet: frames times the codec's 1,920 samples per 80 ms frame.
+    const fn samples_per_packet(self) -> usize {
+        self.frames_per_packet() as usize * ftts_core::audio::SAMPLES_PER_FRAME
     }
 
     const fn default_for(profile: ExecutionProfile) -> Self {
@@ -888,16 +907,25 @@ fn run_say(
 ) -> Result<(), FttsError> {
     let run = robot::RunContext::generate();
     // `--stream raw` puts PCM on stdout, so events move to stderr. One contract, chosen once here
-    // so no later emission can pick the other stream and interleave NDJSON with audio bytes.
-    let raw_stream = args.stream == Some(StreamMode::Raw);
-
-    let outcome = run_say_events(cli, args, environment, stdin, &run, &mut |event| {
-        if raw_stream {
+    // so no later emission can pick the other stream and interleave NDJSON with audio bytes. The
+    // two branches also settle the borrows: in raw mode audio owns `stdout` and events own
+    // `stderr`; otherwise events own `stdout` and the raw sink is a discard that never runs.
+    let outcome = if args.stream == Some(StreamMode::Raw) {
+        run_say_events(cli, args, environment, stdin, &run, stdout, &mut |event| {
             write_json_line(stderr, event)
-        } else {
-            write_json_line(stdout, event)
-        }
-    });
+        })
+    } else {
+        let mut discard = io::sink();
+        run_say_events(
+            cli,
+            args,
+            environment,
+            stdin,
+            &run,
+            &mut discard,
+            &mut |event| write_json_line(stdout, event),
+        )
+    };
 
     if let Err(error) = &outcome {
         // The error is reported on the machine contract, not only as a human line: run_error is a
@@ -943,6 +971,7 @@ fn run_say_events(
     environment: &Environment,
     stdin: &mut dyn Read,
     run: &robot::RunContext,
+    raw_audio: &mut dyn Write,
     emit: &mut dyn FnMut(&Value) -> Result<(), FttsError>,
 ) -> Result<(), FttsError> {
     let settings = EffectiveSettings::resolve(cli, environment)?;
@@ -1024,9 +1053,94 @@ fn run_say_events(
         return Ok(());
     }
 
-    Err(FttsError::Generic(
-        "synthesis is not implemented in the Phase-0 skeleton; use `ftts say --check --model PATH TEXT` for stateless input and admission validation".to_owned(),
-    ))
+    // --- audio destination, decided before any model work ----------------------------------
+    // A run that synthesizes for thirty seconds and then discovers it has nowhere to put the
+    // result has wasted the user's time; the refusal belongs here, before the weights load.
+    let raw_stream = args.stream == Some(StreamMode::Raw);
+    let mut audio = match (&args.output, raw_stream) {
+        (Some(path), false) => AudioOutput::wav(path)?,
+        (None, true) => AudioOutput::raw(),
+        (None, false) => {
+            return Err(FttsError::Usage(
+                "`ftts say` has nowhere to put the audio; pass `-o PATH` for a WAV file or \
+                 `--stream raw` for PCM on stdout"
+                    .to_owned(),
+            ));
+        }
+        // clap declares `-o` and `--stream` mutually exclusive.
+        (Some(_), true) => unreachable!("clap enforces the conflict"),
+    };
+
+    let Some(voice_path) = args.voice.as_deref() else {
+        return Err(FttsError::Usage(
+            "`ftts say` needs a speaker vector; pass `--voice PATH` holding 1024 little-endian \
+             f32 (4096 bytes). Computing one from reference audio is the ECAPA speaker encoder, \
+             which is not implemented yet, so there is no default voice to fall back to"
+                .to_owned(),
+        ));
+    };
+    let speaker = synth::read_speaker_vector(voice_path)?;
+
+    // --- model load ------------------------------------------------------------------------
+    emit_stage(run, emit, "load", "begin", &mut seq)?;
+    let bundle = synth::ModelBundle::resolve(Path::new(&model))?;
+    let loaded = synth::LoadedModel::load(&bundle)?;
+    emit_stage(run, emit, "load", "end", &mut seq)?;
+
+    // --- synthesis -------------------------------------------------------------------------
+    // The engine's observer is not forwarded to the event stream here. Its events are lifecycle
+    // facts the robot contract already carries as `stage` events, and per-frame progress cannot be
+    // emitted from inside this call anyway: `emit` is borrowed for the duration. Progress becomes
+    // observable per packet once synthesis returns, and genuinely incremental frame events belong
+    // with the streaming decode path rather than being faked from a completed run.
+    let observer = |_event: ftts_core::SynthesisEvent| {};
+
+    emit_stage(run, emit, "synthesis", "begin", &mut seq)?;
+    let engine = ftts_core::TtsEngine::from_process_environment()
+        .map_err(|error| FttsError::Generic(format!("cannot start the engine: {error}")))?;
+    let cancellation = ftts_core::CancellationToken::new();
+    let audio_result = synth::synthesize(
+        &loaded,
+        &engine,
+        &request,
+        &speaker,
+        // Canonical greedy consumes no RNG state, so an absent `--seed` changes nothing today;
+        // 0 is the documented default rather than a value picked per run, which would make a
+        // future switch to the production sampler silently irreproducible.
+        cli.seed.unwrap_or(0),
+        &cancellation,
+        &observer,
+    )?;
+    emit_stage(run, emit, "synthesis", "end", &mut seq)?;
+
+    // --- the output tail ---------------------------------------------------------------------
+    let packet_samples = settings.packet_frames.samples_per_packet();
+    let packet_frame_count = settings.packet_frames.frames_per_packet();
+    emit_stage(run, emit, "output", "begin", &mut seq)?;
+    for packet in audio_result.pcm.chunks(packet_samples) {
+        let event = audio.write_packet(packet, raw_audio, run.run_id(), packet_frame_count)?;
+        emit(&event)?;
+    }
+    let audio_bytes = audio.byte_offset();
+    let samples = audio.finish()?;
+    emit_stage(run, emit, "output", "end", &mut seq)?;
+
+    let mut complete = run.event(robot::EventType::RunComplete);
+    complete.insert("exit_code".to_owned(), json!(FttsExitCode::Success.as_u8()));
+    complete.insert("elapsed_ms".to_owned(), json!(run.elapsed_ms()));
+    complete.insert("frames".to_owned(), json!(audio_result.frames));
+    complete.insert("audio_bytes".to_owned(), json!(audio_bytes));
+    complete.insert("samples".to_owned(), json!(samples));
+    complete.insert(
+        "duration_ms".to_owned(),
+        json!(samples * 1000 / u64::from(ftts_core::audio::SAMPLE_RATE_HZ)),
+    );
+    complete.insert(
+        "prepared_token_count".to_owned(),
+        json!(audio_result.prepared_token_count),
+    );
+    emit(&Value::Object(complete))?;
+    Ok(())
 }
 
 /// Where synthesised PCM goes, and the `audio_chunk` events that describe it.
@@ -1231,6 +1345,12 @@ fn read_utf8(reader: &mut dyn Read, source: &str) -> Result<String, FttsError> {
 
 fn resolve_model(explicit: Option<&Path>, environment: &Environment) -> Result<String, FttsError> {
     if let Some(path) = explicit {
+        // A pinned checkpoint is a *directory* of five files, so `--model DIR` is the natural
+        // thing to type and is accepted as such. `.fttsq` is a single file, and both forms reach
+        // the same resolver rather than one being a special case documented somewhere else.
+        if path.is_dir() {
+            return Ok(path.display().to_string());
+        }
         return resolve_existing_file(path, "model artifact")
             .map(|path| path.display().to_string());
     }
