@@ -90,7 +90,7 @@ pub struct QwenGeneratorConfig<'a> {
 }
 
 /// Per-utterance autoregressive state, dropped and rebuilt by every `begin_utterance`.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct UtteranceState {
     /// Final-norm hidden of the newest talker position, `[hidden]`.
     pending_hidden: Vec<f32>,
@@ -886,6 +886,103 @@ mod tests {
             generator.cached_positions(),
             6,
             "a new utterance must not inherit the previous KV prefix"
+        );
+    }
+
+    #[test]
+    fn full_utterance_streamed_kv_matches_causally_replayed_prefill() {
+        // The cached decode path must leave precisely the same talker state as rebuilding the
+        // prompt plus every emitted-frame input in one causal prefill. This is deliberately a
+        // real multi-frame utterance: EOS is masked for the first two generated frames, then ends
+        // the run on the third sampling decision.
+        let mut weights = TinyWeights::new(1.0);
+        weights.talker_q.fill(0.05);
+        weights.talker_kv.fill(0.1);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let mut streamed = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback.clone(),
+            1,
+            SamplingMode::CanonicalGreedy,
+        );
+        let initial_prefill = vec![0.25; 3 * HIDDEN];
+        let trailing = vec![vec![0.5; HIDDEN], vec![0.75; HIDDEN]];
+        streamed
+            .begin_with_prefill(&initial_prefill, 3, trailing.clone())
+            .expect("valid test prefill");
+
+        let mut frames = Vec::new();
+        while let Some(frame) = streamed
+            .next_frame()
+            .expect("streamed frame generation succeeds")
+        {
+            frames.push(frame);
+        }
+        assert_eq!(frames.len(), crate::sampler::TALKER_MIN_NEW_TOKENS);
+
+        let mut replay_prefill = initial_prefill;
+        for (frame_index, frame) in frames.iter().enumerate() {
+            let mut rows = Vec::with_capacity(CODE_GROUP_COUNT);
+            for (depth, &code) in frame.codes.iter().enumerate() {
+                let table = if depth == 0 {
+                    &weights.talker_codec_embedding
+                } else {
+                    &weights.residual_feedback[depth - 1]
+                };
+                rows.push(&table[code as usize * HIDDEN..(code as usize + 1) * HIDDEN]);
+            }
+            let mut input = vec![0.0; HIDDEN];
+            talker::form_frame_input(
+                &rows,
+                trailing.get(frame_index).map(Vec::as_slice),
+                &streamed.header.tts_pad,
+                &mut input,
+            );
+            replay_prefill.extend_from_slice(&input);
+        }
+
+        let mut replayed = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback,
+            1,
+            SamplingMode::CanonicalGreedy,
+        );
+        replayed
+            .begin_with_prefill(&replay_prefill, 3 + frames.len(), trailing)
+            .expect("replayed prefill is valid");
+        let replayed_utterance = replayed.utterance.as_mut().expect("replayed state");
+        replayed_utterance.frames_emitted = frames.len();
+        replayed_utterance.group_zero_history = frames.iter().map(|frame| frame.codes[0]).collect();
+
+        assert_eq!(
+            streamed.kv, replayed.kv,
+            "cached single-position decode and causal replay must retain identical KV buffers"
+        );
+        assert_eq!(
+            streamed.utterance, replayed.utterance,
+            "cached decode and causal replay must park the same next-frame state"
+        );
+        assert_eq!(
+            streamed.next_frame().expect("streamed terminal decision"),
+            replayed.next_frame().expect("replayed terminal decision"),
+            "the replayed state must make the same EOS decision"
         );
     }
 }

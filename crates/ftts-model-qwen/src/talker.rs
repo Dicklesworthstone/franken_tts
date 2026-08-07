@@ -103,7 +103,7 @@ pub struct TalkerLayerWeights<'a> {
 ///
 /// Stored as `[position][kv_width]` so a decode step appends contiguously; this is the reference
 /// layout, chosen for obviousness rather than for locality.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct KvCache {
     keys: Vec<f32>,
     values: Vec<f32>,
@@ -493,7 +493,7 @@ pub struct TalkerWeights<'a> {
 }
 
 /// The 28 independent growing KV caches for a single talker sequence.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TalkerKvCache {
     layers: Vec<KvCache>,
 }
