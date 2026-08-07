@@ -103,6 +103,98 @@ pub fn softmax_rows(x: &mut [f32], rows: usize, cols: usize) {
     }
 }
 
+/// Grouped-query attention for row-major f32 tensors.
+///
+/// `queries` and `out` are `[query_positions, q_heads, head_dim]`; `keys` and `values` are
+/// `[key_positions, kv_heads, head_dim]`; `additive_mask` is `[query_positions, key_positions]`.
+/// Query head `h` reads key/value head `h / (q_heads / kv_heads)`, matching Qwen3-TTS's 16 query
+/// heads over 8 KV heads. The reduction order is scalar and fixed so an ISA-specific kernel has a
+/// direct f32 reference to compare against.
+///
+/// # Panics
+///
+/// Panics if the dimensions disagree or query heads are not evenly grouped over KV heads.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    additive_mask: &[f32],
+    query_positions: usize,
+    key_positions: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) {
+    assert!(kv_heads > 0, "at least one KV head is required");
+    assert_eq!(
+        q_heads % kv_heads,
+        0,
+        "query heads must divide evenly into KV groups"
+    );
+    assert_eq!(
+        queries.len(),
+        query_positions * q_heads * head_dim,
+        "queries must be [query_positions, q_heads, head_dim]"
+    );
+    assert_eq!(
+        keys.len(),
+        key_positions * kv_heads * head_dim,
+        "keys must be [key_positions, kv_heads, head_dim]"
+    );
+    assert_eq!(
+        values.len(),
+        key_positions * kv_heads * head_dim,
+        "values must be [key_positions, kv_heads, head_dim]"
+    );
+    assert_eq!(
+        additive_mask.len(),
+        query_positions * key_positions,
+        "mask must be [query_positions, key_positions]"
+    );
+    assert_eq!(
+        out.len(),
+        query_positions * q_heads * head_dim,
+        "out must be [query_positions, q_heads, head_dim]"
+    );
+
+    let scale = (head_dim as f32).sqrt().recip();
+    let kv_group = q_heads / kv_heads;
+    let mut scores = vec![0.0f32; key_positions];
+
+    for query_position in 0..query_positions {
+        let mask =
+            &additive_mask[query_position * key_positions..(query_position + 1) * key_positions];
+        for q_head in 0..q_heads {
+            let kv_head = q_head / kv_group;
+            let query_base = (query_position * q_heads + q_head) * head_dim;
+            let query = &queries[query_base..query_base + head_dim];
+
+            for (key_position, score) in scores.iter_mut().enumerate() {
+                let key_base = (key_position * kv_heads + kv_head) * head_dim;
+                let key = &keys[key_base..key_base + head_dim];
+                let mut dot = 0.0f32;
+                for lane in 0..head_dim {
+                    dot += query[lane] * key[lane];
+                }
+                *score = dot * scale + mask[key_position];
+            }
+            softmax_rows(&mut scores, 1, key_positions);
+
+            let out_base = query_base;
+            out[out_base..out_base + head_dim].fill(0.0);
+            for (key_position, weight) in scores.iter().copied().enumerate() {
+                let value_base = (key_position * kv_heads + kv_head) * head_dim;
+                let value = &values[value_base..value_base + head_dim];
+                for lane in 0..head_dim {
+                    out[out_base + lane] += weight * value[lane];
+                }
+            }
+        }
+    }
+}
+
 /// Collapse the three mRoPE axes into one `cos`/`sin` row using the checkpoint's INTERLEAVED rule.
 ///
 /// The pinned config sets `rope_scaling.interleaved = true`, which selects a different branch from
@@ -227,6 +319,59 @@ mod tests {
         for index in 0..3 {
             assert!((x[index] - x[index + 3]).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn gqa_maps_each_query_head_to_its_kv_group() {
+        let (query_positions, key_positions, q_heads, kv_heads, head_dim) = (1, 1, 4, 2, 2);
+        let queries = vec![0.0f32; query_positions * q_heads * head_dim];
+        let keys = vec![0.0f32; key_positions * kv_heads * head_dim];
+        let values = [10.0f32, 11.0, 20.0, 21.0];
+        let mut out = vec![0.0f32; query_positions * q_heads * head_dim];
+
+        gqa_attention(
+            &queries,
+            &keys,
+            &values,
+            &[0.0],
+            query_positions,
+            key_positions,
+            q_heads,
+            kv_heads,
+            head_dim,
+            &mut out,
+        );
+
+        assert_eq!(&out[0..2], &[10.0, 11.0]);
+        assert_eq!(&out[2..4], &[10.0, 11.0]);
+        assert_eq!(&out[4..6], &[20.0, 21.0]);
+        assert_eq!(&out[6..8], &[20.0, 21.0]);
+    }
+
+    #[test]
+    fn gqa_honors_the_additive_causal_mask() {
+        let (query_positions, key_positions, q_heads, kv_heads, head_dim) = (2, 2, 1, 1, 2);
+        let queries = vec![0.0f32; query_positions * q_heads * head_dim];
+        let keys = vec![0.0f32; key_positions * kv_heads * head_dim];
+        let values = [2.0f32, 4.0, 10.0, 20.0];
+        let mask = [0.0f32, f32::NEG_INFINITY, 0.0, 0.0];
+        let mut out = vec![0.0f32; query_positions * q_heads * head_dim];
+
+        gqa_attention(
+            &queries,
+            &keys,
+            &values,
+            &mask,
+            query_positions,
+            key_positions,
+            q_heads,
+            kv_heads,
+            head_dim,
+            &mut out,
+        );
+
+        assert_eq!(&out[0..2], &[2.0, 4.0]);
+        assert_eq!(&out[2..4], &[6.0, 12.0]);
     }
 
     #[test]

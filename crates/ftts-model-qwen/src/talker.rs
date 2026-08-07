@@ -18,7 +18,7 @@
 use ftts_kernels::f32ref;
 
 /// Talker geometry. Field values come from `talker_config` in the pinned `config.json`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TalkerConfig {
     /// Model width.
     pub hidden_size: usize,
@@ -619,12 +619,28 @@ pub fn project_text_rows(
     fc2_bias: &[f32],
     output: &mut [f32],
 ) {
-    assert_eq!(input.len(), rows * input_width, "text projection input shape");
-    assert_eq!(fc1_weight.len(), intermediate_width * input_width, "fc1 weight shape");
+    assert_eq!(
+        input.len(),
+        rows * input_width,
+        "text projection input shape"
+    );
+    assert_eq!(
+        fc1_weight.len(),
+        intermediate_width * input_width,
+        "fc1 weight shape"
+    );
     assert_eq!(fc1_bias.len(), intermediate_width, "fc1 bias shape");
-    assert_eq!(fc2_weight.len(), output_width * intermediate_width, "fc2 weight shape");
+    assert_eq!(
+        fc2_weight.len(),
+        output_width * intermediate_width,
+        "fc2 weight shape"
+    );
     assert_eq!(fc2_bias.len(), output_width, "fc2 bias shape");
-    assert_eq!(output.len(), rows * output_width, "text projection output shape");
+    assert_eq!(
+        output.len(),
+        rows * output_width,
+        "text projection output shape"
+    );
 
     let mut activated = vec![0.0f32; rows * intermediate_width];
     f32ref::linear(
