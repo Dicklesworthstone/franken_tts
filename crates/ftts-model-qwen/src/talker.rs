@@ -849,6 +849,36 @@ mod tests {
     }
 
     #[test]
+    fn text_projection_and_per_frame_text_fallback_follow_the_model_order() {
+        let input = [1.0f32, -1.0];
+        let fc1 = [1.0f32, 0.0, 0.0, 1.0];
+        let fc2 = [1.0f32, 1.0];
+        let mut projected = [0.0f32; 1];
+        project_text_rows(
+            &input,
+            1,
+            2,
+            2,
+            1,
+            &fc1,
+            &[0.0, 0.0],
+            &fc2,
+            &[0.0],
+            &mut projected,
+        );
+        let expected = 1.0 / (1.0 + (-1.0f32).exp()) - 1.0 / (1.0 + 1.0f32.exp());
+        assert_eq!(projected, [expected]);
+
+        let code_embedding = [0.25f32, -0.5];
+        let code_embeddings = vec![&code_embedding[..]; CODE_GROUP_COUNT];
+        let mut frame = [0.0f32; 2];
+        form_frame_input(&code_embeddings, None, &[1.0, 2.0], &mut frame);
+        assert_eq!(frame, [5.0, -6.0]);
+        form_frame_input(&code_embeddings, Some(&[3.0, 4.0]), &[1.0, 2.0], &mut frame);
+        assert_eq!(frame, [7.0, -4.0]);
+    }
+
+    #[test]
     fn complete_talker_executes_all_28_layers_and_primary_head() {
         // Small geometry keeps this structural test fast while exercising the real 28-layer
         // schedule, per-layer KV ownership, final norm, and 3,072-way primary-code head.
