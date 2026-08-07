@@ -1001,7 +1001,9 @@ fn layer_norm_in_place(values: &mut [f32], frames: usize, weight: &[f32], bias: 
     }
 }
 
-fn forward_convnext(
+/// Run one causal ConvNeXt block. Public so the conformance harness can gate this exact seam.
+#[must_use]
+pub fn forward_convnext(
     input: &[f32],
     frames: usize,
     channels: usize,
@@ -1091,7 +1093,10 @@ fn forward_residual_unit(
     hidden
 }
 
-fn forward_decoder_block(
+/// Run one BigVGAN upsampling block, returning its output and new frame count.
+/// Public so the conformance harness can gate this exact seam.
+#[must_use]
+pub fn forward_decoder_block(
     input: &[f32],
     frames: usize,
     input_channels: usize,

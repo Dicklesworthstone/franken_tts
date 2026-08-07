@@ -5,12 +5,7 @@
 //! emitted rung receipt carries the oracle tier and SHA-256 digests of both artifacts needed to
 //! re-derive the decision.
 
-use std::{
-    error::Error,
-    fmt,
-    fs,
-    path::Path,
-};
+use std::{error::Error, fmt, fs, path::Path};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -125,10 +120,16 @@ impl fmt::Display for LadderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReadArtifact { artifact, source } => {
-                write!(formatter, "failed to read ladder artifact `{artifact}`: {source}")
+                write!(
+                    formatter,
+                    "failed to read ladder artifact `{artifact}`: {source}"
+                )
             }
             Self::ParseArtifact { artifact, source } => {
-                write!(formatter, "failed to parse ladder artifact `{artifact}`: {source}")
+                write!(
+                    formatter,
+                    "failed to parse ladder artifact `{artifact}`: {source}"
+                )
             }
             Self::InvalidFloor { reason } => {
                 write!(formatter, "invalid nondeterminism floor: {reason}")
@@ -257,13 +258,18 @@ impl LadderRunner {
             source,
         })?;
         let manifest_source = fixture_manifest_path.display().to_string();
-        let manifest_bytes = fs::read(fixture_manifest_path).map_err(|source| {
-            LadderError::ReadArtifact {
+        let manifest_bytes =
+            fs::read(fixture_manifest_path).map_err(|source| LadderError::ReadArtifact {
                 artifact: manifest_source.clone(),
                 source,
-            }
-        })?;
-        Self::from_bytes(tier, floor_source, &floor_bytes, manifest_source, &manifest_bytes)
+            })?;
+        Self::from_bytes(
+            tier,
+            floor_source,
+            &floor_bytes,
+            manifest_source,
+            &manifest_bytes,
+        )
     }
 
     /// Creates a runner from artifact bytes; useful for hermetic tests and embedded evidence.
@@ -279,19 +285,19 @@ impl LadderRunner {
         fixture_manifest_bytes: &[u8],
     ) -> Result<Self, LadderError> {
         let floor_source = floor_source.into();
-        let floor: Value = serde_json::from_slice(floor_bytes).map_err(|source| {
-            LadderError::ParseArtifact {
+        let floor: Value =
+            serde_json::from_slice(floor_bytes).map_err(|source| LadderError::ParseArtifact {
                 artifact: floor_source.clone(),
                 source,
-            }
-        })?;
+            })?;
         let fixture_manifest_source = fixture_manifest_source.into();
-        let fixture_manifest: Value = serde_json::from_slice(fixture_manifest_bytes).map_err(
-            |source| LadderError::ParseArtifact {
-                artifact: fixture_manifest_source.clone(),
-                source,
-            },
-        )?;
+        let fixture_manifest: Value =
+            serde_json::from_slice(fixture_manifest_bytes).map_err(|source| {
+                LadderError::ParseArtifact {
+                    artifact: fixture_manifest_source.clone(),
+                    source,
+                }
+            })?;
         let manifest_tier = fixture_manifest
             .get("oracle_class")
             .and_then(Value::as_str)
@@ -414,22 +420,20 @@ impl LadderRunner {
             .ok_or_else(|| LadderError::InvalidFloor {
                 reason: format!("missing contract_a.{}", rung.floor_key()),
             })?;
-        let status = entry
-            .get("status")
-            .and_then(Value::as_str)
-            .ok_or_else(|| LadderError::InvalidFloor {
+        let status = entry.get("status").and_then(Value::as_str).ok_or_else(|| {
+            LadderError::InvalidFloor {
                 reason: format!("contract_a.{} has no string status", rung.floor_key()),
-            })?;
+            }
+        })?;
         if status != "observed" {
-            let reason = entry
-                .get("reason")
-                .and_then(Value::as_str)
-                .ok_or_else(|| LadderError::InvalidFloor {
+            let reason = entry.get("reason").and_then(Value::as_str).ok_or_else(|| {
+                LadderError::InvalidFloor {
                     reason: format!(
                         "contract_a.{} is `{status}` but has no reason string",
                         rung.floor_key()
                     ),
-                })?;
+                }
+            })?;
             return Ok(FloorDecision::Skip(reason.to_owned()));
         }
 
@@ -449,15 +453,12 @@ impl LadderRunner {
                 Ok(FloorDecision::Compare(ComparisonPolicy::Exact))
             }
             Some(Value::Number(number)) => {
-                let tolerance =
-                    number
-                        .as_f64()
-                        .ok_or_else(|| LadderError::InvalidFloor {
-                            reason: format!(
-                                "contract_a.{}.max_abs is not representable as f64",
-                                rung.floor_key()
-                            ),
-                        })?;
+                let tolerance = number.as_f64().ok_or_else(|| LadderError::InvalidFloor {
+                    reason: format!(
+                        "contract_a.{}.max_abs is not representable as f64",
+                        rung.floor_key()
+                    ),
+                })?;
                 if tolerance.is_sign_negative() || !tolerance.is_finite() {
                     return Err(LadderError::InvalidFloor {
                         reason: format!(
@@ -466,7 +467,9 @@ impl LadderRunner {
                         ),
                     });
                 }
-                Ok(FloorDecision::Compare(ComparisonPolicy::MaximumAbsolute(tolerance)))
+                Ok(FloorDecision::Compare(ComparisonPolicy::MaximumAbsolute(
+                    tolerance,
+                )))
             }
             Some(_) => Err(LadderError::InvalidFloor {
                 reason: format!("contract_a.{}.max_abs is not a number", rung.floor_key()),
@@ -638,7 +641,11 @@ mod tests {
             .expect("floor is valid");
 
         assert_eq!(result.comparison_policy, Some(ComparisonPolicy::Exact));
-        assert_eq!(result.outcome, Outcome::Failed, "no default epsilon is permitted");
+        assert_eq!(
+            result.outcome,
+            Outcome::Failed,
+            "no default epsilon is permitted"
+        );
         assert_eq!(result.receipt["oracle_tier"], "cpu_fp32_fallback");
         assert_eq!(result.receipt["floor_sha256"], sha256(FLOOR.as_bytes()));
         assert_eq!(
@@ -700,7 +707,10 @@ mod tests {
             result.receipt["reason"],
             "the fixture generator records L2+ named module seams, not individual operators"
         );
-        assert!(!runner.scorecard().all_green(), "a skipped L1 cannot be green");
+        assert!(
+            !runner.scorecard().all_green(),
+            "a skipped L1 cannot be green"
+        );
     }
 
     #[test]
