@@ -10,6 +10,62 @@
 //! BF16 inputs to f32 and accumulates its variance in f32, exactly as the resolved QK-Norm contract
 //! requires.
 
+/// Reduction order used by [`linear_with_accumulation`].
+///
+/// The scalar order is the f32 reference used by production code. The lane orders are retained so
+/// the CPU-fp32 fixture test can identify whether a BLAS-style partial reduction is responsible
+/// for a layer-level arithmetic divergence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum F32LinearAccumulation {
+    /// One left-to-right f32 accumulator.
+    Scalar,
+    /// Four independent f32 partial accumulators, reduced in lane order.
+    Lanes4,
+    /// Eight independent f32 partial accumulators, reduced in lane order.
+    Lanes8,
+    /// Four FMA partial accumulators, reduced in lane order.
+    FusedLanes4,
+    /// Eight FMA partial accumulators, reduced in lane order.
+    FusedLanes8,
+}
+
+/// Arithmetic used by [`rms_norm_with_arithmetic`] to form RMSNorm's scale.
+///
+/// The scalar reciprocal-square-root path is the f32 reference used by production code. The other
+/// modes make the exact CPU-fp32 fixture able to discriminate reduction precision and reciprocal
+/// placement without changing that normal path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum F32RmsNormArithmetic {
+    /// Left-to-right f32 reduction and `sqrt(value).recip()`.
+    ScalarReciprocalSqrt,
+    /// Left-to-right f32 reduction and `1.0 / sqrt(value)`.
+    ScalarDivideSqrt,
+    /// Four f32 partial sums, then `sqrt(value).recip()`.
+    Lanes4ReciprocalSqrt,
+    /// Eight f32 partial sums, then `sqrt(value).recip()`.
+    Lanes8ReciprocalSqrt,
+    /// f64 reduction and scale calculation, narrowed only at the final scale.
+    F64ReciprocalSqrt,
+}
+
+/// Association used by [`silu_mul_in_place_with_arithmetic`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum F32SiluArithmetic {
+    /// `x / (1 + exp(-x))`.
+    Divide,
+    /// `x * (1 / (1 + exp(-x)))`, matching `x * sigmoid(x)` association.
+    MultiplyReciprocal,
+}
+
+/// Normalization form used by [`softmax_rows_with_arithmetic`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum F32SoftmaxArithmetic {
+    /// Form one reciprocal then multiply every exponent by it.
+    ReciprocalMultiply,
+    /// Divide every exponent by the sum directly.
+    Divide,
+}
+
 /// Row-major matrix-vector/matrix-matrix product in the layout PyTorch `Linear` stores.
 ///
 /// `x` is `[m, k]`, `weight` is `[n, k]` (out-features major, as `nn.Linear` stores it), and the
@@ -28,6 +84,24 @@ pub fn linear(
     n: usize,
     out: &mut [f32],
 ) {
+    linear_with_accumulation(x, weight, bias, m, k, n, F32LinearAccumulation::Scalar, out);
+}
+
+/// Same operation as [`linear`], with an explicitly chosen f32 dot-product reduction order.
+///
+/// This exists for parity forensics. The normal [`linear`] entry point remains the scalar,
+/// left-to-right reference.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_with_accumulation(
+    x: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    m: usize,
+    k: usize,
+    n: usize,
+    accumulation: F32LinearAccumulation,
+    out: &mut [f32],
+) {
     assert_eq!(x.len(), m * k, "x must be [m, k]");
     assert_eq!(weight.len(), n * k, "weight must be [n, k]");
     assert_eq!(out.len(), m * n, "out must be [m, n]");
@@ -39,11 +113,50 @@ pub fn linear(
         let x_row = &x[row * k..row * k + k];
         for col in 0..n {
             let w_row = &weight[col * k..col * k + k];
-            let mut sum = 0.0f32;
-            for index in 0..k {
-                sum += x_row[index] * w_row[index];
-            }
+            let sum = dot_with_accumulation(x_row, w_row, accumulation);
             out[row * n + col] = bias.map_or(sum, |b| sum + b[col]);
+        }
+    }
+}
+
+fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccumulation) -> f32 {
+    assert_eq!(x.len(), weight.len(), "dot-product inputs must match");
+    match accumulation {
+        F32LinearAccumulation::Scalar => {
+            let mut sum = 0.0f32;
+            for index in 0..x.len() {
+                sum += x[index] * weight[index];
+            }
+            sum
+        }
+        F32LinearAccumulation::Lanes4
+        | F32LinearAccumulation::Lanes8
+        | F32LinearAccumulation::FusedLanes4
+        | F32LinearAccumulation::FusedLanes8 => {
+            let lanes = match accumulation {
+                F32LinearAccumulation::Lanes4 => 4,
+                F32LinearAccumulation::Lanes8 => 8,
+                F32LinearAccumulation::FusedLanes4 => 4,
+                F32LinearAccumulation::FusedLanes8 => 8,
+                F32LinearAccumulation::Scalar => unreachable!("scalar handled above"),
+            };
+            let mut partial = [0.0f32; 8];
+            for index in 0..x.len() {
+                let lane = index % lanes;
+                partial[lane] = match accumulation {
+                    F32LinearAccumulation::FusedLanes4 | F32LinearAccumulation::FusedLanes8 => {
+                        x[index].mul_add(weight[index], partial[lane])
+                    }
+                    F32LinearAccumulation::Scalar
+                    | F32LinearAccumulation::Lanes4
+                    | F32LinearAccumulation::Lanes8 => partial[lane] + x[index] * weight[index],
+                };
+            }
+            let mut sum = 0.0f32;
+            for value in &partial[..lanes] {
+                sum += *value;
+            }
+            sum
         }
     }
 }
@@ -54,34 +167,119 @@ pub fn linear(
 ///
 /// Panics if `x` is not `rows * dim` elements or `weight` is not `dim`.
 pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32, rows: usize, dim: usize, out: &mut [f32]) {
+    rms_norm_with_arithmetic(
+        x,
+        weight,
+        eps,
+        rows,
+        dim,
+        F32RmsNormArithmetic::ScalarReciprocalSqrt,
+        out,
+    );
+}
+
+/// Same operation as [`rms_norm`], with an explicitly selected reduction and scale calculation.
+///
+/// This entry point is for CPU-fp32 parity forensics; [`rms_norm`] remains the normal scalar f32
+/// reference path.
+pub fn rms_norm_with_arithmetic(
+    x: &[f32],
+    weight: &[f32],
+    eps: f32,
+    rows: usize,
+    dim: usize,
+    arithmetic: F32RmsNormArithmetic,
+    out: &mut [f32],
+) {
     assert_eq!(x.len(), rows * dim, "x must be [rows, dim]");
     assert_eq!(weight.len(), dim, "weight must be [dim]");
     assert_eq!(out.len(), rows * dim, "out must be [rows, dim]");
 
     for row in 0..rows {
         let src = &x[row * dim..row * dim + dim];
-        let mut variance = 0.0f32;
-        for value in src {
-            variance += *value * *value;
-        }
-        let scale = (variance / dim as f32 + eps).sqrt().recip();
+        let scale = rms_scale(src, eps, arithmetic);
         for index in 0..dim {
             out[row * dim + index] = src[index] * scale * weight[index];
         }
     }
 }
 
+fn rms_scale(src: &[f32], eps: f32, arithmetic: F32RmsNormArithmetic) -> f32 {
+    match arithmetic {
+        F32RmsNormArithmetic::ScalarReciprocalSqrt => {
+            let sum = sum_squares_f32(src, 1);
+            (sum / src.len() as f32 + eps).sqrt().recip()
+        }
+        F32RmsNormArithmetic::ScalarDivideSqrt => {
+            let sum = sum_squares_f32(src, 1);
+            1.0f32 / (sum / src.len() as f32 + eps).sqrt()
+        }
+        F32RmsNormArithmetic::Lanes4ReciprocalSqrt => {
+            let sum = sum_squares_f32(src, 4);
+            (sum / src.len() as f32 + eps).sqrt().recip()
+        }
+        F32RmsNormArithmetic::Lanes8ReciprocalSqrt => {
+            let sum = sum_squares_f32(src, 8);
+            (sum / src.len() as f32 + eps).sqrt().recip()
+        }
+        F32RmsNormArithmetic::F64ReciprocalSqrt => {
+            let mut sum = 0.0f64;
+            for value in src {
+                let value = f64::from(*value);
+                sum += value * value;
+            }
+            (sum / src.len() as f64 + f64::from(eps)).sqrt().recip() as f32
+        }
+    }
+}
+
+fn sum_squares_f32(src: &[f32], lanes: usize) -> f32 {
+    let mut partial = [0.0f32; 8];
+    for (index, value) in src.iter().enumerate() {
+        partial[index % lanes] += *value * *value;
+    }
+    let mut sum = 0.0f32;
+    for value in &partial[..lanes] {
+        sum += *value;
+    }
+    sum
+}
+
 /// SwiGLU's elementwise half: `silu(gate) * up`, written into `gate`.
 pub fn silu_mul_in_place(gate: &mut [f32], up: &[f32]) {
+    silu_mul_in_place_with_arithmetic(gate, up, F32SiluArithmetic::Divide);
+}
+
+/// Same operation as [`silu_mul_in_place`], with an explicitly chosen f32 association.
+pub fn silu_mul_in_place_with_arithmetic(
+    gate: &mut [f32],
+    up: &[f32],
+    arithmetic: F32SiluArithmetic,
+) {
     assert_eq!(gate.len(), up.len(), "gate and up must match");
     for (g, u) in gate.iter_mut().zip(up) {
         let x = *g;
-        *g = (x / (1.0 + (-x).exp())) * u;
+        let denominator = 1.0 + (-x).exp();
+        let silu = match arithmetic {
+            F32SiluArithmetic::Divide => x / denominator,
+            F32SiluArithmetic::MultiplyReciprocal => x * denominator.recip(),
+        };
+        *g = silu * u;
     }
 }
 
 /// In-place row-wise softmax in f32, max-subtracted for stability.
 pub fn softmax_rows(x: &mut [f32], rows: usize, cols: usize) {
+    softmax_rows_with_arithmetic(x, rows, cols, F32SoftmaxArithmetic::ReciprocalMultiply);
+}
+
+/// Same operation as [`softmax_rows`], with an explicitly selected normalization form.
+pub fn softmax_rows_with_arithmetic(
+    x: &mut [f32],
+    rows: usize,
+    cols: usize,
+    arithmetic: F32SoftmaxArithmetic,
+) {
     assert_eq!(x.len(), rows * cols, "x must be [rows, cols]");
     for row in 0..rows {
         let slice = &mut x[row * cols..row * cols + cols];
@@ -96,9 +294,11 @@ pub fn softmax_rows(x: &mut [f32], rows: usize, cols: usize) {
             *value = (*value - max).exp();
             sum += *value;
         }
-        let inv = sum.recip();
         for value in slice.iter_mut() {
-            *value *= inv;
+            *value = match arithmetic {
+                F32SoftmaxArithmetic::ReciprocalMultiply => *value * sum.recip(),
+                F32SoftmaxArithmetic::Divide => *value / sum,
+            };
         }
     }
 }
@@ -125,6 +325,68 @@ pub fn gqa_attention(
     q_heads: usize,
     kv_heads: usize,
     head_dim: usize,
+    out: &mut [f32],
+) {
+    gqa_attention_with_softmax(
+        queries,
+        keys,
+        values,
+        additive_mask,
+        query_positions,
+        key_positions,
+        q_heads,
+        kv_heads,
+        head_dim,
+        F32SoftmaxArithmetic::ReciprocalMultiply,
+        out,
+    );
+}
+
+/// Same operation as [`gqa_attention`], with an explicitly selected softmax normalization form.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_with_softmax(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    additive_mask: &[f32],
+    query_positions: usize,
+    key_positions: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    softmax_arithmetic: F32SoftmaxArithmetic,
+    out: &mut [f32],
+) {
+    gqa_attention_with_arithmetic(
+        queries,
+        keys,
+        values,
+        additive_mask,
+        query_positions,
+        key_positions,
+        q_heads,
+        kv_heads,
+        head_dim,
+        softmax_arithmetic,
+        F32LinearAccumulation::Scalar,
+        out,
+    );
+}
+
+/// Same operation as [`gqa_attention`], with selected softmax and dot-product reduction forms.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_with_arithmetic(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    additive_mask: &[f32],
+    query_positions: usize,
+    key_positions: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    softmax_arithmetic: F32SoftmaxArithmetic,
+    accumulation: F32LinearAccumulation,
     out: &mut [f32],
 ) {
     assert!(kv_heads > 0, "at least one KV head is required");
@@ -174,24 +436,59 @@ pub fn gqa_attention(
             for (key_position, score) in scores.iter_mut().enumerate() {
                 let key_base = (key_position * kv_heads + kv_head) * head_dim;
                 let key = &keys[key_base..key_base + head_dim];
-                let mut dot = 0.0f32;
-                for lane in 0..head_dim {
-                    dot += query[lane] * key[lane];
-                }
+                let dot = dot_with_accumulation(query, key, accumulation);
                 *score = dot * scale + mask[key_position];
             }
-            softmax_rows(&mut scores, 1, key_positions);
+            softmax_rows_with_arithmetic(&mut scores, 1, key_positions, softmax_arithmetic);
 
             let out_base = query_base;
-            out[out_base..out_base + head_dim].fill(0.0);
-            for (key_position, weight) in scores.iter().copied().enumerate() {
-                let value_base = (key_position * kv_heads + kv_head) * head_dim;
-                let value = &values[value_base..value_base + head_dim];
-                for lane in 0..head_dim {
-                    out[out_base + lane] += weight * value[lane];
-                }
-            }
+            attention_weighted_sum(
+                &scores,
+                values,
+                kv_head,
+                kv_heads,
+                head_dim,
+                accumulation,
+                &mut out[out_base..out_base + head_dim],
+            );
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_weighted_sum(
+    scores: &[f32],
+    values: &[f32],
+    kv_head: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    accumulation: F32LinearAccumulation,
+    out: &mut [f32],
+) {
+    let lanes = match accumulation {
+        F32LinearAccumulation::Scalar => 1,
+        F32LinearAccumulation::Lanes4 | F32LinearAccumulation::FusedLanes4 => 4,
+        F32LinearAccumulation::Lanes8 | F32LinearAccumulation::FusedLanes8 => 8,
+    };
+    for lane in 0..head_dim {
+        let mut partial = [0.0f32; 8];
+        for (key_position, weight) in scores.iter().copied().enumerate() {
+            let value = values[(key_position * kv_heads + kv_head) * head_dim + lane];
+            let partial_index = key_position % lanes;
+            partial[partial_index] = match accumulation {
+                F32LinearAccumulation::FusedLanes4 | F32LinearAccumulation::FusedLanes8 => {
+                    weight.mul_add(value, partial[partial_index])
+                }
+                F32LinearAccumulation::Scalar
+                | F32LinearAccumulation::Lanes4
+                | F32LinearAccumulation::Lanes8 => partial[partial_index] + weight * value,
+            };
+        }
+        let mut sum = 0.0f32;
+        for value in &partial[..lanes] {
+            sum += *value;
+        }
+        out[lane] = sum;
     }
 }
 

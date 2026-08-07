@@ -15,7 +15,9 @@
 //! * **Everything is bias-free** except `text_projection`. `attention_bias` is false in the config,
 //!   so there are no QKV or O biases to load, and a port that allocates them will not notice.
 
-use ftts_kernels::f32ref;
+use ftts_kernels::f32ref::{
+    self, F32LinearAccumulation, F32RmsNormArithmetic, F32SiluArithmetic, F32SoftmaxArithmetic,
+};
 
 /// Talker geometry. Field values come from `talker_config` in the pinned `config.json`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -207,6 +209,68 @@ pub fn forward_layer(
     seq: usize,
     cache: &mut KvCache,
 ) {
+    forward_layer_with_linear_accumulation(
+        config,
+        weights,
+        rotary,
+        mask,
+        hidden,
+        seq,
+        cache,
+        F32LinearAccumulation::Scalar,
+    );
+}
+
+/// Run one decoder layer with an explicitly selected f32 projection reduction order.
+///
+/// [`forward_layer`] is the normal scalar reference path. This entry point makes the reduction
+/// order observable to the CPU-fp32 layer fixture without changing that path.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_layer_with_linear_accumulation(
+    config: &TalkerConfig,
+    weights: &TalkerLayerWeights<'_>,
+    rotary: RotaryRows<'_>,
+    mask: &[f32],
+    hidden: &mut [f32],
+    seq: usize,
+    cache: &mut KvCache,
+    accumulation: F32LinearAccumulation,
+) {
+    forward_layer_with_arithmetic(
+        config,
+        weights,
+        rotary,
+        mask,
+        hidden,
+        seq,
+        cache,
+        accumulation,
+        F32RmsNormArithmetic::ScalarReciprocalSqrt,
+        F32SiluArithmetic::Divide,
+        F32SoftmaxArithmetic::ReciprocalMultiply,
+        F32LinearAccumulation::Scalar,
+    );
+}
+
+/// Run one decoder layer with explicitly selected f32 projection and RMSNorm arithmetic.
+///
+/// [`forward_layer`] is the normal scalar reference path. This entry point is used only to
+/// identify a CPU-fp32 arithmetic-order mismatch at a fixture seam.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_layer_with_arithmetic(
+    config: &TalkerConfig,
+    weights: &TalkerLayerWeights<'_>,
+    rotary: RotaryRows<'_>,
+    mask: &[f32],
+    hidden: &mut [f32],
+    seq: usize,
+    cache: &mut KvCache,
+    accumulation: F32LinearAccumulation,
+    rms_arithmetic: F32RmsNormArithmetic,
+    silu_arithmetic: F32SiluArithmetic,
+    softmax_arithmetic: F32SoftmaxArithmetic,
+    attention_accumulation: F32LinearAccumulation,
+) {
     let hidden_size = config.hidden_size;
     let head_dim = config.head_dim;
     let query_width = config.query_width();
@@ -233,43 +297,47 @@ pub fn forward_layer(
 
     // ── Attention block ────────────────────────────────────────────────────────────────────────
     let mut normed = vec![0.0f32; seq * hidden_size];
-    f32ref::rms_norm(
+    f32ref::rms_norm_with_arithmetic(
         hidden,
         weights.input_layernorm,
         config.rms_norm_eps,
         seq,
         hidden_size,
+        rms_arithmetic,
         &mut normed,
     );
 
     let mut queries = vec![0.0f32; seq * query_width];
     let mut keys = vec![0.0f32; seq * kv_width];
     let mut values = vec![0.0f32; seq * kv_width];
-    f32ref::linear(
+    f32ref::linear_with_accumulation(
         &normed,
         weights.q_proj,
         None,
         seq,
         hidden_size,
         query_width,
+        accumulation,
         &mut queries,
     );
-    f32ref::linear(
+    f32ref::linear_with_accumulation(
         &normed,
         weights.k_proj,
         None,
         seq,
         hidden_size,
         kv_width,
+        accumulation,
         &mut keys,
     );
-    f32ref::linear(
+    f32ref::linear_with_accumulation(
         &normed,
         weights.v_proj,
         None,
         seq,
         hidden_size,
         kv_width,
+        accumulation,
         &mut values,
     );
 
@@ -281,12 +349,13 @@ pub fn forward_layer(
         for head in 0..config.num_attention_heads {
             let offset = position * query_width + head * head_dim;
             let row = &mut queries[offset..offset + head_dim];
-            f32ref::rms_norm(
+            f32ref::rms_norm_with_arithmetic(
                 row,
                 weights.q_norm,
                 config.qk_norm_eps,
                 1,
                 head_dim,
+                rms_arithmetic,
                 &mut scratch,
             );
             row.copy_from_slice(&scratch);
@@ -295,12 +364,13 @@ pub fn forward_layer(
         for head in 0..config.num_key_value_heads {
             let offset = position * kv_width + head * head_dim;
             let row = &mut keys[offset..offset + head_dim];
-            f32ref::rms_norm(
+            f32ref::rms_norm_with_arithmetic(
                 row,
                 weights.k_norm,
                 config.qk_norm_eps,
                 1,
                 head_dim,
+                rms_arithmetic,
                 &mut scratch,
             );
             row.copy_from_slice(&scratch);
@@ -316,7 +386,7 @@ pub fn forward_layer(
     }
 
     let mut context = vec![0.0f32; seq * query_width];
-    f32ref::gqa_attention(
+    f32ref::gqa_attention_with_arithmetic(
         &queries,
         &cache.keys,
         &cache.values,
@@ -326,17 +396,20 @@ pub fn forward_layer(
         config.num_attention_heads,
         config.num_key_value_heads,
         head_dim,
+        softmax_arithmetic,
+        attention_accumulation,
         &mut context,
     );
 
     let mut attention = vec![0.0f32; seq * hidden_size];
-    f32ref::linear(
+    f32ref::linear_with_accumulation(
         &context,
         weights.o_proj,
         None,
         seq,
         query_width,
         hidden_size,
+        accumulation,
         &mut attention,
     );
     for (state, delta) in hidden.iter_mut().zip(&attention) {
@@ -344,46 +417,50 @@ pub fn forward_layer(
     }
 
     // ── MLP block ──────────────────────────────────────────────────────────────────────────────
-    f32ref::rms_norm(
+    f32ref::rms_norm_with_arithmetic(
         hidden,
         weights.post_attention_layernorm,
         config.rms_norm_eps,
         seq,
         hidden_size,
+        rms_arithmetic,
         &mut normed,
     );
 
     let intermediate = config.intermediate_size;
     let mut gate = vec![0.0f32; seq * intermediate];
     let mut up = vec![0.0f32; seq * intermediate];
-    f32ref::linear(
+    f32ref::linear_with_accumulation(
         &normed,
         weights.gate_proj,
         None,
         seq,
         hidden_size,
         intermediate,
+        accumulation,
         &mut gate,
     );
-    f32ref::linear(
+    f32ref::linear_with_accumulation(
         &normed,
         weights.up_proj,
         None,
         seq,
         hidden_size,
         intermediate,
+        accumulation,
         &mut up,
     );
-    f32ref::silu_mul_in_place(&mut gate, &up);
+    f32ref::silu_mul_in_place_with_arithmetic(&mut gate, &up, silu_arithmetic);
 
     let mut down = vec![0.0f32; seq * hidden_size];
-    f32ref::linear(
+    f32ref::linear_with_accumulation(
         &gate,
         weights.down_proj,
         None,
         seq,
         intermediate,
         hidden_size,
+        accumulation,
         &mut down,
     );
     for (state, delta) in hidden.iter_mut().zip(&down) {

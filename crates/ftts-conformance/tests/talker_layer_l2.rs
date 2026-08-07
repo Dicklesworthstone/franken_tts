@@ -17,8 +17,12 @@ use ftts_conformance::{
     },
     report::{OracleTier, Outcome, Receipt},
 };
+use ftts_kernels::f32ref::{
+    F32LinearAccumulation, F32RmsNormArithmetic, F32SiluArithmetic, F32SoftmaxArithmetic,
+};
 use ftts_model_qwen::talker::{
-    KvCache, RotaryRows, TalkerConfig, TalkerLayerWeights, collapse_mrope, forward_layer,
+    KvCache, RotaryRows, TalkerConfig, TalkerLayerWeights, collapse_mrope,
+    forward_layer_with_arithmetic,
 };
 use std::path::{Path, PathBuf};
 
@@ -69,6 +73,43 @@ fn split_axes(array: &NpyArray, seq: usize, head_dim: usize) -> [Vec<f32>; 3] {
         array.data[stride..2 * stride].to_vec(),
         array.data[2 * stride..].to_vec(),
     ]
+}
+
+fn run_layer(
+    config: &TalkerConfig,
+    weights: &TalkerLayerWeights<'_>,
+    rotary: RotaryRows<'_>,
+    mask: &[f32],
+    hidden_in: &[f32],
+    seq: usize,
+    accumulation: F32LinearAccumulation,
+    rms_arithmetic: F32RmsNormArithmetic,
+    silu_arithmetic: F32SiluArithmetic,
+    softmax_arithmetic: F32SoftmaxArithmetic,
+    attention_accumulation: F32LinearAccumulation,
+) -> Vec<f32> {
+    let mut hidden = hidden_in.to_vec();
+    let mut cache = KvCache::new();
+    forward_layer_with_arithmetic(
+        config,
+        weights,
+        rotary,
+        mask,
+        &mut hidden,
+        seq,
+        &mut cache,
+        accumulation,
+        rms_arithmetic,
+        silu_arithmetic,
+        softmax_arithmetic,
+        attention_accumulation,
+    );
+    assert_eq!(
+        cache.len(),
+        seq,
+        "the layer must cache every prefill position"
+    );
+    hidden
 }
 
 #[test]
@@ -191,26 +232,152 @@ fn contract_a_l2_talker_layer_00_cpu_fp32_exact() {
         sections,
     );
 
-    let mut hidden = hidden_in.data.clone();
-    let mut cache = KvCache::new();
-    forward_layer(
+    let rotary = RotaryRows {
+        cos: &cos_rows,
+        sin: &sin_rows,
+    };
+    let hidden = run_layer(
         &config,
         &weights,
-        RotaryRows {
-            cos: &cos_rows,
-            sin: &sin_rows,
-        },
+        rotary,
         &mask.data,
-        &mut hidden,
+        &hidden_in.data,
         seq,
-        &mut cache,
+        F32LinearAccumulation::Scalar,
+        F32RmsNormArithmetic::ScalarReciprocalSqrt,
+        F32SiluArithmetic::Divide,
+        F32SoftmaxArithmetic::ReciprocalMultiply,
+        F32LinearAccumulation::Scalar,
+    );
+    for accumulation in [F32LinearAccumulation::Lanes4, F32LinearAccumulation::Lanes8] {
+        let candidate = run_layer(
+            &config,
+            &weights,
+            rotary,
+            &mask.data,
+            &hidden_in.data,
+            seq,
+            accumulation,
+            F32RmsNormArithmetic::ScalarReciprocalSqrt,
+            F32SiluArithmetic::Divide,
+            F32SoftmaxArithmetic::ReciprocalMultiply,
+            F32LinearAccumulation::Scalar,
+        );
+        let comparison = compare_f32(&expected.data, &candidate, CPU_TIER_TOLERANCE);
+        eprintln!(
+            "ft7 CPU fp32 GEMM_BISECT accumulation={accumulation:?} max_abs={:.16e} over_tolerance={}/{} cosine={:.12}",
+            comparison.max_abs_diff, comparison.over_tolerance, comparison.len, comparison.cosine,
+        );
+    }
+    for accumulation in [
+        F32LinearAccumulation::FusedLanes4,
+        F32LinearAccumulation::FusedLanes8,
+    ] {
+        let candidate = run_layer(
+            &config,
+            &weights,
+            rotary,
+            &mask.data,
+            &hidden_in.data,
+            seq,
+            accumulation,
+            F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
+            F32SiluArithmetic::Divide,
+            F32SoftmaxArithmetic::ReciprocalMultiply,
+            F32LinearAccumulation::Scalar,
+        );
+        let comparison = compare_f32(&expected.data, &candidate, CPU_TIER_TOLERANCE);
+        eprintln!(
+            "ft7 CPU fp32 GEMM_RMSNORM_BISECT accumulation={accumulation:?} rms=Lanes4ReciprocalSqrt max_abs={:.16e} over_tolerance={}/{} cosine={:.12}",
+            comparison.max_abs_diff, comparison.over_tolerance, comparison.len, comparison.cosine,
+        );
+    }
+    for rms_arithmetic in [
+        F32RmsNormArithmetic::ScalarDivideSqrt,
+        F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
+        F32RmsNormArithmetic::Lanes8ReciprocalSqrt,
+        F32RmsNormArithmetic::F64ReciprocalSqrt,
+    ] {
+        let candidate = run_layer(
+            &config,
+            &weights,
+            rotary,
+            &mask.data,
+            &hidden_in.data,
+            seq,
+            F32LinearAccumulation::Scalar,
+            rms_arithmetic,
+            F32SiluArithmetic::Divide,
+            F32SoftmaxArithmetic::ReciprocalMultiply,
+            F32LinearAccumulation::Scalar,
+        );
+        let comparison = compare_f32(&expected.data, &candidate, CPU_TIER_TOLERANCE);
+        eprintln!(
+            "ft7 CPU fp32 RMSNORM_BISECT arithmetic={rms_arithmetic:?} max_abs={:.16e} over_tolerance={}/{} cosine={:.12}",
+            comparison.max_abs_diff, comparison.over_tolerance, comparison.len, comparison.cosine,
+        );
+    }
+    let candidate = run_layer(
+        &config,
+        &weights,
+        rotary,
+        &mask.data,
+        &hidden_in.data,
+        seq,
+        F32LinearAccumulation::Scalar,
+        F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
+        F32SiluArithmetic::MultiplyReciprocal,
+        F32SoftmaxArithmetic::ReciprocalMultiply,
+        F32LinearAccumulation::Scalar,
+    );
+    let comparison = compare_f32(&expected.data, &candidate, CPU_TIER_TOLERANCE);
+    eprintln!(
+        "ft7 CPU fp32 SILU_RMSNORM_BISECT silu=MultiplyReciprocal rms=Lanes4ReciprocalSqrt max_abs={:.16e} over_tolerance={}/{} cosine={:.12}",
+        comparison.max_abs_diff, comparison.over_tolerance, comparison.len, comparison.cosine,
     );
 
-    assert_eq!(
-        cache.len(),
+    let candidate = run_layer(
+        &config,
+        &weights,
+        rotary,
+        &mask.data,
+        &hidden_in.data,
         seq,
-        "the layer must cache every prefill position"
+        F32LinearAccumulation::Scalar,
+        F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
+        F32SiluArithmetic::Divide,
+        F32SoftmaxArithmetic::Divide,
+        F32LinearAccumulation::Scalar,
     );
+    let comparison = compare_f32(&expected.data, &candidate, CPU_TIER_TOLERANCE);
+    eprintln!(
+        "ft7 CPU fp32 SOFTMAX_RMSNORM_BISECT softmax=Divide rms=Lanes4ReciprocalSqrt max_abs={:.16e} over_tolerance={}/{} cosine={:.12}",
+        comparison.max_abs_diff, comparison.over_tolerance, comparison.len, comparison.cosine,
+    );
+    for attention_accumulation in [
+        F32LinearAccumulation::Lanes4,
+        F32LinearAccumulation::Lanes8,
+        F32LinearAccumulation::FusedLanes4,
+    ] {
+        let candidate = run_layer(
+            &config,
+            &weights,
+            rotary,
+            &mask.data,
+            &hidden_in.data,
+            seq,
+            F32LinearAccumulation::Scalar,
+            F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
+            F32SiluArithmetic::Divide,
+            F32SoftmaxArithmetic::Divide,
+            attention_accumulation,
+        );
+        let comparison = compare_f32(&expected.data, &candidate, CPU_TIER_TOLERANCE);
+        eprintln!(
+            "ft7 CPU fp32 ATTENTION_RMSNORM_SOFTMAX_BISECT attention={attention_accumulation:?} rms=Lanes4ReciprocalSqrt softmax=Divide max_abs={:.16e} over_tolerance={}/{} cosine={:.12}",
+            comparison.max_abs_diff, comparison.over_tolerance, comparison.len, comparison.cosine,
+        );
+    }
 
     let comparison = compare_f32(&expected.data, &hidden, CPU_TIER_TOLERANCE);
     eprintln!(
