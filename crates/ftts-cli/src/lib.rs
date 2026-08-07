@@ -1072,12 +1072,37 @@ fn run_say_events(
     };
 
     let Some(voice_path) = args.voice.as_deref() else {
-        return Err(FttsError::Usage(
-            "`ftts say` needs a speaker vector; pass `--voice PATH` holding 1024 little-endian \
-             f32 (4096 bytes). Computing one from reference audio is the ECAPA speaker encoder, \
-             which is not implemented yet, so there is no default voice to fall back to"
-                .to_owned(),
-        ));
+        // A refusal that only restates the requirement leaves the reader with no next action. The
+        // three things they need are: what the file is, why no default exists, and how to actually
+        // get one today — including the fixture path, which is the only speaker vector most people
+        // working in this repo currently have.
+        return Err(FttsError::Usage(format!(
+            "`ftts say` needs a speaker vector, and there is no default voice to fall back to.\n\
+             \n\
+             `--voice PATH` reads a raw 1024-dimensional x-vector: {SPEAKER_VECTOR_BYTES} bytes \
+             holding {TALKER_HIDDEN} little-endian f32, with no header.\n\
+             \n\
+             There is no default because nothing can yet derive one from reference audio. The \
+             ECAPA speaker encoder itself now exists (`ftts_model_qwen::speaker`), but it consumes \
+             a mel spectrogram and no audio-to-mel frontend is implemented, so there is still no \
+             route from a .wav to an x-vector. A zeroed or invented vector would synthesize \
+             confident nonsense rather than fail, so `say` refuses instead of guessing.\n\
+             \n\
+             To get one now, take the captured reference x-vector from the oracle pack (strip the \
+             .npy header, keep the trailing {SPEAKER_VECTOR_BYTES} bytes):\n\
+             \x20   tail -c {SPEAKER_VECTOR_BYTES} \\\n\
+             \x20     {ORACLE_PACK}/synthetic-tone-en/xvector_streaming/stages/prompt_build/prompt.speaker_embedding/tensor.000.npy \\\n\
+             \x20     > voice.spk\n\
+             \x20   ftts say 'Hello.' --model MODEL_DIR --voice voice.spk -o out.wav\n\
+             \n\
+             (that pack location is the default; FTTS_ORACLE_FIXTURES overrides it)\n\
+             \n\
+             Note this is a raw vector, not the .ftvoice pack format \
+             (frankentts-p4-ftvoice-format-x0p), which does not exist yet either.",
+            SPEAKER_VECTOR_BYTES = synth::SPEAKER_VECTOR_BYTES,
+            TALKER_HIDDEN = synth::SPEAKER_VECTOR_BYTES / 4,
+            ORACLE_PACK = "~/.cache/frankentts/oracle-fixtures/ft7-cpu-fp32-r1",
+        )));
     };
     let speaker = synth::read_speaker_vector(voice_path)?;
 

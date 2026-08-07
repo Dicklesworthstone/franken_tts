@@ -478,9 +478,20 @@ fn engine_synthesize_reproduces_the_whole_oracle_utterance_exactly() {
         trailing_text_hidden: trailing_rows,
     };
 
+    // Bound the run just above the capture rather than leaning on the 8,192-frame default.
+    //
+    // Neither side necessarily emits EOS (see the module docs), so an unbounded engine would decode
+    // thousands of fp32 frames to prove nothing beyond what the capture covers. Two frames of slack
+    // is exactly what the assertions need: one to reach the post-capture step whose logits the
+    // oracle kept, and one more so the ceiling is never what ended the utterance.
+    let frame_ceiling = expected_frames as u64 + 2;
     let engine = TtsEngine::new(EngineConfig {
         // The f32 reference forward is deliberately unoptimized; give it room.
         synthesis_stage_budget: Duration::from_secs(600),
+        admission: ftts_core::admission::AdmissionPolicy {
+            max_new_tokens: frame_ceiling,
+            ..ftts_core::admission::AdmissionPolicy::default()
+        },
         ..EngineConfig::default()
     })
     .expect("engine constructs");
@@ -511,19 +522,15 @@ fn engine_synthesize_reproduces_the_whole_oracle_utterance_exactly() {
          frames, so nothing about the stop could be concluded"
     );
 
-    // Enough frames to cover the capture. Fewer means we stopped somewhere the oracle did not.
-    assert!(
-        result.generated_frames >= expected_frames as u64,
-        "engine emitted only {} frames; the oracle captured {expected_frames}",
-        result.generated_frames
-    );
     assert_eq!(
         result.code_frames.len() as u64,
         result.generated_frames,
         "generated_frames must agree with the frames actually carried"
     );
 
-    // Every captured frame, code for code, with the first divergence localized by frame and depth.
+    // Compare the overlap FIRST, so a divergence is reported where it happened rather than as a
+    // frame-count mismatch. A count difference is usually a *consequence* of codes going wrong
+    // several frames earlier, and "emitted 20, expected 255" does not say where.
     let actual: Vec<i64> = result
         .code_frames
         .iter()
@@ -544,11 +551,22 @@ fn engine_synthesize_reproduces_the_whole_oracle_utterance_exactly() {
         .find(|(_, (ours, theirs))| ours != theirs)
     {
         panic!(
-            "code divergence at frame {} depth {}: ours {ours}, oracle {theirs}",
+            "code divergence at frame {} depth {}: ours {ours}, oracle {theirs} \
+             (matched {index} codes = {} full frames before diverging)",
             index / CODE_GROUP_COUNT,
-            index % CODE_GROUP_COUNT
+            index % CODE_GROUP_COUNT,
+            index / CODE_GROUP_COUNT
         );
     }
+
+    // Only now the length: with the overlap proven identical, a count difference is exactly a stop
+    // disagreement and nothing else.
+    assert!(
+        result.generated_frames >= expected_frames as u64,
+        "codes agree over all {} frames the engine produced, but it stopped there while the \
+         oracle continued to {expected_frames} frames — the engine ends the utterance early",
+        result.generated_frames
+    );
     assert_eq!(
         actual, expected_codes.data,
         "whole-utterance codes must match the oracle exactly"

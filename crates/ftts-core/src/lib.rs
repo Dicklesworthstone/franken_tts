@@ -33,6 +33,39 @@ const DEFAULT_SYNTHESIS_BUDGET: Duration = Duration::from_secs(30);
 const DEFAULT_ENROLL_BUDGET: Duration = Duration::from_secs(30);
 const BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
 
+/// Wall time allowed per generated frame, on top of the stage's startup allowance.
+///
+/// A flat whole-stage deadline cannot tell "the model is hung" from "the caller asked for more
+/// speech", and it answers both with the same refusal. That is what made a twelve-word utterance
+/// fail while a two-word one passed: nothing was wrong, the request was simply longer. Bounding the
+/// *rate* instead is length-independent, which is the property a budget actually wants.
+///
+/// The number is measured, not guessed. On the machine this was calibrated on, release synthesis
+/// runs ~1.05 s/frame (20 frames in 20.9 s), so 8 s/frame leaves ~7.6x headroom for a colder or
+/// busier host while still catching a genuine stall within one frame. This is deliberately loose:
+/// the codebase is pre-optimization (the whole project exists to move this number), so a tight
+/// budget here would encode today's slowness as tomorrow's contract.
+const DEFAULT_SYNTHESIS_FRAME_BUDGET: Duration = Duration::from_secs(8);
+
+/// How much slower an unoptimized build is, applied to both synthesis budgets.
+///
+/// Measured on the same machine and the same utterance as the frame budget above: a debug build
+/// spent 26.8 s loading where release spent 2.2 s (12x), and had not finished the same 20 frames
+/// after 20 minutes where release took 20.9 s — so >57x on the decode loop, or >60 s/frame.
+///
+/// That measurement is a lower bound, not a clean one: the run shared the machine with concurrent
+/// cargo builds, so some of the 57x is contention rather than the profile. 32x is chosen to sit
+/// above the honest part of that range with room to spare — at 32x the per-frame allowance is 256 s
+/// against >60 s observed, roughly 4x headroom, matching the release tier's intent rather than
+/// leaving debug on a knife edge. The cost of being too generous is only that a genuinely hung
+/// debug run takes a few minutes to be caught; the cost of being too tight is refusing correct
+/// work, which is the failure this whole mechanism exists to stop.
+///
+/// This exists because a developer running `cargo test` or `cargo run` without `--release` is doing
+/// something legitimate, and being told their correct request "exceeded its budget" teaches them
+/// the engine is broken when it is only slow.
+const DEBUG_BUILD_SLOWDOWN: u32 = 32;
+
 /// Process-wide engine defaults read once from `FTTS_STAGE_BUDGET_*_MS`.
 ///
 /// The initial budget names are `FTTS_STAGE_BUDGET_SYNTHESIS_MS` and
@@ -48,8 +81,19 @@ pub fn process_engine_config() -> EngineConfig {
 pub struct EngineConfig {
     /// Capacity for each independent PCM and event queue.
     pub stream_queue_capacity: usize,
-    /// Maximum wall time for one synthesis CPU stage.
+    /// Wall time allowed for one synthesis stage *before* the per-frame allowance is added.
+    ///
+    /// This is the startup grace: prefill, cache warmup, and the first frame. It is not the whole
+    /// stage's ceiling — see [`Self::synthesis_frame_budget`], which extends the deadline as frames
+    /// are actually produced. A generator that never yields its first frame still trips at exactly
+    /// this value, so this remains the knob that catches a hang.
     pub synthesis_stage_budget: Duration,
+    /// Wall time added to the synthesis deadline for each frame already generated.
+    ///
+    /// This is what makes the budget scale with the length of the utterance instead of refusing
+    /// long ones. Zero is rejected by [`Self::validate`]: it would silently restore the flat
+    /// whole-stage deadline this field exists to replace.
+    pub synthesis_frame_budget: Duration,
     /// Maximum wall time for one enrollment CPU stage.
     pub enroll_stage_budget: Duration,
     /// Predicted-peak-memory policy applied to every synthesis request.
@@ -58,12 +102,30 @@ pub struct EngineConfig {
 
 impl Default for EngineConfig {
     fn default() -> Self {
+        // The synthesis budgets are scaled by build profile; enrollment is not, because it does no
+        // per-frame model work and its 30 s is not close to binding.
+        let slowdown = build_profile_slowdown();
         Self {
             stream_queue_capacity: DEFAULT_QUEUE_CAPACITY,
-            synthesis_stage_budget: DEFAULT_SYNTHESIS_BUDGET,
+            synthesis_stage_budget: DEFAULT_SYNTHESIS_BUDGET * slowdown,
+            synthesis_frame_budget: DEFAULT_SYNTHESIS_FRAME_BUDGET * slowdown,
             enroll_stage_budget: DEFAULT_ENROLL_BUDGET,
             admission: admission::AdmissionPolicy::default(),
         }
+    }
+}
+
+/// The multiplier applied to the synthesis budgets for the current build profile.
+///
+/// `debug_assertions` is the available proxy for "unoptimized". It is not exact — a release build
+/// with `debug-assertions = true` is charged the debug multiplier — but erring toward the larger
+/// budget only costs a hung run some extra seconds before it is caught, while erring the other way
+/// refuses correct work, which is the failure this whole mechanism exists to stop.
+const fn build_profile_slowdown() -> u32 {
+    if cfg!(debug_assertions) {
+        DEBUG_BUILD_SLOWDOWN
+    } else {
+        1
     }
 }
 
@@ -73,6 +135,10 @@ impl EngineConfig {
         config.synthesis_stage_budget = stage_budget_from_environment(
             "FTTS_STAGE_BUDGET_SYNTHESIS_MS",
             config.synthesis_stage_budget,
+        );
+        config.synthesis_frame_budget = stage_budget_from_environment(
+            "FTTS_STAGE_BUDGET_FRAME_MS",
+            config.synthesis_frame_budget,
         );
         config.enroll_stage_budget = stage_budget_from_environment(
             "FTTS_STAGE_BUDGET_ENROLL_MS",
@@ -95,7 +161,10 @@ impl EngineConfig {
                 "stream queue capacity must be greater than zero",
             ));
         }
-        if self.synthesis_stage_budget.is_zero() || self.enroll_stage_budget.is_zero() {
+        if self.synthesis_stage_budget.is_zero()
+            || self.synthesis_frame_budget.is_zero()
+            || self.enroll_stage_budget.is_zero()
+        {
             return Err(EngineError::InvalidConfiguration(
                 "stage budgets must be greater than zero",
             ));
@@ -788,7 +857,14 @@ impl TtsEngine {
             stage: EngineStage::Synthesis,
         });
         let started = Instant::now();
-        let budget = self.config.synthesis_stage_budget;
+        // The deadline rolls forward as frames are produced: startup grace, plus one frame budget
+        // for every frame already in hand. A stalled generator makes no progress, so its deadline
+        // stops moving and it is caught within one frame budget of wherever it stopped — while a
+        // caller who simply asked for more speech is granted proportionally more time instead of
+        // being refused for it. Total work stays bounded by `predicted_max_frames` regardless, so
+        // dropping the flat whole-stage ceiling gives up no safety.
+        let startup_budget = self.config.synthesis_stage_budget;
+        let frame_budget = self.config.synthesis_frame_budget;
         let mut code_frames: Vec<CodeFrame> = Vec::new();
         frame_generator
             .begin_utterance(&prepared)
@@ -799,7 +875,13 @@ impl TtsEngine {
                     event: HealthEvent::Cancelled,
                 });
             })?;
-            if started.elapsed() > budget {
+            // Saturating, because a caller-supplied frame budget times a large frame count can
+            // overflow `Duration`; an unreachable deadline is the right answer there, not a panic.
+            let deadline = frame_budget
+                .checked_mul(u32::try_from(code_frames.len()).unwrap_or(u32::MAX))
+                .and_then(|earned| earned.checked_add(startup_budget))
+                .unwrap_or(Duration::MAX);
+            if started.elapsed() > deadline {
                 observer.on_event(SynthesisEvent::Health {
                     event: HealthEvent::BudgetExceeded,
                 });
@@ -970,6 +1052,158 @@ mod tests {
             ..EngineConfig::default()
         })
         .expect("test engine builds")
+    }
+
+    /// An engine with both synthesis budgets pinned, for exercising the rolling deadline.
+    fn engine_with_frame_budget(startup: Duration, per_frame: Duration) -> TtsEngine {
+        TtsEngine::new(EngineConfig {
+            synthesis_stage_budget: startup,
+            synthesis_frame_budget: per_frame,
+            ..EngineConfig::default()
+        })
+        .expect("test engine builds")
+    }
+
+    /// Emits `remaining` frames, each costing `per_frame`, then either stops at EOS or hangs.
+    ///
+    /// Real slowness and a real hang differ only in whether progress continues, which is exactly
+    /// what the rolling deadline keys on — so both have to be expressible by one generator.
+    /// `stall: None` ends the utterance cleanly; `Some(d)` wedges it, so the deadline is what ends
+    /// it. Getting this wrong is easy and silent: a generator that hangs instead of stopping makes
+    /// the "slow but legal" case fail as a budget refusal and look like the bug it was testing for.
+    struct PacedFrameGenerator {
+        remaining: usize,
+        per_frame: Duration,
+        stall: Option<Duration>,
+        began: bool,
+    }
+
+    impl FrameGenerator for PacedFrameGenerator {
+        fn begin_utterance(&mut self, _prepared: &PreparedText) -> Result<(), GenerationError> {
+            self.began = true;
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError> {
+            assert!(self.began, "next_frame before begin_utterance");
+            if self.remaining == 0 {
+                let Some(stall) = self.stall else {
+                    return Ok(None);
+                };
+                thread::sleep(stall);
+                return Ok(Some(CodeFrame { codes: vec![0; 16] }));
+            }
+            self.remaining -= 1;
+            thread::sleep(self.per_frame);
+            Ok(Some(CodeFrame { codes: vec![0; 16] }))
+        }
+    }
+
+    /// The humane case: steady progress that would blow a flat whole-stage deadline still finishes.
+    ///
+    /// This is the regression that motivated the rolling budget — a twelve-word utterance was
+    /// refused for being long while a two-word one passed, with nothing actually wrong. Ten frames
+    /// at 20 ms each need ~200 ms, far past the 50 ms startup grace; only the per-frame term makes
+    /// the run legal, so a reversion to a flat ceiling fails here.
+    #[test]
+    fn steady_progress_past_the_startup_grace_is_not_refused_for_being_long() {
+        let engine = engine_with_frame_budget(Duration::from_millis(50), Duration::from_millis(30));
+        let observer = RecordingObserver::default();
+        let mut generator = PacedFrameGenerator {
+            remaining: 10,
+            per_frame: Duration::from_millis(20),
+            stall: None,
+            began: false,
+        };
+
+        let result = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &CancellationToken::new(),
+                &observer,
+            )
+            .expect("a steadily-progressing run must not be refused");
+
+        assert_eq!(
+            result.generated_frames, 10,
+            "all ten frames must survive; a flat 50 ms ceiling would have cut this at ~2"
+        );
+    }
+
+    /// The other half: a generator that stops progressing is still caught, and caught promptly.
+    ///
+    /// Without this, "scale the budget with the work" could be satisfied by removing the budget.
+    #[test]
+    fn a_generator_that_stops_progressing_is_still_caught_within_its_earned_deadline() {
+        let engine = engine_with_frame_budget(Duration::from_millis(50), Duration::from_millis(30));
+        let observer = RecordingObserver::default();
+        let mut generator = PacedFrameGenerator {
+            remaining: 3,
+            per_frame: Duration::from_millis(1),
+            stall: Some(Duration::from_millis(400)),
+            began: false,
+        };
+
+        let started = Instant::now();
+        let error = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &CancellationToken::new(),
+                &observer,
+            )
+            .expect_err("a stalled generator must still be refused");
+        let elapsed = started.elapsed();
+
+        assert_eq!(error, EngineError::BudgetExceeded(EngineStage::Synthesis));
+        assert!(
+            observer.events().contains(&SynthesisEvent::Health {
+                event: HealthEvent::BudgetExceeded,
+            }),
+            "the stall must be reported on the health channel, not only as a return value"
+        );
+        // Three frames earn 50 + 3*30 = 140 ms. One 400 ms stall crosses it; the run must end on
+        // that stall rather than accumulating further deadline it never earned.
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "stall detection took {elapsed:?}; the deadline is not supposed to keep growing while \
+             no frames are produced"
+        );
+    }
+
+    /// A zero per-frame budget silently restores the flat deadline, so it is a configuration error.
+    #[test]
+    fn a_zero_frame_budget_is_rejected_rather_than_collapsing_to_a_flat_deadline() {
+        let built = TtsEngine::new(EngineConfig {
+            synthesis_frame_budget: Duration::ZERO,
+            ..EngineConfig::default()
+        });
+        assert!(
+            matches!(built, Err(EngineError::InvalidConfiguration(_))),
+            "a zero per-frame budget must be refused, not accepted as a flat deadline"
+        );
+    }
+
+    /// The unoptimized build gets a larger allowance, because it is slower for reasons that are
+    /// not the caller's fault. Asserting the relationship rather than the constant keeps this
+    /// honest if the measured multiplier is ever re-calibrated.
+    #[test]
+    fn an_unoptimized_build_is_granted_a_larger_synthesis_budget() {
+        let config = EngineConfig::default();
+        let expected = u32::from(cfg!(debug_assertions)) * (DEBUG_BUILD_SLOWDOWN - 1) + 1;
+        assert_eq!(
+            config.synthesis_frame_budget,
+            DEFAULT_SYNTHESIS_FRAME_BUDGET * expected
+        );
+        assert_eq!(
+            config.synthesis_stage_budget,
+            DEFAULT_SYNTHESIS_BUDGET * expected
+        );
+        // Enrollment does no per-frame model work, so it is deliberately not scaled.
+        assert_eq!(config.enroll_stage_budget, DEFAULT_ENROLL_BUDGET);
     }
 
     /// Emits a fixed number of all-zero frames, then EOS. Panics if the loop skips prefill.

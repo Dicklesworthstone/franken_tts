@@ -41,6 +41,7 @@ pub const DOCUMENTED_ENVIRONMENT: &[&str] = &[
     "FTTS_FORCE_ARCH",
     "FTTS_NUMA",
     "FTTS_STAGE_BUDGET_SYNTHESIS_MS",
+    "FTTS_STAGE_BUDGET_FRAME_MS",
     "FTTS_STAGE_BUDGET_ENROLL_MS",
 ];
 
@@ -1006,8 +1007,15 @@ pub fn health_violation_event(
         ftts_core::HealthEvent::Violation(violation) => (violation.to_string(), violation.remedy()),
         ftts_core::HealthEvent::BudgetExceeded => (
             "a stage exceeded its configured budget".to_owned(),
-            "raise FTTS_STAGE_BUDGET_SYNTHESIS_MS or shorten the request; the partial result is \
-             not a completed utterance",
+            // The synthesis deadline is startup grace plus one frame budget per frame produced, so
+            // which knob to reach for depends on where it stopped: no frames means startup, some
+            // frames means the per-frame rate. Naming only the first sent readers to the wrong one.
+            "the run stopped making progress fast enough, which is not the same as the request \
+             being too long — the deadline already grows with each frame produced. If it stopped \
+             before the first frame, raise FTTS_STAGE_BUDGET_SYNTHESIS_MS (startup grace); if it \
+             stopped mid-utterance, raise FTTS_STAGE_BUDGET_FRAME_MS (per-frame rate). An \
+             unoptimized build is already granted 32x both. The partial result is not a completed \
+             utterance",
         ),
         ftts_core::HealthEvent::Cancelled => (
             "the run observed cooperative cancellation".to_owned(),

@@ -181,9 +181,26 @@ fn apply_talker_processors(
     scores: &mut [f32],
     group_zero_history: &[u32],
 ) -> Result<(), SamplerError> {
+    // Once per *distinct* token, never once per occurrence.
+    //
+    // The reference processor is gather → transform → scatter over `input_ids`. Duplicate ids all
+    // gather the same original score and scatter writes that one value, so a code appearing four
+    // times is penalized exactly as much as a code appearing once. Applying the penalty per
+    // occurrence instead compounds it (1.05^n) and progressively crushes any repeated code until
+    // EOS out-scores it — the talker then ends the utterance early, mid-speech, on nothing but
+    // repetition. Observed against the ft7 oracle: code 1657 held for four frames fell 28.425 →
+    // 23.385 under compounding and lost to EOS at 24.146, stopping us at frame 20 where the
+    // reference ran on to 255.
+    let mut penalized = vec![false; scores.len()];
     for &token in group_zero_history {
         let index =
             usize::try_from(token).map_err(|_| SamplerError::InvalidTalkerHistoryToken(token))?;
+        let Some(already) = penalized.get_mut(index) else {
+            return Err(SamplerError::InvalidTalkerHistoryToken(token));
+        };
+        if std::mem::replace(already, true) {
+            continue;
+        }
         let Some(score) = scores.get_mut(index) else {
             return Err(SamplerError::InvalidTalkerHistoryToken(token));
         };
@@ -380,6 +397,53 @@ mod tests {
             .expect("valid talker logits");
 
         assert_eq!(token, 8, "a repeated negative score is multiplied by 1.05");
+    }
+
+    /// A repeated code is penalized once, not once per repeat.
+    ///
+    /// The reference gathers/scatters over `input_ids`, so duplicates collapse. Compounding the
+    /// penalty instead makes any held code decay by 1.05^n; the practical symptom is the talker
+    /// choosing EOS over a legitimately sustained code and truncating speech.
+    #[test]
+    fn contract_a_l3_talker_repetition_penalty_applies_once_per_distinct_token() {
+        let mut logits = vec![f32::NEG_INFINITY; TALKER_VOCAB_SIZE];
+        // Held four times. Penalized once, 10.0 becomes 9.52 and stays ahead of 9.0; compounded by
+        // 1.05^4 it becomes 8.23 and loses. The rival sits between the two outcomes on purpose.
+        logits[7] = 10.0;
+        logits[8] = 9.0;
+
+        let token = QwenSampler::seeded(1)
+            .select_talker(&logits, &[7, 7, 7, 7], SamplingMode::CanonicalGreedy)
+            .expect("valid talker logits");
+
+        assert_eq!(
+            token, 7,
+            "four repeats must penalize 10.0 exactly once (9.52), keeping it above the 9.0 rival; \
+             compounding would give 8.23 and hand the frame to the wrong code"
+        );
+    }
+
+    /// The same compounding bug, at the boundary that actually bit: EOS winning by attrition.
+    #[test]
+    fn contract_a_l3_a_sustained_code_does_not_decay_into_a_spurious_eos() {
+        let mut logits = vec![f32::NEG_INFINITY; TALKER_VOCAB_SIZE];
+        // The ft7 numbers: a code held four frames, against an EOS that never moves.
+        logits[1657] = 28.425;
+        logits[CODEC_EOS_TOKEN_ID as usize] = 24.146;
+
+        let token = QwenSampler::seeded(1)
+            .select_talker(
+                &logits,
+                &[1221, 1014, 1657, 1657, 1657, 1657],
+                SamplingMode::CanonicalGreedy,
+            )
+            .expect("valid talker logits");
+
+        assert_eq!(
+            token, 1657,
+            "a sustained code must not be penalized below EOS by its own repetition; \
+             compounding drops it to 23.385 and ends the utterance mid-speech"
+        );
     }
 
     #[test]
