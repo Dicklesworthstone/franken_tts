@@ -660,6 +660,7 @@ dependencies = [
  "ftts-kernels",
  "ftts-model-qwen",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

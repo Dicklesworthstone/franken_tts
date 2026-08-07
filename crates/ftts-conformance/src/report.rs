@@ -84,6 +84,29 @@ pub enum Outcome {
     ExpectedFailure,
 }
 
+/// Which reference-oracle execution tier produced the expected values.
+///
+/// The tiers intentionally distinguish the CPU FP32 fallback from the native CUDA oracle. A
+/// receipt may only claim the tier it actually exercised; a CPU green is not native-golden proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OracleTier {
+    /// The pinned reference stack running through the CPU FP32 fallback path.
+    CpuFp32Fallback,
+    /// The pinned reference stack running on the native CUDA execution path.
+    NativeCuda,
+}
+
+impl OracleTier {
+    /// The stable receipt wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CpuFp32Fallback => "cpu_fp32_fallback",
+            Self::NativeCuda => "native_cuda",
+        }
+    }
+}
+
 impl Outcome {
     /// The stable wire string used in receipts.
     #[must_use]
@@ -212,6 +235,9 @@ pub struct Receipt {
     seed: Option<u64>,
     elapsed: Option<Duration>,
     detail: Option<Value>,
+    oracle_tier: Option<OracleTier>,
+    floor_sha256: Option<String>,
+    fixture_manifest_sha256: Option<String>,
 }
 
 impl Receipt {
@@ -233,6 +259,9 @@ impl Receipt {
             seed: None,
             elapsed: None,
             detail: None,
+            oracle_tier: None,
+            floor_sha256: None,
+            fixture_manifest_sha256: None,
         }
     }
 
@@ -296,6 +325,28 @@ impl Receipt {
         self
     }
 
+    /// Records the reference-oracle tier whose fixtures supplied the expected values.
+    #[must_use]
+    pub const fn oracle_tier(mut self, oracle_tier: OracleTier) -> Self {
+        self.oracle_tier = Some(oracle_tier);
+        self
+    }
+
+    /// Binds a ladder receipt to the exact floor and fixture manifest it consumed.
+    ///
+    /// Both hashes are SHA-256 digests of whole artifacts, not the fast diagnostic FNV hashes
+    /// used for stage-localization. They let an evidence bundle be independently re-derived.
+    #[must_use]
+    pub fn ladder_artifacts(
+        mut self,
+        floor_sha256: impl Into<String>,
+        fixture_manifest_sha256: impl Into<String>,
+    ) -> Self {
+        self.floor_sha256 = Some(floor_sha256.into());
+        self.fixture_manifest_sha256 = Some(fixture_manifest_sha256.into());
+        self
+    }
+
     /// Renders the receipt as a single JSON object.
     #[must_use]
     pub fn to_json(&self) -> Value {
@@ -312,6 +363,9 @@ impl Receipt {
             "seed": self.seed,
             "elapsed_ms": self.elapsed.map(|d| d.as_secs_f64() * 1000.0),
             "detail": self.detail,
+            "oracle_tier": self.oracle_tier.map(OracleTier::as_str),
+            "floor_sha256": self.floor_sha256,
+            "fixture_manifest_sha256": self.fixture_manifest_sha256,
         })
     }
 
@@ -459,6 +513,8 @@ mod tests {
                     .with_capture_provenance("cpu_fp32_fallback", "cpu", "float32"),
             )
             .tolerance(1.5e-3, "docs/truth-pack/nondeterminism-floor.json")
+            .oracle_tier(OracleTier::CpuFp32Fallback)
+            .ladder_artifacts("floor-sha256", "fixture-manifest-sha256")
             .seed(42)
             .elapsed(Duration::from_millis(12));
 
@@ -477,6 +533,9 @@ mod tests {
             value["tolerance_source"],
             "docs/truth-pack/nondeterminism-floor.json"
         );
+        assert_eq!(value["oracle_tier"], "cpu_fp32_fallback");
+        assert_eq!(value["floor_sha256"], "floor-sha256");
+        assert_eq!(value["fixture_manifest_sha256"], "fixture-manifest-sha256");
         assert_eq!(value["seed"], 42);
         // One JSON object per line keeps CI aggregation trivial.
         assert!(!receipt.to_line().contains('\n'));

@@ -5,13 +5,58 @@ Companion document to [`COMPREHENSIVE_PLAN_FOR_FRANKEN_TTS.md`](../COMPREHENSIVE
 
 | Section | Owning bead | Status |
 |---|---|---|
-| §1 Contract A — `ConformanceExact` | `frankentts-v-ladder-runner-zmk` | not written |
+| §1 Contract A — `ConformanceExact` | `frankentts-v-ladder-runner-zmk`; L1 definition: `frankentts-gdq` | L1 operationalized; remaining contract not written |
 | §2 Contract B — `ProductionQuality` | `frankentts-v-metamorphic-0wq` | not written |
 | §3 Math modes & determinism scope | `frankentts-p0-engine-77h` | not written |
 | **§4 The listening protocol** | **`frankentts-v-listening-25m`** | **operationalized (this document)** |
 
-Sections 1–3 are deliberately unwritten placeholders, not stubs to be filled with prose — the
-beads above own them. Do not merge against §4 to add them; §4 is self-contained.
+Sections 2–3 are deliberately unwritten placeholders, not stubs to be filled with prose — the
+beads above own them. Section 1 contains only the bounded L1 definition below; the ladder-runner
+bead owns its receipt implementation and every other Contract-A rung. Do not merge against §4 to
+add them; §4 is self-contained.
+
+---
+
+## 1. Contract A — `ConformanceExact`: L1 kernel-equivalence rung
+
+**Decision (`frankentts-gdq`): L1 is an implementation-side scalar-vs-dispatched-kernel
+comparison, not a reference-oracle per-operator activation comparison.** The fixture generator
+currently captures named module seams, which are L2+ evidence. Calling its absent per-operator
+captures an L1 failure would make Phase 1 unpassable by construction; inventing a fixture would
+make the ladder look more precise than it is. The reference semantics remain the responsibility
+of L2+ oracle comparisons.
+
+L1 proves a different, necessary property: on the exact same input, the shipped implementation
+selected for an ISA has the same result as the named scalar reference kernel. It is the gate that
+permits a SIMD/intrinsic, packing, or dispatch change to participate in Contract A; it does **not**
+claim agreement with Qwen's Python implementation.
+
+| Scope | Required comparison | Pass condition |
+|---|---|---|
+| Integer kernels (including quantized GEMM accumulators) | scalar reference vs every supported dispatched ISA route | exact elementwise equality, including saturated-extreme inputs at the model's real worst-case K |
+| Floating-point kernels in `strict` mode | scalar reference vs every supported dispatched ISA route | exact elementwise equality when the operation's contract permits it; otherwise the explicitly ledgered ULP/max-abs budget derived for that kernel, with matching finite-value behavior |
+| Floating-point kernels in `fast` mode | strict scalar reference vs the selected fast route | the route's declared, ledgered budget and all non-finite checks; a fast-mode pass never upgrades a strict-mode claim |
+
+Every L1 case must exercise the real shape(s), edge sizes, signed extremes, zero/denormal and
+non-finite policy, plus any captured L2 seam inputs available for the operation. Its receipt must
+name the operation, scalar implementation, dispatched implementation and ISA, math mode, shape,
+input provenance/seed, comparison policy, and first divergent coordinate with summary statistics.
+A missing fast route is `not_applicable`; a route that exists but is not executed, a missing scalar
+reference, or an unavailable required input is `skipped` and makes the L1 bit non-green. `xfail`
+is a failure for this gate.
+
+The ladder runner determines applicability from the routes compiled into the subject artifact. If
+the artifact has no dispatched kernel routes yet, L1 is `not_applicable` rather than `skipped`:
+there is no implementation divergence for L1 to compare. Once a route exists, a passing L1 receipt
+for that route is mandatory before the artifact can be all-green. This is narrow by design: it
+unblocks the Phase-1 scalar-forward exit while preserving a hard proof obligation for every future
+SIMD or ISA-specific path.
+
+`docs/truth-pack/nondeterminism-floor.json` intentionally continues to report
+`L1_operator_seams: not_observed`. That field records **reference-oracle capture coverage**, which
+L1 no longer asks it to provide; it is neither a tolerance nor a required L1 receipt. The
+ladder-runner must report this L1 definition as `L1_kernel_equivalence`, separate from the oracle
+floor's L2+ stage envelopes.
 
 ---
 

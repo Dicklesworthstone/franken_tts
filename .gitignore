@@ -24,3 +24,4 @@ docs/truth-pack/snapshots/
 # Python bytecode from the verification harnesses
 __pycache__/
 *.pyc
+.oracle-venv/

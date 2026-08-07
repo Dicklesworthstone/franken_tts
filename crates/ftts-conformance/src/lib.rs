@@ -113,6 +113,7 @@
 
 pub mod compare;
 pub mod gate;
+pub mod ladder;
 pub mod report;
 
 /// The imports a conformance test almost always wants.
@@ -128,8 +129,8 @@ pub mod prelude {
         ExecutionPath, ModelGate, NONEXISTENT_FALLBACK, require_native_execution,
     };
     pub use crate::report::{
-        CaptureProvenance, FixtureProvenance, Outcome, Receipt, Stage, bytes_hash, emit_stage,
-        pcm_hash, token_stream_hash,
+        CaptureProvenance, FixtureProvenance, OracleTier, Outcome, Receipt, Stage, bytes_hash,
+        emit_stage, pcm_hash, token_stream_hash,
     };
     pub use crate::{gated, xfail};
 }
