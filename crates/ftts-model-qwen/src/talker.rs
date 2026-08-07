@@ -162,7 +162,12 @@ pub struct RotaryRows<'a> {
 ///
 /// Panics if `axes` rows are not `seq * head_dim`, or `head_dim` is odd.
 #[must_use]
-pub fn collapse_mrope(axes: [&[f32]; 3], seq: usize, head_dim: usize, sections: [usize; 3]) -> Vec<f32> {
+pub fn collapse_mrope(
+    axes: [&[f32]; 3],
+    seq: usize,
+    head_dim: usize,
+    sections: [usize; 3],
+) -> Vec<f32> {
     assert!(head_dim.is_multiple_of(2), "head_dim must be even");
     for axis in axes {
         assert_eq!(axis.len(), seq * head_dim, "axis must be [seq, head_dim]");
@@ -206,9 +211,21 @@ pub fn forward_layer(
     let head_dim = config.head_dim;
     let query_width = config.query_width();
     let kv_width = config.kv_width();
-    assert_eq!(hidden.len(), seq * hidden_size, "hidden must be [seq, hidden]");
-    assert_eq!(rotary.cos.len(), seq * head_dim, "cos must be [seq, head_dim]");
-    assert_eq!(rotary.sin.len(), seq * head_dim, "sin must be [seq, head_dim]");
+    assert_eq!(
+        hidden.len(),
+        seq * hidden_size,
+        "hidden must be [seq, hidden]"
+    );
+    assert_eq!(
+        rotary.cos.len(),
+        seq * head_dim,
+        "cos must be [seq, head_dim]"
+    );
+    assert_eq!(
+        rotary.sin.len(),
+        seq * head_dim,
+        "sin must be [seq, head_dim]"
+    );
 
     let past = cache.len();
     let total = past + seq;
@@ -216,14 +233,45 @@ pub fn forward_layer(
 
     // ── Attention block ────────────────────────────────────────────────────────────────────────
     let mut normed = vec![0.0f32; seq * hidden_size];
-    f32ref::rms_norm(hidden, weights.input_layernorm, config.rms_norm_eps, seq, hidden_size, &mut normed);
+    f32ref::rms_norm(
+        hidden,
+        weights.input_layernorm,
+        config.rms_norm_eps,
+        seq,
+        hidden_size,
+        &mut normed,
+    );
 
     let mut queries = vec![0.0f32; seq * query_width];
     let mut keys = vec![0.0f32; seq * kv_width];
     let mut values = vec![0.0f32; seq * kv_width];
-    f32ref::linear(&normed, weights.q_proj, None, seq, hidden_size, query_width, &mut queries);
-    f32ref::linear(&normed, weights.k_proj, None, seq, hidden_size, kv_width, &mut keys);
-    f32ref::linear(&normed, weights.v_proj, None, seq, hidden_size, kv_width, &mut values);
+    f32ref::linear(
+        &normed,
+        weights.q_proj,
+        None,
+        seq,
+        hidden_size,
+        query_width,
+        &mut queries,
+    );
+    f32ref::linear(
+        &normed,
+        weights.k_proj,
+        None,
+        seq,
+        hidden_size,
+        kv_width,
+        &mut keys,
+    );
+    f32ref::linear(
+        &normed,
+        weights.v_proj,
+        None,
+        seq,
+        hidden_size,
+        kv_width,
+        &mut values,
+    );
 
     // QK-Norm over head_dim, then rotary — in that order. Values are neither normed nor rotated.
     let mut scratch = vec![0.0f32; head_dim];
@@ -233,14 +281,28 @@ pub fn forward_layer(
         for head in 0..config.num_attention_heads {
             let offset = position * query_width + head * head_dim;
             let row = &mut queries[offset..offset + head_dim];
-            f32ref::rms_norm(row, weights.q_norm, config.qk_norm_eps, 1, head_dim, &mut scratch);
+            f32ref::rms_norm(
+                row,
+                weights.q_norm,
+                config.qk_norm_eps,
+                1,
+                head_dim,
+                &mut scratch,
+            );
             row.copy_from_slice(&scratch);
             f32ref::apply_rope_in_place(row, cos, sin);
         }
         for head in 0..config.num_key_value_heads {
             let offset = position * kv_width + head * head_dim;
             let row = &mut keys[offset..offset + head_dim];
-            f32ref::rms_norm(row, weights.k_norm, config.qk_norm_eps, 1, head_dim, &mut scratch);
+            f32ref::rms_norm(
+                row,
+                weights.k_norm,
+                config.qk_norm_eps,
+                1,
+                head_dim,
+                &mut scratch,
+            );
             row.copy_from_slice(&scratch);
             f32ref::apply_rope_in_place(row, cos, sin);
         }
@@ -275,7 +337,8 @@ pub fn forward_layer(
             out.fill(0.0);
             for key_position in 0..total {
                 let weight = scores[key_position];
-                let value = &cache.values[key_position * kv_width + kv_head * head_dim..][..head_dim];
+                let value =
+                    &cache.values[key_position * kv_width + kv_head * head_dim..][..head_dim];
                 for index in 0..head_dim {
                     out[index] += weight * value[index];
                 }
@@ -284,23 +347,62 @@ pub fn forward_layer(
     }
 
     let mut attention = vec![0.0f32; seq * hidden_size];
-    f32ref::linear(&context, weights.o_proj, None, seq, query_width, hidden_size, &mut attention);
+    f32ref::linear(
+        &context,
+        weights.o_proj,
+        None,
+        seq,
+        query_width,
+        hidden_size,
+        &mut attention,
+    );
     for (state, delta) in hidden.iter_mut().zip(&attention) {
         *state += *delta;
     }
 
     // ── MLP block ──────────────────────────────────────────────────────────────────────────────
-    f32ref::rms_norm(hidden, weights.post_attention_layernorm, config.rms_norm_eps, seq, hidden_size, &mut normed);
+    f32ref::rms_norm(
+        hidden,
+        weights.post_attention_layernorm,
+        config.rms_norm_eps,
+        seq,
+        hidden_size,
+        &mut normed,
+    );
 
     let intermediate = config.intermediate_size;
     let mut gate = vec![0.0f32; seq * intermediate];
     let mut up = vec![0.0f32; seq * intermediate];
-    f32ref::linear(&normed, weights.gate_proj, None, seq, hidden_size, intermediate, &mut gate);
-    f32ref::linear(&normed, weights.up_proj, None, seq, hidden_size, intermediate, &mut up);
+    f32ref::linear(
+        &normed,
+        weights.gate_proj,
+        None,
+        seq,
+        hidden_size,
+        intermediate,
+        &mut gate,
+    );
+    f32ref::linear(
+        &normed,
+        weights.up_proj,
+        None,
+        seq,
+        hidden_size,
+        intermediate,
+        &mut up,
+    );
     f32ref::silu_mul_in_place(&mut gate, &up);
 
     let mut down = vec![0.0f32; seq * hidden_size];
-    f32ref::linear(&gate, weights.down_proj, None, seq, intermediate, hidden_size, &mut down);
+    f32ref::linear(
+        &gate,
+        weights.down_proj,
+        None,
+        seq,
+        intermediate,
+        hidden_size,
+        &mut down,
+    );
     for (state, delta) in hidden.iter_mut().zip(&down) {
         *state += *delta;
     }
@@ -311,6 +413,9 @@ pub const TALKER_LAYER_COUNT: usize = 28;
 
 /// Primary-code vocabulary width. The residual-code heads are 2,048 wide; this one is not.
 pub const PRIMARY_CODE_VOCAB_SIZE: usize = 3_072;
+
+/// Number of acoustic-code embeddings summed into every next-frame talker input.
+pub const CODE_GROUP_COUNT: usize = 16;
 
 /// All weights required after input embeddings have been assembled.
 ///
@@ -407,7 +512,11 @@ pub fn forward_talker(
         "the cache must contain one entry per talker layer"
     );
     assert_eq!(hidden.len(), seq * config.hidden_size, "hidden shape");
-    assert_eq!(weights.final_norm.len(), config.hidden_size, "final norm shape");
+    assert_eq!(
+        weights.final_norm.len(),
+        config.hidden_size,
+        "final norm shape"
+    );
     assert_eq!(
         weights.codec_head.len(),
         PRIMARY_CODE_VOCAB_SIZE * config.hidden_size,
@@ -491,6 +600,82 @@ pub fn mrope_rows(positions: &[i64], head_dim: usize, theta: f32) -> (Vec<f32>, 
     (cos, sin)
 }
 
+/// Applies the learned biased `2048 -> 2048 -> 1024` SiLU text projection.
+///
+/// Widths are explicit because this f32 reference is also exercised at tiny dimensions in unit
+/// tests. The production caller supplies `(input_width, intermediate_width, output_width) =
+/// (2048, 2048, 1024)` and validates all four checkpoint tensor shapes before calling it.
+/// `input` and `output` are row-major `[rows, width]` buffers.
+#[allow(clippy::too_many_arguments)]
+pub fn project_text_rows(
+    input: &[f32],
+    rows: usize,
+    input_width: usize,
+    intermediate_width: usize,
+    output_width: usize,
+    fc1_weight: &[f32],
+    fc1_bias: &[f32],
+    fc2_weight: &[f32],
+    fc2_bias: &[f32],
+    output: &mut [f32],
+) {
+    assert_eq!(input.len(), rows * input_width, "text projection input shape");
+    assert_eq!(fc1_weight.len(), intermediate_width * input_width, "fc1 weight shape");
+    assert_eq!(fc1_bias.len(), intermediate_width, "fc1 bias shape");
+    assert_eq!(fc2_weight.len(), output_width * intermediate_width, "fc2 weight shape");
+    assert_eq!(fc2_bias.len(), output_width, "fc2 bias shape");
+    assert_eq!(output.len(), rows * output_width, "text projection output shape");
+
+    let mut activated = vec![0.0f32; rows * intermediate_width];
+    f32ref::linear(
+        input,
+        fc1_weight,
+        Some(fc1_bias),
+        rows,
+        input_width,
+        intermediate_width,
+        &mut activated,
+    );
+    for value in &mut activated {
+        *value = *value / (1.0 + (-*value).exp());
+    }
+    f32ref::linear(
+        &activated,
+        fc2_weight,
+        Some(fc2_bias),
+        rows,
+        intermediate_width,
+        output_width,
+        output,
+    );
+}
+
+/// Forms the next-frame talker input from the prior frame's 16 code embeddings and text stream.
+///
+/// The text state is consumed one projected hidden per generated frame. When the stream is
+/// exhausted, callers pass `None`, which selects `tts_pad_embed`; this is not merely prefill
+/// setup, but the normal steady-state path after trailing text ends.
+pub fn form_frame_input(
+    code_embeddings: &[&[f32]],
+    trailing_text_hidden: Option<&[f32]>,
+    tts_pad_embed: &[f32],
+    output: &mut [f32],
+) {
+    assert_eq!(
+        code_embeddings.len(),
+        CODE_GROUP_COUNT,
+        "each generated frame has exactly 16 code groups"
+    );
+    assert_eq!(output.len(), tts_pad_embed.len(), "frame-input width");
+    output.copy_from_slice(trailing_text_hidden.unwrap_or(tts_pad_embed));
+    for embedding in code_embeddings {
+        assert_eq!(embedding.len(), output.len(), "code embedding width");
+        for (result, value) in output.iter_mut().zip(*embedding) {
+            *result += *value;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,7 +714,9 @@ mod tests {
         };
 
         let seq = 3;
-        let mut hidden: Vec<f32> = (0..seq * config.hidden_size).map(|i| (i % 7) as f32).collect();
+        let mut hidden: Vec<f32> = (0..seq * config.hidden_size)
+            .map(|i| (i % 7) as f32)
+            .collect();
         let original = hidden.clone();
         let cos = vec![1.0f32; seq * config.head_dim];
         let sin = vec![0.0f32; seq * config.head_dim];
@@ -543,7 +730,10 @@ mod tests {
         forward_layer(
             &config,
             &weights,
-            RotaryRows { cos: &cos, sin: &sin },
+            RotaryRows {
+                cos: &cos,
+                sin: &sin,
+            },
             &mask,
             &mut hidden,
             seq,
@@ -590,7 +780,10 @@ mod tests {
         forward_layer(
             &config,
             &weights,
-            RotaryRows { cos: &cos, sin: &sin },
+            RotaryRows {
+                cos: &cos,
+                sin: &sin,
+            },
             &mask,
             &mut hidden,
             prefill,
@@ -605,7 +798,10 @@ mod tests {
         forward_layer(
             &config,
             &weights,
-            RotaryRows { cos: &step_cos, sin: &step_sin },
+            RotaryRows {
+                cos: &step_cos,
+                sin: &step_sin,
+            },
             &step_mask,
             &mut step,
             1,
