@@ -392,7 +392,10 @@ fn contract_a_l2_talker_layer_00_residual_attribution() {
         }
     }
     for (family, removed) in &carriers {
-        eprintln!("ft7 CPU fp32 ATTRIBUTION carrier: {family} removes {:.1}%", removed * 100.0);
+        eprintln!(
+            "ft7 CPU fp32 ATTRIBUTION carrier: {family} removes {:.1}%",
+            removed * 100.0
+        );
     }
     assert!(
         !carriers.is_empty(),

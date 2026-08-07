@@ -673,4 +673,42 @@ mod tests {
         let error = ModelBundle::resolve(&dir).expect_err("an empty directory is not a bundle");
         assert!(error.to_string().contains("model.safetensors"), "{error}");
     }
+
+    #[test]
+    fn a_complete_bundle_prefers_its_canonical_artifact_for_synthesis() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ftts-bundle-canonical-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("speech_tokenizer")).expect("create bundle sidecar directory");
+        for name in [
+            CANONICAL_MODEL_BASENAME,
+            "model.safetensors",
+            "speech_tokenizer/model.safetensors",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer_config.json",
+        ] {
+            fs::write(dir.join(name), []).expect("write bundle fixture sidecar");
+        }
+
+        let expected_artifact = dir.join(CANONICAL_MODEL_BASENAME);
+        let bundle = ModelBundle::resolve(&dir).expect("complete canonical bundle resolves");
+        assert_eq!(
+            bundle.canonical_main.as_deref(),
+            Some(expected_artifact.as_path())
+        );
+        assert_eq!(bundle.main, dir.join("model.safetensors"));
+
+        let explicit = ModelBundle::resolve(&expected_artifact)
+            .expect("an explicit canonical artifact resolves against its sidecars");
+        assert_eq!(
+            explicit.canonical_main.as_deref(),
+            Some(expected_artifact.as_path())
+        );
+    }
 }
