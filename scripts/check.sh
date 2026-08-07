@@ -130,6 +130,15 @@ fi
 stage_pass
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 1c. The conformance corpus is a frozen oracle input, not a mutable text list
+# ─────────────────────────────────────────────────────────────────────────────
+stage_start "conformance-corpus freeze (source hashes, coverage, capture matrix)"
+if ! python3 scripts/conformance_corpus.py; then
+    stage_fail "the frozen conformance corpus changed or lost required coverage"
+fi
+stage_pass
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 2. The validators themselves still detect violations
 # ─────────────────────────────────────────────────────────────────────────────
 stage_start "repo-validator selftest (each rule fires on a mutated fixture)"

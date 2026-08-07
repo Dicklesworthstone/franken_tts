@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "corpus_id": "qwen3-tts-12hz-conformance-r1",
+  "purpose": "Frozen Contract-A and Contract-B target-text selection. This is distinct from the bakeoff corpus: it binds exact oracle capture inputs and tail-risk strata, not a comparative listening panel.",
+  "text_source": {
+    "path": "corpus/bakeoff/texts.json",
+    "sha256": "91d0d7ac9abb60c2c0f927b5a87c8ae20a5564012828d8f696ce0507ab7c65da",
+    "selection": [
+      "en-prose-001",
+      "en-dialogue-004",
+      "en-numbers-004",
+      "en-currency-002",
+      "en-names-001",
+      "en-acronyms-002",
+      "en-urls-001",
+      "en-quotations-002",
+      "en-long-001",
+      "en-sibilant-001",
+      "en-sibilant-003",
+      "en-breath-002",
+      "en-longform-001",
+      "en-longform-002",
+      "zh-prose-001",
+      "zh-numbers-001",
+      "zh-sibilant-001",
+      "zh-longform-001",
+      "es-dialogue-002",
+      "es-urls-001",
+      "es-longform-001",
+      "ja-numbers-002",
+      "ja-sibilant-001",
+      "ja-longform-001",
+      "cs-enzh-003",
+      "cs-enes-001",
+      "cs-enja-001",
+      "cs-multi-001"
+    ]
+  },
+  "capture_matrix": {
+    "clone_modes": ["xvector", "icl"],
+    "prompt_modes": ["non_streaming", "streaming"],
+    "short_max_new_tokens": 64,
+    "medium_max_new_tokens": 384,
+    "long_max_new_tokens": 2048,
+    "canonical_decoder": "greedy at both autoregressive levels"
+  },
+  "reference_admission": {
+    "required_duration_buckets_seconds": [3, 10, 30],
+    "required_acoustic_conditions": ["clean_studio", "ordinary_phone", "reverberant_room", "noisy"],
+    "permitted_consent_scopes": [
+      "explicit_recorded_for_this_project",
+      "licensed_dataset_with_speaker_consent",
+      "public_domain_with_documented_consent"
+    ],
+    "required_record_fields": [
+      "reference_id",
+      "audio_path",
+      "audio_sha256",
+      "duration_seconds",
+      "acoustic_condition",
+      "reference_text",
+      "consent_statement",
+      "consent_obtained_utc",
+      "consent_scope",
+      "speaker_pseudonym",
+      "provenance"
+    ],
+    "bootstrap_fixture": {
+      "audio_path": "docs/conformance/synthetic_220hz_24khz.wav",
+      "audio_sha256": "0e155bd9a90647119bf0d1e03755fefcbb61662fb9f42010479c9ba4b154f0a4",
+      "classification": "nonhuman_fixture_only",
+      "not_admissible_as": ["voice-cloning corpus", "ProductionQuality corpus", "listening stimulus"]
+    }
+  },
+  "long_form_boundaries": [
+    {
+      "id": "codec-chunk-first-seam",
+      "target_frames": [290, 310],
+      "text_id": "en-longform-001",
+      "expected_reference_relation": "The official codec chunked path diverges from whole-sequence decoding above 300 frames; this is an expected, ledgered comparison boundary rather than a native parity failure."
+    },
+    {
+      "id": "codec-chunk-second-seam",
+      "target_frames": [600, 610],
+      "text_id": "zh-longform-001",
+      "expected_reference_relation": "Second codec chunk seam; preserves the same expected-divergence classification as the first seam."
+    },
+    {
+      "id": "codec-left-context-prosody",
+      "target_frame_span": [295, 320],
+      "text_id": "en-longform-002",
+      "expected_reference_relation": "Evaluate long-range prosody over the 25-frame left-context seam; clicks alone are insufficient."
+    },
+    {
+      "id": "published-eval-cap",
+      "target_frames": 2048,
+      "text_id": "es-longform-001",
+      "expected_reference_relation": "Exercises the explicit published-evaluation cap and must report cap truncation rather than infer EOS."
+    },
+    {
+      "id": "runtime-default-cap",
+      "target_frames": 8192,
+      "text_id": "ja-longform-001",
+      "expected_reference_relation": "Exercises the runtime-default cap and must report cap truncation rather than infer EOS."
+    }
+  ],
+  "composition": {
+    "categories_required": ["prose", "dialogue", "numbers", "currency", "names", "acronyms", "urls", "quotations", "long_sentence", "long_form", "code_switching"],
+    "canary_axes_required": ["sibilants", "breaths", "code_switching", "numbers", "long_form"],
+    "why": "Each category catches a distinct text normalization or prompt-assembly failure; sibilants, breaths, numbers, code switching, and long form are explicit tail strata. Noisy-reference coverage is supplied only by consent-admitted reference audio and cannot be claimed from target text tags."
+  }
+}
