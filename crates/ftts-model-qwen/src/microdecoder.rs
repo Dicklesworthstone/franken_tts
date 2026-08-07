@@ -1197,6 +1197,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn block_verifier_rejects_the_suffix_after_its_first_mismatched_draft_id() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
+        let talker_hidden = weights_of(config.hidden_size, 35);
+        let mut state = FrameState::new(&config);
+        let sequential =
+            decode_frame_greedy(&config, &rope, &weights, &mut state, &talker_hidden, 23);
+        let verified =
+            verify_frame_draft(&config, &rope, &weights, &talker_hidden, 23, &sequential);
+        let mut mismatched = sequential;
+        const FIRST_MISMATCH: usize = 6;
+        mismatched[FIRST_MISMATCH] = (mismatched[FIRST_MISMATCH] + 1) % RESIDUAL_VOCAB;
+
+        assert_eq!(
+            verified.accepted_greedy_prefix_len(&mismatched),
+            FIRST_MISMATCH,
+            "a rejected id must invalidate its causal suffix rather than being accepted out of order"
+        );
+    }
+
     struct TestLayer {
         input_norm: Vec<f32>,
         q_proj: Vec<f32>,
