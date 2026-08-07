@@ -272,7 +272,10 @@ pub fn codec_rope_rows(position: usize, head_dim: usize, cos: &mut [f32], sin: &
     let half = head_dim / 2;
     for index in 0..half {
         let exponent = (2 * index) as f32 / head_dim as f32;
-        let angle = position as f32 / CODEC_ROPE_THETA.powf(exponent);
+        // The reference forms `inv_freq = 1 / theta^(2i/d)` once and multiplies by the position;
+        // dividing the position directly lands on different bits.
+        let inv_freq = CODEC_ROPE_THETA.powf(exponent).recip();
+        let angle = position as f32 * inv_freq;
         let cosine = angle.cos();
         let sine = angle.sin();
         cos[index] = cosine;
@@ -626,7 +629,9 @@ pub fn snake_beta_in_place(values: &mut [f32], frames: usize, alpha_log: &[f32],
         for frame in 0..frames {
             let index = frame * channels + channel;
             let sine = (values[index] * alpha).sin();
-            values[index] += scale * sine * sine;
+            // The reference squares `sin` first (`pow(sin, 2)`) and then applies the reciprocal;
+            // associating the scale into the first product lands on different bits.
+            values[index] += scale * (sine * sine);
         }
     }
 }
