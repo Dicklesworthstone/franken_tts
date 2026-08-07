@@ -242,23 +242,48 @@ impl RopeTable {
         }
     }
 
+    /// The `cos`/`sin` row for one position, each `head_dim` wide.
+    ///
+    /// Exposed so a parity test can feed the ORACLE's own `position_embeddings` through the same
+    /// layer code, which separates "is our rotary table right" from "is our layer math right".
+    ///
+    /// # Panics
+    ///
+    /// Panics when `position` is outside the frame.
+    #[must_use]
+    pub fn row(&self, position: usize) -> (&[f32], &[f32]) {
+        assert!(position < FRAME_POSITIONS, "position outside the frame");
+        let span = position * self.head_dim..(position + 1) * self.head_dim;
+        (&self.cos[span.clone()], &self.sin[span])
+    }
+
     /// Applies `x = x * cos + rotate_half(x) * sin` for one head at one position.
     ///
     /// # Panics
     ///
     /// Panics when `x` is not one head wide or `position` is outside the frame.
     pub fn apply(&self, x: &mut [f32], position: usize) {
-        assert_eq!(x.len(), self.head_dim, "rope input is not one head wide");
-        assert!(position < FRAME_POSITIONS, "position outside the frame");
-        let half = self.head_dim / 2;
-        let base = position * self.head_dim;
-        let original = x.to_vec();
-        for i in 0..half {
-            let (c_lo, s_lo) = (self.cos[base + i], self.sin[base + i]);
-            let (c_hi, s_hi) = (self.cos[base + i + half], self.sin[base + i + half]);
-            x[i] = original[i] * c_lo - original[i + half] * s_lo;
-            x[i + half] = original[i + half] * c_hi + original[i] * s_hi;
-        }
+        let (cos, sin) = self.row(position);
+        apply_rope_row(x, cos, sin);
+    }
+}
+
+/// Applies `x = x * cos + rotate_half(x) * sin` for one head, with explicit rotary rows.
+///
+/// `rotate_half` is the half-split convention (`[-x2, x1]`), not pairwise interleaving.
+///
+/// # Panics
+///
+/// Panics when `x`, `cos`, and `sin` do not all have the same even length.
+pub fn apply_rope_row(x: &mut [f32], cos: &[f32], sin: &[f32]) {
+    assert_eq!(x.len(), cos.len(), "rope cos width mismatch");
+    assert_eq!(x.len(), sin.len(), "rope sin width mismatch");
+    assert!(x.len().is_multiple_of(2), "head width must be even");
+    let half = x.len() / 2;
+    let original = x.to_vec();
+    for i in 0..half {
+        x[i] = original[i] * cos[i] - original[i + half] * sin[i];
+        x[i + half] = original[i + half] * cos[i + half] + original[i] * sin[i + half];
     }
 }
 
@@ -418,6 +443,26 @@ pub fn layer_step(
     position: usize,
     state: &mut FrameKvState,
 ) -> Vec<f32> {
+    let (cos, sin) = rope.row(position);
+    layer_step_with_rotary(config, weights, cos, sin, hidden, state)
+}
+
+/// [`layer_step`] with the rotary rows supplied explicitly rather than from a [`RopeTable`].
+///
+/// The position is implied by the state: this element attends to the cache as it stands after its
+/// own key/value are appended, which is exactly the causal row.
+///
+/// # Panics
+///
+/// Panics on any shape mismatch against `config`.
+pub fn layer_step_with_rotary(
+    config: &MicrodecoderConfig,
+    weights: &LayerWeights<'_>,
+    cos: &[f32],
+    sin: &[f32],
+    hidden: &[f32],
+    state: &mut FrameKvState,
+) -> Vec<f32> {
     let normed = rms_norm(hidden, weights.input_norm, config.rms_eps);
 
     let mut q = vec![0.0_f32; config.q_width()];
@@ -432,13 +477,13 @@ pub fn layer_step(
         let span = head * config.head_dim..(head + 1) * config.head_dim;
         let normed_head = rms_norm(&q[span.clone()], weights.q_norm, config.rms_eps);
         q[span.clone()].copy_from_slice(&normed_head);
-        rope.apply(&mut q[span], position);
+        apply_rope_row(&mut q[span], cos, sin);
     }
     for head in 0..config.num_kv_heads {
         let span = head * config.head_dim..(head + 1) * config.head_dim;
         let normed_head = rms_norm(&k[span.clone()], weights.k_norm, config.rms_eps);
         k[span.clone()].copy_from_slice(&normed_head);
-        rope.apply(&mut k[span], position);
+        apply_rope_row(&mut k[span], cos, sin);
     }
 
     state.push(&k, &v);
