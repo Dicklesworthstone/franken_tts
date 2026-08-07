@@ -9,6 +9,7 @@ pub mod generate;
 pub mod microdecoder;
 pub mod prompt;
 pub mod sampler;
+pub mod speaker;
 pub mod talker;
 pub mod tokenizer;
 

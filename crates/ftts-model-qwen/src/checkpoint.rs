@@ -162,7 +162,11 @@ impl fmt::Display for CheckpointError {
 impl std::error::Error for CheckpointError {}
 
 /// Widen a whole tensor to owned `f32`.
-fn widen(file: &SafetensorsFile, path: &Path, name: &str) -> Result<Vec<f32>, CheckpointError> {
+pub(crate) fn widen(
+    file: &SafetensorsFile,
+    path: &Path,
+    name: &str,
+) -> Result<Vec<f32>, CheckpointError> {
     let view = file
         .view(name)
         .ok_or_else(|| CheckpointError::MissingTensor {
@@ -176,7 +180,7 @@ fn widen(file: &SafetensorsFile, path: &Path, name: &str) -> Result<Vec<f32>, Ch
     Ok(out)
 }
 
-fn widen_exact(
+pub(crate) fn widen_exact(
     file: &SafetensorsFile,
     path: &Path,
     name: &str,
@@ -193,7 +197,7 @@ fn widen_exact(
     Ok(values)
 }
 
-fn open(path: &Path) -> Result<SafetensorsFile, CheckpointError> {
+pub(crate) fn open(path: &Path) -> Result<SafetensorsFile, CheckpointError> {
     SafetensorsFile::open(path).map_err(|error| CheckpointError::Open {
         path: path.to_path_buf(),
         detail: format!("{error:?}"),
