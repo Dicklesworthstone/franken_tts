@@ -607,6 +607,7 @@ impl MicroLayerQuant {
 /// # Panics
 ///
 /// Panics on any shape mismatch against `config`.
+#[allow(clippy::too_many_arguments)]
 pub fn layer_step_q8(
     config: &MicrodecoderConfig,
     weights: &LayerWeights<'_>,
@@ -1845,7 +1846,9 @@ mod tests {
         for tier in ftts_kernels::int8::Int8Tier::available() {
             let mut state = FrameKvState::new(&config);
             let (cos, sin) = rope.row(0);
-            let out = layer_step_q8(&config, &weights, &quant, cos, sin, &hidden, &mut state, tier);
+            let out = layer_step_q8(
+                &config, &weights, &quant, cos, sin, &hidden, &mut state, tier,
+            );
             match &reference {
                 None => reference = Some(out),
                 Some(expected) => {
@@ -1891,8 +1894,8 @@ mod tests {
         );
 
         let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
-        let cosine =
-            dot(&expected, &actual) / (dot(&expected, &expected).sqrt() * dot(&actual, &actual).sqrt());
+        let cosine = dot(&expected, &actual)
+            / (dot(&expected, &expected).sqrt() * dot(&actual, &actual).sqrt());
         assert!(
             cosine > 0.99,
             "W8A8 layer step diverged from the f32 reference: cosine {cosine}"

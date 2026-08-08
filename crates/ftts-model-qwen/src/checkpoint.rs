@@ -1445,7 +1445,11 @@ mod tests {
             let converter_scale =
                 ftts_artifacts::converter::quantize_output_channel_q8(&row, &mut converter_bytes)
                     .expect("finite row");
-            assert_eq!(kernel_scale.to_bits(), converter_scale.to_bits(), "len {len}");
+            assert_eq!(
+                kernel_scale.to_bits(),
+                converter_scale.to_bits(),
+                "len {len}"
+            );
             assert_eq!(kernel_bytes, converter_bytes, "len {len}");
         }
         // The all-zero row special case must also agree.

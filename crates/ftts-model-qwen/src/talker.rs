@@ -724,14 +724,28 @@ pub fn forward_layer_q8(
         for head in 0..config.num_attention_heads {
             let offset = position * query_width + head * head_dim;
             let row = &mut queries[offset..offset + head_dim];
-            f32ref::rms_norm(row, weights.q_norm, config.qk_norm_eps, 1, head_dim, &mut scratch);
+            f32ref::rms_norm(
+                row,
+                weights.q_norm,
+                config.qk_norm_eps,
+                1,
+                head_dim,
+                &mut scratch,
+            );
             row.copy_from_slice(&scratch);
             f32ref::apply_rope_in_place(row, cos, sin);
         }
         for head in 0..config.num_key_value_heads {
             let offset = position * kv_width + head * head_dim;
             let row = &mut keys[offset..offset + head_dim];
-            f32ref::rms_norm(row, weights.k_norm, config.qk_norm_eps, 1, head_dim, &mut scratch);
+            f32ref::rms_norm(
+                row,
+                weights.k_norm,
+                config.qk_norm_eps,
+                1,
+                head_dim,
+                &mut scratch,
+            );
             row.copy_from_slice(&scratch);
             f32ref::apply_rope_in_place(row, cos, sin);
         }
@@ -827,7 +841,15 @@ pub fn forward_talker_q8(
         weights.layers.iter().zip(quant).zip(&mut cache.layers)
     {
         forward_layer_q8(
-            config, layer, layer_quant, rotary, mask, hidden, seq, layer_cache, tier,
+            config,
+            layer,
+            layer_quant,
+            rotary,
+            mask,
+            hidden,
+            seq,
+            layer_cache,
+            tier,
         );
     }
 
