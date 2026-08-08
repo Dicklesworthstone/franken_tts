@@ -108,8 +108,10 @@ impl QuantizedMatrix {
 pub enum Int8Tier {
     /// Portable left-to-right checked-free scalar loop; the reference every tier must equal.
     Scalar,
-    /// Portable eight-lane loop shaped for LLVM autovectorization (NE-INH-003's measured winner
-    /// class at m=1 on Apple M4 — a live dispatch candidate, not just a fallback).
+    /// Portable eight-lane loop, retained ONLY as an A/B datapoint: measured ~15x SLOWER than
+    /// `Scalar` at m=1 on M4 Pro (NE-001) — the manual lane structure defeats LLVM's
+    /// autovectorizer, while the plain `Scalar` shape vectorizes to memory bandwidth. Never the
+    /// dispatch default.
     Autovec,
     /// Hand SDOT island (aarch64 + FEAT_DotProd), four 16-byte accumulator streams.
     NeonSdot,
@@ -333,15 +335,19 @@ pub fn linear_q8(
     if let Some(bias) = bias {
         assert_eq!(bias.len(), n, "bias must be [n]");
     }
-    for row in 0..m {
-        let x_row = &x_q[row * k..(row + 1) * k];
-        let x_scale = x_scales[row];
-        let out_row = &mut out[row * n..(row + 1) * n];
-        for col in 0..n {
-            let w_row = &weight.data[col * k..(col + 1) * k];
+    // Weight-stationary loop order: each Q8 weight row is streamed exactly once and reused
+    // across all m activation rows, so an m>1 call (prefill, the seq-16 verify pass) does not
+    // re-read the whole matrix m times. Each output element's dot product is unchanged, so this
+    // ordering is bit-identical to the m-outer form.
+    for col in 0..n {
+        let w_row = &weight.data[col * k..(col + 1) * k];
+        let w_scale = weight.scales[col];
+        let bias_term = bias.map(|b| b[col]);
+        for row in 0..m {
+            let x_row = &x_q[row * k..(row + 1) * k];
             let acc = dot_i32(x_row, w_row, tier);
-            let value = acc as f32 * (x_scale * weight.scales[col]);
-            out_row[col] = bias.map_or(value, |b| value + b[col]);
+            let value = acc as f32 * (x_scales[row] * w_scale);
+            out[row * n + col] = bias_term.map_or(value, |b| value + b);
         }
     }
 }
