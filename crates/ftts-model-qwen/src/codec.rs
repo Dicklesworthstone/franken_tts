@@ -6,6 +6,9 @@
 //! quantization. Optimized kernels must reproduce this arithmetic before they become selectable.
 
 use ftts_kernels::f32ref;
+use ftts_kernels::int8::{KernelPlanV0, QuantizedMatrix, autotuned_plan, linear_q8_dynamic};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The number of codec groups emitted per 80 ms frame.
 pub const CODEC_GROUPS: usize = 16;
@@ -410,7 +413,8 @@ pub fn forward_codec_transformer_step(
     let mut query = vec![0.0f32; attention];
     let mut key = vec![0.0f32; attention];
     let mut value = vec![0.0f32; attention];
-    f32ref::linear(
+    dense_linear(
+        DenseClass::Transformer,
         &normed,
         weights.q_proj,
         None,
@@ -419,7 +423,8 @@ pub fn forward_codec_transformer_step(
         attention,
         &mut query,
     );
-    f32ref::linear(
+    dense_linear(
+        DenseClass::Transformer,
         &normed,
         weights.k_proj,
         None,
@@ -428,7 +433,8 @@ pub fn forward_codec_transformer_step(
         attention,
         &mut key,
     );
-    f32ref::linear(
+    dense_linear(
+        DenseClass::Transformer,
         &normed,
         weights.v_proj,
         None,
@@ -488,7 +494,8 @@ pub fn forward_codec_transformer_step(
     }
 
     let mut attention_output = vec![0.0f32; hidden];
-    f32ref::linear(
+    dense_linear(
+        DenseClass::Transformer,
         &context,
         weights.o_proj,
         None,
@@ -512,7 +519,8 @@ pub fn forward_codec_transformer_step(
     );
     let mut gate = vec![0.0f32; intermediate];
     let mut up = vec![0.0f32; intermediate];
-    f32ref::linear(
+    dense_linear(
+        DenseClass::Transformer,
         &normed,
         weights.gate_proj,
         None,
@@ -521,7 +529,8 @@ pub fn forward_codec_transformer_step(
         intermediate,
         &mut gate,
     );
-    f32ref::linear(
+    dense_linear(
+        DenseClass::Transformer,
         &normed,
         weights.up_proj,
         None,
@@ -532,7 +541,8 @@ pub fn forward_codec_transformer_step(
     );
     f32ref::silu_mul_in_place(&mut gate, &up);
     let mut mlp_output = vec![0.0f32; hidden];
-    f32ref::linear(
+    dense_linear(
+        DenseClass::Transformer,
         &gate,
         weights.down_proj,
         None,
@@ -604,7 +614,8 @@ pub fn forward_codec_pre_transformer(
         config.transformer_latent_dim
     );
     let mut hidden = vec![0.0f32; frames * config.transformer_hidden_dim];
-    f32ref::linear(
+    dense_linear(
+        DenseClass::Transformer,
         input,
         weights.input_proj,
         Some(weights.input_proj_bias),
@@ -630,7 +641,8 @@ pub fn forward_codec_pre_transformer(
         f32ref::F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
         &mut normed,
     );
-    f32ref::linear(
+    dense_linear(
+        DenseClass::Transformer,
         &normed,
         weights.output_proj,
         Some(weights.output_proj_bias),
@@ -639,6 +651,120 @@ pub fn forward_codec_pre_transformer(
         config.transformer_latent_dim,
         output,
     );
+}
+
+/// The armed codec W8A8 route: dispatch tier plus a per-weight quantization memo.
+///
+/// The memo is keyed by the weight slice's address and length, with the first and last element
+/// bits stored as a fingerprint: checkpoint tensors live for the process, but if an entry's
+/// fingerprint ever disagrees (a dropped checkpoint's allocation reused), the entry is
+/// requantized rather than trusted. This stays a private implementation detail of
+/// [`dense_linear`]; the artifact-fed `.fttspack` route replaces it when that lands.
+struct CodecInt8Route {
+    plan: KernelPlanV0,
+    transformer: bool,
+    convnext: bool,
+    memo: Mutex<HashMap<(usize, usize), Arc<(u32, u32, QuantizedMatrix)>>>,
+}
+
+/// Which family of dense projections a [`dense_linear`] call belongs to.
+///
+/// Kept coarse on purpose: the two families run at very different sample rates (the transformer
+/// at 12.5 Hz latent rate, ConvNeXt inside the upsample cascade approaching 24 kHz), so they
+/// differ in both cost share and quantization sensitivity. `FTTS_INT8_CODEC` accepts
+/// `1`/`all`, `transformer`, or `convnext` so the two can be measured separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DenseClass {
+    /// Pre-transformer projections and the eight transformer layers.
+    Transformer,
+    /// ConvNeXt pointwise projections inside the upsample stages.
+    ConvNext,
+}
+
+/// `FTTS_INT8_CODEC=1` arms W8A8 for the codec's dense projections (staged lever 4).
+///
+/// Default off: the scalar f32 reduction is the oracle-parity route (see the negative-evidence
+/// note above [`causal_conv1d`]). Armed, the dense projections trade that exactness for int8
+/// speed; the convolutions keep their parity-pinned BLAS route either way, and the RVQ
+/// codebooks are gathers, untouched by any quantization. Read once per process.
+fn codec_int8_route() -> Option<&'static CodecInt8Route> {
+    static ROUTE: OnceLock<Option<CodecInt8Route>> = OnceLock::new();
+    ROUTE
+        .get_or_init(|| {
+            let (transformer, convnext) = match std::env::var("FTTS_INT8_CODEC").as_deref() {
+                Ok("1" | "all") => (true, true),
+                Ok("transformer") => (true, false),
+                Ok("convnext") => (false, true),
+                _ => return None,
+            };
+            Some(CodecInt8Route {
+                plan: autotuned_plan(),
+                transformer,
+                convnext,
+                memo: Mutex::new(HashMap::new()),
+            })
+        })
+        .as_ref()
+}
+
+/// Every dense (non-convolution) codec projection goes through here.
+///
+/// Unarmed, this is byte-for-byte `f32ref::linear` — the scalar reference reduction the parity
+/// suite pins. Armed (`FTTS_INT8_CODEC=1`), the weight is quantized once (canonical symmetric
+/// per-output-channel Q8) and the activations per row, so streaming and offline decode still
+/// agree bit-for-bit: per-row activation quantization is batching-invariant.
+#[allow(clippy::too_many_arguments)]
+fn dense_linear(
+    class: DenseClass,
+    x: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) {
+    let armed = codec_int8_route().filter(|route| match class {
+        DenseClass::Transformer => route.transformer,
+        DenseClass::ConvNext => route.convnext,
+    });
+    let Some(route) = armed else {
+        f32ref::linear(x, weight, bias, m, k, n, out);
+        return;
+    };
+
+    let key = (weight.as_ptr() as usize, weight.len());
+    let fingerprint = (
+        weight.first().map_or(0, |value| value.to_bits()),
+        weight.last().map_or(0, |value| value.to_bits()),
+    );
+    let cached = {
+        let memo = route.memo.lock().expect("codec int8 memo poisoned");
+        memo.get(&key).cloned()
+    };
+    let quantized = match cached {
+        Some(entry) if (entry.0, entry.1) == fingerprint => entry,
+        _ => {
+            let entry = Arc::new((
+                fingerprint.0,
+                fingerprint.1,
+                QuantizedMatrix::quantize(weight, n, k),
+            ));
+            route
+                .memo
+                .lock()
+                .expect("codec int8 memo poisoned")
+                .insert(key, Arc::clone(&entry));
+            entry
+        }
+    };
+    // Offline decode arrives with m = frames (batch regime); streaming pushes small m.
+    let tier = if m > 4 {
+        route.plan.batch_gemm
+    } else {
+        route.plan.decode_gemv
+    };
+    linear_q8_dynamic(x, &quantized.2, bias, m, out, tier);
 }
 
 /// BigVGAN SnakeBeta in time-major `[frames, channels]` storage.
@@ -1329,7 +1455,8 @@ pub fn forward_convnext(
         1e-6,
     );
     let mut expanded = vec![0.0f32; frames * 4 * channels];
-    f32ref::linear(
+    dense_linear(
+        DenseClass::ConvNext,
         &hidden,
         weights.pwconv1,
         Some(weights.pwconv1_bias),
@@ -1341,7 +1468,8 @@ pub fn forward_convnext(
     for value in &mut expanded {
         *value = gelu(*value);
     }
-    f32ref::linear(
+    dense_linear(
+        DenseClass::ConvNext,
         &expanded,
         weights.pwconv2,
         Some(weights.pwconv2_bias),
@@ -1460,7 +1588,8 @@ impl CodecConvNextStream {
         );
         layer_norm_in_place(output, frames, weights.norm_weight, weights.norm_bias, 1e-6);
         let mut expanded = vec![0.0f32; frames * 4 * channels];
-        f32ref::linear(
+        dense_linear(
+            DenseClass::ConvNext,
             output,
             weights.pwconv1,
             Some(weights.pwconv1_bias),
@@ -1473,7 +1602,8 @@ impl CodecConvNextStream {
             *value = gelu(*value);
         }
         let mut residual = vec![0.0f32; input.len()];
-        f32ref::linear(
+        dense_linear(
+            DenseClass::ConvNext,
             &expanded,
             weights.pwconv2,
             Some(weights.pwconv2_bias),

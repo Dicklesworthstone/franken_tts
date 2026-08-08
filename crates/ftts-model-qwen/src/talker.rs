@@ -1260,8 +1260,8 @@ mod tests {
 
         assert_eq!(q8_cache.len(), f32_cache.len());
         let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
-        let cosine =
-            dot(&expected, &actual) / (dot(&expected, &expected).sqrt() * dot(&actual, &actual).sqrt());
+        let cosine = dot(&expected, &actual)
+            / (dot(&expected, &expected).sqrt() * dot(&actual, &actual).sqrt());
         assert!(
             cosine > 0.99,
             "W8A8 talker layer diverged from the f32 reference: cosine {cosine}"
