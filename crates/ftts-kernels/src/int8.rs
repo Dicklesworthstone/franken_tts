@@ -21,6 +21,8 @@
 //! preference is decided by measurement (`FTTS_INT8_TIER` forces a route for A/B), never by
 //! assumption.
 
+use std::sync::OnceLock;
+
 /// Largest absolute Q8 byte the canonical symmetric recipe emits.
 pub const Q8_MAX_ABS: i8 = 127;
 
@@ -157,6 +159,81 @@ impl Int8Tier {
             _ => Self::Scalar,
         }
     }
+}
+
+/// The measured per-regime route assignment, decided once per process.
+///
+/// v0 of the KernelPlan: two regimes, no persistence (`.fttspack` owns that when it lands).
+/// Safe to decide by noisy measurement because every tier produces bit-identical output — a
+/// wrong pick costs microseconds, never correctness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelPlanV0 {
+    /// Route for m=1 decode GEMVs (the talker/microdecoder step shape).
+    pub decode_gemv: Int8Tier,
+    /// Route for batched GEMMs (prefill, seq-16 verify, offline codec).
+    pub batch_gemm: Int8Tier,
+}
+
+/// Measures each available tier at the two live regimes and returns the winners.
+///
+/// Decided once per process and cached. `FTTS_INT8_TIER` overrides both regimes — the A/B
+/// override must pin the route it names, not merely suggest it. Cost: a few milliseconds of
+/// synthetic dots at the model's real reduction lengths.
+pub fn autotuned_plan() -> KernelPlanV0 {
+    static PLAN: OnceLock<KernelPlanV0> = OnceLock::new();
+    *PLAN.get_or_init(|| {
+        if std::env::var("FTTS_INT8_TIER").is_ok() {
+            let forced = Int8Tier::dispatch();
+            return KernelPlanV0 {
+                decode_gemv: forced,
+                batch_gemm: forced,
+            };
+        }
+        KernelPlanV0 {
+            // Talker/microdecoder decode: one activation row against tall matrices; K = 1024
+            // and 3072 are the real reduction lengths, 256 output rows keep the probe cheap
+            // while streaming enough weight bytes to reach the bandwidth regime.
+            decode_gemv: fastest_tier(&[(1, 1024, 256), (1, 3072, 256)]),
+            // Verify/prefill/codec batches: sixteen rows, same reduction lengths.
+            batch_gemm: fastest_tier(&[(16, 1024, 128), (16, 3072, 64)]),
+        }
+    })
+}
+
+/// Times every available tier over the given `(m, k, n)` probes; median of three rounds each,
+/// summed across probes, smallest total wins. Ties break toward the earlier tier in
+/// [`Int8Tier::available`] order (scalar first — the simpler route).
+fn fastest_tier(probes: &[(usize, usize, usize)]) -> Int8Tier {
+    use std::time::Instant;
+    let tiers = Int8Tier::available();
+    let mut best = (tiers[0], f64::MAX);
+    for &tier in &tiers {
+        let mut total = 0.0_f64;
+        for &(m, k, n) in probes {
+            let x_q: Vec<i8> = (0..m * k).map(|i| ((i * 37 + 11) % 255) as i8).collect();
+            let x_scales = vec![1.0_f32; m];
+            let weight = QuantizedMatrix {
+                data: (0..n * k).map(|i| ((i * 29 + 5) % 255) as i8).collect(),
+                scales: vec![1.0_f32; n],
+                n,
+                k,
+            };
+            let mut out = vec![0.0_f32; m * n];
+            let mut rounds: Vec<f64> = (0..3)
+                .map(|_| {
+                    let start = Instant::now();
+                    linear_q8(&x_q, &x_scales, &weight, None, m, &mut out, tier);
+                    start.elapsed().as_secs_f64()
+                })
+                .collect();
+            rounds.sort_by(f64::total_cmp);
+            total += rounds[1];
+        }
+        if total < best.1 {
+            best = (tier, total);
+        }
+    }
+    best.0
 }
 
 /// Whether the SDOT island is compiled in and the CPU reports FEAT_DotProd.
