@@ -150,8 +150,12 @@ impl EngineConfig {
         config.admission.budget_bytes = positive_u64_from_environment("FTTS_MEMORY_BUDGET_MB")
             .and_then(|megabytes| megabytes.checked_mul(1024 * 1024))
             .unwrap_or(config.admission.budget_bytes);
-        config.admission.max_new_tokens = positive_u64_from_environment("FTTS_MAX_FRAMES")
-            .unwrap_or(config.admission.max_new_tokens);
+        if let Some(max_frames) = positive_u64_from_environment("FTTS_MAX_FRAMES") {
+            // An explicit cap is obeyed exactly: it both replaces the policy default and
+            // disables the text-derived EOS backstop that otherwise bounds a bare `ftts say`.
+            config.admission.max_new_tokens = max_frames;
+            config.admission.heuristic_eos_backstop = false;
+        }
         config
     }
 
@@ -1520,12 +1524,27 @@ mod tests {
             config.admission.max_new_tokens,
             admission::DEFAULT_MAX_NEW_TOKENS
         );
-        // The default policy must admit the ordinary case it was sized for: an 8192-frame cap at a
-        // 512-token prompt is 952 MiB of talker KV, which has to fit inside the 2 GiB default.
+        // The default policy applies the text-derived EOS backstop: a 512-token prompt is
+        // granted `512 * 4 + 64` frames, not the flat 8,192-frame ceiling — the sampled EOS is a
+        // stochastic stop, so an unbounded default would let one unlucky utterance run for
+        // minutes. The flat ceiling still binds for explicit caps (see the admission tests).
         let plan = config
             .admission
             .admit(512)
             .expect("the documented default must admit its own worked case");
+        assert_eq!(
+            plan.predicted_max_frames,
+            512 * admission::HEURISTIC_FRAMES_PER_PROMPT_TOKEN
+                + admission::HEURISTIC_FRAME_HEADROOM
+        );
+        assert!(plan.fits());
+
+        // And the worked 8192-frame sizing case still admits when the cap is explicit.
+        let mut explicit = config.admission;
+        explicit.heuristic_eos_backstop = false;
+        let plan = explicit
+            .admit(512)
+            .expect("the documented explicit-cap case must admit");
         assert_eq!(plan.predicted_max_frames, admission::DEFAULT_MAX_NEW_TOKENS);
         assert!(plan.fits());
     }

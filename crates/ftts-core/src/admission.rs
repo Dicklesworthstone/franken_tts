@@ -102,6 +102,13 @@ pub enum BindingConstraint {
     FrameCap,
     /// The context ceiling bound it — the prompt is long enough to crowd out generation.
     ContextCeiling,
+    /// The text-derived EOS backstop bound it (`prompt_tokens * 4 + 64` frames).
+    ///
+    /// The sampled EOS is a stochastic stop (README: "EOS stop timing is sampling-dependent"),
+    /// so a bare `ftts say` without `FTTS_MAX_FRAMES` needs a cap proportional to the text
+    /// rather than the flat 8,192-frame (≈11 minute) policy default. Setting `FTTS_MAX_FRAMES`
+    /// disables this backstop: an explicit cap is obeyed exactly.
+    TextHeuristic,
 }
 
 impl BindingConstraint {
@@ -111,9 +118,20 @@ impl BindingConstraint {
         match self {
             Self::FrameCap => "frame_cap",
             Self::ContextCeiling => "context_ceiling",
+            Self::TextHeuristic => "text_heuristic",
         }
     }
 }
+
+/// Frames granted per prompt token by the EOS backstop.
+///
+/// Calibrated on the demo utterance: 28 prompt tokens (with wrapper) produced 55 frames of real
+/// speech, ≈2 frames/token; 4 leaves room for slow prosody and pauses without permitting a
+/// runaway. An engineering backstop, not a physics claim.
+pub const HEURISTIC_FRAMES_PER_PROMPT_TOKEN: u64 = 4;
+
+/// Flat headroom the EOS backstop adds for leading/trailing silence.
+pub const HEURISTIC_FRAME_HEADROOM: u64 = 64;
 
 /// Everything admission needs to know before any allocation happens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +140,11 @@ pub struct AdmissionRequest {
     pub prompt_tokens: u64,
     /// Caller's frame cap.
     pub max_new_tokens: u64,
+    /// Whether the text-derived EOS backstop also bounds the generation.
+    ///
+    /// False when the caller set an explicit cap (`FTTS_MAX_FRAMES`), which is then obeyed
+    /// exactly.
+    pub heuristic_eos_backstop: bool,
     /// Precision the KV cache is held at.
     pub kv_dtype: KvDtype,
     /// Codec conv ring buffers, from receptive fields.
@@ -269,6 +292,9 @@ pub struct AdmissionPolicy {
     pub budget_bytes: u64,
     /// Frame cap applied to every request.
     pub max_new_tokens: u64,
+    /// Whether the text-derived EOS backstop also applies (disabled by an explicit
+    /// `FTTS_MAX_FRAMES`).
+    pub heuristic_eos_backstop: bool,
     /// Precision the KV cache is held at.
     pub kv_dtype: KvDtype,
     /// Codec conv ring buffers.
@@ -291,6 +317,7 @@ impl Default for AdmissionPolicy {
         Self {
             budget_bytes: DEFAULT_BUDGET_BYTES,
             max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
+            heuristic_eos_backstop: true,
             kv_dtype: KvDtype::Bf16,
             // Phase 0 has no codec rings and no resident weights yet. Zero is the honest value:
             // an invented placeholder would make the prediction look complete while being wrong,
@@ -308,6 +335,7 @@ impl AdmissionPolicy {
         AdmissionRequest {
             prompt_tokens,
             max_new_tokens: self.max_new_tokens,
+            heuristic_eos_backstop: self.heuristic_eos_backstop,
             kv_dtype: self.kv_dtype,
             ring_buffer_bytes: self.ring_buffer_bytes,
             weights_resident_bytes: self.weights_resident_bytes,
@@ -342,8 +370,20 @@ pub fn admit(request: &AdmissionRequest) -> Result<AdmissionPlan, AdmissionRejec
     }
 
     let headroom = MAX_CONTEXT_TOKENS - request.prompt_tokens;
-    let predicted_max_frames = request.max_new_tokens.min(headroom);
-    let binding_constraint = if request.max_new_tokens <= headroom {
+    let heuristic_cap = if request.heuristic_eos_backstop {
+        request
+            .prompt_tokens
+            .saturating_mul(HEURISTIC_FRAMES_PER_PROMPT_TOKEN)
+            .saturating_add(HEURISTIC_FRAME_HEADROOM)
+    } else {
+        u64::MAX
+    };
+    let predicted_max_frames = request.max_new_tokens.min(headroom).min(heuristic_cap);
+    let binding_constraint = if predicted_max_frames == heuristic_cap
+        && heuristic_cap < request.max_new_tokens.min(headroom)
+    {
+        BindingConstraint::TextHeuristic
+    } else if request.max_new_tokens <= headroom {
         BindingConstraint::FrameCap
     } else {
         BindingConstraint::ContextCeiling
@@ -466,11 +506,44 @@ mod tests {
         AdmissionRequest {
             prompt_tokens,
             max_new_tokens,
+            // These tests pin the explicit-cap arithmetic; the backstop has its own tests below.
+            heuristic_eos_backstop: false,
             kv_dtype: KvDtype::Bf16,
             ring_buffer_bytes: 0,
             weights_resident_bytes: 0,
             budget_bytes,
         }
+    }
+
+    #[test]
+    fn the_eos_backstop_binds_a_short_prompt_under_the_flat_default_cap() {
+        let mut with_backstop = request(28, DEFAULT_MAX_NEW_TOKENS, 2 * GIB);
+        with_backstop.heuristic_eos_backstop = true;
+        let plan = admit(&with_backstop).expect("fits easily");
+        assert_eq!(
+            plan.predicted_max_frames,
+            28 * HEURISTIC_FRAMES_PER_PROMPT_TOKEN + HEURISTIC_FRAME_HEADROOM
+        );
+        assert_eq!(plan.binding_constraint, BindingConstraint::TextHeuristic);
+    }
+
+    #[test]
+    fn an_explicit_cap_disables_the_eos_backstop_exactly() {
+        // FTTS_MAX_FRAMES semantics: the explicit value is obeyed even when the heuristic would
+        // have been smaller.
+        let explicit = request(28, 2_000, 2 * GIB);
+        let plan = admit(&explicit).expect("fits");
+        assert_eq!(plan.predicted_max_frames, 2_000);
+        assert_eq!(plan.binding_constraint, BindingConstraint::FrameCap);
+    }
+
+    #[test]
+    fn the_backstop_never_raises_a_smaller_explicit_cap() {
+        let mut small = request(1_000, 32, 2 * GIB);
+        small.heuristic_eos_backstop = true;
+        let plan = admit(&small).expect("fits");
+        assert_eq!(plan.predicted_max_frames, 32);
+        assert_eq!(plan.binding_constraint, BindingConstraint::FrameCap);
     }
 
     /// The three worked points recorded in OQ-6. These are the numbers the rule was derived from;
@@ -589,6 +662,7 @@ mod tests {
         let over = AdmissionRequest {
             prompt_tokens: 512,
             max_new_tokens: 2048,
+            heuristic_eos_backstop: false,
             kv_dtype: KvDtype::Bf16,
             ring_buffer_bytes: u64::MAX,
             weights_resident_bytes: u64::MAX,
