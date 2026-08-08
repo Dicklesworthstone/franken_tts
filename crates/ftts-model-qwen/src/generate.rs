@@ -380,13 +380,26 @@ impl FrameGenerator for QwenGenerator<'_> {
             return Ok(None);
         }
 
-        let residuals = microdecoder::decode_frame_greedy(
+        // The subtalker follows the run's decode mode: greedy conformance stays zero-RNG, while
+        // production SAMPLES every residual depth exactly as upstream's subtalker_dosample=true
+        // does — greedy residuals under a sampled talker sit in a measured silence attractor
+        // (frankentts-p7r; the reference reproduces it in that mismatched configuration).
+        let sampler = &mut self.sampler;
+        let sampling_mode = self.sampling_mode;
+        let residuals = microdecoder::decode_frame_with_selector(
             &self.microdecoder_config,
             &self.microdecoder_rope,
             &self.microdecoder_weights,
             &mut self.frame_state,
             &utterance.pending_hidden,
             primary as usize,
+            |logits| match sampling_mode {
+                SamplingMode::CanonicalGreedy => microdecoder::argmax(logits),
+                SamplingMode::Production => sampler
+                    .select_microdecoder(logits, SamplingMode::Production)
+                    .expect("RESIDUAL_VOCAB rows are well-formed microdecoder logits")
+                    as usize,
+            },
         );
         let mut codes = Vec::with_capacity(CODE_GROUP_COUNT);
         codes.push(primary);

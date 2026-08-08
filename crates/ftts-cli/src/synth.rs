@@ -507,17 +507,17 @@ pub fn synthesize(
         header,
         tts_eos,
         reference: None,
-        // Upstream's runtime ships the SAMPLING stack (generation_config.json: do_sample=true,
-        // T=0.9, top_k=50, repetition_penalty=1.05; subtalker likewise), and that remains this
-        // path's target. Greedy ships today because our Production mode is measured DEFECTIVE
-        // end-to-end (bead frankentts-bug-production-sampler): on the same prompt, greedy
-        // reproduces the pinned reference's audio envelope to five digits (peak frame RMS
-        // 0.08597 vs oracle 0.0859745) while Production emits near-silence (1.1e-5). Do not
-        // flip this back without that bead's exit gate. Second measured limitation, the model's
-        // own: the reference never draws EOS on the synthetic-tone conformance voice (100-frame
-        // probe, all four modes, code-repetition collapse), so utterances are bounded by the
-        // admission cap, not only by EOS.
-        sampling_mode: SamplingMode::CanonicalGreedy,
+        // The PRODUCT samples, exactly as the pinned upstream runtime does
+        // (generation_config.json: do_sample=true, T=0.9, top_k=50, repetition_penalty=1.05,
+        // subtalker likewise); canonical greedy remains the conformance decoder only. The p7r
+        // forensics that certified this path: our talker draw stack matched torch's choices
+        // code-for-code for seven straight frames from the same prefill, the silence defect was
+        // the subtalker being forced greedy under a sampled talker (a measured silence
+        // attractor the reference reproduces in that mismatched configuration), and with the
+        // subtalker sampling per depth the engine's utterance envelope matches the reference's
+        // sampled runs (peak frame RMS 0.086 with trailing silence). Determinism scope: build +
+        // ISA + sampler version + seed, 16 draws per frame.
+        sampling_mode: SamplingMode::Production,
         seed,
     });
 

@@ -277,6 +277,23 @@ impl Hydrated {
         micro_residual: &'a [&'a [f32]],
         micro_heads: &'a [&'a [f32]],
     ) -> QwenGenerator<'a> {
+        self.generator_with_mode(
+            talker_layers,
+            micro_layers,
+            micro_residual,
+            micro_heads,
+            SamplingMode::CanonicalGreedy,
+        )
+    }
+
+    fn generator_with_mode<'a>(
+        &'a self,
+        talker_layers: &'a [TalkerLayerWeights<'a>],
+        micro_layers: &'a [LayerWeights<'a>],
+        micro_residual: &'a [&'a [f32]],
+        micro_heads: &'a [&'a [f32]],
+        sampling_mode: SamplingMode,
+    ) -> QwenGenerator<'a> {
         QwenGenerator::new(QwenGeneratorConfig {
             talker_config: TalkerConfig::default(),
             talker_weights: TalkerWeights {
@@ -318,7 +335,7 @@ impl Hydrated {
             },
             tts_eos: vec![0.0; HIDDEN],
             reference: None,
-            sampling_mode: SamplingMode::CanonicalGreedy,
+            sampling_mode,
             seed: 0,
         })
     }
@@ -651,5 +668,86 @@ fn engine_synthesize_reproduces_the_whole_oracle_utterance_exactly() {
             ))
             .oracle_tier(OracleTier::CpuFp32Fallback)
             .emit();
+    }
+}
+
+/// p7r bisect probe: the engine loop under Production sampling, from the oracle's own prefill.
+///
+/// Prints every frame's 16 codes so the silence-shaped failure can be attributed: degenerate or
+/// repeating c0 means the loop/history/logits interaction is wrong; plausible diverse c0 (the
+/// family the reference draws under sampling) with silent audio means the greedy-residuals-under-
+/// sampled-c0 combination or the codec input is at fault. Run manually:
+/// `cargo test -p ftts-conformance --test engine_e2e_ft7 -- --ignored --nocapture`.
+#[test]
+#[ignore = "manual p7r diagnostic; prints per-frame codes under Production sampling"]
+fn production_mode_codes_probe() {
+    let fixtures = match OracleFixtures::open_default() {
+        Ok(fixtures) => fixtures,
+        Err(FixtureError::PackAbsent { path }) => {
+            skip(&format!("oracle fixture pack absent at {path}"));
+            return;
+        }
+        Err(error) => panic!("fixture pack unusable: {error}"),
+    };
+    let checkpoint = checkpoint_path();
+    if !checkpoint.exists() {
+        skip("pinned weights absent");
+        return;
+    }
+
+    let input_seam = SeamRef {
+        case: CASE,
+        mode: MODE,
+        group: GROUP,
+        seam: "talker.input.input",
+    };
+    let prefill = fixtures
+        .seam(&input_seam, "kwargs.inputs_embeds", 0)
+        .expect("assembled prefill captured");
+    let seq = prefill.shape[1];
+    let trailing = fixtures
+        .seam(&input_seam, "kwargs.trailing_text_hidden", 0)
+        .expect("trailing text stream captured");
+    let tts_pad = fixtures
+        .seam(&input_seam, "kwargs.tts_pad_embed", 0)
+        .expect("tts_pad embedding captured");
+
+    let file = SafetensorsFile::open(&checkpoint).expect("pinned checkpoint maps and parses");
+    file.advise_random();
+    let hydrated = Hydrated::load(&file, tts_pad.data.clone());
+    let talker_layers: Vec<TalkerLayerWeights<'_>> =
+        hydrated.talker_layers.iter().map(borrow_layer).collect();
+    let micro_layers: Vec<LayerWeights<'_>> = hydrated
+        .micro_layers
+        .iter()
+        .map(borrow_micro_layer)
+        .collect();
+    let micro_residual: Vec<&[f32]> = hydrated.residual_embeddings[..RESIDUAL_DEPTHS - 1]
+        .iter()
+        .map(Vec::as_slice)
+        .collect();
+    let micro_heads: Vec<&[f32]> = hydrated.micro_heads.iter().map(Vec::as_slice).collect();
+    let trailing_rows: Vec<Vec<f32>> = trailing.data.chunks(HIDDEN).map(<[f32]>::to_vec).collect();
+
+    let mut generator = hydrated.generator_with_mode(
+        &talker_layers,
+        &micro_layers,
+        &micro_residual,
+        &micro_heads,
+        SamplingMode::Production,
+    );
+    generator
+        .begin_with_prefill(&prefill.data, seq, trailing_rows)
+        .expect("prefill accepted");
+    for frame in 0..14 {
+        match generator.next_frame().expect("frame generation succeeds") {
+            Some(code_frame) => {
+                eprintln!("frame {frame:02}: {:?}", code_frame.codes);
+            }
+            None => {
+                eprintln!("frame {frame:02}: EOS drawn — utterance ended");
+                break;
+            }
+        }
     }
 }

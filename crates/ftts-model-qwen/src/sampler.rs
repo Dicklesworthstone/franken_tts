@@ -365,6 +365,55 @@ mod tests {
         vec![0.0; TALKER_VOCAB_SIZE]
     }
 
+    #[test]
+    fn production_draws_concentrate_on_a_peaked_mode() {
+        // The captured talker logits are sharply peaked (winning code ~26.5 vs a ~5.5 background
+        // — engine_e2e's recorded step-1 row). After T = 0.9 that peak holds ~all probability
+        // mass, so a correct categorical draw selects it essentially always. A sampler whose
+        // draws scatter over the top-k set on THIS distribution has a warper/normalization/draw
+        // bug — this is the unit-level discriminator for silence-shaped production failures.
+        let mut logits = vec![5.5_f32; TALKER_VOCAB_SIZE];
+        logits[125] = 26.5;
+        let mut sampler = QwenSampler::seeded(0);
+        let mut peak_hits = 0usize;
+        for _ in 0..200 {
+            let pick = sampler
+                .select_talker(&logits, &[], SamplingMode::Production)
+                .expect("valid row");
+            assert!(
+                pick < MICRODECODER_VOCAB_SIZE as u32 || pick == CODEC_EOS_TOKEN_ID,
+                "suppressed special {pick} must never be drawn"
+            );
+            if pick == 125 {
+                peak_hits += 1;
+            }
+        }
+        assert!(
+            peak_hits >= 195,
+            "a 21-logit peak after T=0.9 holds ~all mass; drawing it only {peak_hits}/200 times \
+             means the production warper/draw stack is broken"
+        );
+
+        // And on a FLAT top-k the draws must scatter rather than collapse onto one token —
+        // the opposite failure (always returning the first candidate) also produces
+        // degenerate audio.
+        let flat = vec![5.5_f32; TALKER_VOCAB_SIZE];
+        let mut distinct = std::collections::BTreeSet::new();
+        for _ in 0..200 {
+            distinct.insert(
+                sampler
+                    .select_talker(&flat, &[], SamplingMode::Production)
+                    .expect("valid row"),
+            );
+        }
+        assert!(
+            distinct.len() >= 20,
+            "200 draws over a flat top-{TOP_K} produced only {} distinct tokens; the draw is \
+             not exploring the candidate set",
+            distinct.len()
+        );
+    }
+
     fn microdecoder_logits() -> Vec<f32> {
         vec![0.0; MICRODECODER_VOCAB_SIZE]
     }

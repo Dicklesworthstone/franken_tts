@@ -58,7 +58,7 @@ const TEXT: &str = "Hello.";
 /// produced; and the model cannot be expected to stop on its own here — the pinned reference
 /// never draws EOS on the synthetic-tone voice (measured 2026-08-08, 100-token probe, all four
 /// modes), so a bounded truncation IS the correct product outcome for this input.
-const ADMITTED_FRAME_CAP: u64 = 12;
+const ADMITTED_FRAME_CAP: u64 = 24;
 
 fn bundle_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/truth-pack/snapshots/hf")

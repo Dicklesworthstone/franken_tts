@@ -959,6 +959,40 @@ pub fn decode_frame_greedy(
     talker_hidden: &[f32],
     primary_code: usize,
 ) -> Vec<usize> {
+    decode_frame_with_selector(
+        config,
+        rope,
+        weights,
+        state,
+        talker_hidden,
+        primary_code,
+        argmax,
+    )
+}
+
+/// The sequential loop with the per-depth code selection supplied by the caller.
+///
+/// This is how production subtalker SAMPLING runs the same authoritative loop: upstream ships
+/// `subtalker_dosample=true` (T 0.9, top-k 50), and forcing greedy residuals under a sampled
+/// talker is measurably pathological — the pinned reference in exactly that configuration emits
+/// seven silent leading frames before a lucky talker draw escapes the silence attractor
+/// (measured 2026-08-08, x-vector mode, seed 0), which is the silence `frankentts-p7r` observed
+/// end-to-end. Greedy conformance decode keeps its zero-RNG selector via
+/// [`decode_frame_greedy`]; everything else — reset semantics, per-depth tables, autoregressive
+/// feedback — is identical by construction.
+///
+/// # Panics
+///
+/// Panics when the weight tables do not have the expected counts, or on any shape mismatch.
+pub fn decode_frame_with_selector(
+    config: &MicrodecoderConfig,
+    rope: &RopeTable,
+    weights: &MicrodecoderWeights<'_>,
+    state: &mut FrameState,
+    talker_hidden: &[f32],
+    primary_code: usize,
+    mut select: impl FnMut(&[f32]) -> usize,
+) -> Vec<usize> {
     assert_frame_shapes(config, weights, talker_hidden);
 
     // Frame boundary: frame N must not see frame N-1's keys.
@@ -1007,7 +1041,11 @@ pub fn decode_frame_greedy(
         let normed = rms_norm(&hidden, weights.final_norm, config.rms_eps);
         let mut logits = vec![0.0_f32; RESIDUAL_VOCAB];
         matvec(weights.heads[head], &normed, &mut logits);
-        let code = argmax(&logits);
+        let code = select(&logits);
+        assert!(
+            code < RESIDUAL_VOCAB,
+            "selector returned {code}, outside the residual vocab"
+        );
         codes.push(code);
         previous_code = code;
     }
