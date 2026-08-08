@@ -288,6 +288,7 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
 /// normal safe-Rust reference path. Targets without the opt-in macOS backend return `false`, so
 /// their scalar fallback remains bit-for-bit the ordinary reference implementation.
 #[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 fn accelerate_sgemm(
     x: &[f32],
     weight: &[f32],

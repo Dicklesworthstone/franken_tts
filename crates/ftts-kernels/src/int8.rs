@@ -88,9 +88,12 @@ impl QuantizedMatrix {
         assert_eq!(weight.len(), n * k, "weight must be [n, k]");
         let mut data = vec![0_i8; n * k];
         let mut scales = vec![0.0_f32; n];
-        for row in 0..n {
-            let span = row * k..(row + 1) * k;
-            scales[row] = quantize_row_q8(&weight[span.clone()], &mut data[span]);
+        for ((weight_row, data_row), scale) in weight
+            .chunks_exact(k)
+            .zip(data.chunks_exact_mut(k))
+            .zip(scales.iter_mut())
+        {
+            *scale = quantize_row_q8(weight_row, data_row);
         }
         Self { data, scales, n, k }
     }
@@ -178,21 +181,22 @@ pub fn dot_i32(a: &[i8], b: &[i8], tier: Int8Tier) -> i32 {
     match tier {
         Int8Tier::Scalar => dot_i32_scalar(a, b),
         Int8Tier::Autovec => dot_i32_autovec(a, b),
-        Int8Tier::NeonSdot => {
-            #[cfg(all(target_arch = "aarch64", feature = "neon-dotprod"))]
-            {
-                assert!(
-                    neon_dotprod::available(),
-                    "neon-sdot route selected without FEAT_DotProd"
-                );
-                return neon_dotprod::dot_i32(a, b);
-            }
-            #[cfg(not(all(target_arch = "aarch64", feature = "neon-dotprod")))]
-            {
-                panic!("neon-sdot route selected on a build without the island");
-            }
-        }
+        Int8Tier::NeonSdot => dot_i32_neon_or_panic(a, b),
     }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon-dotprod"))]
+fn dot_i32_neon_or_panic(a: &[i8], b: &[i8]) -> i32 {
+    assert!(
+        neon_dotprod::available(),
+        "neon-sdot route selected without FEAT_DotProd"
+    );
+    neon_dotprod::dot_i32(a, b)
+}
+
+#[cfg(not(all(target_arch = "aarch64", feature = "neon-dotprod")))]
+fn dot_i32_neon_or_panic(_a: &[i8], _b: &[i8]) -> i32 {
+    panic!("neon-sdot route selected on a build without the island");
 }
 
 fn dot_i32_scalar(a: &[i8], b: &[i8]) -> i32 {
@@ -362,9 +366,12 @@ pub fn linear_q8_dynamic(
     assert_eq!(x.len(), m * k, "x must be [m, k]");
     let mut x_q = vec![0_i8; m * k];
     let mut x_scales = vec![0.0_f32; m];
-    for row in 0..m {
-        let span = row * k..(row + 1) * k;
-        x_scales[row] = quantize_row_q8(&x[span.clone()], &mut x_q[span]);
+    for ((x_row, q_row), scale) in x
+        .chunks_exact(k)
+        .zip(x_q.chunks_exact_mut(k))
+        .zip(x_scales.iter_mut())
+    {
+        *scale = quantize_row_q8(x_row, q_row);
     }
     linear_q8(&x_q, &x_scales, weight, bias, m, out, tier);
 }

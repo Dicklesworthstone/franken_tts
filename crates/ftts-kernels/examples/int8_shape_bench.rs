@@ -69,7 +69,14 @@ fn main() {
     );
 
     for &m in &[1_usize, 16] {
-        println!("\n== m = {m} {} ==", if m == 1 { "(decode GEMV)" } else { "(seq-16 verify GEMM)" });
+        println!(
+            "\n== m = {m} {} ==",
+            if m == 1 {
+                "(decode GEMV)"
+            } else {
+                "(seq-16 verify GEMM)"
+            }
+        );
         for &(label, n, k) in SHAPES {
             let calls: usize = (32 / m).max(2);
             let weight = pseudo_random_f32(n * k, 0xbe0_0001 ^ (n as u64) << 20 ^ k as u64);
@@ -105,10 +112,12 @@ fn main() {
                 for &tier in &tiers {
                     let start = Instant::now();
                     for _ in 0..calls {
-                        for row in 0..m {
-                            let span = row * k..(row + 1) * k;
-                            x_scales[row] =
-                                quantize_row_q8(black_box(&x[span.clone()]), &mut x_q[span]);
+                        for ((x_row, q_row), scale) in x
+                            .chunks_exact(k)
+                            .zip(x_q.chunks_exact_mut(k))
+                            .zip(x_scales.iter_mut())
+                        {
+                            *scale = quantize_row_q8(black_box(x_row), q_row);
                         }
                         linear_q8(
                             black_box(&x_q),
