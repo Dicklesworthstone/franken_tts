@@ -31,6 +31,11 @@ pub enum F32LinearAccumulation {
     ///
     /// On every other target, this deliberately falls back to [`Self::Scalar`].
     Accelerate,
+    /// [`Self::Accelerate`], with M = 1 calls pinned onto the M >= 2 GEMM kernel.
+    ///
+    /// See [`Self::AccelerateBiasSeededRowInvariant`] for the streaming == offline rationale;
+    /// this is the same pinning for the `beta = 0` route (the codec's RVQ projections).
+    AccelerateRowInvariant,
     /// macOS Accelerate SGEMM over a bias-seeded output, issued with `beta = 1`.
     ///
     /// This is the exact call `slow_conv2d_update_output_frame` makes for a convolution with a
@@ -39,6 +44,15 @@ pub enum F32LinearAccumulation {
     /// the CPU-fp32 fixture can attribute a convolution's divergence; it falls back to
     /// [`Self::Scalar`] with a trailing bias on every non-macOS target.
     AccelerateBiasSeeded,
+    /// [`Self::AccelerateBiasSeeded`], with M = 1 calls pinned onto the M >= 2 GEMM kernel.
+    ///
+    /// Accelerate routes M = 1 to a GEMV kernel whose reduction order differs from its (measured
+    /// row-invariant) M >= 2 GEMM kernel. Seams whose streaming variant must equal whole-sequence
+    /// decode bit-for-bit — the codec convolutions — need every M on the same kernel path, and
+    /// accept drifting a single-frame call away from the oracle's own GEMV bits to get it. Seams
+    /// the ORACLE itself computes at M = 1 (the speaker-encoder embedding head) must NOT use
+    /// this: the GEMV path is the oracle-matching one there.
+    AccelerateBiasSeededRowInvariant,
     /// One f64 accumulator, narrowed to f32 only at the store.
     ///
     /// Not a candidate for what the oracle did — it is an *attribution probe*. Every f32 lane
@@ -149,7 +163,11 @@ pub fn linear_with_accumulation(
         assert_eq!(bias.len(), n, "bias must be [n]");
     }
 
-    if accumulation == F32LinearAccumulation::AccelerateBiasSeeded {
+    if matches!(
+        accumulation,
+        F32LinearAccumulation::AccelerateBiasSeeded
+            | F32LinearAccumulation::AccelerateBiasSeededRowInvariant
+    ) {
         // Seed `out` with the bias and let the BLAS accumulate onto it, exactly as the reference
         // convolution's `beta = 1` GEMM does.
         match bias {
@@ -160,15 +178,27 @@ pub fn linear_with_accumulation(
             }
             None => out.fill(0.0),
         }
-        if accelerate_sgemm(x, weight, m, k, n, 1.0, out) {
+        let row_invariant =
+            accumulation == F32LinearAccumulation::AccelerateBiasSeededRowInvariant;
+        if accelerate_sgemm(x, weight, m, k, n, 1.0, row_invariant, out) {
             return;
         }
         out.fill(0.0);
     }
 
-    if accumulation == F32LinearAccumulation::Accelerate
-        && accelerate_sgemm(x, weight, m, k, n, 0.0, out)
-    {
+    if matches!(
+        accumulation,
+        F32LinearAccumulation::Accelerate | F32LinearAccumulation::AccelerateRowInvariant
+    ) && accelerate_sgemm(
+        x,
+        weight,
+        m,
+        k,
+        n,
+        0.0,
+        accumulation == F32LinearAccumulation::AccelerateRowInvariant,
+        out,
+    ) {
         if let Some(bias) = bias {
             for row in out.chunks_exact_mut(n) {
                 for (value, offset) in row.iter_mut().zip(bias) {
