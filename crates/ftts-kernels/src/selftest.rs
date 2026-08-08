@@ -5,11 +5,19 @@
 //! route therefore has to prove its i32 accumulator against `255 * 127 * K` at this checkpoint's
 //! real reduction lengths, not a bound borrowed from another model.
 //!
-//! The current executable route is only [`KernelTier::Scalar`]. It is intentionally the only tier
-//! this module advertises or marks as passed: native ISA tiers must add their implementation and a
-//! scalar-equality proof row before they become dispatchable. The rows mirror the binding component
-//! maxima in `docs/truth-pack/EXECUTION_CENSUS.json`, plus the seq-16 microdecoder verifier, whose
-//! larger M does not alter its per-output reduction length.
+//! Two proof families run at every census binding K:
+//!
+//! - **U8S8 envelope** (`255 * 127 * K`): the contract ceiling for a future unsigned-activation
+//!   route (x86 VNNI's +128 fold), executed on the checked scalar path. It strictly dominates the
+//!   S8S8 magnitude, so it remains the conservative bound for every row.
+//! - **S8S8 kernel** (`±127 * 127 * K`): executed through the *real* [`crate::int8::dot_i32`]
+//!   kernel on every tier this build can dispatch ([`crate::int8::Int8Tier::available`]), each
+//!   result compared against the independent i64 oracle and the scalar route's i32.
+//!
+//! A native tier must appear here, through its real kernel function, before it may be selected.
+//! The rows mirror the binding component maxima in `docs/truth-pack/EXECUTION_CENSUS.json`, plus
+//! the seq-16 microdecoder verifier, whose larger M does not alter its per-output reduction
+//! length.
 
 /// Largest unsigned activation byte accepted by the U8S8 contract.
 pub const U8_MAX: u8 = u8::MAX;
@@ -25,6 +33,10 @@ pub const S8_MAX_ABS: i8 = 127;
 pub enum KernelTier {
     /// The portable, safe integer reference route.
     Scalar,
+    /// The portable eight-lane route shaped for LLVM autovectorization.
+    Autovec,
+    /// The aarch64 SDOT island (`neon-dotprod` feature + runtime FEAT_DotProd).
+    NeonSdot,
 }
 
 impl KernelTier {
@@ -33,6 +45,37 @@ impl KernelTier {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Scalar => "scalar",
+            Self::Autovec => "autovec",
+            Self::NeonSdot => "neon-sdot",
+        }
+    }
+
+    const fn from_int8(tier: crate::int8::Int8Tier) -> Self {
+        match tier {
+            crate::int8::Int8Tier::Scalar => Self::Scalar,
+            crate::int8::Int8Tier::Autovec => Self::Autovec,
+            crate::int8::Int8Tier::NeonSdot => Self::NeonSdot,
+        }
+    }
+}
+
+/// Which numeric contract a proof check exercised.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DotContract {
+    /// `255 * 127 * K` on the checked scalar path — the conservative envelope for a future
+    /// unsigned-activation (VNNI +128 fold) route.
+    U8S8Envelope,
+    /// `±127 * 127 * K` executed through the real [`crate::int8::dot_i32`] kernel.
+    S8S8Kernel,
+}
+
+impl DotContract {
+    /// Stable machine-readable contract name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::U8S8Envelope => "u8s8-envelope",
+            Self::S8S8Kernel => "s8s8-kernel",
         }
     }
 }
@@ -139,6 +182,8 @@ pub struct SelftestCheck {
     pub row: OverflowProofRow,
     /// Route that executed the check.
     pub tier: KernelTier,
+    /// Numeric contract this check exercised.
+    pub contract: DotContract,
     /// Accumulation performed by that route using all-extreme operands.
     ///
     /// `None` means the route overflowed before producing an i32 result; that is a failed proof,
@@ -178,28 +223,57 @@ pub fn run_selftest() -> SelftestReport {
 }
 
 fn run_selftest_inner(fault_row: Option<&str>) -> SelftestReport {
-    let dispatched = KernelTier::Scalar;
-    let checks = OVERFLOW_PROOF_ROWS
-        .iter()
-        .copied()
-        .map(|row| {
-            let accumulator_i32 = scalar_all_extreme_dot_i32(row.reduction_k);
-            let reference_i64 = all_extreme_dot_i64(row.reduction_k);
-            let accumulator_i32 = if fault_row == Some(row.id) {
-                accumulator_i32.map(|accumulator| accumulator.saturating_sub(1))
+    let dispatched = KernelTier::from_int8(crate::int8::Int8Tier::dispatch());
+    let mut checks = Vec::new();
+    for row in OVERFLOW_PROOF_ROWS.iter().copied() {
+        // U8S8 envelope: the contract ceiling, on the checked scalar path.
+        let accumulator_i32 = scalar_all_extreme_dot_i32(row.reduction_k);
+        let reference_i64 = all_extreme_dot_i64(row.reduction_k);
+        let accumulator_i32 = if fault_row == Some(row.id) {
+            accumulator_i32.map(|accumulator| accumulator.saturating_sub(1))
+        } else {
+            accumulator_i32
+        };
+        checks.push(SelftestCheck {
+            row,
+            tier: KernelTier::Scalar,
+            contract: DotContract::U8S8Envelope,
+            accumulator_i32,
+            reference_i64,
+            passed: accumulator_i32
+                .is_some_and(|accumulator| i64::from(accumulator) == reference_i64),
+        });
+
+        // S8S8 kernel proof: the real dot kernel, on every tier this build can dispatch, at both
+        // all-extreme signs, against the independent i64 oracle and the scalar route's i32.
+        let k = row.reduction_k as usize;
+        let positive = vec![crate::int8::Q8_MAX_ABS; k];
+        let negative = vec![-crate::int8::Q8_MAX_ABS; k];
+        let s8_reference_i64 =
+            i64::from(S8_MAX_ABS) * i64::from(S8_MAX_ABS) * i64::from(row.reduction_k);
+        let scalar_positive =
+            crate::int8::dot_i32(&positive, &positive, crate::int8::Int8Tier::Scalar);
+        for tier in crate::int8::Int8Tier::available() {
+            let up = crate::int8::dot_i32(&positive, &positive, tier);
+            let down = crate::int8::dot_i32(&positive, &negative, tier);
+            let up = if fault_row == Some(row.id) {
+                up.saturating_sub(1)
             } else {
-                accumulator_i32
+                up
             };
-            SelftestCheck {
+            let passed = i64::from(up) == s8_reference_i64
+                && i64::from(down) == -s8_reference_i64
+                && up == scalar_positive;
+            checks.push(SelftestCheck {
                 row,
-                tier: dispatched,
-                accumulator_i32,
-                reference_i64,
-                passed: accumulator_i32
-                    .is_some_and(|accumulator| i64::from(accumulator) == reference_i64),
-            }
-        })
-        .collect();
+                tier: KernelTier::from_int8(tier),
+                contract: DotContract::S8S8Kernel,
+                accumulator_i32: Some(up),
+                reference_i64: s8_reference_i64,
+                passed,
+            });
+        }
+    }
     SelftestReport { dispatched, checks }
 }
 
@@ -216,21 +290,72 @@ fn all_extreme_dot_i64(reduction_k: u32) -> i64 {
 mod tests {
     use super::*;
 
-    const CENSUS: &str = include_str!("../../../docs/truth-pack/EXECUTION_CENSUS.json");
+    //  Crate-local pinned copy; byte-identity with the truth-pack canonical is asserted by a
+    //  unit test whenever the repository checkout is present (crates.io builds have no repo).
+    const CENSUS: &str = include_str!("../pinned/EXECUTION_CENSUS.json");
 
     #[test]
-    fn every_deployed_scalar_row_equals_its_i64_reference() {
+    fn every_deployed_row_equals_its_i64_reference_on_every_tier() {
         let report = run_selftest();
-        assert_eq!(report.dispatched, KernelTier::Scalar);
         assert!(report.passed(), "{report:#?}");
-        assert_eq!(report.checks.len(), OVERFLOW_PROOF_ROWS.len());
-        for check in report.checks {
+
+        let envelope: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|check| check.contract == DotContract::U8S8Envelope)
+            .collect();
+        assert_eq!(envelope.len(), OVERFLOW_PROOF_ROWS.len());
+        for check in &envelope {
             assert_eq!(check.tier, KernelTier::Scalar, "{}", check.row.id);
             assert_eq!(
                 check.accumulator_i32.map(i64::from),
                 Some(check.reference_i64),
                 "{}",
                 check.row.id
+            );
+        }
+
+        let tiers = crate::int8::Int8Tier::available();
+        let s8s8: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|check| check.contract == DotContract::S8S8Kernel)
+            .collect();
+        assert_eq!(s8s8.len(), OVERFLOW_PROOF_ROWS.len() * tiers.len());
+        for check in &s8s8 {
+            assert_eq!(
+                check.accumulator_i32.map(i64::from),
+                Some(check.reference_i64),
+                "{} on {}",
+                check.row.id,
+                check.tier.as_str()
+            );
+        }
+
+        assert!(
+            tiers
+                .iter()
+                .any(|tier| KernelTier::from_int8(*tier) == report.dispatched),
+            "dispatched route {:?} is not among the available tiers",
+            report.dispatched
+        );
+    }
+
+    #[test]
+    fn the_sdot_island_is_proven_on_this_silicon_when_present() {
+        // On an Apple Silicon dev host the island must actually run — a silently absent
+        // FEAT_DotProd would turn every SDOT proof row into vacuous truth.
+        if cfg!(all(target_arch = "aarch64", feature = "neon-dotprod"))
+            && crate::int8::neon_sdot_available()
+        {
+            let report = run_selftest();
+            assert!(
+                report.checks.iter().any(|check| {
+                    check.tier == KernelTier::NeonSdot
+                        && check.contract == DotContract::S8S8Kernel
+                        && check.passed
+                }),
+                "FEAT_DotProd reported but no SDOT proof row executed"
             );
         }
     }
@@ -296,6 +421,25 @@ mod tests {
                 "{} no longer fits i32: {reference}",
                 row.id
             );
+        }
+    }
+
+    #[test]
+    fn pinned_census_copy_matches_the_truth_pack_canonical() {
+        //  The crate-local copy exists because `cargo package` cannot ship the truth pack; the
+        //  truth pack stays canonical. A drifted copy silently pins the selftest to a stale
+        //  census, so equality is asserted byte-for-byte whenever the repo checkout is present.
+        let canonical = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/truth-pack/EXECUTION_CENSUS.json");
+        match std::fs::read_to_string(&canonical) {
+            Ok(bytes) => assert_eq!(
+                bytes, CENSUS,
+                "pinned/EXECUTION_CENSUS.json drifted from the truth-pack canonical; re-copy it"
+            ),
+            Err(_) => eprintln!(
+                "SKIP pinned_census_copy_matches_the_truth_pack_canonical: no repo checkout at {}",
+                canonical.display()
+            ),
         }
     }
 }

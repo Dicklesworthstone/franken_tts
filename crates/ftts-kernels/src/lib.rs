@@ -21,6 +21,7 @@
 //! it may be selected.
 
 pub mod f32ref;
+pub mod int8;
 pub mod mmap;
 pub mod selftest;
 pub mod sleef;
