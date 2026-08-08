@@ -834,7 +834,22 @@ pub fn forward_talker_q8(
         TALKER_LAYER_COUNT,
         "the quantized route needs all 28 layers quantized"
     );
+    assert_eq!(
+        cache.layers.len(),
+        TALKER_LAYER_COUNT,
+        "the cache must contain one entry per talker layer"
+    );
     assert_eq!(hidden.len(), seq * config.hidden_size, "hidden shape");
+    assert_eq!(
+        weights.final_norm.len(),
+        config.hidden_size,
+        "final norm shape"
+    );
+    assert_eq!(
+        weights.codec_head.len(),
+        PRIMARY_CODE_VOCAB_SIZE * config.hidden_size,
+        "codec head shape"
+    );
     assert_eq!(logits.len(), seq * PRIMARY_CODE_VOCAB_SIZE, "logit shape");
 
     for ((layer, layer_quant), layer_cache) in
@@ -1086,6 +1101,171 @@ mod tests {
 
         assert_eq!(hidden, original);
         assert_eq!(cache.len(), seq);
+    }
+
+    /// Deterministic small weights for the q8 layer tests.
+    fn probe_values(len: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / f32::from(u16::MAX) / 256.0 - 0.5
+            })
+            .collect()
+    }
+
+    /// Owned random weights for one full-geometry probe layer.
+    struct QuantProbe {
+        norm: Vec<f32>,
+        head_norm: Vec<f32>,
+        q: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        o: Vec<f32>,
+        gate: Vec<f32>,
+        up: Vec<f32>,
+        down: Vec<f32>,
+    }
+
+    impl QuantProbe {
+        fn new(config: &TalkerConfig) -> Self {
+            Self {
+                norm: vec![1.0; config.hidden_size],
+                head_norm: vec![1.0; config.head_dim],
+                q: probe_values(config.query_width() * config.hidden_size, 11),
+                k: probe_values(config.kv_width() * config.hidden_size, 12),
+                v: probe_values(config.kv_width() * config.hidden_size, 13),
+                o: probe_values(config.hidden_size * config.query_width(), 14),
+                gate: probe_values(config.intermediate_size * config.hidden_size, 15),
+                up: probe_values(config.intermediate_size * config.hidden_size, 16),
+                down: probe_values(config.hidden_size * config.intermediate_size, 17),
+            }
+        }
+
+        fn borrow(&self) -> TalkerLayerWeights<'_> {
+            TalkerLayerWeights {
+                input_layernorm: &self.norm,
+                q_proj: &self.q,
+                k_proj: &self.k,
+                v_proj: &self.v,
+                q_norm: &self.head_norm,
+                k_norm: &self.head_norm,
+                o_proj: &self.o,
+                post_attention_layernorm: &self.norm,
+                gate_proj: &self.gate,
+                up_proj: &self.up,
+                down_proj: &self.down,
+            }
+        }
+    }
+
+    #[test]
+    fn q8_layer_is_bit_identical_across_every_available_tier() {
+        // The tier law at the talker seam: identical i32 accumulators + a fixed dequant order
+        // make the f32 hidden state bit-identical across scalar/autovec/neon-sdot.
+        let config = TalkerConfig::default();
+        let probe = QuantProbe::new(&config);
+        let weights = probe.borrow();
+        let quant = TalkerLayerQuant::quantize(&config, &weights);
+
+        let seq = 2;
+        let base: Vec<f32> = probe_values(seq * config.hidden_size, 99);
+        let cos = vec![1.0f32; seq * config.head_dim];
+        let sin = vec![0.0f32; seq * config.head_dim];
+        let mut mask = vec![0.0f32; seq * seq];
+        mask[1] = f32::NEG_INFINITY;
+
+        let mut reference: Option<Vec<f32>> = None;
+        for tier in ftts_kernels::int8::Int8Tier::available() {
+            let mut hidden = base.clone();
+            let mut cache = KvCache::new();
+            forward_layer_q8(
+                &config,
+                &weights,
+                &quant,
+                RotaryRows {
+                    cos: &cos,
+                    sin: &sin,
+                },
+                &mask,
+                &mut hidden,
+                seq,
+                &mut cache,
+                tier,
+            );
+            match &reference {
+                None => reference = Some(hidden),
+                Some(expected) => {
+                    for (index, (a, b)) in expected.iter().zip(&hidden).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "tier {} differs at element {index}",
+                            tier.as_str()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q8_layer_tracks_the_f32_reference_at_full_geometry() {
+        // Not a parity claim — W8A8 is lossy; its production gate is Contract B. This bounds
+        // gross wiring failures (transposed quant layout, wrong scale pairing) at the real
+        // talker geometry.
+        let config = TalkerConfig::default();
+        let probe = QuantProbe::new(&config);
+        let weights = probe.borrow();
+        let quant = TalkerLayerQuant::quantize(&config, &weights);
+
+        let seq = 2;
+        let base: Vec<f32> = probe_values(seq * config.hidden_size, 99);
+        let cos = vec![1.0f32; seq * config.head_dim];
+        let sin = vec![0.0f32; seq * config.head_dim];
+        let mut mask = vec![0.0f32; seq * seq];
+        mask[1] = f32::NEG_INFINITY;
+
+        let mut expected = base.clone();
+        let mut f32_cache = KvCache::new();
+        forward_layer(
+            &config,
+            &weights,
+            RotaryRows {
+                cos: &cos,
+                sin: &sin,
+            },
+            &mask,
+            &mut expected,
+            seq,
+            &mut f32_cache,
+        );
+
+        let mut actual = base.clone();
+        let mut q8_cache = KvCache::new();
+        forward_layer_q8(
+            &config,
+            &weights,
+            &quant,
+            RotaryRows {
+                cos: &cos,
+                sin: &sin,
+            },
+            &mask,
+            &mut actual,
+            seq,
+            &mut q8_cache,
+            ftts_kernels::int8::Int8Tier::Scalar,
+        );
+
+        assert_eq!(q8_cache.len(), f32_cache.len());
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let cosine =
+            dot(&expected, &actual) / (dot(&expected, &expected).sqrt() * dot(&actual, &actual).sqrt());
+        assert!(
+            cosine > 0.99,
+            "W8A8 talker layer diverged from the f32 reference: cosine {cosine}"
+        );
     }
 
     #[test]
