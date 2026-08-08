@@ -151,6 +151,12 @@ struct SayArgs {
     #[arg(value_name = "TEXT")]
     text: Option<String>,
 
+    /// Output file (same as -o). Format follows the extension: .wav is written natively;
+    /// .m4a, .mp3, and .flac are encoded from the native WAV by the first available system
+    /// encoder (afconvert, ffmpeg, lame, flac).
+    #[arg(value_name = "OUTPUT", conflicts_with_all = ["stream", "output"])]
+    output_positional: Option<PathBuf>,
+
     /// Read UTF-8 text from PATH. Use `-` for stdin.
     #[arg(long, value_name = "PATH", conflicts_with = "text")]
     file: Option<PathBuf>,
@@ -178,7 +184,8 @@ struct SayArgs {
 
 #[derive(Debug, clap::Args)]
 struct EnrollArgs {
-    /// Reference WAV or FLAC audio.
+    /// Reference audio: WAV/FLAC decode natively; m4a/mp3/aac/ogg/opus route through the first
+    /// system decoder found (afconvert on macOS, ffmpeg).
     #[arg(value_name = "REFERENCE_AUDIO")]
     reference_audio: PathBuf,
 
@@ -1035,6 +1042,16 @@ fn run_say_events(
     );
     emit(&Value::Object(prepared))?;
 
+    // `-o PATH` and the positional OUTPUT are the same request; clap rejects supplying both.
+    let requested_output: Option<PathBuf> = args
+        .output
+        .clone()
+        .or_else(|| args.output_positional.clone());
+    let output_plan = requested_output
+        .as_deref()
+        .map(OutputPlan::for_path)
+        .transpose()?;
+
     emit_stage(run, emit, "admission", "begin", &mut seq)?;
     let admission = admission_plan(&request.text, &settings)?;
     emit_stage(run, emit, "admission", "end", &mut seq)?;
@@ -1054,7 +1071,7 @@ fn run_say_events(
             "normalization_trace_requested": request.trace_normalization,
             "seed": cli.seed,
             "trace": cli.trace.as_ref().map(|path| path.display().to_string()),
-            "output": args.output.as_ref().map(|path| path.display().to_string()),
+            "output": requested_output.as_ref().map(|path| path.display().to_string()),
             "admission": admission,
         });
         emit(&event)?;
@@ -1071,17 +1088,17 @@ fn run_say_events(
     // A run that synthesizes for thirty seconds and then discovers it has nowhere to put the
     // result has wasted the user's time; the refusal belongs here, before the weights load.
     let raw_stream = args.stream == Some(StreamMode::Raw);
-    let mut audio = match (&args.output, raw_stream) {
-        (Some(path), false) => AudioOutput::wav(path)?,
+    let mut audio = match (&output_plan, raw_stream) {
+        (Some(plan), false) => AudioOutput::wav(&plan.wav_path)?,
         (None, true) => AudioOutput::raw(),
         (None, false) => {
             return Err(FttsError::Usage(
-                "`ftts say` has nowhere to put the audio; pass `-o PATH` for a WAV file or \
-                 `--stream raw` for PCM on stdout"
+                "`ftts say` has nowhere to put the audio; add an output path (`ftts say \"text\" \
+                 out.wav`, or `-o PATH`) or `--stream raw` for PCM on stdout"
                     .to_owned(),
             ));
         }
-        // clap declares `-o` and `--stream` mutually exclusive.
+        // clap declares every output form and `--stream` mutually exclusive.
         (Some(_), true) => unreachable!("clap enforces the conflict"),
     };
 
@@ -1144,6 +1161,9 @@ fn run_say_events(
     }
     let audio_bytes = audio.byte_offset();
     let samples = audio.finish()?;
+    if let Some(plan) = &output_plan {
+        plan.finalize()?;
+    }
     emit_stage(run, emit, "output", "end", &mut seq)?;
 
     let mut complete = run.event(robot::EventType::RunComplete);
@@ -1187,6 +1207,191 @@ pub struct AudioOutput {
     sink: AudioSink,
     byte_offset: u64,
     samples_written: u64,
+}
+
+/// Audio container selected by the output path's extension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputFormat {
+    /// Written natively by the pure-Rust WAV writer.
+    Wav,
+    /// AAC in an MPEG-4 container, encoded by `afconvert` (macOS) or `ffmpeg`.
+    M4a,
+    /// MP3, encoded by `lame` or `ffmpeg`.
+    Mp3,
+    /// FLAC, encoded by `flac` or `ffmpeg`.
+    Flac,
+}
+
+/// Where the WAV bytes land and what happens to them after synthesis.
+///
+/// Synthesis always writes the pure-Rust WAV stream ("self-contained" covers everything up to
+/// and including that file). For a compressed extension the WAV goes to a sibling staging file
+/// and is then handed to the first available *system* encoder — an optional post-step, never a
+/// runtime dependency of synthesis itself. No encoder found is a refusal with the tool list,
+/// not a silent format switch.
+#[derive(Clone, Debug)]
+struct OutputPlan {
+    /// The path the user asked for.
+    final_path: PathBuf,
+    /// Where the WAV sink writes; equals `final_path` for `.wav`.
+    wav_path: PathBuf,
+    format: OutputFormat,
+}
+
+impl OutputPlan {
+    fn for_path(path: &Path) -> Result<Self, FttsError> {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        let format = match extension.as_deref() {
+            Some("wav") | None => OutputFormat::Wav,
+            Some("m4a" | "aac") => OutputFormat::M4a,
+            Some("mp3") => OutputFormat::Mp3,
+            Some("flac") => OutputFormat::Flac,
+            Some(other) => {
+                return Err(FttsError::Usage(format!(
+                    "unsupported output extension `.{other}`; use .wav (native), .m4a, .mp3, or \
+                     .flac (system encoder)"
+                )));
+            }
+        };
+        let wav_path = if format == OutputFormat::Wav {
+            path.to_path_buf()
+        } else {
+            let mut staging = path.as_os_str().to_owned();
+            staging.push(".ftts-staging.wav");
+            PathBuf::from(staging)
+        };
+        Ok(Self {
+            final_path: path.to_path_buf(),
+            wav_path,
+            format,
+        })
+    }
+
+    /// Encodes the staged WAV into the requested container and removes the staging file.
+    fn finalize(&self) -> Result<(), FttsError> {
+        if self.format == OutputFormat::Wav {
+            return Ok(());
+        }
+        let wav = self.wav_path.as_os_str();
+        let target = self.final_path.as_os_str();
+        // (encoder, arguments) attempts in preference order; the first tool present decides.
+        let attempts: &[(&str, Vec<&std::ffi::OsStr>)] = &match self.format {
+            OutputFormat::M4a => [
+                (
+                    "afconvert",
+                    vec![
+                        "-f".as_ref(),
+                        "m4af".as_ref(),
+                        "-d".as_ref(),
+                        "aac".as_ref(),
+                        wav,
+                        target,
+                    ],
+                ),
+                (
+                    "ffmpeg",
+                    vec![
+                        "-y".as_ref(),
+                        "-loglevel".as_ref(),
+                        "error".as_ref(),
+                        "-i".as_ref(),
+                        wav,
+                        "-c:a".as_ref(),
+                        "aac".as_ref(),
+                        target,
+                    ],
+                ),
+            ],
+            OutputFormat::Mp3 => [
+                (
+                    "lame",
+                    vec!["--quiet".as_ref(), "-V2".as_ref(), wav, target],
+                ),
+                (
+                    "ffmpeg",
+                    vec![
+                        "-y".as_ref(),
+                        "-loglevel".as_ref(),
+                        "error".as_ref(),
+                        "-i".as_ref(),
+                        wav,
+                        "-codec:a".as_ref(),
+                        "libmp3lame".as_ref(),
+                        "-q:a".as_ref(),
+                        "2".as_ref(),
+                        target,
+                    ],
+                ),
+            ],
+            OutputFormat::Flac => [
+                (
+                    "flac",
+                    vec![
+                        "--totally-silent".as_ref(),
+                        "-f".as_ref(),
+                        "-o".as_ref(),
+                        target,
+                        wav,
+                    ],
+                ),
+                (
+                    "ffmpeg",
+                    vec![
+                        "-y".as_ref(),
+                        "-loglevel".as_ref(),
+                        "error".as_ref(),
+                        "-i".as_ref(),
+                        wav,
+                        "-c:a".as_ref(),
+                        "flac".as_ref(),
+                        target,
+                    ],
+                ),
+            ],
+            OutputFormat::Wav => unreachable!("handled above"),
+        };
+
+        let mut tried = Vec::new();
+        for (tool, arguments) in attempts {
+            // `tool` is always one of the fixed string literals in `attempts` above — a
+            // compile-time allowlist. User-controlled data (the two paths) enters only as argv.
+            match std::process::Command::new(tool).args(arguments).status() {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tried.push(*tool);
+                }
+                Err(error) => {
+                    return Err(FttsError::Generic(format!(
+                        "audio encoder `{tool}` could not run: {error}; the synthesized WAV is \
+                         preserved at {}",
+                        self.wav_path.display()
+                    )));
+                }
+                Ok(status) if status.success() => {
+                    // The staging WAV is an intermediate this run created; the requested artifact
+                    // now exists, so the intermediate is removed.
+                    let _ = fs::remove_file(&self.wav_path);
+                    return Ok(());
+                }
+                Ok(status) => {
+                    return Err(FttsError::Generic(format!(
+                        "audio encoder `{tool}` exited with {status}; the synthesized WAV is \
+                         preserved at {}",
+                        self.wav_path.display()
+                    )));
+                }
+            }
+        }
+        Err(FttsError::Generic(format!(
+            "no system audio encoder found for {} (tried: {}); install one or use a .wav output. \
+             The synthesized WAV is preserved at {}",
+            self.final_path.display(),
+            tried.join(", "),
+            self.wav_path.display()
+        )))
+    }
 }
 
 impl AudioOutput {
@@ -1379,6 +1584,17 @@ fn resolve_model(explicit: Option<&Path>, environment: &Environment) -> Result<S
     let searched = model_search_paths(environment);
     if let Some(path) = searched.iter().find(|path| path.is_file()) {
         return Ok(path.display().to_string());
+    }
+    // A directory named by FTTS_MODEL_DIR may itself BE the model: a pinned checkpoint snapshot
+    // (`model.safetensors` + configs) or a directory holding the canonical artifact. `--model DIR`
+    // already accepts that shape; the search path accepting it too is what lets a bare
+    // `ftts say "text" out.wav` work after one exported variable.
+    if let Some(directory) = searched
+        .iter()
+        .filter_map(|path| path.parent())
+        .find(|directory| directory.join("model.safetensors").is_file())
+    {
+        return Ok(directory.display().to_string());
     }
 
     let searched = searched
@@ -1578,10 +1794,32 @@ fn run_robot(
         }
         RobotCommand::Backends => {
             let mut object = robot::EventType::Backends.event();
-            object.insert("available".to_owned(), json!(["scalar-placeholder"]));
-            object.insert("dispatched".to_owned(), Value::Null);
+            // Capability vs executed-route split: `available` is every tier this build can
+            // certify on this CPU; `dispatched` is the one the int8 route would actually run.
+            object.insert(
+                "available".to_owned(),
+                json!(
+                    ftts_kernels::int8::Int8Tier::available()
+                        .iter()
+                        .map(|tier| tier.as_str())
+                        .collect::<Vec<_>>()
+                ),
+            );
+            object.insert(
+                "dispatched".to_owned(),
+                json!(ftts_kernels::int8::Int8Tier::dispatch().as_str()),
+            );
             object.insert("isa_features".to_owned(), json!(detected_isa_features()));
-            object.insert("kernel_plan".to_owned(), Value::Null);
+            let plan = ftts_kernels::int8::autotuned_plan();
+            object.insert(
+                "kernel_plan".to_owned(),
+                json!({
+                    "version": 0,
+                    "decode_gemv": plan.decode_gemv.as_str(),
+                    "batch_gemm": plan.batch_gemm.as_str(),
+                    "persisted": false,
+                }),
+            );
             object.insert("pool_sizing".to_owned(), Value::Null);
             object.insert(
                 "force_arch".to_owned(),
@@ -1589,12 +1827,39 @@ fn run_robot(
             );
             Value::Object(object)
         }
-        RobotCommand::Selftest => json!({
-            "schema_version": ROBOT_SCHEMA_VERSION,
-            "event": "selftest",
-            "status": "skipped",
-            "reason": "no model-specific kernel is implemented in the Phase-0 skeleton",
-        }),
+        RobotCommand::Selftest => {
+            // The permanent integer-kernel law, executed on the end user's silicon: every census
+            // binding row through the real dot kernels on every dispatchable tier. The event's
+            // top-level fields are pinned by the frozen v1 schema fixture (status/reason/checks);
+            // per-row detail lives inside `checks`.
+            let report = ftts_kernels::selftest::run_selftest();
+            let checks: Vec<Value> = report
+                .checks
+                .iter()
+                .map(|check| {
+                    json!({
+                        "row": check.row.id,
+                        "scope": check.row.scope.as_str(),
+                        "census_tensor": check.row.census_tensor,
+                        "reduction_k": check.row.reduction_k,
+                        "tier": check.tier.as_str(),
+                        "contract": check.contract.as_str(),
+                        "dispatched": check.tier == report.dispatched,
+                        "accumulator_i32": check.accumulator_i32,
+                        "reference_i64": check.reference_i64,
+                        "passed": check.passed,
+                    })
+                })
+                .collect();
+            let mut object = robot::EventType::Selftest.event();
+            object.insert(
+                "status".to_owned(),
+                json!(if report.passed() { "passed" } else { "failed" }),
+            );
+            object.insert("reason".to_owned(), Value::Null);
+            object.insert("checks".to_owned(), json!(checks));
+            Value::Object(object)
+        }
     };
     write_json_line(stdout, &event)
 }
@@ -1753,6 +2018,7 @@ mod tests {
         let expected = fs::read_to_string(&root).expect("checked-in README");
         let from_argument = read_text(
             &SayArgs {
+                output_positional: None,
                 text: Some(expected.clone()),
                 file: None,
                 model: None,
@@ -1766,6 +2032,7 @@ mod tests {
         .expect("argument text");
         let from_file = read_text(
             &SayArgs {
+                output_positional: None,
                 text: None,
                 file: Some(root),
                 model: None,
@@ -1779,6 +2046,7 @@ mod tests {
         .expect("file text");
         let from_stdin = read_text(
             &SayArgs {
+                output_positional: None,
                 text: Some("-".to_owned()),
                 file: None,
                 model: None,
@@ -2221,6 +2489,7 @@ mod tests {
         };
         let args = SayArgs {
             text: Some("checked text".to_owned()),
+            output_positional: None,
             file: None,
             model: Some(model),
             voice: None,

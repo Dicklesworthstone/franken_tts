@@ -32,18 +32,22 @@ Sibling of [franken_ocr](https://github.com/Dicklesworthstone/franken_ocr) and f
 
 ## Quick example
 
-```bash
-# Fetch the pinned model snapshot from Hugging Face (weights are not bundled)
-# into a directory of your choice, then:
+One-time setup — fetch the pinned model snapshot from Hugging Face (weights are not bundled) and point `ftts` at it, then set a default voice:
 
-FTTS_MAX_FRAMES=120 ftts say \
-  "Now is the time for all good men to come to the aid of the agents" \
-  --model /path/to/qwen3-tts-12hz-0.6b-base \
-  --voice voice.spk \
-  -o out.wav
+```bash
+export FTTS_MODEL_DIR=/path/to/qwen3-tts-12hz-0.6b-base
+ftts enroll your_recording.wav --default    # or copy any 1,024-float x-vector to $FTTS_MODEL_DIR/default.spk
 ```
 
-That produces real cloned speech on Apple Silicon today. `--voice` takes a 1,024-float x-vector file; enrollment from reference audio is in progress.
+After that, synthesis is one line:
+
+```bash
+ftts say "Now is the time for all good men to come to the aid of the agents" out.m4a
+```
+
+The output format follows the extension: `.wav` is written by the pure-Rust encoder; `.m4a`, `.mp3`, and `.flac` are encoded from that WAV by the first system encoder found (`afconvert` on macOS, `ffmpeg`, `lame`, `flac`) — synthesis itself never depends on one. Generation stops at the model's EOS, backstopped by a text-proportional frame cap; set `FTTS_MAX_FRAMES` only when you want an exact cap. `--model`, `--voice`, and `-o` remain available for explicit control.
+
+Experimental: `FTTS_INT8=1` arms the runtime W8A8 int8 route (talker + microdecoder GEMMs; ~5–7× faster synthesis on Apple Silicon in local runs, greedy code stream argmax-identical to f32 on the tested utterances — quality gates for the sampled production path are still pending, so it is off by default).
 
 ## Status: v0.1.0, a working f32 reference engine
 
@@ -132,7 +136,7 @@ Workspace crates: `ftts-core` (engine), `ftts-model-qwen` (model graph), `ftts-k
 - **f32 only.** No quantized artifacts ship yet.
 - **Enrollment pipeline in progress.** You must supply your own 1,024-float x-vector today.
 - **Voice quality depends on the reference voice** you enroll.
-- **EOS stop timing is sampling-dependent.** Cap generation with `FTTS_MAX_FRAMES`.
+- **EOS stop timing is sampling-dependent.** A text-proportional frame cap backstops it by default; set `FTTS_MAX_FRAMES` for an exact cap.
 
 ## Responsible use
 
