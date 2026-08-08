@@ -660,11 +660,14 @@ pub fn forward_codec_pre_transformer(
 /// fingerprint ever disagrees (a dropped checkpoint's allocation reused), the entry is
 /// requantized rather than trusted. This stays a private implementation detail of
 /// [`dense_linear`]; the artifact-fed `.fttspack` route replaces it when that lands.
+/// One memoized quantization: the weight's first/last element bits plus its Q8 form.
+type QuantMemoEntry = Arc<(u32, u32, QuantizedMatrix)>;
+
 struct CodecInt8Route {
     plan: KernelPlanV0,
     transformer: bool,
     convnext: bool,
-    memo: Mutex<HashMap<(usize, usize), Arc<(u32, u32, QuantizedMatrix)>>>,
+    memo: Mutex<HashMap<(usize, usize), QuantMemoEntry>>,
 }
 
 /// Which family of dense projections a [`dense_linear`] call belongs to.
