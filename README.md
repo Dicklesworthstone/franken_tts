@@ -32,7 +32,7 @@ Sibling of [franken_ocr](https://github.com/Dicklesworthstone/franken_ocr) and f
 
 ## Quick example
 
-One-time setup — fetch the pinned model snapshot from Hugging Face (weights are not bundled) and point `ftts` at it, then set a default voice:
+One-time setup: fetch the pinned model snapshot from Hugging Face (weights are not bundled), point `ftts` at it, and enroll a default voice from a recording you have the right to use.
 
 ```bash
 export FTTS_MODEL_DIR=/path/to/qwen3-tts-12hz-0.6b-base
@@ -45,9 +45,7 @@ After that, synthesis is one line:
 ftts say "Now is the time for all good men to come to the aid of the agents" out.m4a
 ```
 
-The output format follows the extension: `.wav` is written by the pure-Rust encoder; `.m4a`, `.mp3`, and `.flac` are encoded from that WAV by the first system encoder found (`afconvert` on macOS, `ffmpeg`, `lame`, `flac`) — synthesis itself never depends on one. Generation stops at the model's EOS, backstopped by a text-proportional frame cap; set `FTTS_MAX_FRAMES` only when you want an exact cap. `--model`, `--voice`, and `-o` remain available for explicit control.
-
-Experimental: `FTTS_INT8=1` arms the runtime W8A8 int8 route (talker + microdecoder GEMMs; ~5–7× faster synthesis on Apple Silicon in local runs, greedy code stream argmax-identical to f32 on the tested utterances — quality gates for the sampled production path are still pending, so it is off by default).
+The output format follows the extension. `.wav` comes straight from the built-in pure-Rust encoder; `.m4a`, `.mp3`, and `.flac` are converted from that WAV by whichever system encoder is present (`afconvert` on macOS, `ffmpeg`, `lame`, `flac`), and if none is found you get an error naming the tools rather than a silently different format. Generation stops at the model's EOS, with a text-proportional frame cap as a backstop; set `FTTS_MAX_FRAMES` only when you want an exact cap. `--model`, `--voice`, and `-o` remain available for explicit control.
 
 ## Status: v0.1.0, a working f32 reference engine
 
@@ -59,7 +57,17 @@ This is the first release. What works now:
   - Codec: whole-utterance codes exact vs oracle at the engine level.
   - Audio: peak frame RMS 0.08578 vs 0.0859745 for the pinned PyTorch reference.
   - Streaming: codec streaming == offline, bit-identical, under all packet schedules.
-- **Honest performance.** A 55-frame utterance takes ~60 s wall in a release build (~0.5 s/frame, plus a one-time ~30 s model load). That is 6–7× slower than real time, and deliberately so: v0.1.0 is the unoptimized f32 reference. The quantization and hand-kernel phases (int8 SDOT/VNNI) are the roadmap to >1× real time.
+- **Honest performance.** A 55-frame utterance takes ~60 s wall in a release build (~0.5 s/frame, plus a one-time ~30 s model load). That is 6–7× slower than real time, and deliberately so: the default path is the unoptimized f32 reference. The int8 route below is where the speed lives.
+
+### Experimental int8 route (off by default)
+
+The first quantized kernels have landed behind kill-switches. Everything below was measured on one M4 Pro under varying load, against this tree's own f32 reference rather than a pinned external incumbent, so treat the ratios as local evidence:
+
+- `FTTS_INT8=1` runs the talker and microdecoder projection matmuls as W8A8 int8 (symmetric per-channel weights, dynamic per-row activations, exact i32 accumulation). Local synthesis speedup: roughly 5–7×.
+- `FTTS_INT8_CODEC=convnext` (or `all`) extends int8 to the codec's dense projections. The codec alone drops from ~64 ms to ~26–33 ms per 80 ms frame; PCM SNR against the f32 codec on a real sampled utterance measured 41.4 dB for `convnext` and 32.6 dB for `all`.
+- Three kernel tiers ship (plain scalar, an 8-lane variant kept only as a measurement control, and a NEON SDOT island), all proven exactly equal in i32 on every census shape by `ftts robot selftest` on your machine, with a small startup autotuner picking the winner per regime.
+
+Why it stays off: int8 changes the numbers, and the shipping gate for that is listening-based quality evaluation, not kernel math. Under greedy decode the int8 token stream matched f32 exactly on one test utterance and diverged on most others (near-tie argmaxes flip, and the divergence compounds autoregressively), which is expected for a lossy route and is precisely what the pending quality gates exist to judge. Until they pass, f32 remains the default and the flags above are opt-in.
 
 ## Verification
 
@@ -100,18 +108,17 @@ Weights are **not** bundled. Download the pinned Qwen3-TTS-12Hz-0.6B-Base snapsh
 ## Quick start
 
 1. Install `ftts` (above).
-2. Download the pinned model snapshot into `<model-dir>`.
-3. Get a voice: `--voice` takes a 1,024-float x-vector file (`.spk`). Enrollment from reference audio is in progress; for now, bring your own x-vector.
+2. Download the pinned model snapshot into `<model-dir>` and export `FTTS_MODEL_DIR=<model-dir>`.
+3. Enroll a voice: `ftts enroll your_recording.wav --default` computes a speaker embedding from reference audio and stores it as the default. You can also pass any 1,024-float x-vector file directly with `--voice`.
 4. Synthesize:
 
    ```bash
-   FTTS_MAX_FRAMES=120 ftts say "Hello from safe Rust" \
-     --model <model-dir> --voice voice.spk -o hello.wav
+   ftts say "Hello from safe Rust" hello.wav
    ```
 
 ## Robot mode
 
-`franken_tts` is built agent-first. `ftts robot schema` prints the NDJSON event schema; synthesis runs emit machine-readable events and exit with stable, documented codes, so orchestrators and coding agents can drive it without scraping human-facing text.
+`franken_tts` is built agent-first. `ftts robot schema` prints the NDJSON event schema; synthesis runs emit machine-readable events and exit with stable, documented codes, so orchestrators and coding agents can drive it without scraping human-facing text. Two subcommands report the kernel state of the machine they run on: `ftts robot selftest` executes the integer-overflow proof rows through every dispatchable kernel tier and reports per-row verdicts, and `ftts robot backends` lists available tiers, the dispatched route, detected ISA features, and the autotuned kernel plan.
 
 ## Architecture
 
@@ -132,15 +139,16 @@ Workspace crates: `ftts-core` (engine), `ftts-model-qwen` (model graph), `ftts-k
 
 ## Known limitations
 
-- **6–7× slower than real time** on M-series today. v0.1.0 is the f32 reference engine; speed comes from the quantization and kernel phases.
-- **f32 only.** No quantized artifacts ship yet.
-- **Enrollment pipeline in progress.** You must supply your own 1,024-float x-vector today.
+- **Slower than real time by default.** The f32 reference path runs 6–7× slower than real time on M-series. The experimental int8 route closes most of that gap but stays opt-in until its quality gates pass.
+- **int8 quality is unproven.** The int8 kernels are exact integer math, but quantization changes the model's numbers; listening-based evaluation of the sampled production path has not run yet.
+- **No quantized artifacts ship yet.** int8 currently quantizes at load time; the `.fttsq` artifact pipeline for pre-quantized weights is still in progress.
 - **Voice quality depends on the reference voice** you enroll.
 - **EOS stop timing is sampling-dependent.** A text-proportional frame cap backstops it by default; set `FTTS_MAX_FRAMES` for an exact cap.
+- **Compressed output needs a system encoder.** `.m4a`, `.mp3`, and `.flac` shell out to `afconvert`, `ffmpeg`, `lame`, or `flac`; `.wav` needs nothing.
 
 ## Responsible use
 
-Voice cloning is dual-use. This project records consent attestation and provenance in voice packs, ships no audio-acquisition features, preserves any upstream watermarking, and treats identity claims as settled by blind listening — not embedding cosines. Clone voices you have the right to clone.
+Voice cloning is dual-use. This project records consent attestation and provenance in voice packs, ships no audio-acquisition features, preserves any upstream watermarking, and treats identity claims as settled by blind listening, not embedding cosines. Clone voices you have the right to clone.
 
 ## About Contributions
 
