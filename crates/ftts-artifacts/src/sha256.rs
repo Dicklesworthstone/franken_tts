@@ -242,6 +242,33 @@ impl Sha256 {
     }
 }
 
+/// Digests a file by streaming fixed-size reads, returning lowercase hex.
+///
+/// Exists for the same reason [`Sha256`] streams: the files this verifies (downloaded model
+/// checkpoints) are hundreds of megabytes to gigabytes, and reading one into memory just to hash
+/// it would double the peak footprint of a verification pass.
+///
+/// # Errors
+///
+/// Propagates the underlying [`std::io::Error`] from opening or reading the file.
+pub fn hex_digest_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    // 1 MiB: large enough that syscall overhead is negligible, small enough to stay cache-polite.
+    let mut buffer = vec![0_u8; 1 << 20];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(to_hex(&hasher.finish()))
+}
+
 /// Digests a byte slice, returning lowercase hex.
 #[must_use]
 pub fn hex_digest(bytes: &[u8]) -> String {
@@ -323,6 +350,22 @@ mod tests {
                 "digest changed with chunk size {chunk_size}"
             );
         }
+    }
+
+    /// The file path must agree with the in-memory path — it is the same algorithm behind a
+    /// different read loop, and a divergence would verify downloads against the wrong contract.
+    #[test]
+    fn file_digest_matches_the_in_memory_digest() {
+        let dir = std::env::temp_dir().join(format!("ftts-sha256-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("digest-input.bin");
+        // Larger than one read buffer would be unnecessary; larger than one hash block matters.
+        let message: Vec<u8> = (0..70_000_u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &message).expect("write temp file");
+        assert_eq!(
+            hex_digest_file(&path).expect("file digest"),
+            hex_digest(&message)
+        );
     }
 
     /// A single flipped bit must change the digest — the property section verification relies on.
