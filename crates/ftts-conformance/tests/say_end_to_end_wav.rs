@@ -51,9 +51,12 @@ const TEST_NAME: &str = "say_pipeline_writes_audible_wav";
 const CASE: &str = "synthetic-tone-en";
 const TEXT: &str = "Hello.";
 
-/// Frames a six-character utterance must stay under; the engine's own cap is 8,192, and a run that
-/// approaches it is not stopping on EOS.
-const SANE_FRAME_CEILING: u64 = 512;
+/// Frames a six-character utterance must stay under. This is also the ADMITTED cap below, so a
+/// run that fails to stop costs minutes, not the day the engine's 8,192-frame default would: at
+/// the f32 reference's measured ~11 s/frame (PERF-001), an unstoppable utterance under the old
+/// default wedged the mandatory suite for ~24 h before failing. Hitting this ceiling and stopping
+/// on EOS below it are distinguished by the assertions, exactly as before.
+const SANE_FRAME_CEILING: u64 = 64;
 
 fn bundle_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/truth-pack/snapshots/hf")
@@ -112,7 +115,17 @@ fn say_pipeline_writes_audible_wav() {
         }
     };
 
-    let engine = TtsEngine::from_process_environment().expect("engine");
+    let engine = TtsEngine::new(ftts_core::EngineConfig {
+        // Generous stage budget for the deliberately unoptimized f32 reference, and the bounded
+        // admission ceiling documented at SANE_FRAME_CEILING.
+        synthesis_stage_budget: std::time::Duration::from_secs(3_600),
+        admission: ftts_core::admission::AdmissionPolicy {
+            max_new_tokens: SANE_FRAME_CEILING,
+            ..ftts_core::admission::AdmissionPolicy::default()
+        },
+        ..ftts_core::EngineConfig::default()
+    })
+    .expect("engine");
     let cancellation = CancellationToken::new();
     let observer = |_event: ftts_core::SynthesisEvent| {};
     let request = SynthesisRequest::new(TEXT);

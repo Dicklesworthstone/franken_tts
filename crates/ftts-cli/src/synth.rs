@@ -507,9 +507,14 @@ pub fn synthesize(
         header,
         tts_eos,
         reference: None,
-        // Greedy is reproducible and consumes no RNG state; `--seed` is still reported so a later
-        // switch to the production sampler does not change the event contract.
-        sampling_mode: SamplingMode::CanonicalGreedy,
+        // The PRODUCT decodes with the production sampler, exactly as the pinned upstream runtime
+        // does (generation_config.json: do_sample=true, T=0.9, top_k=50, repetition_penalty=1.05;
+        // subtalker likewise). Canonical greedy is the CONFORMANCE decoder (OQ-12) and is not
+        // quality-viable as a product mode: free-running greedy on this model babbles past
+        // 1,000 frames without drawing EOS (observed 2026-08-08 on "Hello."), which is precisely
+        // the degenerate-loop failure mode OQ-12's L5 selection criterion predeclares. `--seed`
+        // scopes determinism to build + ISA + sampler version + seed, per the documented claim.
+        sampling_mode: SamplingMode::Production,
         seed,
     });
 
