@@ -978,14 +978,31 @@ mod tests {
             streamed.kv, replayed.kv,
             "cached single-position decode and causal replay must retain identical KV buffers"
         );
+        // The streamed generator's loop ended BY taking the terminal EOS decision from its parked
+        // logits, so its `finished` flag is already set while the freshly replayed state has not
+        // decided yet. Comparing full states across that boundary would demand the impossible;
+        // instead make the replayed side take the same decision, prove it is the same decision,
+        // and only then require the two states to be identical in every field.
+        assert!(
+            replayed
+                .next_frame()
+                .expect("replayed terminal decision")
+                .is_none(),
+            "the replayed state must make the same EOS decision"
+        );
+        assert!(
+            streamed
+                .next_frame()
+                .expect("streamed EOS must stay sticky")
+                .is_none(),
+        );
         assert_eq!(
             streamed.utterance, replayed.utterance,
             "cached decode and causal replay must park the same next-frame state"
         );
         assert_eq!(
-            streamed.next_frame().expect("streamed terminal decision"),
-            replayed.next_frame().expect("replayed terminal decision"),
-            "the replayed state must make the same EOS decision"
+            streamed.kv, replayed.kv,
+            "the aligned terminal decisions must not have touched the KV buffers"
         );
     }
 }
