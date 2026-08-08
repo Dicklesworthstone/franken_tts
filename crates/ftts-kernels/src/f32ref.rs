@@ -241,15 +241,18 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
         | F32LinearAccumulation::FusedLanes4
         | F32LinearAccumulation::FusedLanes8
         | F32LinearAccumulation::Accelerate
-        | F32LinearAccumulation::AccelerateBiasSeeded => {
+        | F32LinearAccumulation::AccelerateRowInvariant
+        | F32LinearAccumulation::AccelerateBiasSeeded
+        | F32LinearAccumulation::AccelerateBiasSeededRowInvariant => {
             let lanes = match accumulation {
                 F32LinearAccumulation::Lanes4 => 4,
                 F32LinearAccumulation::Lanes8 => 8,
                 F32LinearAccumulation::FusedLanes4 => 4,
                 F32LinearAccumulation::FusedLanes8 => 8,
-                F32LinearAccumulation::Accelerate | F32LinearAccumulation::AccelerateBiasSeeded => {
-                    1
-                }
+                F32LinearAccumulation::Accelerate
+                | F32LinearAccumulation::AccelerateRowInvariant
+                | F32LinearAccumulation::AccelerateBiasSeeded
+                | F32LinearAccumulation::AccelerateBiasSeededRowInvariant => 1,
                 F32LinearAccumulation::Scalar | F32LinearAccumulation::WidenedF64 => {
                     unreachable!("scalar and widened orders are handled above")
                 }
@@ -265,7 +268,9 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
                     | F32LinearAccumulation::Lanes4
                     | F32LinearAccumulation::Lanes8
                     | F32LinearAccumulation::Accelerate
+                    | F32LinearAccumulation::AccelerateRowInvariant
                     | F32LinearAccumulation::AccelerateBiasSeeded
+                    | F32LinearAccumulation::AccelerateBiasSeededRowInvariant
                     | F32LinearAccumulation::WidenedF64 => partial[lane] + x[index] * weight[index],
                 };
             }
@@ -291,22 +296,25 @@ fn accelerate_sgemm(
     k: usize,
     n: usize,
     beta: f32,
+    row_invariant: bool,
     out: &mut [f32],
 ) -> bool {
     // Accelerate routes M = 1 to a GEMV kernel whose reduction order differs from its M >= 2
     // GEMM kernel in the last ulps, while M >= 2 is row-invariant (measured: M of 2, 3, 4 and 14
     // produce bit-identical rows). A streaming decode presents the same convolution at M = packet
     // while offline presents M = utterance, so without this pinning the streaming == offline gate
-    // fails on every 1-frame packet. Present M = 1 as a duplicated-row M = 2 call and keep row 0,
-    // so every M reduces on the same kernel path.
-    if m == 1 {
+    // fails on every 1-frame packet. Under `row_invariant`, present M = 1 as a duplicated-row
+    // M = 2 call and keep row 0, so every M reduces on the same kernel path. Seams the ORACLE
+    // itself computes at M = 1 (the speaker-encoder embedding head) must NOT request this:
+    // the GEMV bits ARE the oracle's bits there.
+    if row_invariant && m == 1 {
         let mut doubled_x = Vec::with_capacity(2 * k);
         doubled_x.extend_from_slice(x);
         doubled_x.extend_from_slice(x);
         let mut doubled_out = Vec::with_capacity(2 * n);
         doubled_out.extend_from_slice(out);
         doubled_out.extend_from_slice(out);
-        if !accelerate_sgemm(&doubled_x, weight, 2, k, n, beta, &mut doubled_out) {
+        if !accelerate_sgemm(&doubled_x, weight, 2, k, n, beta, false, &mut doubled_out) {
             return false;
         }
         out.copy_from_slice(&doubled_out[..n]);
@@ -347,6 +355,7 @@ fn accelerate_sgemm(
     _k: usize,
     _n: usize,
     _beta: f32,
+    _row_invariant: bool,
     _out: &mut [f32],
 ) -> bool {
     false
