@@ -45,6 +45,12 @@ const PINNED_MAIN_TENSOR_COUNT: usize = 478;
 const PINNED_TENSOR_INVENTORY: &str = include_str!("../pinned/TENSOR_INVENTORY.json");
 const PINNED_MODEL_CONFIG: &str = include_str!("../pinned/model_config.json");
 const APACHE_LICENSE: &str = include_str!("../pinned/QWEN_APACHE_LICENSE");
+//  The `ftts pull` download contract: which release assets make a complete model directory, and
+//  the exact digest each must carry. Embedded so a shipped binary can fetch and verify the model
+//  with no network-served manifest to trust.
+const PINNED_MODEL_MANIFEST: &str = include_str!("../pinned/model_manifest.json");
+/// Subdirectory of `$HOME/.cache` that `ftts pull` fills and model resolution falls back to.
+const DEFAULT_MODEL_CACHE_SUBDIR: &str = ".cache/franken_tts/model";
 const ENVIRONMENT_VARIABLES: [&str; 11] = [
     "FTTS_MODEL_DIR",
     "FTTS_DEFAULT_VOICE",
@@ -139,6 +145,8 @@ enum Command {
     Voice(VoiceArgs),
     /// Convert pinned source weights into a portable .fttsq artifact.
     Convert(ConvertArgs),
+    /// Download and verify the pinned model files into the model directory.
+    Pull(PullArgs),
     /// Emit versioned, line-oriented robot contract data.
     Robot(RobotArgs),
     /// Report local configuration and readiness without inference.
@@ -227,6 +235,17 @@ struct ConvertArgs {
     /// Destination .fttsq path. Refuses to overwrite an existing artifact.
     #[arg(short = 'o', long, value_name = "PATH")]
     output: PathBuf,
+}
+
+#[derive(Debug, clap::Args)]
+struct PullArgs {
+    /// Destination model directory. Defaults to FTTS_MODEL_DIR, then ~/.cache/franken_tts/model.
+    #[arg(long, value_name = "PATH")]
+    model: Option<PathBuf>,
+
+    /// Re-download every file even when it is already present and verified.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -534,6 +553,7 @@ fn dispatch(
             command: VoiceCommand::Inspect { path },
         }) => run_voice_inspect(path, stdout),
         Command::Convert(args) => run_convert(&cli, args, environment, stdout, stderr),
+        Command::Pull(args) => run_pull(args, environment, stdout),
         Command::Robot(args) => run_robot(args.command.clone(), environment, stdout),
         Command::Doctor(args) => run_doctor(args, environment, stdout),
     }
@@ -1570,6 +1590,22 @@ fn read_utf8(reader: &mut dyn Read, source: &str) -> Result<String, FttsError> {
 }
 
 fn resolve_model(explicit: Option<&Path>, environment: &Environment) -> Result<String, FttsError> {
+    resolve_model_from(
+        explicit,
+        &model_search_paths(environment),
+        default_pull_model_dir(environment).as_deref(),
+    )
+}
+
+/// The full resolution order — `--model`, then the searched artifact paths (`FTTS_MODEL_DIR`,
+/// then the home cache), then the `ftts pull` destination directory, accepted only when it holds
+/// a complete bundle. Takes its inputs as data so tests can exercise the order against temp
+/// directories without mutating process environment.
+fn resolve_model_from(
+    explicit: Option<&Path>,
+    searched: &[PathBuf],
+    pull_dir: Option<&Path>,
+) -> Result<String, FttsError> {
     if let Some(path) = explicit {
         // A pinned checkpoint is a *directory* of five files, so `--model DIR` is the natural
         // thing to type and is accepted as such. `.fttsq` is a single file, and both forms reach
@@ -1581,7 +1617,6 @@ fn resolve_model(explicit: Option<&Path>, environment: &Environment) -> Result<S
             .map(|path| path.display().to_string());
     }
 
-    let searched = model_search_paths(environment);
     if let Some(path) = searched.iter().find(|path| path.is_file()) {
         return Ok(path.display().to_string());
     }
@@ -1597,14 +1632,24 @@ fn resolve_model(explicit: Option<&Path>, environment: &Environment) -> Result<S
         return Ok(directory.display().to_string());
     }
 
+    // The `ftts pull` destination is a *bundle* directory (checkpoints + tokenizer files), not a
+    // single artifact, so it counts only when the whole bundle is present — a half-finished pull
+    // resolving here would fail later with a less actionable error than the one below.
+    if let Some(directory) = pull_dir
+        && directory.is_dir()
+        && synth::ModelBundle::resolve(directory).is_ok()
+    {
+        return Ok(directory.display().to_string());
+    }
+
     let searched = searched
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
     Err(FttsError::ModelNotFound(format!(
-        "no model artifact was found; searched: [{}]; use `ftts say --model PATH --check TEXT`",
-        searched
+        "no model artifact was found; searched: [{searched}]; run `ftts pull` to fetch the model \
+         (~2.4 GB), or pass --model PATH or set FTTS_MODEL_DIR"
     )))
 }
 
@@ -1661,6 +1706,331 @@ fn run_enroll(
         },
     )
     .map_err(|error| FttsError::Generic(format!("cannot write enrollment result: {error}")))
+}
+
+/// One downloadable model file from the embedded manifest.
+#[derive(Clone, Debug)]
+struct ModelManifestFile {
+    /// The bare release-asset name on the GitHub release.
+    asset: String,
+    /// Relative path under the model directory the asset lands at.
+    dest: String,
+    /// Pinned lowercase-hex SHA-256 the downloaded bytes must carry.
+    sha256: String,
+    /// Pinned exact size, checked before the (much more expensive) digest.
+    bytes: u64,
+}
+
+/// The embedded `ftts pull` download contract: release coordinates plus per-file pins.
+#[derive(Clone, Debug)]
+struct ModelManifest {
+    model_id: String,
+    release_tag: String,
+    repo: String,
+    files: Vec<ModelManifestFile>,
+}
+
+impl ModelManifest {
+    /// The compiled-in manifest. Parsing it can only fail if the checked-in copy is malformed,
+    /// which the unit tests catch before a binary ships.
+    fn embedded() -> Result<Self, FttsError> {
+        Self::parse(PINNED_MODEL_MANIFEST)
+    }
+
+    /// Parses and validates manifest text; every refusal names the offending field, because a
+    /// manifest bug otherwise surfaces as a mystery mid-download.
+    fn parse(text: &str) -> Result<Self, FttsError> {
+        let value: Value = serde_json::from_str(text).map_err(|error| {
+            FttsError::ArtifactFormat(format!("model manifest is not valid JSON: {error}"))
+        })?;
+        if value["schema_version"].as_u64() != Some(1) {
+            return Err(FttsError::ArtifactFormat(format!(
+                "model manifest schema_version {} is not the supported 1",
+                value["schema_version"]
+            )));
+        }
+        let model_id = manifest_string(&value, "model_id")?;
+        let release_tag = manifest_string(&value, "release_tag")?;
+        let repo = manifest_string(&value, "repo")?;
+        let files = value["files"]
+            .as_array()
+            .filter(|files| !files.is_empty())
+            .ok_or_else(|| {
+                FttsError::ArtifactFormat("model manifest needs a non-empty files array".to_owned())
+            })?
+            .iter()
+            .map(parse_manifest_file)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            model_id,
+            release_tag,
+            repo,
+            files,
+        })
+    }
+
+    /// The release-asset URL for one file; the only endpoint `ftts pull` ever contacts.
+    fn download_url(&self, file: &ModelManifestFile) -> String {
+        format!(
+            "https://github.com/{}/releases/download/{}/{}",
+            self.repo, self.release_tag, file.asset
+        )
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.files.iter().map(|file| file.bytes).sum()
+    }
+}
+
+fn manifest_string(value: &Value, field: &str) -> Result<String, FttsError> {
+    value[field]
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            FttsError::ArtifactFormat(format!(
+                "model manifest field {field} must be a non-empty string"
+            ))
+        })
+}
+
+fn parse_manifest_file(value: &Value) -> Result<ModelManifestFile, FttsError> {
+    let asset = manifest_string(value, "asset")?;
+    if asset.contains('/') || asset.contains('\\') {
+        return Err(FttsError::ArtifactFormat(format!(
+            "manifest asset {asset:?} must be a bare release-asset name"
+        )));
+    }
+    let dest = manifest_string(value, "dest")?;
+    validate_manifest_dest(&dest)?;
+    let sha256 = manifest_string(value, "sha256")?;
+    if !is_sha256_hex(&sha256) {
+        return Err(FttsError::ArtifactFormat(format!(
+            "manifest sha256 for {asset} must be 64 lowercase hex characters"
+        )));
+    }
+    let bytes = value["bytes"]
+        .as_u64()
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| {
+            FttsError::ArtifactFormat(format!(
+                "manifest bytes for {asset} must be a positive integer"
+            ))
+        })?;
+    Ok(ModelManifestFile {
+        asset,
+        dest,
+        sha256,
+        bytes,
+    })
+}
+
+/// A manifest `dest` is joined under the model directory, so it must not be able to escape it:
+/// no absolute paths, no `..`, no `.`, no backslash separators.
+fn validate_manifest_dest(dest: &str) -> Result<(), FttsError> {
+    let path = Path::new(dest);
+    let traversal_free = path
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)));
+    if path.is_absolute() || dest.contains('\\') || !traversal_free {
+        return Err(FttsError::ArtifactFormat(format!(
+            "manifest dest {dest:?} must be a relative path with no traversal; it is joined under the model directory"
+        )));
+    }
+    Ok(())
+}
+
+fn is_sha256_hex(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The directory `ftts pull` fills when `--model` is absent, and the last resort model resolution
+/// falls back to: the first `FTTS_MODEL_DIR` entry when set, else `$HOME/.cache/franken_tts/model`.
+fn default_pull_model_dir(environment: &Environment) -> Option<PathBuf> {
+    if let Some(first) = environment
+        .value("FTTS_MODEL_DIR")
+        .and_then(|dirs| std::env::split_paths(dirs).next())
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return Some(first);
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(DEFAULT_MODEL_CACHE_SUBDIR))
+}
+
+/// Skip-versus-download for one manifest file, factored out so it is testable without a network.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PullDecision {
+    /// The destination already carries the pinned size AND the pinned digest.
+    Skip,
+    /// Absent, wrong-sized, wrong-hashed, or `--force`.
+    Download,
+}
+
+/// `Skip` requires both pins to hold: size alone accepts a same-length corruption, and hashing
+/// alone would digest gigabytes a length check could reject for free (which is why the cheap check
+/// runs first). Any mismatch re-downloads rather than erroring — repairing a bad file is exactly
+/// what `pull` is for.
+fn pull_decision(dest: &Path, file: &ModelManifestFile, force: bool) -> PullDecision {
+    if force {
+        return PullDecision::Download;
+    }
+    let Ok(metadata) = fs::metadata(dest) else {
+        return PullDecision::Download;
+    };
+    if !metadata.is_file() || metadata.len() != file.bytes {
+        return PullDecision::Download;
+    }
+    match ftts_artifacts::sha256::hex_digest_file(dest) {
+        Ok(digest) if digest == file.sha256 => PullDecision::Skip,
+        _ => PullDecision::Download,
+    }
+}
+
+/// Downloads `url` to `staging` with the system `curl`.
+///
+/// Shelling out is deliberate: inference never touches the network, so the binary links no HTTP
+/// stack. Only `pull` needs one, and `curl` is the same system-tool seam the audio encoders and
+/// decoders already use.
+fn download_with_curl(url: &str, staging: &Path) -> Result<(), FttsError> {
+    let outcome = std::process::Command::new("curl")
+        .args(["-L", "--fail", "--retry", "3", "-sS", "-o"])
+        .arg(staging)
+        .arg(url)
+        .status();
+    match outcome {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(FttsError::Generic(
+            "`ftts pull` downloads with the system `curl`, which was not found on PATH; \
+             install curl and retry, or download the release assets by hand"
+                .to_owned(),
+        )),
+        Err(error) => Err(FttsError::Generic(format!("cannot run curl: {error}"))),
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(FttsError::Generic(format!(
+            "curl failed downloading {url} ({status}); check network access and retry `ftts pull`"
+        ))),
+    }
+}
+
+/// Size first, digest second, both against the embedded pins.
+fn verify_pulled_file(path: &Path, file: &ModelManifestFile) -> Result<(), FttsError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        FttsError::Generic(format!(
+            "cannot stat downloaded {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.len() != file.bytes {
+        return Err(FttsError::ArtifactFormat(format!(
+            "downloaded {} is {} bytes, expected {}; the incomplete download was discarded, retry `ftts pull`",
+            file.asset,
+            metadata.len(),
+            file.bytes
+        )));
+    }
+    let digest = ftts_artifacts::sha256::hex_digest_file(path).map_err(|error| {
+        FttsError::Generic(format!(
+            "cannot hash downloaded {}: {error}",
+            path.display()
+        ))
+    })?;
+    if digest != file.sha256 {
+        return Err(FttsError::ArtifactFormat(format!(
+            "downloaded {} carries sha256 {digest}, expected {}; the corrupt download was discarded, retry `ftts pull`",
+            file.asset, file.sha256
+        )));
+    }
+    Ok(())
+}
+
+/// `<dest>.part`, in the destination directory so the final rename never crosses a filesystem.
+fn pull_staging_path(dest: &Path) -> PathBuf {
+    let mut name = dest.file_name().map(OsString::from).unwrap_or_default();
+    name.push(".part");
+    dest.with_file_name(name)
+}
+
+/// Downloads one asset to `<dest>.part`, verifies it against the pins, and atomically publishes.
+///
+/// A staging file that fails verification is removed. This is the opposite of `convert`'s
+/// retained staging, on purpose: a failed local conversion is diagnosable evidence, while a
+/// corrupt download says nothing beyond "the network truncated it", and a multi-gigabyte corpse
+/// in the cache directory helps no one.
+fn pull_one_file(
+    manifest: &ModelManifest,
+    file: &ModelManifestFile,
+    dest: &Path,
+) -> Result<(), FttsError> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            FttsError::Generic(format!(
+                "cannot create model directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    let staging = pull_staging_path(dest);
+    let url = manifest.download_url(file);
+    let outcome =
+        download_with_curl(&url, &staging).and_then(|()| verify_pulled_file(&staging, file));
+    if let Err(error) = outcome {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    fs::rename(&staging, dest).map_err(|error| {
+        FttsError::Generic(format!(
+            "downloaded {} verified but could not be published to {}: {error}",
+            file.asset,
+            dest.display()
+        ))
+    })
+}
+
+fn run_pull(
+    args: &PullArgs,
+    environment: &Environment,
+    stdout: &mut dyn Write,
+) -> Result<(), FttsError> {
+    let manifest = ModelManifest::embedded()?;
+    let destination = match &args.model {
+        Some(path) => path.clone(),
+        None => default_pull_model_dir(environment).ok_or_else(|| {
+            FttsError::Usage(
+                "cannot choose a model directory: pass --model PATH, or set FTTS_MODEL_DIR or HOME"
+                    .to_owned(),
+            )
+        })?,
+    };
+    writeln!(
+        stdout,
+        "pulling {} ({} files, {} bytes) into {}",
+        manifest.model_id,
+        manifest.files.len(),
+        manifest.total_bytes(),
+        destination.display()
+    )
+    .map_err(output_error)?;
+    for file in &manifest.files {
+        let dest = destination.join(&file.dest);
+        match pull_decision(&dest, file, args.force) {
+            PullDecision::Skip => writeln!(
+                stdout,
+                "{} ({} bytes): already present, verified",
+                file.dest, file.bytes
+            )
+            .map_err(output_error)?,
+            PullDecision::Download => {
+                writeln!(stdout, "{} ({} bytes): downloading", file.dest, file.bytes)
+                    .map_err(output_error)?;
+                pull_one_file(&manifest, file, &dest)?;
+                writeln!(stdout, "{} ({} bytes): verified", file.dest, file.bytes)
+                    .map_err(output_error)?;
+            }
+        }
+    }
+    writeln!(stdout, "model ready at {}", destination.display()).map_err(output_error)
 }
 
 fn resolve_existing_file<'a>(path: &'a Path, label: &str) -> Result<&'a Path, FttsError> {
@@ -1880,11 +2250,12 @@ fn model_search_paths(environment: &Environment) -> Vec<PathBuf> {
         })
         .unwrap_or_default();
     if let Some(home) = std::env::var_os("HOME") {
-        searched.push(
-            PathBuf::from(home)
-                .join(".cache/franken_tts/models")
-                .join(MODEL_BASENAME),
-        );
+        let home = PathBuf::from(home);
+        searched.push(home.join(".cache/franken_tts/models").join(MODEL_BASENAME));
+        // The `ftts pull` destination, listed after the legacy plural directory so existing
+        // installs keep winning; it is also the bundle-directory fallback in `resolve_model_from`,
+        // which is what lets a bare `ftts pull` then `ftts say` work with no env var at all.
+        searched.push(home.join(DEFAULT_MODEL_CACHE_SUBDIR).join(MODEL_BASENAME));
     }
     searched
 }
@@ -1976,7 +2347,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,enroll,voice,convert,robot,doctor\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
+    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,enroll,voice,convert,pull,robot,doctor\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
 
     #[test]
     fn clap_surface_matches_snapshot() {
@@ -2002,13 +2373,23 @@ mod tests {
             .filter_map(|argument| argument.get_long())
             .collect::<Vec<_>>()
             .join(",");
+        let pull = command
+            .get_subcommands()
+            .find(|command| command.get_name() == "pull")
+            .expect("pull subcommand")
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect::<Vec<_>>()
+            .join(",");
         let global = command
             .get_arguments()
             .filter_map(|argument| argument.get_long())
             .filter(|argument| *argument != "help")
             .collect::<Vec<_>>()
             .join(",");
-        let actual = format!("commands={commands}\nrobot={robot}\nsay={say}\nglobal={global}\n");
+        let actual = format!(
+            "commands={commands}\nrobot={robot}\nsay={say}\npull={pull}\nglobal={global}\n"
+        );
         assert_eq!(actual, CLAP_SURFACE_SNAPSHOT);
     }
 
@@ -2653,6 +3034,262 @@ mod tests {
                     "SKIP pinned-copy check for {name}: {canonical} absent (no repo checkout)"
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn embedded_model_manifest_is_wellformed_and_agrees_with_the_converter_pin() {
+        let manifest = ModelManifest::embedded().expect("embedded manifest parses");
+        assert_eq!(manifest.model_id, "qwen3-tts-12hz-0.6b-base");
+        assert_eq!(manifest.release_tag, "model-qwen3-tts-v1");
+        assert_eq!(manifest.repo, "Dicklesworthstone/franken_tts");
+        assert_eq!(manifest.files.len(), 7);
+
+        for file in &manifest.files {
+            assert!(
+                is_sha256_hex(&file.sha256),
+                "{} carries a malformed digest",
+                file.asset
+            );
+            assert!(file.bytes > 0, "{} has no pinned size", file.asset);
+            let dest = Path::new(&file.dest);
+            assert!(!dest.is_absolute(), "{} dest is absolute", file.asset);
+            assert!(
+                dest.components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))),
+                "{} dest can traverse out of the model directory",
+                file.asset
+            );
+        }
+
+        // The converter and the downloader must pin the same main checkpoint, or `pull` would
+        // fetch bytes `convert` then refuses.
+        let main = manifest
+            .files
+            .iter()
+            .find(|file| file.dest == PINNED_MAIN_WEIGHTS_FILENAME)
+            .expect("manifest carries the main checkpoint");
+        assert_eq!(main.sha256, PINNED_MAIN_WEIGHTS_SHA256);
+        assert_eq!(
+            manifest.download_url(main),
+            "https://github.com/Dicklesworthstone/franken_tts/releases/download/model-qwen3-tts-v1/model.safetensors"
+        );
+
+        // Together the files are exactly what ModelBundle::resolve requires plus the two config
+        // sidecars, so a completed pull always resolves.
+        let dests: Vec<&str> = manifest
+            .files
+            .iter()
+            .map(|file| file.dest.as_str())
+            .collect();
+        for required in [
+            "model.safetensors",
+            "speech_tokenizer/model.safetensors",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer_config.json",
+        ] {
+            assert!(dests.contains(&required), "manifest is missing {required}");
+        }
+    }
+
+    #[test]
+    fn malformed_model_manifests_are_refused_with_the_field_named() {
+        fn manifest_with(
+            schema_version: u64,
+            asset: &str,
+            dest: &str,
+            sha256: &str,
+            bytes: u64,
+        ) -> String {
+            json!({
+                "schema_version": schema_version,
+                "model_id": "m",
+                "release_tag": "t",
+                "repo": "owner/repo",
+                "files": [{"asset": asset, "dest": dest, "sha256": sha256, "bytes": bytes}],
+            })
+            .to_string()
+        }
+        let good_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // The happy shape parses, so every refusal below is attributable to its one bad field.
+        ModelManifest::parse(&manifest_with(1, "a.bin", "a.bin", good_sha, 1))
+            .expect("well-formed manifest parses");
+
+        for (label, text) in [
+            (
+                "unsupported schema_version",
+                manifest_with(2, "a.bin", "a.bin", good_sha, 1),
+            ),
+            (
+                "short sha256",
+                manifest_with(1, "a.bin", "a.bin", "abc123", 1),
+            ),
+            (
+                "uppercase sha256",
+                manifest_with(1, "a.bin", "a.bin", &good_sha.to_uppercase(), 1),
+            ),
+            (
+                "zero bytes",
+                manifest_with(1, "a.bin", "a.bin", good_sha, 0),
+            ),
+            (
+                "absolute dest",
+                manifest_with(1, "a.bin", "/etc/passwd", good_sha, 1),
+            ),
+            (
+                "traversal dest",
+                manifest_with(1, "a.bin", "../escape.bin", good_sha, 1),
+            ),
+            (
+                "asset with a path separator",
+                manifest_with(1, "dir/a.bin", "a.bin", good_sha, 1),
+            ),
+            (
+                "empty files array",
+                json!({
+                    "schema_version": 1,
+                    "model_id": "m",
+                    "release_tag": "t",
+                    "repo": "owner/repo",
+                    "files": [],
+                })
+                .to_string(),
+            ),
+        ] {
+            let error = ModelManifest::parse(&text)
+                .expect_err(&format!("a manifest with {label} must be refused"));
+            assert_eq!(error.exit_code(), FttsExitCode::ArtifactFormat, "{label}");
+        }
+    }
+
+    #[test]
+    fn pull_skips_only_a_file_matching_both_pinned_size_and_digest() {
+        let dir = std::env::temp_dir().join(format!("ftts-pull-decision-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let payload = b"pinned payload";
+        let file = ModelManifestFile {
+            asset: "a.bin".to_owned(),
+            dest: "a.bin".to_owned(),
+            sha256: ftts_artifacts::sha256::hex_digest(payload),
+            bytes: payload.len() as u64,
+        };
+        let dest = dir.join("a.bin");
+
+        let _ = fs::remove_file(&dest);
+        assert_eq!(
+            pull_decision(&dest, &file, false),
+            PullDecision::Download,
+            "absent file must download"
+        );
+
+        fs::write(&dest, payload).expect("write verified payload");
+        assert_eq!(
+            pull_decision(&dest, &file, false),
+            PullDecision::Skip,
+            "matching size and digest must skip"
+        );
+        assert_eq!(
+            pull_decision(&dest, &file, true),
+            PullDecision::Download,
+            "--force must re-download even a verified file"
+        );
+
+        fs::write(&dest, b"pinned_payload").expect("write same-length corruption");
+        assert_eq!(
+            pull_decision(&dest, &file, false),
+            PullDecision::Download,
+            "a same-length corruption must be caught by the digest"
+        );
+
+        fs::write(&dest, b"short").expect("write truncation");
+        assert_eq!(
+            pull_decision(&dest, &file, false),
+            PullDecision::Download,
+            "a truncated file must be caught by the size check"
+        );
+    }
+
+    #[test]
+    fn model_resolution_prefers_explicit_then_searched_then_the_pull_directory() {
+        let root = std::env::temp_dir().join(format!("ftts-resolve-order-{}", std::process::id()));
+
+        // A complete bundle directory: ModelBundle::resolve only asks `is_file`, so empty files
+        // are a sufficient fake (and would fail loudly if the resolver ever started reading).
+        let bundle = root.join("bundle");
+        for relative in [
+            "model.safetensors",
+            "speech_tokenizer/model.safetensors",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer_config.json",
+        ] {
+            let path = bundle.join(relative);
+            fs::create_dir_all(path.parent().expect("bundle parent")).expect("bundle dirs");
+            fs::write(&path, b"").expect("bundle file");
+        }
+        assert!(
+            synth::ModelBundle::resolve(&bundle).is_ok(),
+            "five empty files must satisfy the resolver's is_file checks"
+        );
+
+        let searched_artifact = root.join("searched").join(MODEL_BASENAME);
+        fs::create_dir_all(searched_artifact.parent().expect("searched parent"))
+            .expect("searched dir");
+        fs::write(&searched_artifact, b"").expect("searched artifact");
+        let searched = vec![searched_artifact.clone()];
+        let absent = vec![root.join("absent").join(MODEL_BASENAME)];
+
+        // 1. `--model` outranks everything.
+        assert_eq!(
+            resolve_model_from(Some(&bundle), &searched, Some(&bundle)).expect("explicit"),
+            bundle.display().to_string()
+        );
+
+        // 2. A searched artifact outranks the pull directory.
+        assert_eq!(
+            resolve_model_from(None, &searched, Some(&bundle)).expect("searched"),
+            searched_artifact.display().to_string()
+        );
+
+        // 3. The pull directory resolves when nothing searched exists.
+        assert_eq!(
+            resolve_model_from(None, &absent, Some(&bundle)).expect("pull fallback"),
+            bundle.display().to_string()
+        );
+
+        // 4. An incomplete pull directory does not resolve, and the error teaches `ftts pull`.
+        let incomplete = root.join("incomplete");
+        fs::create_dir_all(&incomplete).expect("incomplete dir");
+        let error = resolve_model_from(None, &absent, Some(&incomplete))
+            .expect_err("an empty pull directory must not resolve");
+        assert_eq!(error.exit_code(), FttsExitCode::ModelNotFound);
+        assert!(error.to_string().contains("ftts pull"), "{error}");
+        assert!(error.to_string().contains("2.4 GB"), "{error}");
+        assert!(error.to_string().contains("FTTS_MODEL_DIR"), "{error}");
+    }
+
+    #[test]
+    fn the_pull_directory_default_prefers_the_env_override() {
+        let mut environment = Environment::default();
+        environment
+            .values
+            .insert("FTTS_MODEL_DIR", Some(OsString::from("/tmp/env-model-dir")));
+        assert_eq!(
+            default_pull_model_dir(&environment),
+            Some(PathBuf::from("/tmp/env-model-dir"))
+        );
+
+        // Without the override the default lives under $HOME; the exact suffix is the contract
+        // `ftts pull` and model resolution share.
+        if std::env::var_os("HOME").is_some() {
+            let fallback = default_pull_model_dir(&Environment::default())
+                .expect("HOME is set, so a default exists");
+            assert!(
+                fallback.ends_with(DEFAULT_MODEL_CACHE_SUBDIR),
+                "{fallback:?}"
+            );
         }
     }
 }

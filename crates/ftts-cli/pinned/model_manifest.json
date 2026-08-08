@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "model_id": "qwen3-tts-12hz-0.6b-base",
+  "release_tag": "model-qwen3-tts-v1",
+  "repo": "Dicklesworthstone/franken_tts",
+  "files": [
+    {
+      "asset": "model.safetensors",
+      "dest": "model.safetensors",
+      "sha256": "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6",
+      "bytes": 1829344272
+    },
+    {
+      "asset": "speech_tokenizer_model.safetensors",
+      "dest": "speech_tokenizer/model.safetensors",
+      "sha256": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
+      "bytes": 682293092
+    },
+    {
+      "asset": "vocab.json",
+      "dest": "vocab.json",
+      "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+      "bytes": 2776833
+    },
+    {
+      "asset": "merges.txt",
+      "dest": "merges.txt",
+      "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+      "bytes": 1671839
+    },
+    {
+      "asset": "tokenizer_config.json",
+      "dest": "tokenizer_config.json",
+      "sha256": "dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670",
+      "bytes": 7344
+    },
+    {
+      "asset": "config.json",
+      "dest": "config.json",
+      "sha256": "2e714c787c8edb98b05432685cddb634add2de4d4e645f653d68251ef72ba011",
+      "bytes": 4494
+    },
+    {
+      "asset": "generation_config.json",
+      "dest": "generation_config.json",
+      "sha256": "f1b90b4513f3b34c62851049e2492d7b4c5940daf1276f89c82b8ef04127f3aa",
+      "bytes": 245
+    }
+  ]
+}

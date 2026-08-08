@@ -67,7 +67,7 @@ impl FttsError {
             }
             Self::Usage(_) => "re-run with --help to see the accepted argument shapes",
             Self::ModelNotFound(_) => {
-                "pass --model PATH or set FTTS_MODEL_DIR; `ftts robot health` lists every directory searched"
+                "run `ftts pull` to fetch the model (~2.4 GB), or pass --model PATH or set FTTS_MODEL_DIR; `ftts robot health` lists every directory searched"
             }
             Self::Input(_) => {
                 "check the input text or file encoding; input must be non-empty UTF-8"
