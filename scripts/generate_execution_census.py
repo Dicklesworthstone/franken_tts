@@ -419,10 +419,21 @@ def main() -> int:
     )
     arguments = parser.parse_args()
 
-    for path in (INVENTORY, TALKER_CONFIG, CODEC_CONFIG):
+    #  The committed inventory going missing is always a defect. The two config snapshots are
+    #  gitignored truth-pack artifacts (hashes committed, bytes fetched), so their absence on a
+    #  fresh checkout — CI, a new machine — means "cannot re-derive here", not "the census
+    #  drifted". Exit 3 lets the gate record an honest skip instead of a counterfeit red.
+    if not INVENTORY.is_file():
+        print(f"missing pinned input: {INVENTORY.relative_to(ROOT)}", file=sys.stderr)
+        return 1
+    for path in (TALKER_CONFIG, CODEC_CONFIG):
         if not path.is_file():
-            print(f"missing pinned input: {path.relative_to(ROOT)}", file=sys.stderr)
-            return 1
+            print(
+                f"pinned snapshot not fetched: {path.relative_to(ROOT)} — run "
+                "docs/truth-pack/fetch-truth-pack.sh to enable the census drift check",
+                file=sys.stderr,
+            )
+            return 3
 
     document = build(
         json.loads(INVENTORY.read_text()),

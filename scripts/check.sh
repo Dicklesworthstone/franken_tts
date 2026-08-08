@@ -124,10 +124,17 @@ stage_pass
 # 1b. Execution census is regenerated from the pinned inputs, not hand-edited
 # ─────────────────────────────────────────────────────────────────────────────
 stage_start "execution-census drift guard (census matches its pinned inputs)"
-if ! python3 scripts/generate_execution_census.py --check; then
+CENSUS_STATUS=0
+python3 scripts/generate_execution_census.py --check || CENSUS_STATUS=$?
+if [[ "$CENSUS_STATUS" -eq 3 ]]; then
+    # Exit 3 = the gitignored config snapshots are not fetched on this machine (fresh checkout,
+    # CI). The census cannot be re-derived without them; an honest skip, never a red.
+    stage_skip "truth-pack snapshots not fetched; census drift not checkable here"
+elif [[ "$CENSUS_STATUS" -ne 0 ]]; then
     stage_fail "docs/truth-pack/EXECUTION_CENSUS.json is stale; run scripts/generate_execution_census.py"
+else
+    stage_pass
 fi
-stage_pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1c. The conformance corpus is a frozen oracle input, not a mutable text list
