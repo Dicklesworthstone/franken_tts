@@ -178,8 +178,7 @@ pub fn linear_with_accumulation(
             }
             None => out.fill(0.0),
         }
-        let row_invariant =
-            accumulation == F32LinearAccumulation::AccelerateBiasSeededRowInvariant;
+        let row_invariant = accumulation == F32LinearAccumulation::AccelerateBiasSeededRowInvariant;
         if accelerate_sgemm(x, weight, m, k, n, 1.0, row_invariant, out) {
             return;
         }
@@ -1008,6 +1007,7 @@ fn accelerate_gqa_attention(
             head_dim,
             key_positions,
             0.0,
+            false,
             &mut scores,
         ) {
             return false;
@@ -1029,6 +1029,7 @@ fn accelerate_gqa_attention(
             key_positions,
             head_dim,
             0.0,
+            false,
             &mut context,
         ) {
             return false;
@@ -1086,7 +1087,10 @@ fn attention_weighted_sum(
         F32LinearAccumulation::Scalar => 1,
         F32LinearAccumulation::Lanes4 | F32LinearAccumulation::FusedLanes4 => 4,
         F32LinearAccumulation::Lanes8 | F32LinearAccumulation::FusedLanes8 => 8,
-        F32LinearAccumulation::Accelerate | F32LinearAccumulation::AccelerateBiasSeeded => 1,
+        F32LinearAccumulation::Accelerate
+        | F32LinearAccumulation::AccelerateRowInvariant
+        | F32LinearAccumulation::AccelerateBiasSeeded
+        | F32LinearAccumulation::AccelerateBiasSeededRowInvariant => 1,
         F32LinearAccumulation::WidenedF64 => unreachable!("handled above"),
     };
     for lane in 0..head_dim {
@@ -1102,7 +1106,9 @@ fn attention_weighted_sum(
                 | F32LinearAccumulation::Lanes4
                 | F32LinearAccumulation::Lanes8
                 | F32LinearAccumulation::Accelerate
+                | F32LinearAccumulation::AccelerateRowInvariant
                 | F32LinearAccumulation::AccelerateBiasSeeded
+                | F32LinearAccumulation::AccelerateBiasSeededRowInvariant
                 | F32LinearAccumulation::WidenedF64 => partial[partial_index] + weight * value,
             };
         }

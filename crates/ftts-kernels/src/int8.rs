@@ -137,15 +137,19 @@ impl Int8Tier {
     ///
     /// The override exists for interleaved A/B measurement (`scalar` / `autovec` / `neon-sdot`);
     /// an unavailable or unrecognized override falls back to the measured default rather than
-    /// panicking mid-synthesis. Until a per-shape KernelPlan lands, the default is `Autovec`,
-    /// per inherited prior NE-INH-003 (autovec beat hand-SDOT at m=1 on Apple M4); `neon-sdot`
-    /// must currently be selected explicitly.
+    /// panicking mid-synthesis. Until a per-shape KernelPlan lands, the default is `NeonSdot`
+    /// where FEAT_DotProd exists, else `Scalar`. Measured on M4 Pro (2026-08-08, shape bench,
+    /// noisy shared host, indicative): plain `Scalar` autovectorizes to ~50 GB/s and ties SDOT
+    /// at m=1 — NE-INH-003 reconfirmed — while the hand-shaped `Autovec` lane loop defeats the
+    /// vectorizer and loses ~15x; it stays only as an A/B datapoint.
     #[must_use]
     pub fn dispatch() -> Self {
         match std::env::var("FTTS_INT8_TIER").as_deref() {
             Ok("scalar") => Self::Scalar,
+            Ok("autovec") => Self::Autovec,
             Ok("neon-sdot") if neon_sdot_available() => Self::NeonSdot,
-            _ => Self::Autovec,
+            _ if neon_sdot_available() => Self::NeonSdot,
+            _ => Self::Scalar,
         }
     }
 }
@@ -225,9 +229,7 @@ mod neon_dotprod {
     //! bit-identical scalar fallback in the parent module, every load bounds-checked by loop
     //! structure, every unsafe operation carrying a SAFETY note.
 
-    use core::arch::aarch64::{
-        vaddq_s32, vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8,
-    };
+    use core::arch::aarch64::{vaddq_s32, vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8};
 
     /// Whether the running CPU reports FEAT_DotProd.
     #[must_use]
@@ -449,7 +451,12 @@ mod tests {
             let b = pseudo_random_q8(len, tail_seed(len) ^ 1);
             let reference = dot_i32(&a, &b, Int8Tier::Scalar);
             for tier in Int8Tier::available() {
-                assert_eq!(dot_i32(&a, &b, tier), reference, "len={len} {}", tier.as_str());
+                assert_eq!(
+                    dot_i32(&a, &b, tier),
+                    reference,
+                    "len={len} {}",
+                    tier.as_str()
+                );
             }
         }
     }
@@ -468,7 +475,10 @@ mod tests {
 
         let zeros = [0.0_f32; 4];
         let mut qz = [1_i8; 4];
-        assert_eq!(quantize_row_q8(&zeros, &mut qz).to_bits(), 1.0_f32.to_bits());
+        assert_eq!(
+            quantize_row_q8(&zeros, &mut qz).to_bits(),
+            1.0_f32.to_bits()
+        );
         assert_eq!(qz, [0, 0, 0, 0]);
 
         let matrix = QuantizedMatrix::quantize(&[2.0, -1.0, 0.0, 3.0], 2, 2);
@@ -485,7 +495,9 @@ mod tests {
         let mut x = vec![0.0_f32; k];
         let mut state = 0x1234_5678_u64;
         let mut next = || {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         };
         for value in weight.iter_mut() {
@@ -502,16 +514,25 @@ mod tests {
         crate::f32ref::linear(&x, &weight, None, 1, k, n, &mut out_f32);
 
         let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
-        let cosine =
-            dot(&out_q8, &out_f32) / (dot(&out_q8, &out_q8).sqrt() * dot(&out_f32, &out_f32).sqrt());
-        assert!(cosine > 0.999, "W8A8 dequant plumbing is broken: cosine {cosine}");
+        let cosine = dot(&out_q8, &out_f32)
+            / (dot(&out_q8, &out_q8).sqrt() * dot(&out_f32, &out_f32).sqrt());
+        assert!(
+            cosine > 0.999,
+            "W8A8 dequant plumbing is broken: cosine {cosine}"
+        );
     }
 
     #[test]
     fn tiers_produce_bit_identical_f32_output_not_merely_close() {
         let (n, k) = (256_usize, 1024_usize);
-        let weight: Vec<f32> = pseudo_random_q8(n * k, 77).iter().map(|&b| f32::from(b) / 64.0).collect();
-        let x: Vec<f32> = pseudo_random_q8(k, 78).iter().map(|&b| f32::from(b) / 64.0).collect();
+        let weight: Vec<f32> = pseudo_random_q8(n * k, 77)
+            .iter()
+            .map(|&b| f32::from(b) / 64.0)
+            .collect();
+        let x: Vec<f32> = pseudo_random_q8(k, 78)
+            .iter()
+            .map(|&b| f32::from(b) / 64.0)
+            .collect();
         let quantized = QuantizedMatrix::quantize(&weight, n, k);
         let mut reference = vec![0.0_f32; n];
         linear_q8_dynamic(&x, &quantized, None, 1, &mut reference, Int8Tier::Scalar);
