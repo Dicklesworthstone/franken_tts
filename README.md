@@ -32,18 +32,15 @@ Sibling of [franken_ocr](https://github.com/Dicklesworthstone/franken_ocr) and f
 
 ## Quick example
 
-One-time setup: fetch the pinned model snapshot from Hugging Face (weights are not bundled), point `ftts` at it, and enroll a default voice from a recording you have the right to use.
+Three commands, no configuration:
 
 ```bash
-export FTTS_MODEL_DIR=/path/to/qwen3-tts-12hz-0.6b-base
-ftts enroll your_recording.wav --default    # or copy any 1,024-float x-vector to $FTTS_MODEL_DIR/default.spk
-```
-
-After that, synthesis is one line:
-
-```bash
+ftts pull                              # one-time: fetch the pinned model (~2.4 GB, SHA-256 verified)
+ftts enroll voice_memo.m4a --default   # clone a voice from any recording you have the right to use
 ftts say "Now is the time for all good men to come to the aid of the agents" out.m4a
 ```
+
+The model installs into `~/.cache/franken_tts/model` and every command finds it there automatically; `--model` and `FTTS_MODEL_DIR` remain available to point elsewhere.
 
 The output format follows the extension. `.wav` comes straight from the built-in pure-Rust encoder; `.m4a`, `.mp3`, and `.flac` are converted from that WAV by whichever system encoder is present (`afconvert` on macOS, `ffmpeg`, `lame`, `flac`), and if none is found you get an error naming the tools rather than a silently different format. Generation stops at the model's EOS, with a text-proportional frame cap as a backstop; set `FTTS_MAX_FRAMES` only when you want an exact cap. `--model`, `--voice`, and `-o` remain available for explicit control.
 
@@ -103,18 +100,34 @@ Prebuilt binaries cover macOS (arm64, x86_64), Linux (x86_64, arm64), and Window
 
 ### Getting the model
 
-Weights are **not** bundled. Download the pinned Qwen3-TTS-12Hz-0.6B-Base snapshot from [Hugging Face](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) (Apache-2.0) into a directory, then point the CLI at it with `ftts say --model <dir>`.
+Weights are not bundled with the binary; `ftts pull` fetches the pinned Qwen3-TTS-12Hz-0.6B-Base snapshot (~2.4 GB, Apache-2.0 by Qwen) from this project's [model release](https://github.com/Dicklesworthstone/franken_tts/releases/tag/model-qwen3-tts-v1) into `~/.cache/franken_tts/model`, verifying every file's SHA-256 against the manifest embedded in the binary. Re-running `ftts pull` verifies and skips files already present. You can instead download the same snapshot from [Hugging Face](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) manually and point the CLI at it with `--model <dir>` or `FTTS_MODEL_DIR`.
 
-## Quick start
+## Cloning your voice, step by step
 
-1. Install `ftts` (above).
-2. Download the pinned model snapshot into `<model-dir>` and export `FTTS_MODEL_DIR=<model-dir>`.
-3. Enroll a voice: `ftts enroll your_recording.wav --default` computes a speaker embedding from reference audio and stores it as the default. You can also pass any 1,024-float x-vector file directly with `--voice`.
-4. Synthesize:
+1. Install `ftts` (above), then fetch the model once: `ftts pull`.
+2. **Record about 30 to 50 seconds of yourself reading the passage below**, in a quiet room, at your natural pace, on any device — a phone voice memo is fine. Any common format works (`.m4a`, `.mp3`, `.wav`, `.flac`).
+3. Enroll it as your default voice:
 
    ```bash
-   ftts say "Hello from safe Rust" hello.wav
+   ftts enroll my_recording.m4a --default
    ```
+
+   Enrollment computes a 1,024-float speaker embedding from the audio alone — **no transcript is needed**. The enroll step warns about recordings that will clone poorly (background noise, clipping, whispering, multiple speakers). Use `-o name.spk` instead of `--default` to keep several voices and select one per-run with `--voice name.spk`.
+4. Speak:
+
+   ```bash
+   ftts say "Hello from my cloned voice" hello.m4a
+   ```
+
+### The enrollment passage
+
+Any natural speech works, but a phonetically rich passage measurably beats casual filler — this is to voices what "the quick brown fox" is to fonts. The script below combines the two standards from speech science: the **Rainbow Passage** (built to contain essentially every English phoneme and connected-speech transition) and the Speech Accent Archive's **"Please call Stella"** elicitation paragraph (dense with discriminative consonant clusters and vowels). Read both, in order, as one recording:
+
+> Please call Stella. Ask her to bring these things with her from the store: six spoons of fresh snow peas, five thick slabs of blue cheese, and maybe a snack for her brother Bob. We also need a small plastic snake and a big toy frog for the kids. She can scoop these things into three red bags, and we will go meet her Wednesday at the train station.
+>
+> When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow. The rainbow is a division of white light into many beautiful colors. These take the shape of a long round arch, with its path high above, and its two ends apparently beyond the horizon. There is, according to legend, a boiling pot of gold at one end. People look, but no one ever finds it. When a man looks for something beyond his reach, his friends say he is looking for the pot of gold at the end of the rainbow.
+
+Keep a note of exactly what you read: the upcoming higher-quality ICL cloning mode conditions on the reference audio *plus its verbatim transcript*, so a recording of a known passage is already future-proof.
 
 ## Robot mode
 
