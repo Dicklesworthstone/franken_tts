@@ -26,7 +26,11 @@ tally_local_w_l_n: <wins/losses/neutrals>
 
 ## Local entries
 
-None. `truth_pack_status=unavailable`; no lever has local model, fixture, or silicon evidence.
+### NE-001 hand-shaped-8lane-int8-loop
+
+`claim_id: local-int8-autovec-lane-shape`; `evidence_id: crates/ftts-kernels/examples/int8_shape_bench.rs run 2026-08-08 (M4 Pro, shared host under swarm load — cv rows above 5 percent, ratios indicative not certified)`; `status: NEGATIVE`; `model_source_commit: 5d83992436eae1d760afd27aff78a71d676296fc (weights not consumed; synthetic operands at pinned census shapes)`; `fixture_sha256: not-applicable (synthetic all-shape operands)`; `cpu_features: Apple M4 Pro, FEAT_DotProd + FEAT_I8MM present`; `command_env: CARGO_TARGET_DIR=<private> cargo run --release --locked -p ftts-kernels --example int8_shape_bench`; `kill_switch: FTTS_INT8_TIER=autovec (route remains selectable for re-measurement)`; `before_after: the hand-shaped 8-lane i8-to-i32 lane loop (Int8Tier::Autovec) ran approximately 15x SLOWER than the plain left-to-right scalar loop (Int8Tier::Scalar) at every m=1 census shape — the manual lane structure defeats LLVM's widening-MAC autovectorization, while the naive scalar shape vectorizes to about 50 GB/s and ties hand-SDOT`; `equivalence: exact i32 equality across all three tiers (selftest S8S8 rows + tier-equality tests)`; `killing_metric: m=1 real-shape wall time`; `disposition: KEEP (route retained as A/B datapoint, never dispatched by default; dispatch order is NeonSdot where detected, else Scalar)`; `do_not_retry: unless LLVM major changes or a quiet-window cv-gated rerun contradicts the 15x gap`; `tally_local_w_l_n: 0/1/0`.
+
+This is also the first local re-confirmation signal for NE-INH-001/NE-INH-003: the winning int8 m=1 shape on Apple Silicon is the one LLVM autovectorizes, and hand SDOT merely ties it at memory bandwidth. Certification to ledger quality still requires a quiet-window rerun that passes the cv gate.
 
 ## Inherited priors (pre-truth-pack)
 
