@@ -18,8 +18,17 @@ Cargo.lock.orig
 # bv (beads viewer) local config and caches
 .bv/
 
-# Truth-pack snapshots: hashes are committed (docs/truth-pack/MANIFEST.sha256), bytes are not.
-docs/truth-pack/snapshots/
+# Truth-pack snapshots: hashes are committed (docs/truth-pack/MANIFEST.sha256), bytes are not —
+# EXCEPT the two small redistribution-safe files ftts-cli include_str!s at COMPILE time (the pin
+# assertion config and the Apache attribution text). Without them a fresh clone cannot build the
+# binary at all; their bytes are manifest-verified (2e714c78… / a44a6081…) so the pin stays honest.
+docs/truth-pack/snapshots/*
+!docs/truth-pack/snapshots/hf/
+docs/truth-pack/snapshots/hf/*
+!docs/truth-pack/snapshots/hf/config.json
+!docs/truth-pack/snapshots/gh/
+docs/truth-pack/snapshots/gh/*
+!docs/truth-pack/snapshots/gh/LICENSE
 
 # Python bytecode from the verification harnesses
 __pycache__/
