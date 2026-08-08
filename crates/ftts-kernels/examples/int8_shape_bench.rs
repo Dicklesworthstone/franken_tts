@@ -141,12 +141,15 @@ fn main() {
             }
 
             let f32_stats = stats(&f32_samples);
-            let f32_bytes = (n * k * 4) as f64;
+            // The f32 reference loops rows outermost, so it streams the weight matrix once per
+            // activation row (m times per call); the q8 kernel is weight-stationary and streams
+            // it exactly once per call. The column reports actual weight bytes moved per second.
+            let f32_bytes = (n * k * 4 * m) as f64;
             println!(
                 "{label}  f32     {:9.1} us  cv {:4.1}%  ({:5.1} GB/s weight-stream)",
                 f32_stats.mean_us,
                 f32_stats.cv_percent,
-                f32_bytes * m as f64 / (f32_stats.mean_us * 1e-6) / 1e9 / m as f64,
+                f32_bytes / (f32_stats.mean_us * 1e-6) / 1e9,
             );
             for (tier, samples) in tiers.iter().zip(&tier_samples) {
                 let tier_stats = stats(samples);
