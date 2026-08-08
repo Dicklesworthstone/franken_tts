@@ -480,7 +480,12 @@ def run_case(wrapper: Any, case: dict[str, Any], output_dir: Path, recorder: Hoo
             "requested_max_new_tokens": int(case["max_new_tokens"]),
             "sample_rate": int(sample_rate),
             "generated_frames": int(codes.shape[0]),
-            "stopped_before_max_new_tokens": int(codes.shape[0]) < int(case["max_new_tokens"]),
+            #  The honest stop witness is upstream's own rule — codec_eos (2150) present in the
+            #  emitted group-0 codes — NOT frames < cap: an N-step run always reports N-1 frames
+            #  (the final step's microdecoder never runs), so the count comparison reads every
+            #  capped run as "stopped". Measured 2026-08-08: a 100-token cap yielded 99 frames
+            #  with no EOS in any mode, and the old expression called all four "stopped".
+            "stopped_before_max_new_tokens": bool((codes[:, 0] == 2150).any().item()),
             "generated_codes_sha256": hashlib.sha256(codes.detach().cpu().numpy().tobytes()).hexdigest(),
             "files": files,
         }

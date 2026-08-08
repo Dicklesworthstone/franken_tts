@@ -507,14 +507,17 @@ pub fn synthesize(
         header,
         tts_eos,
         reference: None,
-        // The PRODUCT decodes with the production sampler, exactly as the pinned upstream runtime
-        // does (generation_config.json: do_sample=true, T=0.9, top_k=50, repetition_penalty=1.05;
-        // subtalker likewise). Canonical greedy is the CONFORMANCE decoder (OQ-12) and is not
-        // quality-viable as a product mode: free-running greedy on this model babbles past
-        // 1,000 frames without drawing EOS (observed 2026-08-08 on "Hello."), which is precisely
-        // the degenerate-loop failure mode OQ-12's L5 selection criterion predeclares. `--seed`
-        // scopes determinism to build + ISA + sampler version + seed, per the documented claim.
-        sampling_mode: SamplingMode::Production,
+        // Upstream's runtime ships the SAMPLING stack (generation_config.json: do_sample=true,
+        // T=0.9, top_k=50, repetition_penalty=1.05; subtalker likewise), and that remains this
+        // path's target. Greedy ships today because our Production mode is measured DEFECTIVE
+        // end-to-end (bead frankentts-bug-production-sampler): on the same prompt, greedy
+        // reproduces the pinned reference's audio envelope to five digits (peak frame RMS
+        // 0.08597 vs oracle 0.0859745) while Production emits near-silence (1.1e-5). Do not
+        // flip this back without that bead's exit gate. Second measured limitation, the model's
+        // own: the reference never draws EOS on the synthetic-tone conformance voice (100-frame
+        // probe, all four modes, code-repetition collapse), so utterances are bounded by the
+        // admission cap, not only by EOS.
+        sampling_mode: SamplingMode::CanonicalGreedy,
         seed,
     });
 
