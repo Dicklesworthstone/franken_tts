@@ -11,9 +11,9 @@ categories = ["multimedia::audio"]
 
 [dependencies]
 fancy-regex = "0.18"
-ftts-artifacts = { path = "../ftts-artifacts", version = "0.1.0" }
-ftts-core = { path = "../ftts-core", version = "0.1.0" }
-ftts-kernels = { path = "../ftts-kernels", version = "0.1.0" }
+ftts-artifacts = { path = "../ftts-artifacts", version = "0.1.1" }
+ftts-core = { path = "../ftts-core", version = "0.1.1" }
+ftts-kernels = { path = "../ftts-kernels", version = "0.1.1" }
 rustfft = "6.2"
 serde_json = "1.0"
 unicode-normalization = "0.1"

@@ -12,10 +12,10 @@ autobins = false
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-ftts-artifacts = { path = "../ftts-artifacts", version = "0.1.0" }
-ftts-core = { path = "../ftts-core", version = "0.1.0" }
-ftts-kernels = { path = "../ftts-kernels", version = "0.1.0" }
-ftts-model-qwen = { path = "../ftts-model-qwen", version = "0.1.0" }
+ftts-artifacts = { path = "../ftts-artifacts", version = "0.1.1" }
+ftts-core = { path = "../ftts-core", version = "0.1.1" }
+ftts-kernels = { path = "../ftts-kernels", version = "0.1.1" }
+ftts-model-qwen = { path = "../ftts-model-qwen", version = "0.1.1" }
 serde_json = "1.0"
 symphonia = { version = "0.5.4", default-features = false, features = ["flac", "pcm", "wav"] }
 
