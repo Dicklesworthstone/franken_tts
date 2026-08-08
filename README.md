@@ -1,5 +1,7 @@
 # franken_tts
 
+![franken_tts](assets/frankentts_illustration.webp)
+
 **A pure-Rust, memory-safe, CPU-only runtime for one text-to-speech model: [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base). Zero-shot voice cloning with no Python, no ML framework, and no GPU at inference.**
 
 [![License: MIT + rider](https://img.shields.io/badge/license-MIT%20%2B%20rider-blue.svg)](LICENSE)
