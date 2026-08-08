@@ -38,6 +38,8 @@
 //! Strict-mode acceptance therefore compares **argmax / token ids**, never logit bits, unless a
 //! verify kernel reproduces this loop's reduction order exactly.
 
+use ftts_kernels::int8::{Int8Tier, QuantizedMatrix, linear_q8_dynamic};
+
 /// Number of code groups per frame: one primary code plus 15 residuals.
 pub const CODES_PER_FRAME: usize = 16;
 
@@ -549,6 +551,157 @@ pub fn layer_step_with_rotary(
         .collect()
 }
 
+/// One microdecoder layer's seven projections, quantized W8 per-output-channel symmetric.
+///
+/// Phase-2 staged lever 2b: the body GEMMs only. Per-depth embeddings, per-depth heads, all
+/// norms, rotary, and attention stay f32 — the heads are a separately gated lever, and the
+/// embeddings are gathers, not GEMMs.
+#[derive(Clone, Debug)]
+pub struct MicroLayerQuant {
+    /// Query projection, `[q_width, hidden]`.
+    pub q_proj: QuantizedMatrix,
+    /// Key projection, `[kv_width, hidden]`.
+    pub k_proj: QuantizedMatrix,
+    /// Value projection, `[kv_width, hidden]`.
+    pub v_proj: QuantizedMatrix,
+    /// Output projection, `[hidden, q_width]`.
+    pub o_proj: QuantizedMatrix,
+    /// SwiGLU gate projection, `[intermediate, hidden]`.
+    pub gate_proj: QuantizedMatrix,
+    /// SwiGLU up projection, `[intermediate, hidden]`.
+    pub up_proj: QuantizedMatrix,
+    /// SwiGLU down projection, `[hidden, intermediate]`.
+    pub down_proj: QuantizedMatrix,
+}
+
+impl MicroLayerQuant {
+    /// Quantizes one layer's projections with the canonical symmetric Q8 recipe.
+    #[must_use]
+    pub fn quantize(config: &MicrodecoderConfig, weights: &LayerWeights<'_>) -> Self {
+        let hidden = config.hidden_size;
+        Self {
+            q_proj: QuantizedMatrix::quantize(weights.q_proj, config.q_width(), hidden),
+            k_proj: QuantizedMatrix::quantize(weights.k_proj, config.kv_width(), hidden),
+            v_proj: QuantizedMatrix::quantize(weights.v_proj, config.kv_width(), hidden),
+            o_proj: QuantizedMatrix::quantize(weights.o_proj, hidden, config.q_width()),
+            gate_proj: QuantizedMatrix::quantize(
+                weights.gate_proj,
+                config.intermediate_size,
+                hidden,
+            ),
+            up_proj: QuantizedMatrix::quantize(weights.up_proj, config.intermediate_size, hidden),
+            down_proj: QuantizedMatrix::quantize(
+                weights.down_proj,
+                hidden,
+                config.intermediate_size,
+            ),
+        }
+    }
+}
+
+/// [`layer_step_with_rotary`] with the seven projections running W8A8 int8.
+///
+/// Norms, QK-Norm, rotary, attention, and residual adds are byte-for-byte the f32 reference's
+/// arithmetic; only the projection matmuls differ.
+///
+/// # Panics
+///
+/// Panics on any shape mismatch against `config`.
+pub fn layer_step_q8(
+    config: &MicrodecoderConfig,
+    weights: &LayerWeights<'_>,
+    quant: &MicroLayerQuant,
+    cos: &[f32],
+    sin: &[f32],
+    hidden: &[f32],
+    state: &mut FrameKvState,
+    tier: Int8Tier,
+) -> Vec<f32> {
+    let normed = rms_norm(hidden, weights.input_norm, config.rms_eps);
+
+    let mut q = vec![0.0_f32; config.q_width()];
+    let mut k = vec![0.0_f32; config.kv_width()];
+    let mut v = vec![0.0_f32; config.kv_width()];
+    linear_q8_dynamic(&normed, &quant.q_proj, None, 1, &mut q, tier);
+    linear_q8_dynamic(&normed, &quant.k_proj, None, 1, &mut k, tier);
+    linear_q8_dynamic(&normed, &quant.v_proj, None, 1, &mut v, tier);
+
+    for head in 0..config.num_q_heads {
+        let span = head * config.head_dim..(head + 1) * config.head_dim;
+        let normed_head = rms_norm(&q[span.clone()], weights.q_norm, config.rms_eps);
+        q[span.clone()].copy_from_slice(&normed_head);
+        apply_rope_row(&mut q[span], cos, sin);
+    }
+    for head in 0..config.num_kv_heads {
+        let span = head * config.head_dim..(head + 1) * config.head_dim;
+        let normed_head = rms_norm(&k[span.clone()], weights.k_norm, config.rms_eps);
+        k[span.clone()].copy_from_slice(&normed_head);
+        apply_rope_row(&mut k[span], cos, sin);
+    }
+
+    state.push(&k, &v);
+
+    let scale = 1.0 / (config.head_dim as f32).sqrt();
+    let positions = state.len();
+    let mut context = vec![0.0_f32; config.q_width()];
+    for head in 0..config.num_q_heads {
+        let kv_head = head / config.q_per_kv();
+        let query = &q[head * config.head_dim..(head + 1) * config.head_dim];
+        let keys = &state.keys[kv_head];
+        let values = &state.values[kv_head];
+
+        let mut scores = vec![0.0_f32; positions];
+        for (p, score) in scores.iter_mut().enumerate() {
+            let key = &keys[p * config.head_dim..(p + 1) * config.head_dim];
+            *score = query
+                .iter()
+                .zip(key.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+                * scale;
+        }
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut total = 0.0_f32;
+        for score in &mut scores {
+            *score = (*score - max).exp();
+            total += *score;
+        }
+        let out = &mut context[head * config.head_dim..(head + 1) * config.head_dim];
+        for (p, weight) in scores.iter().enumerate() {
+            let normalized = weight / total;
+            let value = &values[p * config.head_dim..(p + 1) * config.head_dim];
+            for (slot, v) in out.iter_mut().zip(value.iter()) {
+                *slot += normalized * v;
+            }
+        }
+    }
+
+    let mut attn_out = vec![0.0_f32; config.hidden_size];
+    linear_q8_dynamic(&context, &quant.o_proj, None, 1, &mut attn_out, tier);
+    let residual: Vec<f32> = hidden
+        .iter()
+        .zip(attn_out.iter())
+        .map(|(h, a)| h + a)
+        .collect();
+
+    let normed = rms_norm(&residual, weights.post_attention_norm, config.rms_eps);
+    let mut gate = vec![0.0_f32; config.intermediate_size];
+    let mut up = vec![0.0_f32; config.intermediate_size];
+    linear_q8_dynamic(&normed, &quant.gate_proj, None, 1, &mut gate, tier);
+    linear_q8_dynamic(&normed, &quant.up_proj, None, 1, &mut up, tier);
+    for (g, u) in gate.iter_mut().zip(up.iter()) {
+        *g = silu(*g) * u;
+    }
+    let mut mlp_out = vec![0.0_f32; config.hidden_size];
+    linear_q8_dynamic(&gate, &quant.down_proj, None, 1, &mut mlp_out, tier);
+
+    residual
+        .iter()
+        .zip(mlp_out.iter())
+        .map(|(r, m)| r + m)
+        .collect()
+}
+
 /// Greedy selection: the lowest index wins a tie, matching `argmax` in the reference.
 ///
 /// # Panics
@@ -991,6 +1144,67 @@ pub fn decode_frame_with_selector(
     state: &mut FrameState,
     talker_hidden: &[f32],
     primary_code: usize,
+    select: impl FnMut(&[f32]) -> usize,
+) -> Vec<usize> {
+    decode_frame_with_selector_inner(
+        config,
+        rope,
+        weights,
+        None,
+        state,
+        talker_hidden,
+        primary_code,
+        select,
+    )
+}
+
+/// [`decode_frame_with_selector`] with the five body layers running W8A8 int8.
+///
+/// The per-depth heads and embeddings stay f32. Reset semantics, the index map, and the
+/// autoregressive feedback are shared with the reference loop by construction — both routes run
+/// the same function body, differing only in the layer-step projection kernel.
+///
+/// # Panics
+///
+/// Panics when `quant` does not cover every layer, or as [`decode_frame_with_selector`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_with_selector_q8(
+    config: &MicrodecoderConfig,
+    rope: &RopeTable,
+    weights: &MicrodecoderWeights<'_>,
+    quant: &[MicroLayerQuant],
+    tier: Int8Tier,
+    state: &mut FrameState,
+    talker_hidden: &[f32],
+    primary_code: usize,
+    select: impl FnMut(&[f32]) -> usize,
+) -> Vec<usize> {
+    assert_eq!(
+        quant.len(),
+        config.num_layers,
+        "the quantized route needs every microdecoder layer quantized"
+    );
+    decode_frame_with_selector_inner(
+        config,
+        rope,
+        weights,
+        Some((quant, tier)),
+        state,
+        talker_hidden,
+        primary_code,
+        select,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_frame_with_selector_inner(
+    config: &MicrodecoderConfig,
+    rope: &RopeTable,
+    weights: &MicrodecoderWeights<'_>,
+    quant: Option<(&[MicroLayerQuant], Int8Tier)>,
+    state: &mut FrameState,
+    talker_hidden: &[f32],
+    primary_code: usize,
     mut select: impl FnMut(&[f32]) -> usize,
 ) -> Vec<usize> {
     assert_frame_shapes(config, weights, talker_hidden);
@@ -1021,14 +1235,29 @@ pub fn decode_frame_with_selector(
         };
 
         for (index, layer) in weights.layers.iter().enumerate() {
-            hidden = layer_step(
-                config,
-                rope,
-                layer,
-                &hidden,
-                position,
-                &mut state.layers[index],
-            );
+            hidden = match quant {
+                Some((quant_layers, tier)) => {
+                    let (cos, sin) = rope.row(position);
+                    layer_step_q8(
+                        config,
+                        layer,
+                        &quant_layers[index],
+                        cos,
+                        sin,
+                        &hidden,
+                        &mut state.layers[index],
+                        tier,
+                    )
+                }
+                None => layer_step(
+                    config,
+                    rope,
+                    layer,
+                    &hidden,
+                    position,
+                    &mut state.layers[index],
+                ),
+            };
         }
 
         let head = match role {
@@ -1598,6 +1827,76 @@ mod tests {
                 down_proj: &self.down_proj,
             }
         }
+    }
+
+    #[test]
+    fn q8_layer_step_is_bit_identical_across_every_available_tier() {
+        // The tier law at the model seam: the same quantized layer step must produce
+        // bit-identical f32 hiddens on scalar, autovec, and (where present) neon-sdot, because
+        // the i32 accumulators are exactly equal and the dequant order is fixed.
+        let config = tiny();
+        let layer = TestLayer::new(&config);
+        let weights = layer.borrow();
+        let quant = MicroLayerQuant::quantize(&config, &weights);
+        let rope = RopeTable::new(&config);
+        let hidden = weights_of(config.hidden_size, 42);
+
+        let mut reference = None;
+        for tier in ftts_kernels::int8::Int8Tier::available() {
+            let mut state = FrameKvState::new(&config);
+            let (cos, sin) = rope.row(0);
+            let out = layer_step_q8(&config, &weights, &quant, cos, sin, &hidden, &mut state, tier);
+            match &reference {
+                None => reference = Some(out),
+                Some(expected) => {
+                    assert_eq!(expected.len(), out.len());
+                    for (index, (a, b)) in expected.iter().zip(&out).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "tier {} differs at element {index}",
+                            tier.as_str()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q8_layer_step_tracks_the_f32_reference_on_tiny_geometry() {
+        // Not a parity claim — W8A8 is lossy by design and its production gate is Contract B.
+        // This bounds gross wiring failures (wrong scale order, transposed quant layout).
+        let config = tiny();
+        let layer = TestLayer::new(&config);
+        let weights = layer.borrow();
+        let quant = MicroLayerQuant::quantize(&config, &weights);
+        let rope = RopeTable::new(&config);
+        let hidden = weights_of(config.hidden_size, 42);
+
+        let mut f32_state = FrameKvState::new(&config);
+        let expected = layer_step(&config, &rope, &weights, &hidden, 0, &mut f32_state);
+
+        let mut q8_state = FrameKvState::new(&config);
+        let (cos, sin) = rope.row(0);
+        let actual = layer_step_q8(
+            &config,
+            &weights,
+            &quant,
+            cos,
+            sin,
+            &hidden,
+            &mut q8_state,
+            ftts_kernels::int8::Int8Tier::Autovec,
+        );
+
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let cosine =
+            dot(&expected, &actual) / (dot(&expected, &expected).sqrt() * dot(&actual, &actual).sqrt());
+        assert!(
+            cosine > 0.99,
+            "W8A8 layer step diverged from the f32 reference: cosine {cosine}"
+        );
     }
 
     /// Owns a whole microdecoder's worth of small test weights.

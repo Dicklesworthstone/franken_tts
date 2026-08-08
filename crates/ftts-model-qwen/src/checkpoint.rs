@@ -1426,6 +1426,41 @@ mod tests {
     use std::io::Write as _;
 
     #[test]
+    fn runtime_and_converter_q8_quantizers_are_byte_identical_by_construction() {
+        // The doctrine's by-construction guarantee: `.fttsq` artifact bytes and runtime W8A8
+        // quantization must come from the same arithmetic. The two crates cannot share the
+        // function (ftts-artifacts depends on ftts-kernels), so this test pins the restatement.
+        let mut state = 0x0dd0_beef_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((state >> 33) as f32 / (1u64 << 30) as f32) - 2.0
+        };
+        for len in [1_usize, 17, 1024, 3072] {
+            let row: Vec<f32> = (0..len).map(|_| next()).collect();
+            let mut kernel_bytes = vec![0_i8; len];
+            let kernel_scale = ftts_kernels::int8::quantize_row_q8(&row, &mut kernel_bytes);
+            let mut converter_bytes = vec![0_i8; len];
+            let converter_scale =
+                ftts_artifacts::converter::quantize_output_channel_q8(&row, &mut converter_bytes)
+                    .expect("finite row");
+            assert_eq!(kernel_scale.to_bits(), converter_scale.to_bits(), "len {len}");
+            assert_eq!(kernel_bytes, converter_bytes, "len {len}");
+        }
+        // The all-zero row special case must also agree.
+        let zeros = [0.0_f32; 8];
+        let mut kernel_bytes = [1_i8; 8];
+        let mut converter_bytes = [2_i8; 8];
+        let kernel_scale = ftts_kernels::int8::quantize_row_q8(&zeros, &mut kernel_bytes);
+        let converter_scale =
+            ftts_artifacts::converter::quantize_output_channel_q8(&zeros, &mut converter_bytes)
+                .expect("finite row");
+        assert_eq!(kernel_scale.to_bits(), converter_scale.to_bits());
+        assert_eq!(kernel_bytes, converter_bytes);
+    }
+
+    #[test]
     fn the_wrapper_written_here_is_the_wrapper_prompt_strips() {
         // `extract_prompt_text_ids` slices `[3..len-5]`; if the two disagree, the target text is
         // silently truncated or padded with wrapper ids and the model speaks garbage.

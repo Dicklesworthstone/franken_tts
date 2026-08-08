@@ -18,6 +18,7 @@
 use ftts_kernels::f32ref::{
     self, F32LinearAccumulation, F32RmsNormArithmetic, F32SiluArithmetic, F32SoftmaxArithmetic,
 };
+use ftts_kernels::int8::{Int8Tier, QuantizedMatrix, linear_q8_dynamic};
 
 /// Talker geometry. Field values come from `talker_config` in the pinned `config.json`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -587,6 +588,247 @@ pub fn forward_talker(
 
     for (layer, layer_cache) in weights.layers.iter().zip(&mut cache.layers) {
         forward_layer(config, layer, rotary, mask, hidden, seq, layer_cache);
+    }
+
+    let mut normalized = vec![0.0f32; hidden.len()];
+    f32ref::rms_norm(
+        hidden,
+        weights.final_norm,
+        config.rms_norm_eps,
+        seq,
+        config.hidden_size,
+        &mut normalized,
+    );
+    hidden.copy_from_slice(&normalized);
+    f32ref::linear(
+        hidden,
+        weights.codec_head,
+        None,
+        seq,
+        config.hidden_size,
+        PRIMARY_CODE_VOCAB_SIZE,
+        logits,
+    );
+}
+
+/// One talker layer's seven projection matrices, quantized W8 per-output-channel symmetric.
+///
+/// This is the Phase-2 staged lever 2a (`FTTS_INT8=1`): only the GEMMs quantize. Norm weights,
+/// QK-Norm, rotary, attention arithmetic, residual adds, the final norm, and the primary head
+/// all stay f32, per the fixed doctrine recipe. Built once at generator construction from the
+/// same borrowed f32 tensors the reference path reads; the f32 path itself is untouched.
+#[derive(Clone, Debug)]
+pub struct TalkerLayerQuant {
+    /// Query projection, `[query_width, hidden]`.
+    pub q_proj: QuantizedMatrix,
+    /// Key projection, `[kv_width, hidden]`.
+    pub k_proj: QuantizedMatrix,
+    /// Value projection, `[kv_width, hidden]`.
+    pub v_proj: QuantizedMatrix,
+    /// Output projection, `[hidden, query_width]`.
+    pub o_proj: QuantizedMatrix,
+    /// SwiGLU gate projection, `[intermediate, hidden]`.
+    pub gate_proj: QuantizedMatrix,
+    /// SwiGLU up projection, `[intermediate, hidden]`.
+    pub up_proj: QuantizedMatrix,
+    /// SwiGLU down projection, `[hidden, intermediate]`.
+    pub down_proj: QuantizedMatrix,
+}
+
+impl TalkerLayerQuant {
+    /// Quantizes one layer's projections with the canonical symmetric Q8 recipe.
+    #[must_use]
+    pub fn quantize(config: &TalkerConfig, weights: &TalkerLayerWeights<'_>) -> Self {
+        let hidden = config.hidden_size;
+        let query_width = config.query_width();
+        let kv_width = config.kv_width();
+        let intermediate = config.intermediate_size;
+        Self {
+            q_proj: QuantizedMatrix::quantize(weights.q_proj, query_width, hidden),
+            k_proj: QuantizedMatrix::quantize(weights.k_proj, kv_width, hidden),
+            v_proj: QuantizedMatrix::quantize(weights.v_proj, kv_width, hidden),
+            o_proj: QuantizedMatrix::quantize(weights.o_proj, hidden, query_width),
+            gate_proj: QuantizedMatrix::quantize(weights.gate_proj, intermediate, hidden),
+            up_proj: QuantizedMatrix::quantize(weights.up_proj, intermediate, hidden),
+            down_proj: QuantizedMatrix::quantize(weights.down_proj, hidden, intermediate),
+        }
+    }
+}
+
+/// [`forward_layer`] with the seven projections running W8A8 int8 and everything else f32.
+///
+/// The reference f32 path is structurally unchanged when this function is not called; the
+/// kill-switch branch lives at the `forward_talker_q8` call site, not inside the layer.
+///
+/// # Panics
+///
+/// Panics on any shape mismatch, exactly as [`forward_layer`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_layer_q8(
+    config: &TalkerConfig,
+    weights: &TalkerLayerWeights<'_>,
+    quant: &TalkerLayerQuant,
+    rotary: RotaryRows<'_>,
+    mask: &[f32],
+    hidden: &mut [f32],
+    seq: usize,
+    cache: &mut KvCache,
+    tier: Int8Tier,
+) {
+    let hidden_size = config.hidden_size;
+    let head_dim = config.head_dim;
+    let query_width = config.query_width();
+    let kv_width = config.kv_width();
+    assert_eq!(
+        hidden.len(),
+        seq * hidden_size,
+        "hidden must be [seq, hidden]"
+    );
+    assert_eq!(
+        rotary.cos.len(),
+        seq * head_dim,
+        "cos must be [seq, head_dim]"
+    );
+    assert_eq!(
+        rotary.sin.len(),
+        seq * head_dim,
+        "sin must be [seq, head_dim]"
+    );
+    let past = cache.len();
+    let total = past + seq;
+    assert_eq!(mask.len(), seq * total, "mask must be [seq, past + seq]");
+
+    // ── Attention block ─────────────────────────────────────────────────────────────────────
+    let mut normed = vec![0.0f32; seq * hidden_size];
+    f32ref::rms_norm(
+        hidden,
+        weights.input_layernorm,
+        config.rms_norm_eps,
+        seq,
+        hidden_size,
+        &mut normed,
+    );
+
+    let mut queries = vec![0.0f32; seq * query_width];
+    let mut keys = vec![0.0f32; seq * kv_width];
+    let mut values = vec![0.0f32; seq * kv_width];
+    linear_q8_dynamic(&normed, &quant.q_proj, None, seq, &mut queries, tier);
+    linear_q8_dynamic(&normed, &quant.k_proj, None, seq, &mut keys, tier);
+    linear_q8_dynamic(&normed, &quant.v_proj, None, seq, &mut values, tier);
+
+    // QK-Norm over head_dim, then rotary — identical to the f32 reference.
+    let mut scratch = vec![0.0f32; head_dim];
+    for position in 0..seq {
+        let cos = &rotary.cos[position * head_dim..position * head_dim + head_dim];
+        let sin = &rotary.sin[position * head_dim..position * head_dim + head_dim];
+        for head in 0..config.num_attention_heads {
+            let offset = position * query_width + head * head_dim;
+            let row = &mut queries[offset..offset + head_dim];
+            f32ref::rms_norm(row, weights.q_norm, config.qk_norm_eps, 1, head_dim, &mut scratch);
+            row.copy_from_slice(&scratch);
+            f32ref::apply_rope_in_place(row, cos, sin);
+        }
+        for head in 0..config.num_key_value_heads {
+            let offset = position * kv_width + head * head_dim;
+            let row = &mut keys[offset..offset + head_dim];
+            f32ref::rms_norm(row, weights.k_norm, config.qk_norm_eps, 1, head_dim, &mut scratch);
+            row.copy_from_slice(&scratch);
+            f32ref::apply_rope_in_place(row, cos, sin);
+        }
+    }
+
+    for position in 0..seq {
+        cache.append(
+            &keys[position * kv_width..position * kv_width + kv_width],
+            &values[position * kv_width..position * kv_width + kv_width],
+        );
+    }
+
+    let mut context = vec![0.0f32; seq * query_width];
+    f32ref::gqa_attention(
+        &queries,
+        &cache.keys,
+        &cache.values,
+        mask,
+        seq,
+        total,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        head_dim,
+        &mut context,
+    );
+
+    let mut attention = vec![0.0f32; seq * hidden_size];
+    linear_q8_dynamic(&context, &quant.o_proj, None, seq, &mut attention, tier);
+    for (state, delta) in hidden.iter_mut().zip(&attention) {
+        *state += *delta;
+    }
+
+    // ── MLP block ───────────────────────────────────────────────────────────────────────────
+    f32ref::rms_norm(
+        hidden,
+        weights.post_attention_layernorm,
+        config.rms_norm_eps,
+        seq,
+        hidden_size,
+        &mut normed,
+    );
+
+    let intermediate = config.intermediate_size;
+    let mut gate = vec![0.0f32; seq * intermediate];
+    let mut up = vec![0.0f32; seq * intermediate];
+    linear_q8_dynamic(&normed, &quant.gate_proj, None, seq, &mut gate, tier);
+    linear_q8_dynamic(&normed, &quant.up_proj, None, seq, &mut up, tier);
+    f32ref::silu_mul_in_place(&mut gate, &up);
+
+    let mut down = vec![0.0f32; seq * hidden_size];
+    linear_q8_dynamic(&gate, &quant.down_proj, None, seq, &mut down, tier);
+    for (state, delta) in hidden.iter_mut().zip(&down) {
+        *state += *delta;
+    }
+}
+
+/// [`forward_talker`] with every layer's projections running W8A8 int8.
+///
+/// The final norm and the primary-code head stay f32: sampling-logit boundaries are in the
+/// protected high-precision set. Callers arm this path explicitly (the `FTTS_INT8=1`
+/// kill-switch in `QwenGenerator`); the f32 route remains the default and is untouched.
+///
+/// # Panics
+///
+/// Panics on any geometry mismatch, exactly as [`forward_talker`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_talker_q8(
+    config: &TalkerConfig,
+    weights: &TalkerWeights<'_>,
+    quant: &[TalkerLayerQuant],
+    rotary: RotaryRows<'_>,
+    mask: &[f32],
+    hidden: &mut [f32],
+    seq: usize,
+    cache: &mut TalkerKvCache,
+    logits: &mut [f32],
+    tier: Int8Tier,
+) {
+    assert_eq!(
+        weights.layers.len(),
+        TALKER_LAYER_COUNT,
+        "the Base talker has exactly 28 layers"
+    );
+    assert_eq!(
+        quant.len(),
+        TALKER_LAYER_COUNT,
+        "the quantized route needs all 28 layers quantized"
+    );
+    assert_eq!(hidden.len(), seq * config.hidden_size, "hidden shape");
+    assert_eq!(logits.len(), seq * PRIMARY_CODE_VOCAB_SIZE, "logit shape");
+
+    for ((layer, layer_quant), layer_cache) in
+        weights.layers.iter().zip(quant).zip(&mut cache.layers)
+    {
+        forward_layer_q8(
+            config, layer, layer_quant, rotary, mask, hidden, seq, layer_cache, tier,
+        );
     }
 
     let mut normalized = vec![0.0f32; hidden.len()];

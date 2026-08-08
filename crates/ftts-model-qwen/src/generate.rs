@@ -13,7 +13,8 @@
 use ftts_core::{CodeFrame, FrameGenerator, GenerationError, PreparedText};
 
 use crate::microdecoder::{
-    self, FrameState, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_VOCAB, RopeTable,
+    self, FrameState, MicroLayerQuant, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_VOCAB,
+    RopeTable,
 };
 use crate::prompt::{
     self, HiddenState, PromptAssemblyInput, PromptError, PromptHeader, PromptMode,
@@ -21,8 +22,9 @@ use crate::prompt::{
 use crate::sampler::{CODEC_EOS_TOKEN_ID, QwenSampler, SamplingMode};
 use crate::talker::{
     self, CODE_GROUP_COUNT, PRIMARY_CODE_VOCAB_SIZE, RotaryRows, TalkerConfig, TalkerKvCache,
-    TalkerWeights,
+    TalkerLayerQuant, TalkerWeights,
 };
+use ftts_kernels::int8::Int8Tier;
 
 /// The talker's pinned mRoPE base. The microdecoder and codec each use a different theta; crossing
 /// them is a silent correctness failure, so the constant lives next to its only call sites.
@@ -105,6 +107,19 @@ struct UtteranceState {
     finished: bool,
 }
 
+/// The armed W8A8 int8 route: quantized projection tables for both stacks plus the dot tier.
+///
+/// Built once at construction when the `FTTS_INT8=1` kill-switch is armed (staged levers 2a+2b);
+/// `None` leaves the f32 reference path structurally untouched. Norms, QK-Norm, rotary,
+/// attention, per-depth heads/embeddings, the final norms, and the primary head remain f32 in
+/// both stacks per the fixed doctrine recipe.
+#[derive(Debug)]
+struct Int8Route {
+    talker: Vec<TalkerLayerQuant>,
+    micro: Vec<MicroLayerQuant>,
+    tier: Int8Tier,
+}
+
 /// The Qwen3-TTS Base implementation of [`FrameGenerator`].
 #[derive(Debug)]
 pub struct QwenGenerator<'a> {
@@ -124,6 +139,7 @@ pub struct QwenGenerator<'a> {
     kv: TalkerKvCache,
     frame_state: FrameState,
     utterance: Option<UtteranceState>,
+    int8: Option<Int8Route>,
 }
 
 impl<'a> QwenGenerator<'a> {
@@ -177,6 +193,25 @@ impl<'a> QwenGenerator<'a> {
 
         let microdecoder_rope = RopeTable::new(&config.microdecoder_config);
         let frame_state = FrameState::new(&config.microdecoder_config);
+
+        // Staged levers 2a+2b: runtime W8A8, armed only by the explicit kill-switch. The default
+        // path quantizes nothing and calls the untouched f32 reference functions.
+        let int8 = (std::env::var("FTTS_INT8").as_deref() == Ok("1")).then(|| Int8Route {
+            talker: config
+                .talker_weights
+                .layers
+                .iter()
+                .map(|layer| TalkerLayerQuant::quantize(&config.talker_config, layer))
+                .collect(),
+            micro: config
+                .microdecoder_weights
+                .layers
+                .iter()
+                .map(|layer| MicroLayerQuant::quantize(&config.microdecoder_config, layer))
+                .collect(),
+            tier: Int8Tier::dispatch(),
+        });
+
         Self {
             talker_config: config.talker_config,
             talker_weights: config.talker_weights,
@@ -194,6 +229,7 @@ impl<'a> QwenGenerator<'a> {
             kv: TalkerKvCache::new(),
             frame_state,
             utterance: None,
+            int8,
         }
     }
 
@@ -272,19 +308,34 @@ impl<'a> QwenGenerator<'a> {
         let (cos, sin) = talker::mrope_rows(&positions, self.talker_config.head_dim, MROPE_THETA);
         let mask = causal_mask(seq);
         let mut logits = vec![0.0_f32; seq * PRIMARY_CODE_VOCAB_SIZE];
-        talker::forward_talker(
-            &self.talker_config,
-            &self.talker_weights,
-            RotaryRows {
-                cos: &cos,
-                sin: &sin,
-            },
-            &mask,
-            &mut hidden,
-            seq,
-            &mut self.kv,
-            &mut logits,
-        );
+        let rotary = RotaryRows {
+            cos: &cos,
+            sin: &sin,
+        };
+        match &self.int8 {
+            Some(route) => talker::forward_talker_q8(
+                &self.talker_config,
+                &self.talker_weights,
+                &route.talker,
+                rotary,
+                &mask,
+                &mut hidden,
+                seq,
+                &mut self.kv,
+                &mut logits,
+                route.tier,
+            ),
+            None => talker::forward_talker(
+                &self.talker_config,
+                &self.talker_weights,
+                rotary,
+                &mask,
+                &mut hidden,
+                seq,
+                &mut self.kv,
+                &mut logits,
+            ),
+        }
         self.utterance = Some(UtteranceState {
             pending_hidden: hidden[(seq - 1) * hidden_size..].to_vec(),
             pending_logits: logits[(seq - 1) * PRIMARY_CODE_VOCAB_SIZE..].to_vec(),
@@ -386,21 +437,35 @@ impl FrameGenerator for QwenGenerator<'_> {
         // (frankentts-p7r; the reference reproduces it in that mismatched configuration).
         let sampler = &mut self.sampler;
         let sampling_mode = self.sampling_mode;
-        let residuals = microdecoder::decode_frame_with_selector(
-            &self.microdecoder_config,
-            &self.microdecoder_rope,
-            &self.microdecoder_weights,
-            &mut self.frame_state,
-            &utterance.pending_hidden,
-            primary as usize,
-            |logits| match sampling_mode {
-                SamplingMode::CanonicalGreedy => microdecoder::argmax(logits),
-                SamplingMode::Production => sampler
-                    .select_microdecoder(logits, SamplingMode::Production)
-                    .expect("RESIDUAL_VOCAB rows are well-formed microdecoder logits")
-                    as usize,
-            },
-        );
+        let select = |logits: &[f32]| match sampling_mode {
+            SamplingMode::CanonicalGreedy => microdecoder::argmax(logits),
+            SamplingMode::Production => sampler
+                .select_microdecoder(logits, SamplingMode::Production)
+                .expect("RESIDUAL_VOCAB rows are well-formed microdecoder logits")
+                as usize,
+        };
+        let residuals = match &self.int8 {
+            Some(route) => microdecoder::decode_frame_with_selector_q8(
+                &self.microdecoder_config,
+                &self.microdecoder_rope,
+                &self.microdecoder_weights,
+                &route.micro,
+                route.tier,
+                &mut self.frame_state,
+                &utterance.pending_hidden,
+                primary as usize,
+                select,
+            ),
+            None => microdecoder::decode_frame_with_selector(
+                &self.microdecoder_config,
+                &self.microdecoder_rope,
+                &self.microdecoder_weights,
+                &mut self.frame_state,
+                &utterance.pending_hidden,
+                primary as usize,
+                select,
+            ),
+        };
         let mut codes = Vec::with_capacity(CODE_GROUP_COUNT);
         codes.push(primary);
         codes.extend(residuals.iter().map(|&code| code as u32));
@@ -430,19 +495,34 @@ impl FrameGenerator for QwenGenerator<'_> {
         );
         let mask = vec![0.0_f32; self.kv.len() + 1];
         let mut logits = vec![0.0_f32; PRIMARY_CODE_VOCAB_SIZE];
-        talker::forward_talker(
-            &self.talker_config,
-            &self.talker_weights,
-            RotaryRows {
-                cos: &cos,
-                sin: &sin,
-            },
-            &mask,
-            &mut next_input,
-            1,
-            &mut self.kv,
-            &mut logits,
-        );
+        let rotary = RotaryRows {
+            cos: &cos,
+            sin: &sin,
+        };
+        match &self.int8 {
+            Some(route) => talker::forward_talker_q8(
+                &self.talker_config,
+                &self.talker_weights,
+                &route.talker,
+                rotary,
+                &mask,
+                &mut next_input,
+                1,
+                &mut self.kv,
+                &mut logits,
+                route.tier,
+            ),
+            None => talker::forward_talker(
+                &self.talker_config,
+                &self.talker_weights,
+                rotary,
+                &mask,
+                &mut next_input,
+                1,
+                &mut self.kv,
+                &mut logits,
+            ),
+        }
 
         utterance.pending_hidden = next_input;
         utterance.pending_logits = logits;

@@ -247,7 +247,7 @@ impl SplitResidualVectorQuantizer<'_> {
             frames,
             config.codebook_dim,
             config.codec_latent_dim,
-            f32ref::F32LinearAccumulation::Accelerate,
+            f32ref::F32LinearAccumulation::AccelerateRowInvariant,
             &mut first_projected,
         );
         f32ref::linear_with_accumulation(
@@ -257,7 +257,7 @@ impl SplitResidualVectorQuantizer<'_> {
             frames,
             config.codebook_dim,
             config.codec_latent_dim,
-            f32ref::F32LinearAccumulation::Accelerate,
+            f32ref::F32LinearAccumulation::AccelerateRowInvariant,
             &mut rest_projected,
         );
         for index in 0..output.len() {
@@ -774,7 +774,7 @@ pub fn causal_conv1d(
         frames,
         reduction,
         output_channels,
-        f32ref::F32LinearAccumulation::AccelerateBiasSeeded,
+        f32ref::F32LinearAccumulation::AccelerateBiasSeededRowInvariant,
         output,
     );
 }
@@ -845,7 +845,7 @@ pub fn causal_transpose_conv1d(
         frames,
         input_channels,
         column_width,
-        f32ref::F32LinearAccumulation::Accelerate,
+        f32ref::F32LinearAccumulation::AccelerateRowInvariant,
         &mut columns,
     );
 
