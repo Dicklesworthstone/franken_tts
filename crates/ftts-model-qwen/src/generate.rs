@@ -209,7 +209,7 @@ impl<'a> QwenGenerator<'a> {
                 .iter()
                 .map(|layer| MicroLayerQuant::quantize(&config.microdecoder_config, layer))
                 .collect(),
-            tier: Int8Tier::dispatch(),
+            tier: ftts_kernels::int8::autotuned_plan().decode_gemv,
         });
 
         Self {
