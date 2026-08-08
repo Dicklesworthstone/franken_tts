@@ -3,12 +3,15 @@ name = "ftts-artifacts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
+description = "Weight containers and safetensors reading for franken_tts (.fttsq, census, conversion)"
+keywords = ["tts", "speech", "qwen", "voice", "audio"]
+categories = ["multimedia::audio"]
 
 [dependencies]
-ftts-core = { path = "../ftts-core" }
-ftts-kernels = { path = "../ftts-kernels" }
+ftts-core = { path = "../ftts-core", version = "0.1.0" }
+ftts-kernels = { path = "../ftts-kernels", version = "0.1.0" }
 serde_json = "1.0"
 
 [lints]

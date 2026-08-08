@@ -13,11 +13,11 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
-license = "Apache-2.0"
+license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/franken_tts"
 
 [workspace.dependencies]
-asupersync = { path = "../asupersync", default-features = false }
+asupersync = { path = "../asupersync", version = "0.4.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

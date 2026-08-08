@@ -3,8 +3,11 @@ name = "ftts-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
+description = "Engine core for franken_tts: admission, budgets, health, streaming audio buffers"
+keywords = ["tts", "speech", "qwen", "voice", "audio"]
+categories = ["multimedia::audio"]
 
 [dependencies]
 asupersync.workspace = true

@@ -38,11 +38,14 @@ const PINNED_MAIN_WEIGHTS_SHA256: &str =
     "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6";
 const PINNED_MODEL_REVISION: &str = "5d83992436eae1d760afd27aff78a71d676296fc";
 const PINNED_MAIN_TENSOR_COUNT: usize = 478;
-const PINNED_TENSOR_INVENTORY: &str =
-    include_str!("../../../docs/truth-pack/TENSOR_INVENTORY.json");
-const PINNED_MODEL_CONFIG: &str = include_str!("../../../docs/truth-pack/snapshots/hf/config.json");
-const APACHE_LICENSE: &str = include_str!("../../../docs/truth-pack/snapshots/gh/LICENSE");
-const ENVIRONMENT_VARIABLES: [&str; 9] = [
+//  Crate-local pinned copies (`pinned/`): `cargo package` cannot ship files outside the crate
+//  root, and these three are compile-time product surfaces (the artifact census, the model-dir
+//  pin assertion, and the Apache attribution the binary prints). A unit test asserts each copy is
+//  byte-identical to the truth-pack canonical whenever the truth pack is present.
+const PINNED_TENSOR_INVENTORY: &str = include_str!("../pinned/TENSOR_INVENTORY.json");
+const PINNED_MODEL_CONFIG: &str = include_str!("../pinned/model_config.json");
+const APACHE_LICENSE: &str = include_str!("../pinned/QWEN_APACHE_LICENSE");
+const ENVIRONMENT_VARIABLES: [&str; 11] = [
     "FTTS_MODEL_DIR",
     "FTTS_DEFAULT_VOICE",
     "FTTS_THREADS",
@@ -52,6 +55,8 @@ const ENVIRONMENT_VARIABLES: [&str; 9] = [
     "FTTS_QUANT",
     "FTTS_FORCE_ARCH",
     "FTTS_NUMA",
+    "FTTS_MAX_FRAMES",
+    "FTTS_MEMORY_BUDGET_MB",
 ];
 
 /// Runs the shared `ftts` / `franken_tts` command-line interface.
@@ -2345,5 +2350,40 @@ mod tests {
             parsed["message"].as_str().expect("message").contains('\n'),
             "the newline must survive as data, not be stripped"
         );
+    }
+
+    #[test]
+    fn pinned_copies_match_the_truth_pack_canonicals() {
+        //  `pinned/` exists because `cargo package` cannot ship the truth pack. The truth pack
+        //  stays canonical; a drifted copy would embed a stale pin assertion or attribution in
+        //  the shipped binary, so byte-identity is asserted whenever the repo checkout is present.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for (canonical, embedded, name) in [
+            (
+                "docs/truth-pack/TENSOR_INVENTORY.json",
+                PINNED_TENSOR_INVENTORY,
+                "TENSOR_INVENTORY.json",
+            ),
+            (
+                "docs/truth-pack/snapshots/hf/config.json",
+                PINNED_MODEL_CONFIG,
+                "model_config.json",
+            ),
+            (
+                "docs/truth-pack/snapshots/gh/LICENSE",
+                APACHE_LICENSE,
+                "QWEN_APACHE_LICENSE",
+            ),
+        ] {
+            match std::fs::read_to_string(root.join(canonical)) {
+                Ok(bytes) => assert_eq!(
+                    bytes, embedded,
+                    "pinned/{name} drifted from {canonical}; re-copy it"
+                ),
+                Err(_) => eprintln!(
+                    "SKIP pinned-copy check for {name}: {canonical} absent (no repo checkout)"
+                ),
+            }
+        }
     }
 }
