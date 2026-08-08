@@ -235,7 +235,7 @@ pub fn speaker_from_voice(bundle: &ModelBundle, path: &Path) -> Result<Vec<f32>,
     if bytes.len() == SPEAKER_VECTOR_BYTES {
         return decode_speaker_vector(path, &bytes);
     }
-    let pcm = decode_reference_audio(path)?;
+    let pcm = decode_reference_audio_any(path)?;
     let mel = log_mel_from_24khz_pcm(&pcm)
         .map_err(|error| FttsError::Input(format!("cannot extract speaker features: {error}")))?;
     let encoder = SpeakerEncoder::load(&bundle.main).map_err(checkpoint_error)?;
@@ -301,6 +301,90 @@ fn decode_speaker_vector(path: &Path, bytes: &[u8]) -> Result<Vec<f32>, FttsErro
         )));
     }
     Ok(vector)
+}
+
+/// Container formats the embedded decoder does not read; these route through a system decoder,
+/// mirroring how output encoding shells out — synthesis and enrollment themselves never depend
+/// on one.
+const SYSTEM_DECODED_EXTENSIONS: [&str; 6] = ["m4a", "mp3", "aac", "mp4", "ogg", "opus"];
+
+/// Decodes reference audio of any supported container to mono f32 PCM.
+///
+/// WAV and FLAC decode through the embedded pure-Rust path. Compressed containers (m4a, mp3, …)
+/// are first transcoded to a temporary WAV by the first system decoder found — `afconvert` on
+/// macOS, then `ffmpeg` — with a clear error naming both tools when neither exists.
+fn decode_reference_audio_any(path: &Path) -> Result<Vec<f32>, FttsError> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let needs_system_decoder = extension
+        .as_deref()
+        .is_some_and(|extension| SYSTEM_DECODED_EXTENSIONS.contains(&extension));
+    if !needs_system_decoder {
+        return decode_reference_audio(path);
+    }
+
+    let staging = std::env::temp_dir().join(format!(
+        "ftts-enroll-{}-{}.wav",
+        std::process::id(),
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("reference")
+    ));
+    let attempts: &[(&str, Vec<&std::ffi::OsStr>)] = &[
+        (
+            "afconvert",
+            vec![
+                "-f".as_ref(),
+                "WAVE".as_ref(),
+                "-d".as_ref(),
+                "LEI16".as_ref(),
+                path.as_os_str(),
+                staging.as_os_str(),
+            ],
+        ),
+        (
+            "ffmpeg",
+            vec![
+                "-y".as_ref(),
+                "-loglevel".as_ref(),
+                "error".as_ref(),
+                "-i".as_ref(),
+                path.as_os_str(),
+                "-acodec".as_ref(),
+                "pcm_s16le".as_ref(),
+                staging.as_os_str(),
+            ],
+        ),
+    ];
+    let mut ran = false;
+    for (tool, arguments) in attempts {
+        match std::process::Command::new(tool).args(arguments).status() {
+            Ok(status) if status.success() => {
+                ran = true;
+                break;
+            }
+            Ok(status) => {
+                let _ = fs::remove_file(&staging);
+                return Err(FttsError::Input(format!(
+                    "{tool} failed decoding reference audio {} (exit {status})",
+                    path.display()
+                )));
+            }
+            Err(_) => continue, // tool not installed; try the next one
+        }
+    }
+    if !ran {
+        return Err(FttsError::Input(format!(
+            "reference audio {} is a compressed container and no system decoder was found; \
+             install afconvert (macOS) or ffmpeg, or supply WAV/FLAC",
+            path.display()
+        )));
+    }
+    let decoded = decode_reference_audio(&staging);
+    let _ = fs::remove_file(&staging);
+    decoded
 }
 
 fn decode_reference_audio(path: &Path) -> Result<Vec<f32>, FttsError> {
