@@ -1435,7 +1435,7 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1);
-            ((state >> 33) as f32 / (1u64 << 30) as f32) - 2.0
+            ((state >> 33) as f32 / (1u64 << 29) as f32) - 2.0
         };
         for len in [1_usize, 17, 1024, 3072] {
             let row: Vec<f32> = (0..len).map(|_| next()).collect();
