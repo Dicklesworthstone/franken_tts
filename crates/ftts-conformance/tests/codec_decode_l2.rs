@@ -31,10 +31,10 @@ use ftts_kernels::f32ref;
 use ftts_model_qwen::codec::{
     CausalConvWeights, CausalTransposeConvWeights, CodecConfig, CodecConvNextWeights,
     CodecDecoderBlockWeights, CodecDecoderWeights, CodecKvCache, CodecPreTransformerWeights,
-    CodecResidualUnitWeights, CodecTransformerLayerWeights, CodecUpsampleStageWeights,
-    MaterializedCodebook, SplitResidualVectorQuantizer, causal_conv1d, causal_transpose_conv1d,
-    codec_rope_rows, decode_codec_offline, forward_codec_transformer_step, forward_convnext,
-    forward_decoder_block, snake_beta_in_place,
+    CodecResidualUnitWeights, CodecStreamingState, CodecTransformerLayerWeights,
+    CodecUpsampleStageWeights, MaterializedCodebook, SplitResidualVectorQuantizer, causal_conv1d,
+    causal_transpose_conv1d, codec_rope_rows, decode_codec_offline, forward_codec_transformer_step,
+    forward_convnext, forward_decoder_block, snake_beta_in_place,
 };
 use std::path::{Path, PathBuf};
 
@@ -153,10 +153,13 @@ const PINNED_DIVERGENCE: &[(&str, f64, usize)] = &[
     ("codec_decoder.block_05", 7.6293945312500000e-6, 42_042),
     ("codec_decoder.block_06", 2.2351741790771484e-8, 15_125),
     ("decode_codec_offline[icl]", 1.7881393432617188e-7, 25_749),
+    // Moved 5.402e-8/1_904 -> 4.610e-8/1_877 when the Accelerate M=1 GEMV path was pinned to the
+    // M>=2 GEMM kernel for streaming==offline M-invariance (this capture decodes a single frame,
+    // so its conv GEMMs ran M=1 offline); the shift is toward the oracle.
     (
         "decode_codec_offline[xvector]",
-        5.4016709327697754e-8,
-        1_904,
+        4.6100467443466187e-8,
+        1_877,
     ),
 ];
 
@@ -1093,4 +1096,150 @@ fn contract_a_l2_codec_decoder_stages_cpu_fp32_exact() {
         failures.is_empty(),
         "codec decoder seams moved off the pinned CPU-fp32 divergence ratchet: {failures:#?}"
     );
+}
+
+/// The bead's standing gate (frankentts-p1-codec-hu7): **streaming == offline, BIT-IDENTICAL.**
+///
+/// The named reference is our whole-sequence offline decode (per the binding addendum — never the
+/// official 25-frame-context chunker, whose behaviour past 300 frames is an upstream artifact).
+/// The same 14-frame ICL code stream is pushed through [`CodecStreamingState`] under four packet
+/// schedules — per-frame, packet-4, one whole-utterance packet, and an irregular fuzz schedule —
+/// and every one must reproduce the offline PCM bit-for-bit and leave identical `clear()`-reset
+/// behaviour for the next utterance. Chunking must not change arithmetic: any divergence here is
+/// a wiring bug in the ring buffers or retained KV, never a tolerance question.
+#[test]
+fn streaming_decode_is_bit_identical_to_offline_across_packet_schedules() {
+    let fixtures = match OracleFixtures::open_default() {
+        Ok(fixtures) => fixtures,
+        Err(error) => {
+            skip(&format!("fixtures unavailable: {error}"));
+            return;
+        }
+    };
+    let checkpoint = checkpoint_path();
+    if !checkpoint.is_file() {
+        skip(&format!(
+            "pinned checkpoint absent at {}",
+            checkpoint.display()
+        ));
+        return;
+    }
+    let mode = "icl_non_streaming";
+    if !fixtures.has_seam(&seam(mode, "codec_decoder.input.input")) {
+        skip("codec_decode seams absent from the fixture pack");
+        return;
+    }
+
+    let file = SafetensorsFile::open(&checkpoint).expect("pinned speech tokenizer opens");
+    let owned = OwnedCodec::load(&file);
+    let layer_weights: Vec<CodecTransformerLayerWeights<'_>> =
+        owned.layers.iter().map(OwnedLayer::borrow).collect();
+    let config = CodecConfig::default();
+    let weights = owned.decoder_weights(&layer_weights);
+    let (codes, frames) = load_codes(&fixtures, &seam(mode, "codec_decoder.input.input"));
+    assert!(
+        frames >= 8,
+        "the packet schedules below need a multi-frame stream; this capture has {frames}"
+    );
+
+    let offline = decode_codec_offline(config, owned.quantizer(), &weights, &codes, frames)
+        .expect("oracle codes decode offline");
+
+    let schedules: [(&str, Vec<usize>); 6] = [
+        ("packet-1", vec![1; frames]),
+        ("packet-4", {
+            let mut packets = vec![4; frames / 4];
+            if frames % 4 > 0 {
+                packets.push(frames % 4);
+            }
+            packets
+        }),
+        ("whole-utterance", vec![frames]),
+        (
+            "fuzz-3-1-5-2-3",
+            vec![3, 1, 5, 2, frames.saturating_sub(11)],
+        ),
+        ("packet-2", vec![2; frames / 2]),
+        ("tail-single", vec![frames - 1, 1]),
+    ];
+    let mut state = CodecStreamingState::new(config, &weights);
+    let mut verdicts: Vec<String> = Vec::new();
+    for (name, schedule) in &schedules {
+        assert_eq!(
+            schedule.iter().sum::<usize>(),
+            frames,
+            "schedule {name} must cover the stream exactly"
+        );
+        state.clear();
+        let mut streamed = Vec::with_capacity(offline.len());
+        let mut packet_pcm = Vec::new();
+        let mut cursor = 0usize;
+        for &packet in schedule {
+            state
+                .push(
+                    owned.quantizer(),
+                    &weights,
+                    &codes[cursor * 16..(cursor + packet) * 16],
+                    packet,
+                    &mut packet_pcm,
+                )
+                .expect("streaming packet decodes");
+            streamed.extend_from_slice(&packet_pcm);
+            cursor += packet;
+        }
+        assert_eq!(
+            streamed.len(),
+            offline.len(),
+            "schedule {name}: streamed sample count"
+        );
+        if let Some(index) = streamed
+            .iter()
+            .zip(&offline)
+            .position(|(streamed, offline)| streamed.to_bits() != offline.to_bits())
+        {
+            let divergent = streamed
+                .iter()
+                .zip(&offline)
+                .filter(|(streamed, offline)| streamed.to_bits() != offline.to_bits())
+                .count();
+            let max_abs = streamed
+                .iter()
+                .zip(&offline)
+                .fold(0.0f32, |acc, (s, o)| acc.max((s - o).abs()));
+            verdicts.push(format!(
+                "{name}: FIRST divergence at sample {index} (frame {}), {divergent}/{} \
+                 samples differ, max_abs {max_abs:e} (streamed {:e} vs offline {:e})",
+                index / 1920,
+                streamed.len(),
+                streamed[index],
+                offline[index]
+            ));
+        } else {
+            eprintln!("schedule {name}: bit-identical over {frames} frames");
+        }
+    }
+
+    assert!(
+        verdicts.is_empty(),
+        "streaming is NOT bit-identical to offline — ring-buffer/retained-KV state or a \
+         diverging streaming code path (a whole-utterance-packet failure means the streaming \
+         ops themselves differ from offline; a packet-only failure means carried state): \
+         {verdicts:#?}"
+    );
+    Receipt::new(
+        "contract_a_codec_streaming_equals_offline_bit_identical",
+        Outcome::Passed,
+    )
+    .contract("ConformanceExact/streaming")
+    .seam("codec.streaming_vs_offline.pcm")
+    .reason(format!(
+        "streaming == offline BIT-IDENTICAL over {frames} frames under 4 packet schedules \
+         (packet-1, packet-4, whole-utterance, fuzz), state reused across schedules via clear()"
+    ))
+    .tolerance(
+        0.0,
+        "structural gate: same ops, same order — zero tolerance by construction",
+    )
+    .oracle_tier(OracleTier::CpuFp32Fallback)
+    .emit();
 }

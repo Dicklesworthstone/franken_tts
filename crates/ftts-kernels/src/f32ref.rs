@@ -263,6 +263,25 @@ fn accelerate_sgemm(
     beta: f32,
     out: &mut [f32],
 ) -> bool {
+    // Accelerate routes M = 1 to a GEMV kernel whose reduction order differs from its M >= 2
+    // GEMM kernel in the last ulps, while M >= 2 is row-invariant (measured: M of 2, 3, 4 and 14
+    // produce bit-identical rows). A streaming decode presents the same convolution at M = packet
+    // while offline presents M = utterance, so without this pinning the streaming == offline gate
+    // fails on every 1-frame packet. Present M = 1 as a duplicated-row M = 2 call and keep row 0,
+    // so every M reduces on the same kernel path.
+    if m == 1 {
+        let mut doubled_x = Vec::with_capacity(2 * k);
+        doubled_x.extend_from_slice(x);
+        doubled_x.extend_from_slice(x);
+        let mut doubled_out = Vec::with_capacity(2 * n);
+        doubled_out.extend_from_slice(out);
+        doubled_out.extend_from_slice(out);
+        if !accelerate_sgemm(&doubled_x, weight, 2, k, n, beta, &mut doubled_out) {
+            return false;
+        }
+        out.copy_from_slice(&doubled_out[..n]);
+        return true;
+    }
     let m = i32::try_from(m).expect("SGEMM rows fit CBLAS i32 dimensions");
     let k = i32::try_from(k).expect("SGEMM reduction fits CBLAS i32 dimensions");
     let n = i32::try_from(n).expect("SGEMM columns fit CBLAS i32 dimensions");
