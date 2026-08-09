@@ -147,6 +147,11 @@ pub struct LoadedModel {
     talker: TalkerCheckpoint,
     codec: CodecCheckpoint,
     tokenizer: QwenTokenizer,
+    /// A second mapping of the canonical artifact, when the bundle carries one. The int8 route
+    /// hydrates its Q8 tables straight from this (proven byte-identical to requantizing the
+    /// widened f32 copies, scales included); mapping the file twice costs nothing beyond page
+    /// cache the first mapping already warmed.
+    artifact: Option<ftts_artifacts::fttsq::MappedFttsq>,
 }
 
 impl LoadedModel {
@@ -179,6 +184,18 @@ impl LoadedModel {
             },
             codec: CodecCheckpoint::load(&bundle.codec).map_err(checkpoint_error)?,
             tokenizer,
+            artifact: bundle
+                .canonical_main
+                .as_deref()
+                .map(|path| {
+                    ftts_artifacts::fttsq::MappedFttsq::open(path).map_err(|error| {
+                        FttsError::ArtifactFormat(format!(
+                            "cannot map canonical artifact {}: {error}",
+                            path.display()
+                        ))
+                    })
+                })
+                .transpose()?,
         })
     }
 }
@@ -648,37 +665,40 @@ pub fn synthesize(
     // fifteen-table set the talker feedback path uses.
     let micro_residual = &residual[..residual.len() - 1];
 
-    let mut generator = QwenGenerator::new(QwenGeneratorConfig {
-        talker_config: TalkerConfig::default(),
-        talker_weights: model.talker.talker_weights(&talker_layers),
-        text: model.talker.text_weights(&table),
-        feedback: model.talker.feedback_tables(&residual),
-        microdecoder_config: MicrodecoderConfig::default(),
-        microdecoder_weights: model.talker.microdecoder_weights(
-            &micro_layers,
-            micro_residual,
-            &heads,
-        ),
-        prompt_mode: PromptMode {
-            clone_mode: CloneMode::XVector,
-            non_streaming_mode: false,
+    let mut generator = QwenGenerator::new_with_artifact(
+        QwenGeneratorConfig {
+            talker_config: TalkerConfig::default(),
+            talker_weights: model.talker.talker_weights(&talker_layers),
+            text: model.talker.text_weights(&table),
+            feedback: model.talker.feedback_tables(&residual),
+            microdecoder_config: MicrodecoderConfig::default(),
+            microdecoder_weights: model.talker.microdecoder_weights(
+                &micro_layers,
+                micro_residual,
+                &heads,
+            ),
+            prompt_mode: PromptMode {
+                clone_mode: CloneMode::XVector,
+                non_streaming_mode: false,
+            },
+            header,
+            tts_eos,
+            reference: None,
+            // The PRODUCT samples, exactly as the pinned upstream runtime does
+            // (generation_config.json: do_sample=true, T=0.9, top_k=50, repetition_penalty=1.05,
+            // subtalker likewise); canonical greedy remains the conformance decoder only. The p7r
+            // forensics that certified this path: our talker draw stack matched torch's choices
+            // code-for-code for seven straight frames from the same prefill, the silence defect was
+            // the subtalker being forced greedy under a sampled talker (a measured silence
+            // attractor the reference reproduces in that mismatched configuration), and with the
+            // subtalker sampling per depth the engine's utterance envelope matches the reference's
+            // sampled runs (peak frame RMS 0.086 with trailing silence). Determinism scope: build +
+            // ISA + sampler version + seed, 16 draws per frame.
+            sampling_mode: SamplingMode::Production,
+            seed,
         },
-        header,
-        tts_eos,
-        reference: None,
-        // The PRODUCT samples, exactly as the pinned upstream runtime does
-        // (generation_config.json: do_sample=true, T=0.9, top_k=50, repetition_penalty=1.05,
-        // subtalker likewise); canonical greedy remains the conformance decoder only. The p7r
-        // forensics that certified this path: our talker draw stack matched torch's choices
-        // code-for-code for seven straight frames from the same prefill, the silence defect was
-        // the subtalker being forced greedy under a sampled talker (a measured silence
-        // attractor the reference reproduces in that mismatched configuration), and with the
-        // subtalker sampling per depth the engine's utterance envelope matches the reference's
-        // sampled runs (peak frame RMS 0.086 with trailing silence). Determinism scope: build +
-        // ISA + sampler version + seed, 16 draws per frame.
-        sampling_mode: SamplingMode::Production,
-        seed,
-    });
+        model.artifact.as_ref(),
+    );
 
     // 5. The engine owns admission, the budget, cancellation, and the frame loop — and the
     // codec decodes IN PARALLEL with it: a tee on the generator feeds every produced frame
@@ -865,11 +885,12 @@ mod tests {
         // Compare against the tone sampled directly at the target rate, ignoring the window's
         // run-up at each end where the kernel is truncated by the signal boundary.
         let skip = 64;
+        let interior = out.len() - skip;
         let mut worst = 0.0_f32;
-        for index in skip..out.len() - skip {
+        for (index, sample) in out.iter().enumerate().take(interior).skip(skip) {
             let t = index as f64 / f64::from(SPEAKER_SAMPLE_RATE_HZ);
             let ideal = (std::f64::consts::TAU * TONE_HZ * t).sin() as f32;
-            worst = worst.max((out[index] - ideal).abs());
+            worst = worst.max((sample - ideal).abs());
         }
         assert!(
             worst < 0.02,
