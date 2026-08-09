@@ -199,6 +199,7 @@
       <a href="#wasm" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">WASM</a>
       <a href="#receipts" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Receipts</a>
       <a href="#voices" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Voices</a>
+      <a href="#denoise" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Denoise</a>
       <a href="#install" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Install</a>
     </nav>
 
@@ -719,6 +720,42 @@
       </p>
     </div>
     <div id="voice-cards" class="grid md:grid-cols-2 lg:grid-cols-4 gap-5 reveal"></div>
+  </section>
+
+  <!-- ============================== DENOISE ============================== -->
+  <section id="denoise" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
+    <div class="text-center mb-12 reveal">
+      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+        THE DENOISER
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+      </div>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Static In, <span class="text-emerald-400">Voice</span> Out.</h2>
+      <p class="text-slate-400 max-w-3xl mx-auto text-base md:text-lg">
+        A cloned voice inherits the noise of the recording it came from: enroll next to a fan and
+        every sentence carries the fan. <code class="text-emerald-300">ftts enroll --denoise</code>
+        cleans the reference first, using a pure-Rust port of FastEnhancer&#8209;S, a 207&#8239;K&#8209;parameter
+        speech-enhancement network. It predicts a complex mask over each spectrogram frame as it
+        listens, so steady hiss and rumble are multiplied toward zero while speech, phase included,
+        passes through. The port matches its PyTorch reference to 125&#8239;dB, which is float rounding,
+        and the weights ride along with <code class="text-emerald-300">ftts pull</code> as an 0.8&#8239;MB file.
+        CLI today; the engine compiles to wasm unchanged and is headed for this playground.
+      </p>
+    </div>
+    <div class="grid md:grid-cols-3 gap-5 max-w-4xl mx-auto reveal">
+      <div class="rounded-2xl border border-white/5 bg-black/40 p-6 text-center">
+        <div class="text-3xl font-black text-emerald-400 mb-1">65&#8239;dB</div>
+        <div class="text-slate-400 text-sm">of white static removed from a test reference's pause floor</div>
+      </div>
+      <div class="rounded-2xl border border-white/5 bg-black/40 p-6 text-center">
+        <div class="text-3xl font-black text-emerald-400 mb-1">207&#8239;K</div>
+        <div class="text-slate-400 text-sm">parameters, so the whole model is smaller than one album cover JPEG</div>
+      </div>
+      <div class="rounded-2xl border border-white/5 bg-black/40 p-6 text-center">
+        <div class="text-3xl font-black text-emerald-400 mb-1">125&#8239;dB</div>
+        <div class="text-slate-400 text-sm">parity against the pinned PyTorch oracle on every fixture</div>
+      </div>
+    </div>
   </section>
 
   <!-- ============================== INSTALL ============================== -->
