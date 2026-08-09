@@ -30,6 +30,25 @@ tally_w_l_n: <wins/losses/neutrals for this lever>
 ## Local entries
 
 ```text
+PERF-002
+claim_id: artifact-native-q8-hydration
+evidence_id: examples/artifact_q8_hydration.rs run 2026-08-09 + same-seed say byte-compare; commits 90c75d3/9183802/54eb4b8
+status: KEEP
+model_source_commit: 5d83992436eae1d760afd27aff78a71d676296fc
+fixture_sha256: not-applicable (whole-checkpoint hydration comparison, no fixture)
+artifact_sha256: 597f7eb3314a2fe5be74fa10a6a3a28ace9e10e582c641deccd37348a0ccd824 (qwen3-tts-12hz-0.6b-base.fttsq)
+cpu_features: Apple M4 Pro aarch64
+command_env: cargo run --release -p ftts-model-qwen --example artifact_q8_hydration -- ~/.cache/franken_tts/model/qwen3-tts-12hz-0.6b-base.fttsq   (fleet-loaded host)
+kill_switch: FTTS_ARTIFACT_Q8=0 (restores widen-then-requantize hydration)
+incumbent: the tree's own runtime requantize hydration (same process, same run)
+before_after: int8-table hydration 1.112 s -> 146 ms (7.6x, same-process A/B); interleaved warm e2e say pairs armed 12.2/13.6 s vs off 14.2/15.0 s
+cv_percent: not-gated (same-process isolated stage A/B for the headline number; e2e pairs are corroboration under fleet load, not the claim)
+equivalence: BYTE-IDENTICAL — fused Q8 payload bytes asserted equal across all 33 layers, worst scale ulp distance 0, and same-seed say output byte-identical armed vs kill-switched
+disposition: KEEP; context: the artifact's Q8 payload IS the canonical quantization (shared-quantizer contract), so this also removes a class of drift, not just time. Remaining startup cost is the 9.5 s f32 widen of hot tensors the f32 fallback structs still demand — that lever needs checkpoint-side storage changes (Option-alized hot f32 buffers when the int8 route is armed).
+tally_w_l_n: 1/0/0
+```
+
+```text
 PERF-001
 claim_id: talker-f32-reference-baseline
 evidence_id: crates/ftts-conformance/tests/talker_perf_baseline.rs receipt, 2026-08-07
