@@ -107,6 +107,127 @@ pub fn confirm(out: &mut dyn Write, question: &str) -> std::io::Result<Option<bo
     ))
 }
 
+/// Whether a human is reading stdout, as opposed to a pipe, a file, an agent, or CI.
+///
+/// Deliberately distinct from [`decorate`]: `NO_COLOR` means "no color", not "give me JSON", so a
+/// user who sets it still gets human output, just uncolored.
+#[must_use]
+pub fn is_interactive() -> bool {
+    std::io::stdout().is_terminal()
+}
+
+/// Renders the `say` lifecycle as something a person wants to read.
+///
+/// The NDJSON stream is a machine contract — stable schema, one event per line, `audio_chunk` per
+/// packet — and it is exactly the wrong thing to put in front of somebody who typed a sentence and
+/// wants a file. Rather than weaken that contract, this consumes the same events and prints a
+/// different view of them; the stream is unchanged for every non-terminal consumer.
+#[derive(Default)]
+pub struct SayPresenter {
+    load_started_ms: u64,
+    synthesis_started_ms: u64,
+    load_ms: u64,
+    synthesis_ms: u64,
+    frames: u64,
+}
+
+impl SayPresenter {
+    /// Feed one lifecycle event. Unknown events are ignored, so a schema addition cannot break
+    /// human output — it simply will not be narrated until someone teaches this about it.
+    ///
+    /// # Errors
+    ///
+    /// When the sink cannot be written.
+    pub fn event(&mut self, event: &serde_json::Value, out: &mut dyn Write) -> std::io::Result<()> {
+        let kind = event.get("event").and_then(serde_json::Value::as_str);
+        let elapsed = event
+            .get("elapsed_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        match kind {
+            Some("run_start") => {
+                let voice = event
+                    .get("voice")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("default");
+                writeln!(out, "{} {}", detail("voice"), emphasis(voice))?;
+            }
+            Some("stage") => {
+                let name = event
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let state = event
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                match (name, state) {
+                    ("load", "begin") => self.load_started_ms = elapsed,
+                    ("load", "end") => {
+                        self.load_ms = elapsed.saturating_sub(self.load_started_ms);
+                        ok(
+                            out,
+                            &format!("model loaded {}", detail(&secs(self.load_ms))),
+                        )?;
+                    }
+                    ("synthesis", "begin") => self.synthesis_started_ms = elapsed,
+                    ("synthesis", "end") => {
+                        self.synthesis_ms = elapsed.saturating_sub(self.synthesis_started_ms);
+                    }
+                    _ => {}
+                }
+            }
+            // Per-packet chunks are the machine contract's business. A person watching a file get
+            // written does not want one line per 320 ms of audio.
+            Some("audio_chunk") => {}
+            Some("run_complete") => {
+                let audio_ms = event
+                    .get("duration_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                self.frames = event
+                    .get("frames")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                ok(
+                    out,
+                    &format!(
+                        "synthesized {} frames {}",
+                        self.frames,
+                        detail(&secs(self.synthesis_ms))
+                    ),
+                )?;
+                let mut tail = format!("{} of audio in {} total", secs(audio_ms), secs(elapsed));
+                if let Some(ttfa) = event.get("ttfa_ms").and_then(serde_json::Value::as_u64) {
+                    tail.push_str(&format!(" · first audio {ttfa} ms"));
+                }
+                // Report synthesis against real time, not the whole run: model load is a fixed
+                // one-off, and folding it in makes a short sentence look slow for a reason that
+                // has nothing to do with how fast the engine generates.
+                if audio_ms > 0 && self.synthesis_ms > 0 {
+                    #[allow(clippy::cast_precision_loss)]
+                    let ratio = audio_ms as f64 / self.synthesis_ms as f64;
+                    tail.push_str(&format!(" · synthesis {ratio:.2}× real time"));
+                }
+                writeln!(out, "  {}", detail(&tail))?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Milliseconds as a short human duration.
+fn secs(ms: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let seconds = ms as f64 / 1000.0;
+    if seconds < 10.0 {
+        format!("{seconds:.2} s")
+    } else {
+        format!("{seconds:.1} s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

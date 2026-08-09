@@ -270,6 +270,13 @@ struct SayArgs {
     /// Parse inputs and run the conservative admission preflight without synthesis.
     #[arg(long)]
     check: bool,
+
+    /// Emit the NDJSON event stream even when stdout is a terminal.
+    ///
+    /// Piped, redirected and CI runs already get NDJSON — nothing but a terminal gets the human
+    /// view — so this exists for a person who wants to watch the machine contract directly.
+    #[arg(long)]
+    robot: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1061,7 +1068,7 @@ fn run_say(
         run_say_events(cli, args, environment, stdin, &run, stdout, &mut |event| {
             write_json_line(stderr, event)
         })
-    } else {
+    } else if args.robot || !style::is_interactive() {
         let mut discard = io::sink();
         run_say_events(
             cli,
@@ -1071,6 +1078,25 @@ fn run_say(
             &run,
             &mut discard,
             &mut |event| write_json_line(stdout, event),
+        )
+    } else {
+        // A terminal gets the human view of the same lifecycle. The NDJSON contract is untouched:
+        // it is what every pipe, file, CI job and agent still receives, because none of them is a
+        // terminal. `--robot` forces it back on for a human debugging the stream itself.
+        let mut discard = io::sink();
+        let mut presenter = style::SayPresenter::default();
+        run_say_events(
+            cli,
+            args,
+            environment,
+            stdin,
+            &run,
+            &mut discard,
+            &mut |event| {
+                presenter
+                    .event(event, stdout)
+                    .map_err(|error| FttsError::Generic(format!("cannot write progress: {error}")))
+            },
         )
     };
 
@@ -2682,7 +2708,7 @@ mod tests {
         );
     }
 
-    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,enroll,voice,convert,pull,robot,doctor\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
+    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,enroll,voice,convert,pull,robot,doctor\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check,robot\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
 
     #[test]
     fn clap_surface_matches_snapshot() {
