@@ -25,6 +25,7 @@
 pub mod f32ref;
 pub mod int8;
 pub mod mmap;
+pub mod route;
 pub mod selftest;
 pub mod sleef;
 pub mod startup_env;

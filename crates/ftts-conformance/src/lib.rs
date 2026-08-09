@@ -182,6 +182,9 @@ macro_rules! test_name {
 macro_rules! require_model {
     ($contract:expr $(,)?) => {
         match $crate::gate::ModelGate::resolve() {
+        // Oracle-parity tests measure the f32 reference route, never the optimized default.
+        $crate::pin_reference_route();
+
             $crate::gate::ModelGate::Present { artifact } => artifact,
             $crate::gate::ModelGate::Absent { reason } => {
                 $crate::report::Receipt::new(
@@ -343,6 +346,14 @@ macro_rules! assert_exact {
 
 /// Implementation targets for the macros. Not a stable surface — call the macros.
 #[doc(hidden)]
+/// Pins this process to the f32 reference route (see `ftts_kernels::route`).
+///
+/// Every conformance entry point calls this: parity suites certify the reference numerics, so
+/// the optimized-by-default product route must never leak into an oracle comparison.
+pub fn pin_reference_route() {
+    ftts_kernels::route::pin_reference();
+}
+
 pub mod macro_support {
     use crate::{
         compare::{

@@ -397,6 +397,7 @@ impl LadderRunner {
     /// Returns an error when the local fixture cache is absent, either artifact is malformed, or
     /// the manifest is not the declared CPU FP32 fallback tier.
     pub fn cpu_fp32_fixture() -> Result<Self, LadderError> {
+        ftts_kernels::route::pin_reference();
         Self::from_paths(
             OracleTier::CpuFp32Fallback,
             &cpu_fp32_floor_path(),
@@ -418,6 +419,7 @@ impl LadderRunner {
         floor_path: &Path,
         fixture_manifest_path: &Path,
     ) -> Result<Self, LadderError> {
+        ftts_kernels::route::pin_reference();
         let floor_source = floor_path.display().to_string();
         let floor_bytes = fs::read(floor_path).map_err(|source| LadderError::ReadArtifact {
             artifact: floor_source.clone(),
@@ -450,6 +452,7 @@ impl LadderRunner {
         fixture_manifest_source: impl Into<String>,
         fixture_manifest_bytes: &[u8],
     ) -> Result<Self, LadderError> {
+        ftts_kernels::route::pin_reference();
         let floor_source = floor_source.into();
         let floor: Value =
             serde_json::from_slice(floor_bytes).map_err(|source| LadderError::ParseArtifact {

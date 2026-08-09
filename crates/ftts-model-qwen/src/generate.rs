@@ -196,11 +196,9 @@ impl<'a> QwenGenerator<'a> {
 
         // Staged levers 2a+2b: runtime W8A8, armed only by the explicit kill-switch. The default
         // path quantizes nothing and calls the untouched f32 reference functions.
-        let int8 = matches!(
-            std::env::var("FTTS_INT8").as_deref(),
-            Ok("1" | "w8a8" | "w8a16")
-        )
-        .then(|| {
+        // The optimized route is the library default; `FTTS_INT8=0` or a conformance
+        // reference-pin selects the f32 reference instead (ftts_kernels::route).
+        let int8 = ftts_kernels::route::optimized_default("FTTS_INT8").then(|| {
             // FTTS_INT8_SCOPE narrows the lever for sensitivity attribution: `talker` or
             // `micro` quantizes one stack and leaves the other on the f32 reference. An empty
             // table below means "this stack stays f32" at the branch sites.

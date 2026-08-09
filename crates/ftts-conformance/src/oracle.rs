@@ -136,6 +136,7 @@ impl OracleFixtures {
     ///
     /// Returns [`FixtureError`] when the pack is absent or its manifest is unusable.
     pub fn open_default() -> Result<Self, FixtureError> {
+        ftts_kernels::route::pin_reference();
         let root = match std::env::var(FIXTURES_ENV) {
             Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
             _ => {
@@ -152,6 +153,7 @@ impl OracleFixtures {
     ///
     /// Returns [`FixtureError`] when the directory or its manifest is missing or malformed.
     pub fn open(root: &Path) -> Result<Self, FixtureError> {
+        ftts_kernels::route::pin_reference();
         let manifest_path = root.join("fixture_manifest.json");
         if !manifest_path.is_file() {
             return Err(FixtureError::PackAbsent {

@@ -80,11 +80,13 @@ pub struct Team {
 pub fn armed() -> Option<&'static Team> {
     static TEAM: OnceLock<Option<Team>> = OnceLock::new();
     TEAM.get_or_init(|| {
+        let ceiling = std::thread::available_parallelism().map_or(1, usize::from);
+        // Default six ways: the measured knee on M4 Pro (memory-bound beyond it). Partitioning
+        // never changes output bits, so the default applies everywhere, reference route included.
         let requested: usize = std::env::var("FTTS_INT8_THREADS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(1);
-        let ceiling = std::thread::available_parallelism().map_or(1, usize::from);
+            .unwrap_or(6);
         let partitions = requested.min(ceiling);
         if partitions <= 1 {
             return None;

@@ -694,10 +694,16 @@ fn codec_int8_route() -> Option<&'static CodecInt8Route> {
     static ROUTE: OnceLock<Option<CodecInt8Route>> = OnceLock::new();
     ROUTE
         .get_or_init(|| {
+            // Default: the convnext arm (the one the spectral gate measured transparent),
+            // unless the master switch or a reference pin turns the optimized route off, or
+            // the variable itself says otherwise.
+            let master_on = ftts_kernels::route::optimized_default("FTTS_INT8");
             let (transformer, convnext) = match std::env::var("FTTS_INT8_CODEC").as_deref() {
                 Ok("1" | "all") => (true, true),
                 Ok("transformer") => (true, false),
                 Ok("convnext") => (false, true),
+                Ok("0" | "off" | "false") => return None,
+                _ if master_on && !ftts_kernels::route::reference_pinned() => (false, true),
                 _ => return None,
             };
             Some(CodecInt8Route {
@@ -800,7 +806,12 @@ pub fn snake_beta_in_place(values: &mut [f32], frames: usize, alpha_log: &[f32],
 /// constants. Default off: the scalar libm walk above is the parity reference. Read once.
 fn fast_snake_armed() -> bool {
     static ARMED: OnceLock<bool> = OnceLock::new();
-    *ARMED.get_or_init(|| std::env::var("FTTS_FAST_SNAKE").as_deref() == Ok("1"))
+    *ARMED.get_or_init(|| match std::env::var("FTTS_FAST_SNAKE").as_deref() {
+        Ok("1" | "on" | "true") => !ftts_kernels::route::reference_pinned(),
+        Ok("0" | "off" | "false") => false,
+        // Unset: follow the master optimized-route default.
+        _ => ftts_kernels::route::optimized_default("FTTS_INT8"),
+    })
 }
 
 fn snake_beta_fast(values: &mut [f32], frames: usize, alpha_log: &[f32], beta_log: &[f32]) {
