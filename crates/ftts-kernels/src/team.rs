@@ -158,26 +158,22 @@ static WASM_TEAM: OnceLock<Option<Team>> = OnceLock::new();
 #[cfg(target_arch = "wasm32")]
 static WASM_SHARED: OnceLock<&'static Shared> = OnceLock::new();
 
-/// Publishes the shared control block and arms a `partitions`-way team.
+/// Publishes the shared control block Workers park on, without sizing the team.
 ///
-/// Call once, from the thread that will own dispatch, before spawning `partitions - 1` Workers
-/// that each call [`wasm_worker_loop`]. Returns the number of Workers the caller must start.
+/// Split from [`arm_wasm_team`] deliberately. A Worker must be able to park *before* the team
+/// exists, because the team's width has to be the number of Workers that actually started — and
+/// that is not known until they report. Publishing first, arming second, is what makes a Worker
+/// that fails to boot cost a partition rather than a hang.
 ///
-/// # Why this shape
+/// # Why any of this runs in a Worker
 ///
-/// The caller is partition 0 and blocks on a condvar until the others report done. `atomic.wait`
-/// **traps on a browser's main thread**, so the owning thread must itself be a Worker — in this
-/// project, the engine Worker that already runs synthesis. Arming from the main thread would not
-/// merely be slow, it would abort.
-///
-/// Returns 0 (and arms nothing) when `partitions <= 1`, which is the serial fallback.
+/// The dispatcher is partition 0 and blocks on a condvar until the others report done.
+/// `atomic.wait` **traps on a browser's main thread**, so the owning thread must itself be a
+/// Worker — here, the engine Worker that already runs synthesis. Arming from the main thread
+/// would not merely be slow, it would abort.
 #[cfg(target_arch = "wasm32")]
-pub fn install_wasm_team(partitions: usize) -> usize {
-    if partitions <= 1 {
-        let _ = WASM_TEAM.set(None);
-        return 0;
-    }
-    let shared: &'static Shared = *WASM_SHARED.get_or_init(|| {
+pub fn publish_wasm_block() {
+    let _ = WASM_SHARED.get_or_init(|| {
         Box::leak(Box::new(Shared {
             control: Mutex::new(Control {
                 generation: 0,
@@ -189,12 +185,30 @@ pub fn install_wasm_team(partitions: usize) -> usize {
             done: Condvar::new(),
         }))
     });
+}
+
+/// Arms a `partitions`-way team over the already-published control block.
+///
+/// Call this only after `partitions - 1` Workers have confirmed they are parked in
+/// [`wasm_worker_loop`]. Sizing the team before they report would be a deadlock waiting to
+/// happen: the dispatcher decrements `remaining` down from `partitions - 1` and blocks until it
+/// reaches zero, so a partition that never started is a partition that never reports done.
+///
+/// `partitions <= 1` arms nothing, which is the serial fallback a browser without
+/// `SharedArrayBuffer` — or one where every Worker failed to start — correctly lands on.
+#[cfg(target_arch = "wasm32")]
+pub fn arm_wasm_team(partitions: usize) {
+    if partitions <= 1 {
+        let _ = WASM_TEAM.set(None);
+        return;
+    }
+    publish_wasm_block();
+    let shared = *WASM_SHARED.get().expect("just published");
     let _ = WASM_TEAM.set(Some(Team {
         shared,
         partitions,
         dispatch_gate: Mutex::new(()),
     }));
-    partitions - 1
 }
 
 /// The body every spawned Worker runs, forever.

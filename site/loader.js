@@ -6,7 +6,38 @@
 // a mismatch deletes the staging file and starts that file over.
 
 import { MODEL_FILES, TOTAL_BYTES, CHUNK_BYTES } from "./model-manifest.js?v=@SITEV@";
-import { digestBlob } from "./sha256.js?v=@SITEV@";
+import { Sha256, digestBlob } from "./sha256.js?v=@SITEV@";
+
+// A verified file records its identity here so it is never re-hashed. Hashing 2 GB in JS costs
+// ~10 s on a fast desktop and far more on a phone, all of it on the main thread — long enough for
+// iOS to kill the tab as unresponsive. Verification is a property of bytes on disk, not of a page
+// load, so it is done ONCE (streamed alongside the download, while the bytes are already in hand)
+// and remembered.
+const VERIFIED_MARKER = "verified.json";
+
+async function readVerified(root) {
+  try {
+    const handle = await root.getFileHandle(VERIFIED_MARKER);
+    return JSON.parse(await (await handle.getFile()).text());
+  } catch {
+    return {};
+  }
+}
+
+/// Hands the event loop back so a long verification cannot look like a hung page.
+///
+/// Without this the digest is one unbroken JS run — ~10 s of it for a 2 GB model on a fast
+/// desktop, considerably more on a phone — and iOS reclaims tabs that stop answering.
+function yieldToEventLoop() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function writeVerified(root, ledger) {
+  const handle = await root.getFileHandle(VERIFIED_MARKER, { create: true });
+  const writable = await handle.createWritable();
+  await writable.write(JSON.stringify(ledger));
+  await writable.close();
+}
 
 async function opfsRoot() {
   return navigator.storage.getDirectory();
@@ -38,6 +69,7 @@ async function fetchRange(asset, start, endInclusive) {
  */
 export async function ensureModel(onProgress) {
   const root = await opfsRoot();
+  const verified = await readVerified(root);
   const out = {};
   let bytesDone = 0;
   let assetsDone = 0;
@@ -57,8 +89,14 @@ export async function ensureModel(onProgress) {
       const done = await root.getFileHandle(file.asset);
       const blob = await done.getFile();
       if (blob.size === file.bytes) {
-        report("verifying", file.asset);
-        if ((await digestBlob(blob)) === file.sha256) {
+        const noted = verified[file.asset];
+        const trusted = noted && noted.bytes === file.bytes && noted.sha256 === file.sha256;
+        if (!trusted) report("verifying", file.asset);
+        if (trusted || (await digestBlob(blob, 8 * 1024 * 1024, yieldToEventLoop)) === file.sha256) {
+          if (!trusted) {
+            verified[file.asset] = { bytes: file.bytes, sha256: file.sha256 };
+            await writeVerified(root, verified);
+          }
           out[file.key] = file.text
             ? new TextDecoder().decode(await blob.arrayBuffer())
             : { asset: file.asset, bytes: file.bytes };
@@ -85,6 +123,7 @@ export async function ensureModel(onProgress) {
     // merely existing: a short file resumes from its own length, and a full-length file with the
     // wrong bytes fails verification below and is deleted.
     const handle = await root.getFileHandle(file.asset, { create: true });
+    let freshDigest = null;
     let offset = (await handle.getFile()).size;
     if (offset > file.bytes) offset = 0; // manifest changed under a stale file
     if (offset < file.bytes) {
@@ -95,6 +134,11 @@ export async function ensureModel(onProgress) {
         ? await handle.createSyncAccessHandle().catch(() => null)
         : null;
       const writable = sync ? null : await handle.createWritable({ keepExistingData: true });
+      // Hash as the bytes arrive. A fresh download therefore needs NO verification pass at all —
+      // the second full read of a 1.3 GB file was pure waste, and on a phone it was fatal. A
+      // resume cannot do this (the hash state for the existing prefix is gone), so it falls back
+      // to reading the finished file once, with yields.
+      const live = offset === 0 ? new Sha256() : null;
       try {
         while (offset < file.bytes) {
           const end = Math.min(offset + CHUNK_BYTES, file.bytes) - 1;
@@ -105,6 +149,7 @@ export async function ensureModel(onProgress) {
           } else {
             await writable.write({ type: "write", position: offset, data: chunk });
           }
+          live?.update(chunk);
           offset += chunk.byteLength;
         }
       } finally {
@@ -115,14 +160,24 @@ export async function ensureModel(onProgress) {
           await writable.close();
         }
       }
+      // The live hash is only valid for a download that started at zero; a resume leaves it null
+      // and falls through to the one-off read below.
+      if (live) freshDigest = live.hex();
     }
 
-    report("verifying", file.asset, file.bytes);
     const written = await handle.getFile();
-    if (written.size !== file.bytes || (await digestBlob(written)) !== file.sha256) {
+    if (!freshDigest) {
+      report("verifying", file.asset, file.bytes);
+      freshDigest = await digestBlob(written, 8 * 1024 * 1024, yieldToEventLoop);
+    }
+    if (written.size !== file.bytes || freshDigest !== file.sha256) {
       await root.removeEntry(file.asset);
+      delete verified[file.asset];
+      await writeVerified(root, verified);
       throw new Error(`${file.asset}: digest mismatch after download; cleared for retry`);
     }
+    verified[file.asset] = { bytes: file.bytes, sha256: file.sha256 };
+    await writeVerified(root, verified);
 
     out[file.key] = file.text
       ? new TextDecoder().decode(await (await (await root.getFileHandle(file.asset)).getFile()).arrayBuffer())

@@ -21,7 +21,9 @@ fn main() {
         .unwrap_or_else(|error| panic!("cannot read {input}: {error}"));
     assert!(bytes.len() % 4 == 0, "raw f32 input must be 4-byte aligned");
     let wav: Vec<f32> = bytes
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
