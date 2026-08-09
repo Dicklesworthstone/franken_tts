@@ -698,6 +698,75 @@ pub fn layer_step_q8(
         .collect()
 }
 
+/// The armed microdecoder quantization route: body layers, optional heads, and the op mode.
+#[derive(Clone, Copy, Debug)]
+pub struct MicroQuantRoute<'a> {
+    /// One quantized body per layer.
+    pub layers: &'a [MicroLayerQuant],
+    /// Quantized per-depth heads for the int8+refine scoring path; `None` keeps heads f32.
+    pub heads: Option<&'a [QuantizedMatrix]>,
+    /// Which quantized linear op class the route runs.
+    pub mode: QuantLinearMode,
+}
+
+/// Candidates recomputed exactly in f32 after int8 head scoring.
+///
+/// The production sampler draws from the top 50; 96 leaves a wide margin for int8 rank noise
+/// around the cut, so the true f32 top-50 lands inside the refined set in practice (a corpus
+/// diagnostic, not a per-frame guarantee — this route only arms with the optimized product
+/// path, never under a reference pin).
+const HEAD_REFINE_CANDIDATES: usize = 96;
+
+/// Scores one residual head via the int8 kernel, then rebuilds an exact-f32 logit row for the
+/// top candidates.
+///
+/// The skill's "int8 head + top-K refine" structural lever: the 2,048-way head matvec is the
+/// microdecoder's second-largest per-step cost after the body, and the sampler only ever looks
+/// at the top of the row. Scoring runs W8A8 (through the worker team); the highest
+/// [`HEAD_REFINE_CANDIDATES`] logits are then recomputed with the reference's own per-row
+/// scalar dot, so every value the sampler can select is bit-identical to the full-f32 row.
+/// Unrefined positions are `-inf` and unpickable.
+fn score_head_refined(
+    head_q8: &QuantizedMatrix,
+    head_f32: &[f32],
+    normed: &[f32],
+    mode: QuantLinearMode,
+    logits: &mut [f32],
+) {
+    let hidden = normed.len();
+    let vocab = head_q8.n;
+    let mut coarse = vec![0.0_f32; vocab];
+    quant_linear(mode, normed, head_q8, None, 1, &mut coarse);
+
+    // Top-M indices by coarse logit: selection sort over a running boundary is O(vocab * M)
+    // with M=96 — cheaper and simpler than sorting 2,048 floats, and allocation-light.
+    let mut candidates: Vec<usize> = Vec::with_capacity(HEAD_REFINE_CANDIDATES);
+    let mut kept = vec![false; vocab];
+    for _ in 0..HEAD_REFINE_CANDIDATES.min(vocab) {
+        let mut best: Option<usize> = None;
+        for token in 0..vocab {
+            if !kept[token] && best.is_none_or(|current| coarse[token] > coarse[current]) {
+                best = Some(token);
+            }
+        }
+        let token = best.expect("vocab is non-empty");
+        kept[token] = true;
+        candidates.push(token);
+    }
+
+    logits.fill(f32::NEG_INFINITY);
+    for &token in &candidates {
+        // The reference matvec's per-row arithmetic: one left-to-right scalar dot. The refined
+        // value is therefore exactly the full-f32 row's value at this token.
+        let row = &head_f32[token * hidden..(token + 1) * hidden];
+        let mut sum = 0.0_f32;
+        for index in 0..hidden {
+            sum += row[index] * normed[index];
+        }
+        logits[token] = sum;
+    }
+}
+
 /// Greedy selection: the lowest index wins a tie, matching `argmax` in the reference.
 ///
 /// # Panics
@@ -1168,23 +1237,29 @@ pub fn decode_frame_with_selector_q8(
     config: &MicrodecoderConfig,
     rope: &RopeTable,
     weights: &MicrodecoderWeights<'_>,
-    quant: &[MicroLayerQuant],
-    mode: QuantLinearMode,
+    route: &MicroQuantRoute<'_>,
     state: &mut FrameState,
     talker_hidden: &[f32],
     primary_code: usize,
     select: impl FnMut(&[f32]) -> usize,
 ) -> Vec<usize> {
     assert_eq!(
-        quant.len(),
+        route.layers.len(),
         config.num_layers,
         "the quantized route needs every microdecoder layer quantized"
     );
+    if let Some(heads) = route.heads {
+        assert_eq!(
+            heads.len(),
+            RESIDUAL_DEPTHS,
+            "the quantized head route needs every per-depth head quantized"
+        );
+    }
     decode_frame_with_selector_inner(
         config,
         rope,
         weights,
-        Some((quant, mode)),
+        Some(route),
         state,
         talker_hidden,
         primary_code,
@@ -1197,7 +1272,7 @@ fn decode_frame_with_selector_inner(
     config: &MicrodecoderConfig,
     rope: &RopeTable,
     weights: &MicrodecoderWeights<'_>,
-    quant: Option<(&[MicroLayerQuant], QuantLinearMode)>,
+    quant: Option<&MicroQuantRoute<'_>>,
     state: &mut FrameState,
     talker_hidden: &[f32],
     primary_code: usize,
@@ -1232,7 +1307,8 @@ fn decode_frame_with_selector_inner(
 
         for (index, layer) in weights.layers.iter().enumerate() {
             hidden = match quant {
-                Some((quant_layers, mode)) => {
+                Some(route) => {
+                    let (quant_layers, mode) = (route.layers, route.mode);
                     let (cos, sin) = rope.row(position);
                     layer_step_q8(
                         config,
@@ -1265,7 +1341,16 @@ fn decode_frame_with_selector_inner(
 
         let normed = rms_norm(&hidden, weights.final_norm, config.rms_eps);
         let mut logits = vec![0.0_f32; RESIDUAL_VOCAB];
-        matvec(weights.heads[head], &normed, &mut logits);
+        match quant.and_then(|route| route.heads.map(|heads| (heads, route.mode))) {
+            Some((heads, mode)) => score_head_refined(
+                &heads[head],
+                weights.heads[head],
+                &normed,
+                mode,
+                &mut logits,
+            ),
+            None => matvec(weights.heads[head], &normed, &mut logits),
+        }
         let code = select(&logits);
         assert!(
             code < RESIDUAL_VOCAB,
@@ -1822,6 +1907,48 @@ mod tests {
                 up_proj: &self.up_proj,
                 down_proj: &self.down_proj,
             }
+        }
+    }
+
+    #[test]
+    fn refined_head_scoring_reproduces_the_full_f32_top_50_exactly() {
+        // The lever's correctness claim: every logit the sampler can pick (top 50 of 2,048)
+        // is present in the refined row with its exact full-f32 value. Checked across seeds
+        // at the real vocab width.
+        let hidden_size = 64_usize;
+        let vocab = RESIDUAL_VOCAB;
+        for seed in 0..12_u32 {
+            let head = weights_of(vocab * hidden_size, 300 + seed);
+            let normed = weights_of(hidden_size, 900 + seed);
+            let head_q8 = ftts_kernels::int8::QuantizedMatrix::quantize(&head, vocab, hidden_size);
+
+            let mut full = vec![0.0_f32; vocab];
+            matvec(&head, &normed, &mut full);
+
+            let mut refined = vec![0.0_f32; vocab];
+            score_head_refined(
+                &head_q8,
+                &head,
+                &normed,
+                ftts_kernels::int8::QuantLinearMode::W8A8(ftts_kernels::int8::Int8Tier::Scalar),
+                &mut refined,
+            );
+
+            // Full-precision top 50 by the same deterministic rule the selector family uses.
+            let mut order: Vec<usize> = (0..vocab).collect();
+            order.sort_by(|&a, &b| full[b].partial_cmp(&full[a]).unwrap().then(a.cmp(&b)));
+            for &token in &order[..50] {
+                assert_eq!(
+                    refined[token].to_bits(),
+                    full[token].to_bits(),
+                    "seed {seed}: top-50 token {token} missing or inexact in the refined row"
+                );
+            }
+            assert_eq!(
+                argmax(&refined),
+                argmax(&full),
+                "seed {seed}: argmax drifted"
+            );
         }
     }
 

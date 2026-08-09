@@ -117,6 +117,9 @@ struct UtteranceState {
 struct Int8Route {
     talker: Vec<TalkerLayerQuant>,
     micro: Vec<MicroLayerQuant>,
+    /// Quantized per-depth heads for the int8+f32-refine scoring path (empty when the
+    /// microdecoder stack is not armed).
+    micro_heads: Vec<ftts_kernels::int8::QuantizedMatrix>,
     mode: QuantLinearMode,
 }
 
@@ -225,6 +228,22 @@ impl<'a> QwenGenerator<'a> {
                         .layers
                         .iter()
                         .map(|layer| MicroLayerQuant::quantize(&config.microdecoder_config, layer))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                micro_heads: if arm_micro {
+                    config
+                        .microdecoder_weights
+                        .heads
+                        .iter()
+                        .map(|head| {
+                            ftts_kernels::int8::QuantizedMatrix::quantize(
+                                head,
+                                RESIDUAL_VOCAB,
+                                config.microdecoder_config.hidden_size,
+                            )
+                        })
                         .collect()
                 } else {
                     Vec::new()
@@ -470,8 +489,11 @@ impl FrameGenerator for QwenGenerator<'_> {
                 &self.microdecoder_config,
                 &self.microdecoder_rope,
                 &self.microdecoder_weights,
-                &route.micro,
-                route.mode,
+                &microdecoder::MicroQuantRoute {
+                    layers: &route.micro,
+                    heads: (!route.micro_heads.is_empty()).then_some(route.micro_heads.as_slice()),
+                    mode: route.mode,
+                },
                 &mut self.frame_state,
                 &utterance.pending_hidden,
                 primary as usize,

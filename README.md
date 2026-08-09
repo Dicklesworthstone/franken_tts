@@ -6,7 +6,7 @@
 
 [![License: MIT + rider](https://img.shields.io/badge/license-MIT%20%2B%20rider-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-0.1.0-green.svg)](https://github.com/Dicklesworthstone/franken_tts/releases)
+[![Version](https://img.shields.io/badge/version-0.1.3-green.svg)](https://github.com/Dicklesworthstone/franken_tts/releases)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_tts/main/install.sh | bash
@@ -20,10 +20,11 @@ Sibling of [franken_ocr](https://github.com/Dicklesworthstone/franken_ocr) and f
 
 **The problem.** Running a modern voice-cloning TTS model normally means dragging in Python, PyTorch, and a GPU for a 0.6B-parameter model. And Qwen3-TTS's public story of "a 12.5 Hz model" hides its real CPU cost: a **15-step autoregressive residual-code microdecoder inside every 80 ms frame**. The 28-layer talker runs once, then a 5-layer code predictor runs *fifteen sequential times* (per-depth embeddings, per-depth 2,048-way heads), then a causal codec decodes. First-order Q8 weight traffic is ≈1.65 GB per frame; the microdecoder body accounts for ~1.18 GB of it, reread 15×.
 
-**The solution.** `franken_tts` reimplements the whole pipeline in safe Rust, verified seam-by-seam against the upstream PyTorch model, and treats that hidden microdecoder as the primary optimization target rather than a liability: cache-resident hot-packing, per-depth quantization, and **FrankenMTP**, speculative block drafting that the 5-layer predictor itself verifies exactly in a single causal pass. Those three are the roadmap; the f32 reference engine ships today.
+**The solution.** `franken_tts` reimplements the whole pipeline in safe Rust, verified seam-by-seam against the upstream PyTorch model, and treats that hidden microdecoder as the primary optimization target rather than a liability: cache-resident hot-packing, per-depth quantization, and **FrankenMTP**, speculative block drafting that the 5-layer predictor itself verifies exactly in a single causal pass. Per-depth quantization ships today as the default int8 route. The other two are still ahead: the cache-resident hot pack is designed but unimplemented, and FrankenMTP's drafter and block-verification primitives exist in-tree without being wired into the generation path. The bit-exact f32 reference engine stays one environment variable away.
 
 | Why franken_tts | |
 |---|---|
+| **Faster than real time on CPU** | Speech synthesizes faster than it plays on a Mac Mini M4 Pro — no GPU, and the biggest optimization is still ahead. |
 | **One binary, no runtime deps** | `ftts say "text" --voice v.spk -o out.wav`. No Python, no PyTorch, no CUDA. |
 | **Memory-safe** | Pure Rust, end to end. |
 | **Verified against the oracle** | Argmax-exact talker parity vs oracle through all 28 layers; whole-utterance codec codes exact vs oracle; audio envelope checked against the pinned PyTorch reference. |
@@ -44,9 +45,9 @@ The model installs into `~/.cache/franken_tts/model` and every command finds it 
 
 The output format follows the extension. `.wav` comes straight from the built-in pure-Rust encoder; `.m4a`, `.mp3`, and `.flac` are converted from that WAV by whichever system encoder is present (`afconvert` on macOS, `ffmpeg`, `lame`, `flac`), and if none is found you get an error naming the tools rather than a silently different format. Generation stops at the model's EOS, with a text-proportional frame cap as a backstop; set `FTTS_MAX_FRAMES` only when you want an exact cap. `--model`, `--voice`, and `-o` remain available for explicit control.
 
-## Status: v0.1.0, a working f32 reference engine
+## Status: v0.1.3, optimized route by default
 
-This is the first release. What works now:
+Four releases in, all on 2026-08-08/09 (see [CHANGELOG](CHANGELOG.md)): v0.1.0 shipped the f32 reference engine, v0.1.1 made the model a one-command download, v0.1.2 moved that download to a pre-quantized artifact, and v0.1.3 made the optimized int8 route the library-wide default. What works now:
 
 - **Real speech out.** `ftts say` synthesizes complete utterances on Apple Silicon with the production sampling stack matching upstream runtime defaults: do_sample, temperature 0.9, top-k 50, repetition penalty 1.05, sampled subtalker.
 - **Parity receipts.**
@@ -54,11 +55,11 @@ This is the first release. What works now:
   - Codec: whole-utterance codes exact vs oracle at the engine level.
   - Audio: peak frame RMS 0.08578 vs 0.0859745 for the pinned PyTorch reference.
   - Streaming: codec streaming == offline, bit-identical, under all packet schedules.
-- **Performance, measured honestly.** The `ftts` binary now defaults to the optimized int8 route (below). On one M4 Pro that was busy running a dozen other build jobs, a 59-frame utterance (4.7 s of audio) synthesized in 4.5–7.2 s: 0.66–1.05× real time depending on machine load, with model load and one-time weight quantization adding ~3 s up front. The f32 reference path remains available (`FTTS_INT8=0`) and runs 6–7× slower than real time by design — it exists for correctness, not speed.
+- **Faster than real time on a Mac Mini M4 Pro, and getting faster quickly.** The optimized int8 route (below) is the default everywhere as of v0.1.3, library included — it synthesizes speech faster than it plays, on a fanless-class desktop, with no GPU. And the headroom is not spent: v0.1.3 fused the talker's QKV and gate‖up projections into single int8 dispatches, and the big lever — FrankenMTP speculative block decoding, which collapses the microdecoder's 15 sequential steps into one verified pass — is still ahead. Throughput does fall off on a machine already saturated with other work: under a dozen concurrent build jobs the same route measured 0.66–1.05× real time. Model load costs ~4 s before the first sample; since v0.1.2 that is artifact load only, not a quantization pass, and short one-shot utterances are dominated by it — judge throughput on a real paragraph, not on `"Hi."`. The f32 reference path remains available (`FTTS_INT8=0`) and runs 6–7× slower than real time by design — it exists for correctness, not speed.
 
 ### The optimized route (the default in the `ftts` binary)
 
-The `ftts` binary arms the quantized stack by default; the library crates keep f32 defaults so every oracle-parity suite still tests the reference path. `FTTS_INT8=0` is the master switch back to the bit-exact f32 reference. What the default route runs, with its measured evidence (one M4 Pro, this tree's own f32 reference as the comparison — local evidence, not a cross-project benchmark):
+Since v0.1.3 the quantized stack is the library-wide default (`ftts_kernels::route::optimized_default`), not just a CLI setting, so library consumers get the same speed path as the binary; conformance and oracle entry points pin the f32 reference route explicitly, so parity suites never measure the optimized numerics. `FTTS_INT8=0` is the master switch back to the bit-exact f32 reference. What the default route runs, with its measured evidence (one M4 Pro, this tree's own f32 reference as the comparison — local evidence, not a cross-project benchmark):
 
 - **W8A8 int8 talker + microdecoder** (symmetric per-channel weights, dynamic per-row activations, exact i32 accumulation), fanned across a six-thread persistent worker team whose partitioning is bit-identical to serial execution at every thread count.
 - **int8 codec ConvNeXt projections** — the arm the spectral gate measured transparent: 0.65 dB mean log-spectral distance against the f32 codec on identical codes, spectrograms visually indistinguishable. The coarser `all` arm exists but failed the 1 dB threshold and is not the default.
@@ -113,7 +114,9 @@ Weights are not bundled with the binary; `ftts pull` fetches this project's pre-
    ftts enroll my_recording.m4a --default
    ```
 
-   Enrollment computes a 1,024-float speaker embedding from the audio alone — **no transcript is needed**. The enroll step warns about recordings that will clone poorly (background noise, clipping, whispering, multiple speakers). Use `-o name.spk` instead of `--default` to keep several voices and select one per-run with `--voice name.spk`.
+   Enrollment computes a 1,024-float speaker embedding from the audio alone — **no transcript is needed**. Compressed references (`.m4a`, `.mp3`, `.aac`, `.ogg`, `.opus`) are resampled to the speaker encoder's pinned 24 kHz mono for you, at any source rate (fixed in v0.1.3 — before that, 44.1/48 kHz voice memos were refused). A `.wav` or `.flac` reference is read directly and must already be 24 kHz; convert it first with `ffmpeg -i in.wav -ar 24000 -ac 1 out.wav`. The enroll step warns about recordings that will clone poorly (background noise, clipping, whispering, multiple speakers).
+
+   `--default` will not overwrite an existing `default.spk`; that guard is deliberate and `--force` does not waive it (`--force` only proceeds past *quality* warnings). To replace a voice, move the old one aside first. Use `-o name.spk` instead of `--default` to keep several voices and select one per run with `--voice name.spk`.
 4. Speak:
 
    ```bash
@@ -153,10 +156,10 @@ Workspace crates: `ftts-core` (engine), `ftts-model-qwen` (model graph), `ftts-k
 
 ## Known limitations
 
-- **Real time is load-dependent.** The default optimized route measured 0.66–1.05× real time on a heavily loaded M4 Pro; a quiet machine sits at the top of that range. The f32 reference route (`FTTS_INT8=0`) runs 6–7× slower than real time by design.
+- **Real time is load-dependent.** The default optimized route runs faster than real time on an unloaded Mac Mini M4 Pro; on the same machine saturated with concurrent build jobs it measured 0.66–1.05× real time. The f32 reference route (`FTTS_INT8=0`) runs 6–7× slower than real time by design.
 - **The optimized default trades exactness for speed.** Kernel integer math is exactly proven, and the codec and SnakeBeta pieces pass objective spectral gates, but listening-based evaluation of the full sampled path is still open (DISC-003); `FTTS_INT8=0` restores the reference route.
-- **Weights quantize at load time (~2–3 s).** Pre-quantized artifact downloads are planned; today `ftts pull` fetches the f32 snapshot and the optimized route quantizes in memory.
-- **No quantized artifacts ship yet.** int8 currently quantizes at load time; the `.fttsq` artifact pipeline for pre-quantized weights is still in progress.
+- **Model load costs ~4 s before the first sample.** `ftts pull` ships pre-quantized weights as of v0.1.2, so this is artifact load rather than a quantization pass, but it is still paid once per process — short one-shot utterances are dominated by it.
+- **The two biggest optimizations are not built yet.** The microdecoder's 5-layer body is re-read 15× per frame (~1.18 GB of the ~1.65 GB per-frame weight traffic), and neither planned fix has landed: the cache-resident MTP hot pack is designed but unimplemented, and FrankenMTP's drafter and block-verification primitives are in-tree without being wired into the generation path, so decode still runs all 15 steps sequentially.
 - **Voice quality depends on the reference voice** you enroll.
 - **EOS stop timing is sampling-dependent.** A text-proportional frame cap backstops it by default; set `FTTS_MAX_FRAMES` for an exact cap.
 - **Compressed output needs a system encoder.** `.m4a`, `.mp3`, and `.flac` shell out to `afconvert`, `ffmpeg`, `lame`, or `flac`; `.wav` needs nothing.

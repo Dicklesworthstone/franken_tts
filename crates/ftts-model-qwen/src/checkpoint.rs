@@ -1413,6 +1413,39 @@ impl CodecCheckpoint {
         }
     }
 
+    /// A fresh streaming decoder state for frame-by-frame decode.
+    ///
+    /// Streamed output is bit-identical to [`Self::decode`] of the same code stream under every
+    /// packet schedule — the standing streaming==offline gate — which is what lets a caller
+    /// overlap codec decode with generation.
+    #[must_use]
+    pub fn stream_state(&self) -> crate::codec::CodecStreamingState {
+        let layers: Vec<CodecTransformerLayerWeights<'_>> =
+            self.layers.iter().map(OwnedCodecLayer::borrow).collect();
+        let weights = self.decoder_weights(&layers);
+        crate::codec::CodecStreamingState::new(self.config, &weights)
+    }
+
+    /// Decodes one nonempty packet of `frames` code rows, appending finalized PCM to `output`.
+    ///
+    /// # Errors
+    ///
+    /// If the packet's code layout is malformed.
+    pub fn stream_push(
+        &self,
+        state: &mut crate::codec::CodecStreamingState,
+        codes: &[i32],
+        frames: usize,
+        output: &mut Vec<f32>,
+    ) -> Result<(), CheckpointError> {
+        let layers: Vec<CodecTransformerLayerWeights<'_>> =
+            self.layers.iter().map(OwnedCodecLayer::borrow).collect();
+        let weights = self.decoder_weights(&layers);
+        state
+            .push(self.quantizer(), &weights, codes, frames, output)
+            .map_err(CheckpointError::Codec)
+    }
+
     /// Decode `frames` frame-major 16-code groups to mono 24 kHz `f32` PCM.
     ///
     /// # Errors

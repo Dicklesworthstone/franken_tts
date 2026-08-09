@@ -619,17 +619,79 @@ pub fn synthesize(
         seed,
     });
 
-    // 5. The engine owns admission, the budget, cancellation, and the frame loop.
+    // 5. The engine owns admission, the budget, cancellation, and the frame loop — and the
+    // codec decodes IN PARALLEL with it: a tee on the generator feeds every produced frame
+    // through a bounded channel to a scoped codec worker driving the streaming decoder.
+    // Streamed output is bit-identical to offline decode under every packet schedule (the
+    // standing streaming==batch gate), so this overlap changes wall time and nothing else.
+    // Deadlock shape: the worker only ever blocks on `recv` (it always drains), and the
+    // generator only ever blocks on `send` when the worker is more than 256 frames behind —
+    // bounded, and covered by the engine's rolling frame budget if the worker wedges.
     let preparer = PreparedPassThrough { prepared };
-    let result = engine
-        .synthesize(
-            request.clone(),
-            &preparer,
-            &mut generator as &mut dyn FrameGenerator,
-            cancellation,
-            observer,
-        )
-        .map_err(engine_error)?;
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ftts_core::CodeFrame>(256);
+    let codec = &model.codec;
+    let (result, pcm) = std::thread::scope(
+        |scope| -> Result<(ftts_core::SynthesisResult, Vec<f32>), FttsError> {
+            let worker = scope.spawn(move || -> Result<Vec<f32>, FttsError> {
+                const PACKET_FRAMES: usize = 4;
+                let mut state = codec.stream_state();
+                let mut pcm = Vec::new();
+                // `stream_push` REPLACES its output buffer with one packet's samples (see the
+                // streaming==offline test), so packets decode into a scratch and append here.
+                let mut packet_pcm = Vec::new();
+                let mut packet: Vec<i32> = Vec::with_capacity(16 * PACKET_FRAMES);
+                let mut packet_frames = 0_usize;
+                while let Ok(frame) = frame_rx.recv() {
+                    if frame.codes.len() != 16 {
+                        return Err(FttsError::Generic(format!(
+                            "generated frame carries {} codes, expected 16",
+                            frame.codes.len()
+                        )));
+                    }
+                    for code in &frame.codes {
+                        packet.push(i32::try_from(*code).map_err(|_| {
+                            FttsError::Generic(format!(
+                                "generated code {code} does not fit the codec's i32"
+                            ))
+                        })?);
+                    }
+                    packet_frames += 1;
+                    if packet_frames == PACKET_FRAMES {
+                        codec
+                            .stream_push(&mut state, &packet, packet_frames, &mut packet_pcm)
+                            .map_err(checkpoint_error)?;
+                        pcm.extend_from_slice(&packet_pcm);
+                        packet.clear();
+                        packet_frames = 0;
+                    }
+                }
+                if packet_frames > 0 {
+                    codec
+                        .stream_push(&mut state, &packet, packet_frames, &mut packet_pcm)
+                        .map_err(checkpoint_error)?;
+                    pcm.extend_from_slice(&packet_pcm);
+                }
+                Ok(pcm)
+            });
+
+            let mut tee = TeeGenerator {
+                inner: &mut generator,
+                frames: frame_tx,
+            };
+            let result = engine
+                .synthesize(
+                    request.clone(),
+                    &preparer,
+                    &mut tee as &mut dyn FrameGenerator,
+                    cancellation,
+                    observer,
+                )
+                .map_err(engine_error);
+            drop(tee); // closes the channel; the worker drains the tail packet and exits
+            let pcm = worker.join().expect("codec worker must not panic")?;
+            Ok((result?, pcm))
+        },
+    )?;
 
     if result.code_frames.is_empty() {
         return Err(FttsError::Generic(
@@ -640,34 +702,39 @@ pub fn synthesize(
         ));
     }
 
-    // 6. Codes to PCM. The codec wants frame-major `i32` groups.
-    let frames = result.code_frames.len();
-    let mut codes = Vec::with_capacity(frames * 16);
-    for frame in &result.code_frames {
-        if frame.codes.len() != 16 {
-            return Err(FttsError::Generic(format!(
-                "generated frame carries {} codes, expected 16",
-                frame.codes.len()
-            )));
-        }
-        for code in &frame.codes {
-            codes.push(i32::try_from(*code).map_err(|_| {
-                FttsError::Generic(format!(
-                    "generated code {code} does not fit the codec's i32"
-                ))
-            })?);
-        }
-    }
-    let pcm = model
-        .codec
-        .decode(&codes, frames)
-        .map_err(checkpoint_error)?;
-
     Ok(SynthesizedAudio {
         frames: result.generated_frames,
         prepared_token_count: result.prepared_token_count,
         pcm,
     })
+}
+
+/// Forwards a generator's frames unchanged while teeing each one to the codec worker.
+///
+/// A send only fails when the worker has already died with its own error; surfacing a
+/// generation error here aborts the engine loop early, and the worker's real failure is
+/// reported at join.
+struct TeeGenerator<'a> {
+    inner: &'a mut dyn FrameGenerator,
+    frames: std::sync::mpsc::SyncSender<ftts_core::CodeFrame>,
+}
+
+impl FrameGenerator for TeeGenerator<'_> {
+    fn begin_utterance(&mut self, prepared: &PreparedText) -> Result<(), GenerationError> {
+        self.inner.begin_utterance(prepared)
+    }
+
+    fn next_frame(&mut self) -> Result<Option<ftts_core::CodeFrame>, GenerationError> {
+        let frame = self.inner.next_frame()?;
+        if let Some(frame) = &frame
+            && self.frames.send(frame.clone()).is_err()
+        {
+            return Err(GenerationError::new(
+                "the codec worker stopped accepting frames; its error follows at join",
+            ));
+        }
+        Ok(frame)
+    }
 }
 
 /// Map an engine refusal onto the CLI's exit-code contract.
