@@ -1436,6 +1436,83 @@ mod tests {
         );
     }
 
+    /// Denoising must not buy a quiet floor by dulling the voice.
+    ///
+    /// High frequencies are where this fails first and where it matters most: broadband hiss
+    /// overlaps sibilance almost exactly, so a suppressor tuned by overall SNR happily trades
+    /// away 4–10 kHz — and the speaker encoder reads sibilance as identity, so that trade shows
+    /// up as a duller *and less recognizable* clone rather than merely a duller one.
+    ///
+    /// The probe is broadband speech-like content: every band must survive comparably, so the
+    /// assertion is on the spread across bands, not on any single band's absolute retention.
+    #[test]
+    fn denoise_does_not_preferentially_zap_high_frequencies() {
+        let rate = SPEAKER_SAMPLE_RATE_HZ as usize;
+        let mut state = 0xDEAD_BEEF_1234_5678_u64;
+        let mut hiss = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / 16_777_216.0) - 0.5
+        };
+        // Equal-amplitude tones spanning the band, gated into syllable-like bursts so the
+        // estimator treats them as speech rather than as hum.
+        let probes: [f64; 5] = [300.0, 1_200.0, 3_000.0, 6_000.0, 9_000.0];
+        let burst = rate / 4;
+        let noisy: Vec<f32> = (0..rate * 3)
+            .map(|n| {
+                let t = n as f64 / rate as f64;
+                let voice = if (n / burst).is_multiple_of(2) {
+                    let phase = (n % burst) as f32 / burst as f32;
+                    let envelope = (std::f32::consts::PI * phase).sin();
+                    probes
+                        .iter()
+                        .map(|hz| (std::f64::consts::TAU * hz * t).sin() as f32 * 0.12)
+                        .sum::<f32>()
+                        * envelope
+                } else {
+                    0.0
+                };
+                voice + hiss() * 0.02
+            })
+            .collect();
+
+        let cleaned = denoise_reference(&noisy);
+
+        // Per-probe retention, measured by projecting each band onto its own tone (a one-bin
+        // Goertzel-style correlation) inside a burst.
+        let span = burst / 2..burst;
+        let energy_at = |pcm: &[f32], hz: f64| -> f32 {
+            let (mut re, mut im) = (0.0_f64, 0.0_f64);
+            for (offset, sample) in pcm[span.clone()].iter().enumerate() {
+                let t = (span.start + offset) as f64 / rate as f64;
+                let angle = std::f64::consts::TAU * hz * t;
+                re += f64::from(*sample) * angle.cos();
+                im += f64::from(*sample) * angle.sin();
+            }
+            (re.hypot(im) / span.len() as f64) as f32
+        };
+
+        let retention: Vec<f32> = probes
+            .iter()
+            .map(|hz| energy_at(&cleaned, *hz) / energy_at(&noisy, *hz).max(1e-9))
+            .collect();
+        let low = retention[0];
+        for (hz, kept) in probes.iter().zip(retention.iter()) {
+            assert!(
+                *kept > 0.5,
+                "{hz} Hz retained only {kept:.3}; the denoiser is eating the band, not the noise \
+                 (all bands: {retention:?})"
+            );
+            assert!(
+                *kept > low * 0.6,
+                "{hz} Hz retained {kept:.3} against {low:.3} at 300 Hz — high frequencies are \
+                 being attenuated preferentially, which is how sibilance and speaker identity go \
+                 (all bands: {retention:?})"
+            );
+        }
+    }
+
     /// A clip too short to survive its own downsample must round to nothing here rather than
     /// reaching the mel front end as an empty slice — which is why `decode_reference_audio`
     /// re-checks emptiness against the resampled PCM instead of only the decoded PCM.

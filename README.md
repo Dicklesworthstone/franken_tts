@@ -37,11 +37,18 @@ Three commands, no configuration:
 
 ```bash
 ftts pull                              # one-time: fetch the quantized model (~2.0 GB, SHA-256 verified)
-ftts enroll voice_memo.m4a --default   # clone a voice from any recording you have the right to use
 ftts say "Now is the time for all good men to come to the aid of the agents" out.m4a
 ```
 
-The model installs into `~/.cache/franken_tts/model` and every command finds it there automatically; `--model` and `FTTS_MODEL_DIR` remain available to point elsewhere.
+That speaks immediately with **aria**, the built-in default voice; `--voice piper` selects the lighter built-in alternative. Clone your own voice from any recording you have the right to use, and it becomes the default:
+
+```bash
+ftts enroll voice_memo.m4a --default   # your voice replaces the built-in default
+ftts say "Hello in my own voice" hello.m4a
+ftts say --voice aria "And back to the built-in one" aria.m4a
+```
+
+The built-ins are real enrolled x-vectors (from pure-tone references — of sixteen auditioned candidates only these two passed listening), not recordings of anyone. The model installs into `~/.cache/franken_tts/model` and every command finds it there automatically; `--model` and `FTTS_MODEL_DIR` remain available to point elsewhere.
 
 The output format follows the extension. `.wav` comes straight from the built-in pure-Rust encoder; `.m4a`, `.mp3`, and `.flac` are converted from that WAV by whichever system encoder is present (`afconvert` on macOS, `ffmpeg`, `lame`, `flac`), and if none is found you get an error naming the tools rather than a silently different format. Generation stops at the model's EOS, with a text-proportional frame cap as a backstop; set `FTTS_MAX_FRAMES` only when you want an exact cap. `--model`, `--voice`, and `-o` remain available for explicit control.
 
@@ -114,9 +121,9 @@ Weights are not bundled with the binary; `ftts pull` fetches this project's pre-
    ftts enroll my_recording.m4a --default
    ```
 
-   Enrollment computes a 1,024-float speaker embedding from the audio alone — **no transcript is needed**. Any container at any sample rate works — 44.1 and 48 kHz phone and Mac voice memos included. Compressed references are converted by the system decoder; `.wav` and `.flac` are read directly and resampled in-process by a windowed-sinc (Lanczos-3) kernel. Audio already at 24 kHz is passed through untouched. The enroll step warns about recordings that will clone poorly (background noise, clipping, whispering, multiple speakers).
+   Enrollment computes a 1,024-float speaker embedding from the audio alone — **no transcript is needed**. Any container at any sample rate works — 44.1 and 48 kHz phone and Mac voice memos included. Compressed references are converted by the system decoder; `.wav` and `.flac` are read directly and resampled in-process by a windowed-sinc (Lanczos-6) kernel. Audio already at 24 kHz is passed through untouched. The enroll step warns about recordings that will clone poorly (background noise, clipping, whispering, multiple speakers), and `--denoise` applies opt-in spectral subtraction for noisy references.
 
-   `--default` will not overwrite an existing `default.spk`; that guard is deliberate and `--force` does not waive it (`--force` only proceeds past *quality* warnings). To replace a voice, move the old one aside first. Use `-o name.spk` instead of `--default` to keep several voices and select one per run with `--voice name.spk`.
+   Re-enrolling over an existing voice asks for confirmation in a terminal, or proceeds when you pass `--overwrite`; either way the displaced voice is saved to `<name>.spk.bak` and the write is staged-then-renamed so a crash cannot leave a half-written voice. (`--force` is separate: it only proceeds past *quality* warnings.) Use `-o name.spk` instead of `--default` to keep several voices and select one per run with `--voice name.spk`.
 4. Speak:
 
    ```bash

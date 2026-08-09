@@ -34,6 +34,61 @@ use serde_json::{Value, json};
 const ROBOT_SCHEMA_VERSION: u8 = 1;
 const SCAFFOLD_ADMISSION_TEXT_LIMIT_BYTES: usize = 1_048_576;
 const MODEL_BASENAME: &str = "qwen3-tts-12hz-0.6b-base.fttsq";
+
+/// Built-in voices: name, one-line character, and the enrolled 1,024-float x-vector.
+///
+/// Each was enrolled from a pure sine tone — the speaker encoder maps even a bare tone to a
+/// stable point in voice space, and single sines land on clean voices where richer harmonic
+/// stacks came out muddy. Sixteen candidates were auditioned 2026-08-09; these two were the only
+/// listener-verified keepers, and a clarity-plus-harmonicity screen calibrated on those verdicts
+/// rejected every other sweep point — 560 and 720 Hz are genuine local optima. "aria" is the
+/// out-of-box default when no enrollment exists. These are conveniences, not clones: enrolling a
+/// real reference always takes precedence.
+const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
+    (
+        "aria",
+        "bright, clear, feminine — the out-of-box default (560 Hz tone)",
+        include_bytes!("../presets/aria.spk"),
+    ),
+    (
+        "piper",
+        "light and airy, higher register (720 Hz tone)",
+        include_bytes!("../presets/piper.spk"),
+    ),
+];
+
+/// The preset used when `--voice`, `FTTS_DEFAULT_VOICE`, and MODEL_DIR/default.spk are all
+/// absent, so a fresh install speaks out of the box.
+const DEFAULT_PRESET_VOICE: &str = "aria";
+
+/// Names a preset resolves to a temp-materialized `.spk` path the existing voice loaders read.
+///
+/// Only fires when the value is NOT an existing file, so a file named like a preset still wins.
+/// The file is rewritten unconditionally: 4 KB per run is cheaper than trusting stale content.
+fn materialize_preset_voice(name: &str) -> Option<Result<PathBuf, FttsError>> {
+    let (_, _, bytes) = PRESET_VOICES
+        .iter()
+        .find(|(preset, _, _)| *preset == name)?;
+    let path = std::env::temp_dir().join(format!("ftts-preset-{name}-{}.spk", std::process::id()));
+    Some(
+        fs::write(&path, bytes)
+            .map(|()| path.clone())
+            .map_err(|error| {
+                FttsError::Generic(format!(
+                    "cannot materialize preset voice {name} at {}: {error}",
+                    path.display()
+                ))
+            }),
+    )
+}
+
+fn preset_names() -> String {
+    PRESET_VOICES
+        .iter()
+        .map(|(name, _, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 const PINNED_MAIN_WEIGHTS_FILENAME: &str = "model.safetensors";
 const PINNED_MAIN_WEIGHTS_SHA256: &str =
     "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6";
@@ -178,8 +233,9 @@ struct SayArgs {
     #[arg(long, value_name = "PATH")]
     model: Option<PathBuf>,
 
-    /// Optional .ftvoice voice pack.
-    #[arg(long, value_name = "PATH")]
+    /// Voice source: a .spk vector, reference audio, or a built-in voice name
+    /// (aria, piper). Default: MODEL_DIR/default.spk, else the built-in "aria".
+    #[arg(long, value_name = "PATH|NAME")]
     voice: Option<PathBuf>,
 
     /// Write WAV output here. Mutually exclusive with raw stdout streaming.
@@ -1145,22 +1201,18 @@ fn run_say_events(
     // --- model load ------------------------------------------------------------------------
     emit_stage(run, emit, "load", "begin", &mut seq)?;
     let bundle = synth::ModelBundle::resolve(Path::new(&model))?;
-    let voice_path = voice
-        .as_deref()
-        .map(PathBuf::from)
-        .or_else(|| {
-            let candidate = bundle.root.join("default.spk");
-            candidate.is_file().then_some(candidate)
-        })
-        .ok_or_else(|| {
-            FttsError::Usage(
-                "`ftts say` needs a real voice source; pass --voice PATH, set \
-                 FTTS_DEFAULT_VOICE=PATH, or run `ftts enroll REF.wav --model MODEL_DIR --default`. \
-                 Qwen3-TTS Base has no preset speaker, so a missing default is refused rather than \
-                 fabricated."
-                    .to_owned(),
-            )
-        })?;
+    let voice_path = match voice.as_deref().map(PathBuf::from).or_else(|| {
+        let candidate = bundle.root.join("default.spk");
+        candidate.is_file().then_some(candidate)
+    }) {
+        Some(path) => path,
+        // Out-of-box: no --voice, no FTTS_DEFAULT_VOICE, no enrollment — speak with the built-in
+        // default preset rather than refusing. The preset is itself a real enrolled x-vector
+        // (from a tone reference), not a fabricated speaker, and any user enrollment or explicit
+        // voice always outranks it.
+        None => materialize_preset_voice(DEFAULT_PRESET_VOICE)
+            .expect("the default preset name is a member of PRESET_VOICES")?,
+    };
     let speaker = synth::speaker_from_voice(&bundle, &voice_path, None)?;
     let loaded = synth::LoadedModel::load(&bundle)?;
     emit_stage(run, emit, "load", "end", &mut seq)?;
@@ -1689,7 +1741,28 @@ fn resolve_requested_voice(
     environment: &Environment,
 ) -> Result<Option<String>, FttsError> {
     if let Some(path) = explicit {
-        return resolve_optional_file(Some(path), "voice source");
+        // A bare preset name selects a built-in voice — but only when no such file exists, so
+        // `--voice aria` in a directory containing a file named `aria` still means the file.
+        if !path.exists()
+            && let Some(name) = path.to_str()
+            && let Some(materialized) = materialize_preset_voice(name)
+        {
+            return materialized.map(|path| Some(path.display().to_string()));
+        }
+        // A failed bare word was probably a preset-name attempt: name the built-ins in the
+        // refusal so the user does not have to hunt the docs for the list.
+        let looks_like_name =
+            path.extension().is_none() && path.components().count() == 1 && !path.exists();
+        return resolve_optional_file(Some(path), "voice source").map_err(|error| {
+            if looks_like_name {
+                FttsError::Input(format!(
+                    "{error}; built-in voice names are: {}",
+                    preset_names()
+                ))
+            } else {
+                error
+            }
+        });
     }
     environment
         .value("FTTS_DEFAULT_VOICE")
@@ -2510,6 +2583,54 @@ fn output_error(error: io::Error) -> FttsError {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn preset_voices_are_valid_speaker_vectors() {
+        assert!(
+            PRESET_VOICES
+                .iter()
+                .any(|(name, _, _)| *name == DEFAULT_PRESET_VOICE),
+            "the default preset must exist in the table"
+        );
+        for (name, character, bytes) in PRESET_VOICES {
+            assert_eq!(
+                bytes.len(),
+                synth::SPEAKER_VECTOR_BYTES,
+                "preset {name} must be exactly one 1,024-float x-vector"
+            );
+            assert!(
+                !character.is_empty(),
+                "preset {name} needs a character line"
+            );
+            for chunk in bytes.as_chunks::<4>().0 {
+                let value = f32::from_le_bytes(*chunk);
+                assert!(
+                    value.is_finite(),
+                    "preset {name} carries a non-finite value"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preset_names_resolve_and_unknown_names_do_not() {
+        let environment = Environment {
+            values: BTreeMap::new(),
+            stage_budget_values: BTreeMap::new(),
+        };
+        let resolved = resolve_requested_voice(Some(Path::new("aria")), &environment)
+            .expect("preset name resolves")
+            .expect("preset yields a path");
+        let bytes = fs::read(&resolved).expect("materialized preset readable");
+        assert_eq!(bytes.len(), synth::SPEAKER_VECTOR_BYTES);
+
+        let error = resolve_requested_voice(Some(Path::new("no-such-voice")), &environment)
+            .expect_err("unknown names are refused");
+        assert!(
+            error.to_string().contains("aria"),
+            "the refusal must list the built-in names, got: {error}"
+        );
+    }
 
     const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,enroll,voice,convert,pull,robot,doctor\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
 
