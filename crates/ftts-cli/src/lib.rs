@@ -37,19 +37,8 @@ const MODEL_BASENAME: &str = "qwen3-tts-12hz-0.6b-base.fttsq";
 
 /// Built-in voices: name, one-line character, and the enrolled 1,024-float x-vector.
 ///
-/// Two lineages ship here, and the difference is worth stating rather than blurring.
-///
-/// "aria" and "ember" were enrolled from the model's OWN synthesized speech (a rich reference
-/// passage), which is what makes them stable: tone-enrolled vectors sit off the speaker encoder's
-/// speech manifold and rendered inconsistently across texts (every one of eighteen tone
-/// candidates eventually failed listening or the clarity-plus-harmonicity stability screen),
-/// while speech-enrolled vectors passed the three-text battery cleanly. "ember" is "aria"'s
-/// passage pitch-shifted ~3.4 semitones down before re-enrollment. Their lineage is synthetic end
-/// to end and they clone no person.
-///
-/// "matt" is the out-of-box default when no enrollment exists.
-///
-/// Enrolling a real reference always takes precedence over any of them.
+/// "matt" is the out-of-box default when no enrollment exists. Enrolling a real reference
+/// always takes precedence over any of them.
 const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
     (
         "aria",
