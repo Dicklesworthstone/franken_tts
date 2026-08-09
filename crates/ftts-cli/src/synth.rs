@@ -835,18 +835,7 @@ fn neural_denoise_reference(
             path.display()
         ))
     })?;
-    let enhancer_rate = ftts_kernels::enhance::SAMPLE_RATE_HZ;
-    let mut wav48 = resample_lanczos(pcm24k, SPEAKER_SAMPLE_RATE_HZ, enhancer_rate);
-    let target_len = wav48.len();
-    // Pad to the hop grid: with len % 512 == 0 the enhancer returns exactly len samples.
-    const ENHANCER_HOP: usize = 512;
-    let padded = target_len.div_ceil(ENHANCER_HOP) * ENHANCER_HOP;
-    wav48.resize(padded, 0.0);
-    let mut enhanced = enhancer.enhance_48k(&wav48);
-    enhanced.truncate(target_len);
-    let mut back = resample_lanczos(&enhanced, enhancer_rate, SPEAKER_SAMPLE_RATE_HZ);
-    back.truncate(pcm24k.len());
-    Ok(Some(back))
+    Ok(Some(enhancer.enhance_24k(pcm24k)))
 }
 
 fn denoise_reference(pcm: &[f32]) -> Vec<f32> {

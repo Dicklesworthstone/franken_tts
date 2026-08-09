@@ -173,21 +173,27 @@ pub fn bench_int8_gemv(tier: &str, k: usize, n: usize, rounds: usize) -> Result<
     Ok(out.iter().sum())
 }
 
-/// Arms the int8 worker team and returns how many Workers the caller must now start.
+/// Publishes the control block Workers park on, before the team has a size.
 ///
-/// Call this from the engine Worker — never the page's main thread. The dispatching thread blocks
-/// on a condvar while partitions run, and `atomic.wait` **traps** on the main thread, so arming
-/// there would abort rather than merely stall. Each Worker the caller spawns must instantiate this
-/// same module against the same `WebAssembly.Memory` and then call [`worker_loop_entry`] with its
-/// index, `1..=returned`.
-///
-/// Returns 0 when `partitions <= 1`, which is the honest answer for a browser without
-/// `SharedArrayBuffer` — the engine then runs serially instead of failing.
+/// Call from the engine Worker — never the page's main thread, where `atomic.wait` traps. Each
+/// Worker then instantiates this same module against the same `WebAssembly.Memory` and calls
+/// [`worker_loop_entry`] with its index. Once they report parked, call [`arm_worker_team`] with
+/// the count that actually started.
 #[cfg(not(unix))]
-#[must_use]
 #[wasm_bindgen]
-pub fn arm_worker_team(partitions: usize) -> usize {
-    ftts_kernels::team::install_wasm_team(partitions)
+pub fn publish_team_block() {
+    ftts_kernels::team::publish_wasm_block();
+}
+
+/// Sizes the team once the Workers that will serve it have confirmed they are parked.
+///
+/// `partitions` counts the dispatcher too, so pass `readyWorkers + 1`. Anything <= 1 arms
+/// nothing and the engine runs serially — the correct outcome on a browser without
+/// `SharedArrayBuffer`, and on one where every Worker failed to start.
+#[cfg(not(unix))]
+#[wasm_bindgen]
+pub fn arm_worker_team(partitions: usize) {
+    ftts_kernels::team::arm_wasm_team(partitions);
 }
 
 /// The body a spawned Worker runs; never returns.
@@ -223,7 +229,15 @@ pub struct WasmEngine {
     tokenizer: QwenTokenizer,
     artifact: Arc<ftts_artifacts::fttsq::MappedFttsq>,
     speaker_encoder: Option<SpeakerEncoder>,
+    denoiser: Option<ftts_kernels::enhance::Enhancer>,
 }
+
+/// The FastEnhancer-S denoiser weights, embedded like the preset voices: 0.8 MB of
+/// inference-form safetensors (see `docs/DENOISER.md` for the pin). Embedding them keeps
+/// browser enrollment cleanup working with no extra fetch, no CORS surface, and no
+/// divergence between what the CLI and the tab run.
+const DENOISER_SAFETENSORS: &[u8] =
+    include_bytes!("../assets/fastenhancer-s-48k-denoise.safetensors");
 
 /// Model bytes accumulated directly inside wasm linear memory, a slice at a time.
 ///
@@ -422,6 +436,7 @@ impl WasmEngine {
             tokenizer,
             artifact,
             speaker_encoder: None,
+            denoiser: None,
         })
     }
 
@@ -592,12 +607,45 @@ impl WasmEngine {
 
     /// Enroll a voice from mono 24 kHz PCM in `[-1, 1]`; returns the 1,024-float x-vector.
     ///
-    /// The speaker encoder hydrates lazily from the artifact on first use and is cached.
+    /// The reference is denoised first with the embedded FastEnhancer-S port — the same
+    /// automatic cleanup the CLI applies — so a laptop-mic recording enrolls without its
+    /// room hiss. Use [`WasmEngine::enroll_raw`] to skip cleanup.
+    ///
+    /// The speaker encoder hydrates lazily from the artifact on first use and is cached,
+    /// as is the denoiser.
     ///
     /// # Errors
     ///
     /// Throws when the PCM is too short for the mel front end or hydration fails.
     pub fn enroll(&mut self, pcm: &[f32]) -> Result<Vec<f32>, JsValue> {
+        if self.denoiser.is_none() {
+            let file = ftts_artifacts::safetensors::SafetensorsFile::from_bytes(
+                DENOISER_SAFETENSORS.to_vec(),
+            )
+            .map_err(|error| {
+                js_error(
+                    "embedded denoiser weights are malformed",
+                    format!("{error:?}"),
+                )
+            })?;
+            let enhancer = ftts_artifacts::enhance_loader::enhancer_from_safetensors(&file)
+                .map_err(|error| js_error("embedded denoiser weights are malformed", error))?;
+            self.denoiser = Some(enhancer);
+        }
+        let cleaned = self
+            .denoiser
+            .as_ref()
+            .expect("cached just above")
+            .enhance_24k(pcm);
+        self.enroll_raw(&cleaned)
+    }
+
+    /// Enroll exactly the PCM given, with no noise cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Throws when the PCM is too short for the mel front end or hydration fails.
+    pub fn enroll_raw(&mut self, pcm: &[f32]) -> Result<Vec<f32>, JsValue> {
         if self.speaker_encoder.is_none() {
             let encoder = SpeakerEncoder::load_fttsq_mapped(
                 &self.artifact,

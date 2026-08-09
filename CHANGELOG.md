@@ -25,6 +25,11 @@ individual commits are intentionally not cited.
 
 ### Added
 
+- Enrollment now denoises automatically: when the pulled weights are present, every
+  `ftts enroll` cleans the reference with the neural engine before computing the
+  embedding, and the browser playground does the same for mic enrollments (weights
+  embedded in the wasm module). `--no-denoise` enrolls the recording untouched;
+  `--denoise` additionally engages the classic engine when the weights are absent.
 - Neural enrollment denoise: `ftts enroll --denoise` now runs a pure-Rust port of
   FastEnhancer-S 48 kHz (207 K parameters, MIT), proven to 114–125 dB SNR parity against
   its pinned PyTorch reference on every fixture. `ftts pull` fetches the 0.8 MB weight

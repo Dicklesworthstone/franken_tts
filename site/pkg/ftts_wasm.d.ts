@@ -63,13 +63,26 @@ export class WasmEngine {
     /**
      * Enroll a voice from mono 24 kHz PCM in `[-1, 1]`; returns the 1,024-float x-vector.
      *
-     * The speaker encoder hydrates lazily from the artifact on first use and is cached.
+     * The reference is denoised first with the embedded FastEnhancer-S port — the same
+     * automatic cleanup the CLI applies — so a laptop-mic recording enrolls without its
+     * room hiss. Use [`WasmEngine::enroll_raw`] to skip cleanup.
+     *
+     * The speaker encoder hydrates lazily from the artifact on first use and is cached,
+     * as is the denoiser.
      *
      * # Errors
      *
      * Throws when the PCM is too short for the mel front end or hydration fails.
      */
     enroll(pcm: Float32Array): Float32Array;
+    /**
+     * Enroll exactly the PCM given, with no noise cleanup.
+     *
+     * # Errors
+     *
+     * Throws when the PCM is too short for the mel front end or hydration fails.
+     */
+    enroll_raw(pcm: Float32Array): Float32Array;
     /**
      * Hydrate from bytes already resident in wasm memory, consuming the staging buffer.
      *
@@ -108,6 +121,15 @@ export class WasmEngine {
      */
     synthesize(text: string, speaker: Float32Array, seed: bigint, max_frames: number): Float32Array;
 }
+
+/**
+ * Sizes the team once the Workers that will serve it have confirmed they are parked.
+ *
+ * `partitions` counts the dispatcher too, so pass `readyWorkers + 1`. Anything <= 1 arms
+ * nothing and the engine runs serially — the correct outcome on a browser without
+ * `SharedArrayBuffer`, and on one where every Worker failed to start.
+ */
+export function arm_worker_team(partitions: number): void;
 
 /**
  * Times the per-frame kernel schedule at the model's real shapes; returns a JSON report.
@@ -166,6 +188,31 @@ export function preset_vector(name: string): Float32Array;
  */
 export function presets(): string;
 
+/**
+ * Publishes the control block Workers park on, before the team has a size.
+ *
+ * Call from the engine Worker — never the page's main thread, where `atomic.wait` traps. Each
+ * Worker then instantiates this same module against the same `WebAssembly.Memory` and calls
+ * [`worker_loop_entry`] with its index. Once they report parked, call [`arm_worker_team`] with
+ * the count that actually started.
+ */
+export function publish_team_block(): void;
+
+/**
+ * The body a spawned Worker runs; never returns.
+ *
+ * # Errors
+ *
+ * Throws if called before [`arm_worker_team`] published the control block, which is a host
+ * sequencing bug — parking on a block that does not exist would hang silently instead.
+ */
+export function worker_loop_entry(worker: number): void;
+
+/**
+ * How many partitions the int8 team is running with; 1 means serial.
+ */
+export function worker_team_width(): number;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -182,10 +229,15 @@ export interface InitOutput {
     readonly preset_vector: (a: number, b: number) => [number, number, number, number];
     readonly presets: () => [number, number];
     readonly wasmengine_enroll: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly wasmengine_enroll_raw: (a: number, b: number, c: number) => [number, number, number, number];
     readonly wasmengine_from_staging: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly wasmengine_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
     readonly wasmengine_synthesize: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => [number, number, number, number];
+    readonly worker_loop_entry: (a: number) => [number, number];
+    readonly worker_team_width: () => number;
+    readonly arm_worker_team: (a: number) => void;
     readonly install_panic_hook: () => void;
+    readonly publish_team_block: () => void;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;

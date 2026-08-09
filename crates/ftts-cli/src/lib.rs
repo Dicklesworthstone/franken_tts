@@ -3,6 +3,7 @@
 //! Shared, stateless command-line dispatch for both FrankenTTS binaries.
 
 mod error;
+pub mod resident;
 pub mod robot;
 pub mod style;
 pub mod synth;
@@ -231,6 +232,16 @@ enum Command {
     Robot(RobotArgs),
     /// Report local configuration and readiness without inference.
     Doctor(DoctorArgs),
+    /// Internal: run the resident engine daemon. Spawned by `ftts say`; not for direct use.
+    #[command(hide = true, name = "resident-daemon")]
+    ResidentDaemon(ResidentDaemonArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ResidentDaemonArgs {
+    /// Model directory this daemon serves.
+    #[arg(long, value_name = "PATH")]
+    bundle_root: PathBuf,
 }
 
 #[derive(Debug, clap::Args)]
@@ -277,6 +288,15 @@ struct SayArgs {
     /// view — so this exists for a person who wants to watch the machine contract directly.
     #[arg(long)]
     robot: bool,
+
+    /// Load the model in this process instead of using the resident engine.
+    ///
+    /// By default `ftts say` keeps the loaded model in a background process so the next
+    /// invocation starts without the multi-second load, unloading itself after ten idle
+    /// minutes (FTTS_RESIDENT_IDLE_SECS overrides). This flag, or FTTS_NO_RESIDENT=1,
+    /// opts a run out; results are identical either way.
+    #[arg(long)]
+    no_resident: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -676,6 +696,7 @@ fn dispatch(
         Command::Pull(args) => run_pull(args, environment, stdout),
         Command::Robot(args) => run_robot(args.command.clone(), environment, stdout),
         Command::Doctor(args) => run_doctor(args, environment, stdout),
+        Command::ResidentDaemon(args) => resident::run_daemon(&args.bundle_root),
     }
 }
 
@@ -1283,7 +1304,16 @@ fn run_say_events(
     };
     let speaker =
         synth::speaker_from_voice(&bundle, &voice_path, synth::ReferenceCleanup::default())?;
-    let loaded = synth::LoadedModel::load(&bundle)?;
+    // With the resident engine (the default), the model stays loaded in a background
+    // process and this invocation skips its own hydration; the daemon's load happens
+    // inside the synthesis stage on its first request. Any resident-path unavailability
+    // falls back to the classic in-process load below, never to a failure.
+    let use_resident = resident::enabled(args.no_resident);
+    let loaded = if use_resident {
+        None
+    } else {
+        Some(synth::LoadedModel::load(&bundle)?)
+    };
     emit_stage(run, emit, "load", "end", &mut seq)?;
 
     // --- synthesis -------------------------------------------------------------------------
@@ -1294,22 +1324,48 @@ fn run_say_events(
     // with the streaming decode path rather than being faked from a completed run.
     let observer = |_event: ftts_core::SynthesisEvent| {};
 
+    // Canonical greedy consumes no RNG state, so an absent `--seed` changes nothing today;
+    // 0 is the documented default rather than a value picked per run, which would make a
+    // future switch to the production sampler silently irreproducible.
+    let seed = cli.seed.unwrap_or(0);
+
     emit_stage(run, emit, "synthesis", "begin", &mut seq)?;
-    let engine = ftts_core::TtsEngine::from_process_environment()
-        .map_err(|error| FttsError::Generic(format!("cannot start the engine: {error}")))?;
-    let cancellation = ftts_core::CancellationToken::new();
-    let audio_result = synth::synthesize(
-        &loaded,
-        &engine,
-        &request,
-        &speaker,
-        // Canonical greedy consumes no RNG state, so an absent `--seed` changes nothing today;
-        // 0 is the documented default rather than a value picked per run, which would make a
-        // future switch to the production sampler silently irreproducible.
-        cli.seed.unwrap_or(0),
-        &cancellation,
-        &observer,
-    )?;
+    let resident_audio = if use_resident {
+        resident::try_synthesize(
+            &bundle,
+            &resident::WireRequest {
+                text: &request.text,
+                normalize: settings.normalize.as_str(),
+                trace: request.trace_normalization,
+                speaker: &speaker,
+                seed,
+            },
+        )?
+    } else {
+        None
+    };
+    let audio_result = match resident_audio {
+        Some(audio) => audio,
+        None => {
+            let loaded = match loaded {
+                Some(loaded) => loaded,
+                // The resident path was requested but no daemon could serve it.
+                None => synth::LoadedModel::load(&bundle)?,
+            };
+            let engine = ftts_core::TtsEngine::from_process_environment()
+                .map_err(|error| FttsError::Generic(format!("cannot start the engine: {error}")))?;
+            let cancellation = ftts_core::CancellationToken::new();
+            synth::synthesize(
+                &loaded,
+                &engine,
+                &request,
+                &speaker,
+                seed,
+                &cancellation,
+                &observer,
+            )?
+        }
+    };
     emit_stage(run, emit, "synthesis", "end", &mut seq)?;
 
     // --- the output tail ---------------------------------------------------------------------
@@ -2728,7 +2784,7 @@ mod tests {
         );
     }
 
-    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,enroll,voice,convert,pull,robot,doctor\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check,robot\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
+    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,enroll,voice,convert,pull,robot,doctor,resident-daemon\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check,robot,no-resident\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
 
     #[test]
     fn clap_surface_matches_snapshot() {
@@ -2789,6 +2845,7 @@ mod tests {
                 stream: None,
                 check: true,
                 robot: false,
+                no_resident: true,
             },
             &mut Cursor::new(Vec::<u8>::new()),
         )
@@ -2804,6 +2861,7 @@ mod tests {
                 stream: None,
                 check: true,
                 robot: false,
+                no_resident: true,
             },
             &mut Cursor::new(Vec::<u8>::new()),
         )
@@ -2819,6 +2877,7 @@ mod tests {
                 stream: None,
                 check: true,
                 robot: false,
+                no_resident: true,
             },
             &mut Cursor::new(expected.as_bytes()),
         )
@@ -3262,6 +3321,7 @@ mod tests {
             stream: None,
             check: true,
             robot: false,
+            no_resident: true,
         };
         let mut stdin = Cursor::new(Vec::<u8>::new());
         let mut stdout = Vec::new();

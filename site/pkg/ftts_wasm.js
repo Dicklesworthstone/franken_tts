@@ -115,7 +115,12 @@ export class WasmEngine {
     /**
      * Enroll a voice from mono 24 kHz PCM in `[-1, 1]`; returns the 1,024-float x-vector.
      *
-     * The speaker encoder hydrates lazily from the artifact on first use and is cached.
+     * The reference is denoised first with the embedded FastEnhancer-S port — the same
+     * automatic cleanup the CLI applies — so a laptop-mic recording enrolls without its
+     * room hiss. Use [`WasmEngine::enroll_raw`] to skip cleanup.
+     *
+     * The speaker encoder hydrates lazily from the artifact on first use and is cached,
+     * as is the denoiser.
      *
      * # Errors
      *
@@ -127,6 +132,26 @@ export class WasmEngine {
         const ptr0 = passArrayF32ToWasm0(pcm, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.wasmengine_enroll(this.__wbg_ptr, ptr0, len0);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v2 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v2;
+    }
+    /**
+     * Enroll exactly the PCM given, with no noise cleanup.
+     *
+     * # Errors
+     *
+     * Throws when the PCM is too short for the mel front end or hydration fails.
+     * @param {Float32Array} pcm
+     * @returns {Float32Array}
+     */
+    enroll_raw(pcm) {
+        const ptr0 = passArrayF32ToWasm0(pcm, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmengine_enroll_raw(this.__wbg_ptr, ptr0, len0);
         if (ret[3]) {
             throw takeFromExternrefTable0(ret[2]);
         }
@@ -232,6 +257,18 @@ export class WasmEngine {
     }
 }
 if (Symbol.dispose) WasmEngine.prototype[Symbol.dispose] = WasmEngine.prototype.free;
+
+/**
+ * Sizes the team once the Workers that will serve it have confirmed they are parked.
+ *
+ * `partitions` counts the dispatcher too, so pass `readyWorkers + 1`. Anything <= 1 arms
+ * nothing and the engine runs serially — the correct outcome on a browser without
+ * `SharedArrayBuffer`, and on one where every Worker failed to start.
+ * @param {number} partitions
+ */
+export function arm_worker_team(partitions) {
+    wasm.arm_worker_team(partitions);
+}
 
 /**
  * Times the per-frame kernel schedule at the model's real shapes; returns a JSON report.
@@ -352,6 +389,43 @@ export function presets() {
     } finally {
         wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
     }
+}
+
+/**
+ * Publishes the control block Workers park on, before the team has a size.
+ *
+ * Call from the engine Worker — never the page's main thread, where `atomic.wait` traps. Each
+ * Worker then instantiates this same module against the same `WebAssembly.Memory` and calls
+ * [`worker_loop_entry`] with its index. Once they report parked, call [`arm_worker_team`] with
+ * the count that actually started.
+ */
+export function publish_team_block() {
+    wasm.publish_team_block();
+}
+
+/**
+ * The body a spawned Worker runs; never returns.
+ *
+ * # Errors
+ *
+ * Throws if called before [`arm_worker_team`] published the control block, which is a host
+ * sequencing bug — parking on a block that does not exist would hang silently instead.
+ * @param {number} worker
+ */
+export function worker_loop_entry(worker) {
+    const ret = wasm.worker_loop_entry(worker);
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
+    }
+}
+
+/**
+ * How many partitions the int8 team is running with; 1 means serial.
+ * @returns {number}
+ */
+export function worker_team_width() {
+    const ret = wasm.worker_team_width();
+    return ret >>> 0;
 }
 function __wbg_get_imports() {
     const import0 = {

@@ -13,10 +13,15 @@ export const modelstaging_push_fttsq: (a: number, b: number, c: number) => [numb
 export const preset_vector: (a: number, b: number) => [number, number, number, number];
 export const presets: () => [number, number];
 export const wasmengine_enroll: (a: number, b: number, c: number) => [number, number, number, number];
+export const wasmengine_enroll_raw: (a: number, b: number, c: number) => [number, number, number, number];
 export const wasmengine_from_staging: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
 export const wasmengine_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
 export const wasmengine_synthesize: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => [number, number, number, number];
+export const worker_loop_entry: (a: number) => [number, number];
+export const worker_team_width: () => number;
+export const arm_worker_team: (a: number) => void;
 export const install_panic_hook: () => void;
+export const publish_team_block: () => void;
 export const __wbindgen_externrefs: WebAssembly.Table;
 export const __wbindgen_free: (a: number, b: number, c: number) => void;
 export const __wbindgen_malloc: (a: number, b: number) => number;

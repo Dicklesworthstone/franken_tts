@@ -322,7 +322,9 @@
               <p id="script" class="pg-note" style="white-space: pre-wrap; color: #cbd5e1"></p>
             </div>
             <p class="pg-note">
-              Cloning runs the speaker encoder locally on your recording; the audio is discarded
+              Cloning first runs your recording through the built-in neural denoiser (the same
+              FastEnhancer port the CLI uses, described below), then the speaker encoder — so
+              laptop-mic hiss and room rumble never make it into the voice. The audio is discarded
               once the 4 KB voice vector exists. Clone only voices you have the right to use.
             </p>
           </div>
@@ -732,28 +734,84 @@
       </div>
       <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Static In, <span class="text-emerald-400">Voice</span> Out.</h2>
       <p class="text-slate-400 max-w-3xl mx-auto text-base md:text-lg">
-        A cloned voice inherits the noise of the recording it came from: enroll next to a fan and
-        every sentence carries the fan. <code class="text-emerald-300">ftts enroll --denoise</code>
-        cleans the reference first, using a pure-Rust port of FastEnhancer&#8209;S, a 207&#8239;K&#8209;parameter
-        speech-enhancement network. It predicts a complex mask over each spectrogram frame as it
-        listens, so steady hiss and rumble are multiplied toward zero while speech, phase included,
-        passes through. The port matches its PyTorch reference to 125&#8239;dB, which is float rounding,
-        and the weights ride along with <code class="text-emerald-300">ftts pull</code> as an 0.8&#8239;MB file.
-        CLI today; the engine compiles to wasm unchanged and is headed for this playground.
+        A cloned voice inherits the recording it came from, noise and all: enroll next to a fan
+        and every sentence the clone ever speaks carries the fan. So enrollment now cleans the
+        reference automatically, in the CLI and in this playground, using a pure-Rust port of
+        FastEnhancer&#8209;S, a 207&#8239;K&#8209;parameter speech-enhancement network. The practical effect is
+        hard to overstate: an ordinary iPhone voice memo enrolls sounding like it was recorded in
+        a treated studio, with no audible noise floor, and every future utterance in that voice
+        keeps that cleanliness.
       </p>
     </div>
-    <div class="grid md:grid-cols-3 gap-5 max-w-4xl mx-auto reveal">
+
+    <div class="grid md:grid-cols-2 gap-6 max-w-6xl mx-auto mb-12 reveal">
+      <div class="rounded-2xl border border-white/5 bg-black/40 p-7">
+        <div class="pg-label mb-3">How it decides what is noise</div>
+        <p class="pg-note mb-3">
+          The recording is sliced into overlapping 21&#8239;ms spectrogram frames. For every
+          time&#8209;frequency cell the network predicts a <strong>complex ratio mask</strong>: a number
+          that scales that cell toward zero if it looks like noise and leaves it alone if it looks
+          like speech. Three things let a model this small make that call well:
+        </p>
+        <p class="pg-note mb-2">
+          <strong>Memory across time.</strong> Small GRUs carry state from frame to frame, so the
+          network accumulates a running picture of what the steady background sounds like. Hiss
+          and rumble are steady; speech never is. That asymmetry is the core signal.
+        </p>
+        <p class="pg-note mb-2">
+          <strong>Attention across frequency.</strong> A tiny attention layer compares frequency
+          bands within each frame. Voiced speech is a comb of harmonics that move together;
+          broadband static has no such structure, so the two are separable even where they overlap.
+        </p>
+        <p class="pg-note">
+          <strong>Phase comes along.</strong> The mask is complex, so it corrects phase as well as
+          loudness. Magnitude-only methods rebuild clean loudness on top of noisy phase, which is
+          audible as an underwater smearing; a complex mask avoids the artifact class entirely.
+        </p>
+      </div>
+      <div class="rounded-2xl border border-white/5 bg-black/40 p-7">
+        <div class="pg-label mb-3">Versus the classical state of the art</div>
+        <p class="pg-note mb-3">
+          Noise reduction circa 2010 was already sophisticated. Spectral subtraction (1979)
+          measured the noise spectrum during pauses and subtracted it everywhere, leaving the
+          random tonal chirps engineers call musical noise. Wiener and MMSE estimators
+          (Ephraim&#8209;Malah, 1984) replaced blunt subtraction with a statistically optimal per-bin
+          gain. The line ended with OM&#8209;LSA and IMCRA (Cohen, 2001&#8211;2003): gains gated by a
+          per-bin probability that speech is present at all. That method ships in this repo as the
+          no-weights fallback, and it is genuinely good at steady hiss.
+        </p>
+        <p class="pg-note mb-3">
+          All of them share one design: <em>estimate the noise, then subtract it</em>. They must
+          hear the noise alone (during pauses) to model it, they treat anything that drifts from
+          that model as speech, and they touch only magnitude, never phase.
+        </p>
+        <p class="pg-note">
+          The learned mask inverts the design: trained on thousands of hours of paired clean and
+          noisy speech, it <em>recognizes speech</em> rather than estimating noise. It needs no
+          silent pauses to learn the background, it tracks noise that drifts, it preserves
+          consonant onsets that subtraction dulls, and it fixes phase. On our static-hiss test the
+          difference is 65&#8239;dB of floor removed against OM&#8209;LSA&#8217;s 25 &#8212; and the enrolled voice
+          lands <em>closer</em> to a clean-studio enrollment than the raw recording does.
+        </p>
+      </div>
+    </div>
+
+    <div class="grid md:grid-cols-4 gap-5 max-w-6xl mx-auto reveal">
       <div class="rounded-2xl border border-white/5 bg-black/40 p-6 text-center">
         <div class="text-3xl font-black text-emerald-400 mb-1">65&#8239;dB</div>
-        <div class="text-slate-400 text-sm">of white static removed from a test reference's pause floor</div>
+        <div class="text-slate-400 text-sm">of white static removed from a test reference&#8217;s pause floor</div>
       </div>
       <div class="rounded-2xl border border-white/5 bg-black/40 p-6 text-center">
         <div class="text-3xl font-black text-emerald-400 mb-1">207&#8239;K</div>
-        <div class="text-slate-400 text-sm">parameters, so the whole model is smaller than one album cover JPEG</div>
+        <div class="text-slate-400 text-sm">parameters; the weights are an 0.8&#8239;MB file, embedded in the wasm build</div>
       </div>
       <div class="rounded-2xl border border-white/5 bg-black/40 p-6 text-center">
         <div class="text-3xl font-black text-emerald-400 mb-1">125&#8239;dB</div>
         <div class="text-slate-400 text-sm">parity against the pinned PyTorch oracle on every fixture</div>
+      </div>
+      <div class="rounded-2xl border border-white/5 bg-black/40 p-6 text-center">
+        <div class="text-3xl font-black text-emerald-400 mb-1">0</div>
+        <div class="text-slate-400 text-sm">flags to remember: enrollment cleans automatically; opt out with --no-denoise</div>
       </div>
     </div>
   </section>

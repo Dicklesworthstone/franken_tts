@@ -404,6 +404,24 @@ impl Enhancer {
         result
     }
 
+    /// Denoises a 24 kHz mono clip: up to the model's native 48 kHz, through the network,
+    /// back down to 24 kHz, preserving length exactly.
+    ///
+    /// This is the shape both product surfaces consume (the engine's pipeline is 24 kHz
+    /// end to end); `enhance_48k` stays public for callers already at the native rate.
+    pub fn enhance_24k(&self, wav24k: &[f32]) -> Vec<f32> {
+        let mut wav48 = resample_lanczos6(wav24k, 24_000, SAMPLE_RATE_HZ);
+        let target_len = wav48.len();
+        // On the hop grid the STFT round trip returns every sample (see enhance_48k).
+        let padded = target_len.div_ceil(HOP) * HOP;
+        wav48.resize(padded, 0.0);
+        let mut enhanced = self.enhance_48k(&wav48);
+        enhanced.truncate(target_len);
+        let mut back = resample_lanczos6(&enhanced, SAMPLE_RATE_HZ, 24_000);
+        back.truncate(wav24k.len());
+        back
+    }
+
     fn new_state(&self) -> Vec<Vec<f32>> {
         vec![vec![0.0f32; RF_FREQ * RF_CH]; BLOCKS]
     }
@@ -664,6 +682,63 @@ impl Enhancer {
         }
         mask
     }
+}
+
+/// Windowed-sinc (Lanczos-6) rate conversion, the same kernel enrollment trusts for its
+/// any-rate references: cutoff clamped to the lower Nyquist, taps normalized by their own
+/// sum so DC gain stays 1 at the clip edges.
+#[must_use]
+pub fn resample_lanczos6(mono: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate {
+        return mono.to_vec();
+    }
+    const LOBES: f64 = 6.0;
+    let ratio = f64::from(to_rate) / f64::from(from_rate);
+    let cutoff = ratio.min(1.0);
+    let half = (LOBES / cutoff).ceil() as isize;
+    let out_len = ((mono.len() as f64) * ratio).round() as usize;
+
+    let mut out = Vec::with_capacity(out_len);
+    for index in 0..out_len {
+        let center = index as f64 / ratio;
+        let first = center.floor() as isize - half + 1;
+        let mut acc = 0.0_f64;
+        let mut norm = 0.0_f64;
+        for tap in first..first + 2 * half {
+            if tap < 0 {
+                continue;
+            }
+            let Some(sample) = mono.get(tap as usize) else {
+                break;
+            };
+            let weight = lanczos6_tap(center - tap as f64, cutoff);
+            acc += weight * f64::from(*sample);
+            norm += weight;
+        }
+        out.push(if norm.abs() > 1e-12 {
+            (acc / norm) as f32
+        } else {
+            0.0
+        });
+    }
+    out
+}
+
+fn lanczos6_tap(distance: f64, cutoff: f64) -> f64 {
+    const LOBES: f64 = 6.0;
+    let x = distance * cutoff;
+    if x.abs() >= LOBES {
+        return 0.0;
+    }
+    let sinc = |v: f64| {
+        if v.abs() < 1e-12 {
+            1.0
+        } else {
+            let p = std::f64::consts::PI * v;
+            p.sin() / p
+        }
+    };
+    sinc(x) * sinc(x / LOBES)
 }
 
 /// Same-padding k-wide conv over `width` positions, optional SiLU.
