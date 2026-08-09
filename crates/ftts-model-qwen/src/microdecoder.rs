@@ -1245,27 +1245,10 @@ pub fn verify_frame_draft(
         );
     }
 
-    // Flattened [position, hidden] storage is the fixed seq-16 interface the packed verifier will
-    // replace. Keeping it contiguous here prevents the scalar reference from defining a different
-    // data layout or index map than the eventual kernel.
-    let mut hidden = Vec::with_capacity(FRAME_POSITIONS * config.hidden_size);
-    hidden.extend_from_slice(talker_hidden);
-    hidden.extend_from_slice(&embedding_row(
-        weights.talker_codec_embedding,
-        primary_code,
-        config.hidden_size,
-    ));
-    for position in 2..FRAME_POSITIONS {
-        let table = match position_role(position) {
-            PositionRole::ResidualEmbedding { table, .. } => table,
-            role => panic!("position {position} must use a residual embedding, got {role:?}"),
-        };
-        hidden.extend_from_slice(&embedding_row(
-            weights.residual_embeddings[table],
-            drafted_codes[position - 2],
-            config.hidden_size,
-        ));
-    }
+    // Flattened [position, hidden] storage is the fixed seq-16 interface the packed verifier
+    // shares; `frame_input_block` is the single definition of the position/table index map, so
+    // the scalar reference and `verify_frame_draft_q8` can never disagree about layout.
+    let mut hidden = frame_input_block(config, weights, talker_hidden, primary_code, drafted_codes);
 
     // Layer-major order is the training-mode block forward. Each layer owns an independent
     // 16-position causal cache, exactly as in the sequential position-major decoder.
@@ -1286,6 +1269,114 @@ pub fn verify_frame_draft(
         hidden = next;
     }
 
+    DraftVerification {
+        logits: score_frame_heads(config, weights, None, &hidden),
+    }
+}
+
+/// [`verify_frame_draft`] on the quantized route, with each layer running the packed seq-16
+/// kernel instead of a per-position loop.
+///
+/// This is where FrankenMTP's speedup actually lives. The scalar verifier is a correctness seam:
+/// it walks 16 positions through `layer_step`, so it re-reads each layer's weights once per
+/// position and costs *more* than the sequential decode it replaces. Routing the five layers
+/// through [`layer_block_q8`] collapses that to one pass over the body per frame — the 1.18 GB
+/// of per-frame int8 weight traffic the microdecoder spends re-reading its 78.7 MB body fifteen
+/// times becomes 78.7 MB read once.
+///
+/// Head scoring mirrors [`decode_frame_with_selector_q8`] exactly: quantized heads take the
+/// int8+top-K-refine path, `None` keeps the reference f32 matvec, so a draft verified here is
+/// scored the same way the sequential decoder would score it.
+///
+/// # Panics
+///
+/// Panics when the route does not carry every layer, when the draft is not exactly
+/// [`RESIDUAL_DEPTHS`] codes, or on any shape or token-range mismatch.
+#[must_use]
+pub fn verify_frame_draft_q8(
+    config: &MicrodecoderConfig,
+    rope: &RopeTable,
+    weights: &MicrodecoderWeights<'_>,
+    route: &MicroQuantRoute<'_>,
+    talker_hidden: &[f32],
+    primary_code: usize,
+    drafted_codes: &[usize],
+) -> DraftVerification {
+    assert_frame_shapes(config, weights, talker_hidden);
+    assert_eq!(
+        route.layers.len(),
+        config.num_layers,
+        "the quantized route needs every microdecoder layer quantized"
+    );
+    assert_eq!(
+        drafted_codes.len(),
+        RESIDUAL_DEPTHS,
+        "expected {RESIDUAL_DEPTHS} drafted residual codes"
+    );
+    for (depth, code) in drafted_codes.iter().enumerate() {
+        assert!(
+            *code < RESIDUAL_VOCAB,
+            "drafted c{}={code} is outside residual vocab {RESIDUAL_VOCAB}",
+            depth + 1
+        );
+    }
+
+    let mut hidden = frame_input_block(config, weights, talker_hidden, primary_code, drafted_codes);
+
+    // One pass over each layer's body for the whole frame, versus fifteen in the sequential
+    // schedule. Layer-major order and the per-layer fresh cache match the scalar verifier.
+    for (layer, quant) in weights.layers.iter().zip(route.layers) {
+        hidden = layer_block_q8(config, layer, quant, rope, &hidden, route.mode);
+    }
+
+    DraftVerification {
+        logits: score_frame_heads(
+            config,
+            weights,
+            route.heads.map(|heads| (heads, route.mode)),
+            &hidden,
+        ),
+    }
+}
+
+/// Builds the `[FRAME_POSITIONS, hidden]` verifier input: talker state, `c0`, then the draft.
+///
+/// Shared by both verifier schedules so the position/table index map has exactly one definition.
+fn frame_input_block(
+    config: &MicrodecoderConfig,
+    weights: &MicrodecoderWeights<'_>,
+    talker_hidden: &[f32],
+    primary_code: usize,
+    drafted_codes: &[usize],
+) -> Vec<f32> {
+    let mut hidden = Vec::with_capacity(FRAME_POSITIONS * config.hidden_size);
+    hidden.extend_from_slice(talker_hidden);
+    hidden.extend_from_slice(&embedding_row(
+        weights.talker_codec_embedding,
+        primary_code,
+        config.hidden_size,
+    ));
+    for position in 2..FRAME_POSITIONS {
+        let table = match position_role(position) {
+            PositionRole::ResidualEmbedding { table, .. } => table,
+            role => panic!("position {position} must use a residual embedding, got {role:?}"),
+        };
+        hidden.extend_from_slice(&embedding_row(
+            weights.residual_embeddings[table],
+            drafted_codes[position - 2],
+            config.hidden_size,
+        ));
+    }
+    hidden
+}
+
+/// Scores positions 1..=15 of a finished verifier block through their per-depth heads.
+fn score_frame_heads(
+    config: &MicrodecoderConfig,
+    weights: &MicrodecoderWeights<'_>,
+    quant_heads: Option<(&[QuantizedMatrix], QuantLinearMode)>,
+    hidden: &[f32],
+) -> Vec<Vec<f32>> {
     let mut logits = Vec::with_capacity(RESIDUAL_DEPTHS);
     for position in 1..FRAME_POSITIONS {
         let head = match position_role(position) {
@@ -1300,11 +1391,15 @@ pub fn verify_frame_draft(
             config.rms_eps,
         );
         let mut row = vec![0.0_f32; RESIDUAL_VOCAB];
-        matvec(weights.heads[head], &normed, &mut row);
+        match quant_heads {
+            Some((heads, mode)) => {
+                score_head_refined(&heads[head], weights.heads[head], &normed, mode, &mut row);
+            }
+            None => matvec(weights.heads[head], &normed, &mut row),
+        }
         logits.push(row);
     }
-
-    DraftVerification { logits }
+    logits
 }
 
 /// Runs the full 15-step sequential loop for one frame under greedy decode.
@@ -2105,6 +2200,110 @@ mod tests {
                     "seed {seed}: element {index} diverged — block {block:?} vs sequential \
                      {step:?}; batching must never perturb the arithmetic"
                 );
+            }
+        }
+    }
+
+    /// The packed verifier must reproduce the scalar verifier's rows exactly when both run the
+    /// same quantized body — the schedule is the only difference, and
+    /// [`layer_block_q8`]'s bit-identity makes that a construction, not a tolerance.
+    ///
+    /// Guards the composition the speedup depends on: if this ever drifts, a drafted block would
+    /// be accepted or repaired on different evidence than the sequential decoder would produce,
+    /// which is a correctness bug and not a speed/quality trade.
+    #[test]
+    fn packed_verifier_matches_the_scalar_verifier_on_the_same_quantized_body() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let layers: Vec<TestLayer> = (0..config.num_layers)
+            .map(|_| TestLayer::new(&config))
+            .collect();
+        let borrowed: Vec<LayerWeights<'_>> = layers.iter().map(TestLayer::borrow).collect();
+        let quant: Vec<MicroLayerQuant> = borrowed
+            .iter()
+            .map(|layer| MicroLayerQuant::quantize(&config, layer))
+            .collect();
+        let mode = QuantLinearMode::W8A8(ftts_kernels::int8::Int8Tier::Scalar);
+
+        let talker_codec = weights_of(TALKER_CODEC_VOCAB * config.hidden_size, 11);
+        let residual_tables: Vec<Vec<f32>> = (0..RESIDUAL_DEPTHS - 1)
+            .map(|depth| weights_of(RESIDUAL_VOCAB * config.hidden_size, 20 + depth as u32))
+            .collect();
+        let head_tables: Vec<Vec<f32>> = (0..RESIDUAL_DEPTHS)
+            .map(|depth| weights_of(RESIDUAL_VOCAB * config.hidden_size, 40 + depth as u32))
+            .collect();
+        let residual_refs: Vec<&[f32]> = residual_tables.iter().map(Vec::as_slice).collect();
+        let head_refs: Vec<&[f32]> = head_tables.iter().map(Vec::as_slice).collect();
+        let final_norm = vec![1.0_f32; config.hidden_size];
+
+        let weights = MicrodecoderWeights {
+            layers: &borrowed,
+            talker_codec_embedding: &talker_codec,
+            residual_embeddings: &residual_refs,
+            heads: &head_refs,
+            final_norm: &final_norm,
+        };
+        let route = MicroQuantRoute {
+            layers: &quant,
+            heads: None,
+            mode,
+        };
+
+        for seed in 0..4_u32 {
+            let talker_hidden = weights_of(config.hidden_size, 700 + seed);
+            let drafted: Vec<usize> = (0..RESIDUAL_DEPTHS)
+                .map(|depth| (depth * 137 + seed as usize * 31) % RESIDUAL_VOCAB)
+                .collect();
+            let primary_code = (seed as usize * 17) % TALKER_CODEC_VOCAB;
+
+            // Scalar schedule over the same quantized body, position by position.
+            let mut hidden =
+                frame_input_block(&config, &weights, &talker_hidden, primary_code, &drafted);
+            for (layer, layer_quant) in borrowed.iter().zip(quant.iter()) {
+                let mut state = FrameKvState::new(&config);
+                let mut next = Vec::with_capacity(FRAME_POSITIONS * config.hidden_size);
+                for position in 0..FRAME_POSITIONS {
+                    let (cos, sin) = rope.row(position);
+                    let row =
+                        &hidden[position * config.hidden_size..(position + 1) * config.hidden_size];
+                    next.extend_from_slice(&layer_step_q8(
+                        &config,
+                        layer,
+                        layer_quant,
+                        cos,
+                        sin,
+                        row,
+                        &mut state,
+                        mode,
+                    ));
+                }
+                hidden = next;
+            }
+            let expected = score_frame_heads(&config, &weights, None, &hidden);
+
+            let packed = verify_frame_draft_q8(
+                &config,
+                &rope,
+                &weights,
+                &route,
+                &talker_hidden,
+                primary_code,
+                &drafted,
+            );
+
+            assert_eq!(
+                packed.logits().len(),
+                expected.len(),
+                "seed {seed}: row count"
+            );
+            for (depth, (fast, slow)) in packed.logits().iter().zip(expected.iter()).enumerate() {
+                for (token, (a, b)) in fast.iter().zip(slow.iter()).enumerate() {
+                    assert!(
+                        a.to_bits() == b.to_bits(),
+                        "seed {seed}: depth {depth} token {token} diverged — packed {a:?} vs \
+                         scalar {b:?}"
+                    );
+                }
             }
         }
     }
