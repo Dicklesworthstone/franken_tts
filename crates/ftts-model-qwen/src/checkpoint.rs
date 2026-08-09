@@ -217,22 +217,6 @@ pub(crate) fn widen_exact(
     Ok(values)
 }
 
-fn widen_exact_with(
-    widen_tensor: &mut dyn FnMut(&str) -> Result<Vec<f32>, CheckpointError>,
-    name: &str,
-    expected: usize,
-) -> Result<Vec<f32>, CheckpointError> {
-    let values = widen_tensor(name)?;
-    if values.len() != expected {
-        return Err(CheckpointError::TensorShape {
-            tensor: name.to_owned(),
-            expected,
-            actual: values.len(),
-        });
-    }
-    Ok(values)
-}
-
 pub(crate) fn open(path: &Path) -> Result<SafetensorsFile, CheckpointError> {
     SafetensorsFile::open(path).map_err(|error| CheckpointError::Open {
         path: path.to_path_buf(),
@@ -420,29 +404,93 @@ struct OwnedAttentionLayer {
     tensors: [Vec<f32>; 11],
 }
 
-impl OwnedAttentionLayer {
-    fn load_with(
-        prefix: &str,
-        widen_tensor: &mut dyn FnMut(&str) -> Result<Vec<f32>, CheckpointError>,
-    ) -> Result<Self, CheckpointError> {
-        let names = [
-            "input_layernorm.weight",
-            "self_attn.q_proj.weight",
-            "self_attn.k_proj.weight",
-            "self_attn.v_proj.weight",
-            "self_attn.q_norm.weight",
-            "self_attn.k_norm.weight",
-            "self_attn.o_proj.weight",
-            "post_attention_layernorm.weight",
-            "mlp.gate_proj.weight",
-            "mlp.up_proj.weight",
-            "mlp.down_proj.weight",
-        ];
-        let mut tensors: [Vec<f32>; 11] = Default::default();
-        for (slot, suffix) in tensors.iter_mut().zip(names) {
-            *slot = widen_tensor(&format!("{prefix}.{suffix}"))?;
+/// The eleven per-layer tensor name suffixes, in [`OwnedAttentionLayer`] field order.
+const ATTENTION_LAYER_SUFFIXES: [&str; 11] = [
+    "input_layernorm.weight",
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.q_norm.weight",
+    "self_attn.k_norm.weight",
+    "self_attn.o_proj.weight",
+    "post_attention_layernorm.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+];
+
+/// Widens `names` concurrently, returning the tensors in the order the names were given.
+///
+/// Hydration writes gigabytes of freshly widened f32 and was measured wholly serial at ~0.4 GB/s
+/// on one core; the tensors are independent, so a scoped worker pool with an atomic cursor turns
+/// the load into a page-fault-and-memcpy race instead. Output order is positional and each
+/// tensor's bytes are computed exactly as the serial loop computed them, so the result is
+/// byte-identical to sequential hydration — the parallelism has no numeric surface. This is
+/// startup-only work, deliberately outside the decode path's `KernelTeam` discipline.
+///
+/// The first error wins and is returned after every worker has stopped.
+fn widen_many(
+    names: &[String],
+    widen_tensor: &(dyn Fn(&str) -> Result<Vec<f32>, CheckpointError> + Sync),
+) -> Result<Vec<Vec<f32>>, CheckpointError> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(names.len())
+        .max(1);
+    if workers == 1 {
+        return names.iter().map(|name| widen_tensor(name)).collect();
+    }
+
+    let cursor = AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<Vec<f32>>>> = Mutex::new((0..names.len()).map(|_| None).collect());
+    let first_error: Mutex<Option<CheckpointError>> = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = cursor.fetch_add(1, Ordering::Relaxed);
+                    if index >= names.len() || first_error.lock().expect("error slot").is_some() {
+                        return;
+                    }
+                    match widen_tensor(&names[index]) {
+                        Ok(tensor) => {
+                            slots.lock().expect("tensor slots")[index] = Some(tensor);
+                        }
+                        Err(error) => {
+                            first_error.lock().expect("error slot").get_or_insert(error);
+                            return;
+                        }
+                    }
+                }
+            });
         }
-        Ok(Self { tensors })
+    });
+    if let Some(error) = first_error.into_inner().expect("error slot") {
+        return Err(error);
+    }
+    Ok(slots
+        .into_inner()
+        .expect("tensor slots")
+        .into_iter()
+        .map(|slot| slot.expect("every tensor hydrated or an error was returned"))
+        .collect())
+}
+
+impl OwnedAttentionLayer {
+    /// Reassembles a layer from eleven already-widened tensors in
+    /// [`ATTENTION_LAYER_SUFFIXES`] order.
+    fn from_widened(tensors: impl Iterator<Item = Vec<f32>>) -> Self {
+        let mut slots: [Vec<f32>; 11] = Default::default();
+        let mut count = 0;
+        for (slot, tensor) in slots.iter_mut().zip(tensors) {
+            *slot = tensor;
+            count += 1;
+        }
+        assert_eq!(count, 11, "a layer is exactly eleven tensors");
+        Self { tensors: slots }
     }
 
     fn talker(&self) -> TalkerLayerWeights<'_> {
@@ -743,76 +791,111 @@ impl TalkerCheckpoint {
     fn load_with(
         path: &Path,
         text_embedding_source: TextEmbeddingSource,
-        mut widen_tensor: impl FnMut(&str) -> Result<Vec<f32>, CheckpointError>,
+        widen_tensor: impl Fn(&str) -> Result<Vec<f32>, CheckpointError> + Sync,
     ) -> Result<Self, CheckpointError> {
         let hidden = TALKER_HIDDEN;
-        let mut talker_layers = Vec::with_capacity(TALKER_LAYER_COUNT);
-        for layer in 0..TALKER_LAYER_COUNT {
-            talker_layers.push(OwnedAttentionLayer::load_with(
-                &format!("talker.model.layers.{layer}"),
-                &mut widen_tensor,
-            )?);
-        }
         let micro_layer_count = MicrodecoderConfig::default().num_layers;
-        let mut micro_layers = Vec::with_capacity(micro_layer_count);
+
+        // One flat, canonically ordered name list, hydrated in one concurrent pass; the struct is
+        // then assembled by walking the results in the same order. Field-order changes here must
+        // keep the two walks in lockstep -- the assertions at each seam catch a drift.
+        let mut names: Vec<String> = Vec::new();
+        for layer in 0..TALKER_LAYER_COUNT {
+            for suffix in ATTENTION_LAYER_SUFFIXES {
+                names.push(format!("talker.model.layers.{layer}.{suffix}"));
+            }
+        }
         for layer in 0..micro_layer_count {
-            micro_layers.push(OwnedAttentionLayer::load_with(
-                &format!("talker.code_predictor.model.layers.{layer}"),
-                &mut widen_tensor,
-            )?);
+            for suffix in ATTENTION_LAYER_SUFFIXES {
+                names.push(format!(
+                    "talker.code_predictor.model.layers.{layer}.{suffix}"
+                ));
+            }
         }
-        let mut residual_embeddings = Vec::with_capacity(CODE_GROUP_COUNT - 1);
         for table in 0..CODE_GROUP_COUNT - 1 {
-            residual_embeddings.push(widen_tensor(&format!(
+            names.push(format!(
                 "talker.code_predictor.model.codec_embedding.{table}.weight"
-            ))?);
+            ));
         }
-        let mut micro_heads = Vec::with_capacity(RESIDUAL_DEPTHS);
         for head in 0..RESIDUAL_DEPTHS {
-            micro_heads.push(widen_tensor(&format!(
-                "talker.code_predictor.lm_head.{head}.weight"
-            ))?);
+            names.push(format!("talker.code_predictor.lm_head.{head}.weight"));
         }
+        for single in [
+            "talker.model.norm.weight",
+            "talker.codec_head.weight",
+            "talker.model.codec_embedding.weight",
+            "talker.code_predictor.model.norm.weight",
+            "talker.text_projection.linear_fc1.weight",
+            "talker.text_projection.linear_fc1.bias",
+            "talker.text_projection.linear_fc2.weight",
+            "talker.text_projection.linear_fc2.bias",
+        ] {
+            names.push(single.to_owned());
+        }
+
+        let mut widened = widen_many(&names, &widen_tensor)?.into_iter();
+
+        let talker_layers: Vec<OwnedAttentionLayer> = (0..TALKER_LAYER_COUNT)
+            .map(|_| OwnedAttentionLayer::from_widened(widened.by_ref().take(11)))
+            .collect();
+        let micro_layers: Vec<OwnedAttentionLayer> = (0..micro_layer_count)
+            .map(|_| OwnedAttentionLayer::from_widened(widened.by_ref().take(11)))
+            .collect();
+        let residual_embeddings: Vec<Vec<f32>> =
+            widened.by_ref().take(CODE_GROUP_COUNT - 1).collect();
+        let micro_heads: Vec<Vec<f32>> = widened.by_ref().take(RESIDUAL_DEPTHS).collect();
+        assert_eq!(
+            residual_embeddings.len(),
+            CODE_GROUP_COUNT - 1,
+            "hydration walk drifted at the residual tables"
+        );
+        assert_eq!(
+            micro_heads.len(),
+            RESIDUAL_DEPTHS,
+            "hydration walk drifted at the heads"
+        );
+
+        let mut single =
+            |name: &str, expected: Option<usize>| -> Result<Vec<f32>, CheckpointError> {
+                let values = widened
+                    .next()
+                    .expect("hydration walk covers every singleton tensor");
+                if let Some(expected) = expected
+                    && values.len() != expected
+                {
+                    return Err(CheckpointError::TensorShape {
+                        tensor: name.to_owned(),
+                        expected,
+                        actual: values.len(),
+                    });
+                }
+                Ok(values)
+            };
 
         Ok(Self {
             path: path.to_path_buf(),
             text_embedding_source,
             talker_layers,
-            talker_final_norm: widen_exact_with(
-                &mut widen_tensor,
-                "talker.model.norm.weight",
-                hidden,
-            )?,
-            codec_head: widen_tensor("talker.codec_head.weight")?,
-            codec_embedding: widen_tensor("talker.model.codec_embedding.weight")?,
+            talker_final_norm: single("talker.model.norm.weight", Some(hidden))?,
+            codec_head: single("talker.codec_head.weight", None)?,
+            codec_embedding: single("talker.model.codec_embedding.weight", None)?,
             residual_embeddings,
             micro_layers,
-            micro_final_norm: widen_exact_with(
-                &mut widen_tensor,
-                "talker.code_predictor.model.norm.weight",
-                hidden,
-            )?,
+            micro_final_norm: single("talker.code_predictor.model.norm.weight", Some(hidden))?,
             micro_heads,
-            fc1_weight: widen_exact_with(
-                &mut widen_tensor,
+            fc1_weight: single(
                 "talker.text_projection.linear_fc1.weight",
-                TEXT_EMBED_WIDTH * TEXT_EMBED_WIDTH,
+                Some(TEXT_EMBED_WIDTH * TEXT_EMBED_WIDTH),
             )?,
-            fc1_bias: widen_exact_with(
-                &mut widen_tensor,
+            fc1_bias: single(
                 "talker.text_projection.linear_fc1.bias",
-                TEXT_EMBED_WIDTH,
+                Some(TEXT_EMBED_WIDTH),
             )?,
-            fc2_weight: widen_exact_with(
-                &mut widen_tensor,
+            fc2_weight: single(
                 "talker.text_projection.linear_fc2.weight",
-                hidden * TEXT_EMBED_WIDTH,
+                Some(hidden * TEXT_EMBED_WIDTH),
             )?,
-            fc2_bias: widen_exact_with(
-                &mut widen_tensor,
-                "talker.text_projection.linear_fc2.bias",
-                hidden,
-            )?,
+            fc2_bias: single("talker.text_projection.linear_fc2.bias", Some(hidden))?,
         })
     }
 
