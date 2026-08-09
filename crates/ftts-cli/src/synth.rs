@@ -516,7 +516,18 @@ fn decode_reference_audio(path: &Path) -> Result<Vec<f32>, FttsError> {
             path.display()
         )));
     }
-    Ok(resample_to_speaker_rate(mono, rate))
+    let pcm = resample_to_speaker_rate(mono, rate);
+    // Downsampling shortens the signal, and a clip of a few samples at a high source rate can
+    // round to nothing. The mel front end would then see an empty slice, so the emptiness check
+    // has to be made against the PCM actually handed on, not only against what was decoded.
+    if pcm.is_empty() {
+        return Err(FttsError::Input(format!(
+            "reference audio {} is too short to resample from {rate} Hz to \
+             {SPEAKER_SAMPLE_RATE_HZ} Hz; supply a longer recording",
+            path.display()
+        )));
+    }
+    Ok(pcm)
 }
 
 /// Resamples decoded mono PCM to the speaker encoder's pinned rate.
