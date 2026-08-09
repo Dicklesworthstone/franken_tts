@@ -1302,8 +1302,21 @@ fn run_say_events(
         None => materialize_preset_voice(DEFAULT_PRESET_VOICE)
             .expect("the default preset name is a member of PRESET_VOICES")?,
     };
-    let speaker =
-        synth::speaker_from_voice(&bundle, &voice_path, synth::ReferenceCleanup::default())?;
+    // A `--voice` that names an audio file (not a .spk vector) computes an ephemeral
+    // enrollment, and gets the same automatic denoise `ftts enroll` applies — otherwise the
+    // one-off form of the exact same operation would sound worse than the saved form. The
+    // report goes unread here: `say` has no enrollment console, and the .spk/preset paths
+    // never enter the cleanup code.
+    let mut say_denoise_report = None;
+    let denoise_ephemeral = bundle.root.join(synth::DENOISE_ARTIFACT_RELPATH).is_file();
+    let speaker = synth::speaker_from_voice(
+        &bundle,
+        &voice_path,
+        synth::ReferenceCleanup {
+            denoise: denoise_ephemeral.then_some(&mut say_denoise_report),
+            dereverb: None,
+        },
+    )?;
     // With the resident engine (the default), the model stays loaded in a background
     // process and this invocation skips its own hydration; the daemon's load happens
     // inside the synthesis stage on its first request. Any resident-path unavailability
@@ -2359,8 +2372,11 @@ fn pull_one_file(
     // Durability before publish: rename orders the directory entry, not the data. Without the
     // fsync a crash can leave a truncated file at the verified name — and the tokenizer/codec
     // sidecars, unlike the .fttsq, carry no load-time digest to catch that. Same contract as
-    // FttsqWriter::write_to_path.
-    fs::File::open(&staging)
+    // FttsqWriter::write_to_path. The handle must be writable: Windows refuses to flush a
+    // read-only handle (ERROR_ACCESS_DENIED), while Unix fsync accepts one.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&staging)
         .and_then(|file| file.sync_all())
         .map_err(|error| {
             FttsError::Generic(format!(
