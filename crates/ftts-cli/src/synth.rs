@@ -493,19 +493,80 @@ fn decode_reference_audio(path: &Path) -> Result<Vec<f32>, FttsError> {
             path.display()
         ))
     })?;
-    if rate != SPEAKER_SAMPLE_RATE_HZ {
-        return Err(FttsError::Input(format!(
-            "reference audio {} is {rate} Hz; the pinned speaker encoder requires {SPEAKER_SAMPLE_RATE_HZ} Hz",
-            path.display()
-        )));
-    }
     if mono.is_empty() {
         return Err(FttsError::Input(format!(
             "reference audio {} contains no PCM samples",
             path.display()
         )));
     }
-    Ok(mono)
+    Ok(resample_to_speaker_rate(mono, rate))
+}
+
+/// Resamples decoded mono PCM to the speaker encoder's pinned rate.
+///
+/// Compressed references already arrive at 24 kHz because the system decoder is told to convert
+/// (`frankentts-gra`), but a `.wav` or `.flac` is read directly and can be any rate — 44.1 and 48
+/// kHz being what every phone, Mac voice memo, and DAW export actually produces. Refusing those
+/// pushed the identical resample onto the user as an `ffmpeg` incantation, so it happens here.
+///
+/// Audio already at the pinned rate is returned untouched, so this cannot perturb any existing
+/// enrollment: it only turns a former hard error into a working path.
+///
+/// Windowed-sinc (Lanczos-3) with the kernel cutoff clamped to the lower of the two rates, which
+/// is what suppresses aliasing on the common downsampling direction. Taps are normalized by their
+/// own sum so DC gain stays 1 even where the window runs off the ends of the signal.
+fn resample_to_speaker_rate(mono: Vec<f32>, from_rate: u32) -> Vec<f32> {
+    if from_rate == SPEAKER_SAMPLE_RATE_HZ {
+        return mono;
+    }
+    const LOBES: f64 = 3.0;
+    let ratio = f64::from(SPEAKER_SAMPLE_RATE_HZ) / f64::from(from_rate);
+    let cutoff = ratio.min(1.0);
+    let half = (LOBES / cutoff).ceil() as isize;
+    let out_len = ((mono.len() as f64) * ratio).round() as usize;
+
+    let mut out = Vec::with_capacity(out_len);
+    for index in 0..out_len {
+        let center = index as f64 / ratio;
+        let first = center.floor() as isize - half + 1;
+        let mut acc = 0.0_f64;
+        let mut norm = 0.0_f64;
+        for tap in first..first + 2 * half {
+            if tap < 0 {
+                continue;
+            }
+            let Some(sample) = mono.get(tap as usize) else {
+                break;
+            };
+            let weight = lanczos_tap(center - tap as f64, cutoff, LOBES);
+            acc += weight * f64::from(*sample);
+            norm += weight;
+        }
+        out.push(if norm.abs() > 1e-12 {
+            (acc / norm) as f32
+        } else {
+            0.0
+        });
+    }
+    out
+}
+
+/// One Lanczos tap: a sinc lowpass at `cutoff`, windowed by a wider sinc over `lobes`.
+fn lanczos_tap(offset: f64, cutoff: f64, lobes: f64) -> f64 {
+    let scaled = cutoff * offset;
+    if scaled.abs() >= lobes {
+        return 0.0;
+    }
+    sinc(scaled) * sinc(scaled / lobes)
+}
+
+/// Normalized sinc, `sin(pi x) / (pi x)`, with the removable singularity at zero filled in.
+fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-12 {
+        return 1.0;
+    }
+    let scaled = std::f64::consts::PI * x;
+    scaled.sin() / scaled
 }
 
 /// Hands the engine a `PreparedText` that was computed before the weights were borrowed.
@@ -759,6 +820,62 @@ pub fn generation_error(message: &str) -> GenerationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audio already at the pinned rate must come back untouched — the resample path is additive
+    /// and may not perturb any enrollment that worked before it existed.
+    #[test]
+    fn audio_at_the_pinned_rate_is_returned_bit_for_bit() {
+        let pcm: Vec<f32> = (0..4_096)
+            .map(|n| (n as f32 * 0.017).sin() * 0.4 + (n as f32 * 0.31).sin() * 0.05)
+            .collect();
+        let out = resample_to_speaker_rate(pcm.clone(), SPEAKER_SAMPLE_RATE_HZ);
+        assert_eq!(out.len(), pcm.len());
+        for (index, (a, b)) in out.iter().zip(pcm.iter()).enumerate() {
+            assert!(
+                a.to_bits() == b.to_bits(),
+                "sample {index} was altered at the pinned rate"
+            );
+        }
+    }
+
+    /// A tone that survives the resample proves the kernel is a real lowpass and not a decimator:
+    /// 48 kHz is the rate every phone and Mac voice memo records at, and a 1 kHz tone sits well
+    /// inside the 12 kHz band that survives the trip to 24 kHz.
+    #[test]
+    fn a_48k_tone_resamples_to_24k_with_its_shape_intact() {
+        const SOURCE_HZ: u32 = 48_000;
+        const TONE_HZ: f64 = 1_000.0;
+        let samples = SOURCE_HZ as usize; // one second
+        let pcm: Vec<f32> = (0..samples)
+            .map(|n| {
+                let t = n as f64 / f64::from(SOURCE_HZ);
+                (std::f64::consts::TAU * TONE_HZ * t).sin() as f32
+            })
+            .collect();
+
+        let out = resample_to_speaker_rate(pcm, SOURCE_HZ);
+
+        let expected_len = SPEAKER_SAMPLE_RATE_HZ as usize;
+        assert!(
+            out.len().abs_diff(expected_len) <= 1,
+            "expected ~{expected_len} samples at {SPEAKER_SAMPLE_RATE_HZ} Hz, got {}",
+            out.len()
+        );
+
+        // Compare against the tone sampled directly at the target rate, ignoring the window's
+        // run-up at each end where the kernel is truncated by the signal boundary.
+        let skip = 64;
+        let mut worst = 0.0_f32;
+        for index in skip..out.len() - skip {
+            let t = index as f64 / f64::from(SPEAKER_SAMPLE_RATE_HZ);
+            let ideal = (std::f64::consts::TAU * TONE_HZ * t).sin() as f32;
+            worst = worst.max((out[index] - ideal).abs());
+        }
+        assert!(
+            worst < 0.02,
+            "resampled tone drifted from the analytic reference by {worst}"
+        );
+    }
 
     #[test]
     fn a_short_speaker_vector_is_refused_rather_than_padded() {
