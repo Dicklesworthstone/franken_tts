@@ -56,6 +56,9 @@ struct Control {
     generation: u64,
     job: Option<Job>,
     remaining: usize,
+    /// Set when any partition panicked during the current dispatch, so the caller can
+    /// propagate a loud failure instead of hanging on a worker that will never report done.
+    panicked: bool,
 }
 
 struct Shared {
@@ -115,6 +118,7 @@ pub fn armed() -> Option<&'static Team> {
                 generation: 0,
                 job: None,
                 remaining: 0,
+                panicked: false,
             }),
             go: Condvar::new(),
             done: Condvar::new(),
@@ -140,15 +144,24 @@ fn worker_loop(shared: &'static Shared, worker: usize) {
     let mut seen = 0_u64;
     loop {
         let job = {
-            let mut control = shared.control.lock().expect("team control poisoned");
+            let mut control = lock_control(shared);
             while control.generation == seen {
-                control = shared.go.wait(control).expect("team control poisoned");
+                control = shared
+                    .go
+                    .wait(control)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
             seen = control.generation;
             control.job.expect("generation bumped without a job")
         };
-        run_partition(&job, worker);
-        let mut control = shared.control.lock().expect("team control poisoned");
+        // A panicking partition must still report done, or the caller hangs forever waiting
+        // for a decrement that will never come. The panic is recorded and re-raised loudly on
+        // the caller's thread instead.
+        let outcome = std::panic::catch_unwind(|| run_partition(&job, worker));
+        let mut control = lock_control(shared);
+        if outcome.is_err() {
+            control.panicked = true;
+        }
         control.remaining -= 1;
         if control.remaining == 0 {
             shared.done.notify_all();
@@ -156,9 +169,23 @@ fn worker_loop(shared: &'static Shared, worker: usize) {
     }
 }
 
+/// Locks team control, tolerating poison: every dispatch re-establishes the full invariant
+/// (job, generation, remaining) from scratch, so a lock poisoned by an earlier panic carries
+/// no state that could mislead the next dispatch.
+fn lock_control(shared: &Shared) -> std::sync::MutexGuard<'_, Control> {
+    shared
+        .control
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Computes one worker's contiguous column range. Identical arithmetic to the serial
 /// weight-stationary loop in [`crate::int8::linear_q8`], restricted to `[start, end)`.
 fn run_partition(job: &Job, worker: usize) {
+    #[cfg(test)]
+    if worker > 0 && tests::PANIC_INJECT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        panic!("injected worker panic for the hang-hardening test");
+    }
     let chunk = job.n.div_ceil(job.partitions);
     let start = (worker * chunk).min(job.n);
     let end = ((worker + 1) * chunk).min(job.n);
@@ -229,28 +256,48 @@ impl Team {
             partitions: self.partitions,
         };
 
-        // One dispatch at a time, held through the join (module-docs fact 3).
-        let _gate = self.dispatch_gate.lock().expect("dispatch gate poisoned");
+        // One dispatch at a time, held through the join (module-docs fact 3). Poison
+        // tolerance: a prior caller's panic leaves no dispatch state behind — everything is
+        // re-established below.
+        let _gate = self
+            .dispatch_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         {
-            let mut control = self.shared.control.lock().expect("team control poisoned");
+            let mut control = lock_control(self.shared);
             control.job = Some(job);
             control.generation += 1;
             control.remaining = self.partitions - 1;
+            control.panicked = false;
             self.shared.go.notify_all();
         }
 
-        // The caller is partition 0: it works instead of idling.
-        run_partition(&job, 0);
+        // The caller is partition 0: it works instead of idling. Its own panic must still
+        // wait out the workers (they hold live pointers into the caller's slices), so the
+        // join below runs before any unwind continues.
+        let caller_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_partition(&job, 0);
+        }));
 
-        let mut control = self.shared.control.lock().expect("team control poisoned");
+        let mut control = lock_control(self.shared);
         while control.remaining > 0 {
             control = self
                 .shared
                 .done
                 .wait(control)
-                .expect("team control poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         control.job = None;
+        let worker_panicked = control.panicked;
+        drop(control);
+
+        if let Err(payload) = caller_outcome {
+            std::panic::resume_unwind(payload);
+        }
+        assert!(
+            !worker_panicked,
+            "a team worker panicked during this dispatch; the output buffer is not fully written"
+        );
     }
 }
 
@@ -258,6 +305,29 @@ impl Team {
 mod tests {
     use super::*;
     use crate::int8::linear_q8;
+
+    /// One-shot fuse consumed by [`run_partition`] on a worker thread.
+    pub(super) static PANIC_INJECT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[test]
+    fn a_panicking_worker_fails_the_dispatch_loudly_instead_of_hanging() {
+        let team = test_team(3);
+        let weight = matrix(64, 32, 5);
+        let x_q = vec![1_i8; 32];
+        let mut out = vec![0.0_f32; 64];
+        PANIC_INJECT.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            team.linear_q8(&x_q, &[1.0], &weight, None, 1, &mut out, Int8Tier::Scalar);
+        }));
+        assert!(
+            outcome.is_err(),
+            "a worker panic must surface at the caller, not hang or pass"
+        );
+        // And the team must still be usable afterwards.
+        team.linear_q8(&x_q, &[1.0], &weight, None, 1, &mut out, Int8Tier::Scalar);
+        assert!(out.iter().all(|value| value.is_finite()));
+    }
 
     fn matrix(n: usize, k: usize, seed: u64) -> QuantizedMatrix {
         let mut state = seed;
@@ -281,6 +351,7 @@ mod tests {
                 generation: 0,
                 job: None,
                 remaining: 0,
+                panicked: false,
             }),
             go: Condvar::new(),
             done: Condvar::new(),
