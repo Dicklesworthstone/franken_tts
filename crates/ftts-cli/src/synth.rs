@@ -849,9 +849,8 @@ impl ImcraTracker {
 
         // Pass 1: smooth in frequency, then in time, then track the minimum.
         let smoothed_freq = smooth_across_bins(power);
-        for bin in 0..self.bins {
-            self.smoothed[bin] =
-                IMCRA_ALPHA_S * self.smoothed[bin] + (1.0 - IMCRA_ALPHA_S) * smoothed_freq[bin];
+        for (slot, fresh) in self.smoothed.iter_mut().zip(&smoothed_freq) {
+            *slot = IMCRA_ALPHA_S * *slot + (1.0 - IMCRA_ALPHA_S) * fresh;
         }
         track_minimum(
             &self.smoothed,
@@ -872,9 +871,8 @@ impl ImcraTracker {
         // Pass 2: repeat the smoothing using only those bins, which keeps a strong harmonic from
         // dragging its neighbours' floor upward.
         let refined_freq = smooth_across_bins_masked(power, &noise_only, &self.smoothed_refined);
-        for bin in 0..self.bins {
-            self.smoothed_refined[bin] = IMCRA_ALPHA_S * self.smoothed_refined[bin]
-                + (1.0 - IMCRA_ALPHA_S) * refined_freq[bin];
+        for (slot, fresh) in self.smoothed_refined.iter_mut().zip(&refined_freq) {
+            *slot = IMCRA_ALPHA_S * *slot + (1.0 - IMCRA_ALPHA_S) * fresh;
         }
         track_minimum(
             &self.smoothed_refined,
@@ -888,10 +886,14 @@ impl ImcraTracker {
             let floor = (IMCRA_B_MIN * self.running_min_refined[bin]).max(1e-12);
             let gamma_min = power[bin] / floor;
             let zeta = self.smoothed_refined[bin] / floor;
-            let q = if gamma_min <= 1.0 || zeta < IMCRA_ZETA0 {
-                1.0
-            } else if gamma_min >= IMCRA_GAMMA1 {
+            // Cohen 2003 eq. 29. Either statistic rising above its threshold is enough to declare
+            // speech; absence requires BOTH to sit low. Reading this as an OR — letting a low
+            // `zeta` alone force absence — gates every speech bin down to the floor, because the
+            // refined smoother deliberately holds `zeta` at the noise level wherever speech is.
+            let q = if gamma_min >= IMCRA_GAMMA1 || zeta >= IMCRA_ZETA0 {
                 0.0
+            } else if gamma_min <= 1.0 {
+                1.0
             } else {
                 (IMCRA_GAMMA1 - gamma_min) / (IMCRA_GAMMA1 - 1.0)
             };
@@ -905,7 +907,7 @@ impl ImcraTracker {
         }
 
         self.frame += 1;
-        if self.frame % IMCRA_SUBWINDOW_LEN == 0 {
+        if self.frame.is_multiple_of(IMCRA_SUBWINDOW_LEN) {
             self.roll_subwindow();
         }
         presence
@@ -1365,7 +1367,7 @@ mod tests {
         let clean: Vec<f32> = (0..samples)
             .map(|n| {
                 let t = n as f64 / f64::from(SPEAKER_SAMPLE_RATE_HZ);
-                let speaking = (n / (SPEAKER_SAMPLE_RATE_HZ as usize / 2)) % 2 == 0;
+                let speaking = (n / (SPEAKER_SAMPLE_RATE_HZ as usize / 2)).is_multiple_of(2);
                 if speaking {
                     (std::f64::consts::TAU * TONE_HZ * t).sin() as f32 * 0.35
                 } else {
