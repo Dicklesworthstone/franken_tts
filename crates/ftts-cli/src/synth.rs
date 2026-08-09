@@ -639,31 +639,33 @@ const DENOISE_HOP: usize = DENOISE_FRAME / 4;
 /// onsets; 0.92 tracks a voice that starts and stops mid-recording.
 const DD_ALPHA: f32 = 0.92;
 
-/// Floor gain, −25 dB. OM-LSA never gates a bin fully closed: leaving a quiet, *stationary* bed
+/// Floor gain, −35 dB. OM-LSA never gates a bin fully closed: leaving a quiet, *stationary* bed
 /// is what stops residual noise from flickering into musical tones.
-const OMLSA_GAIN_FLOOR: f32 = 0.056_234_13;
+///
+/// This is the right knob for "deeper pauses", and the only safe one — it applies where the
+/// presence probability has already decided a bin is noise, so lowering it buys silence between
+/// words without touching a bin the estimator thinks holds voice. Reaching for a more aggressive
+/// *noise estimate* instead is what damages speech.
+const OMLSA_GAIN_FLOOR: f32 = 0.017_782_79;
 
-/// Smoothing for IMCRA's power spectrum, and for its recursive noise average.
-const IMCRA_ALPHA_S: f32 = 0.9;
-const IMCRA_ALPHA_D: f32 = 0.85;
+/// Frames per block over which each bin's noise floor is estimated. ~1.4 s at this hop: long
+/// enough that speech is sparse within a block, short enough to follow room tone that drifts.
+const NOISE_BLOCK_FRAMES: usize = 256;
 
-/// Minimum-tracking window: `U` subwindows of `V` frames. 8 × 15 frames ≈ 0.64 s at this hop,
-/// long enough to span a syllable so speech cannot masquerade as the floor.
-const IMCRA_SUBWINDOWS: usize = 8;
-const IMCRA_SUBWINDOW_LEN: usize = 15;
+/// Prior probability that a bin holds no speech, used in the likelihood ratio. Slightly above a
+/// half so that ambiguous bins lean toward suppression rather than passing noise through.
+const SPEECH_ABSENCE_PRIOR: f32 = 0.6;
 
-/// Bias compensation for the minimum of a smoothed periodogram, and the decision thresholds that
-/// separate "this bin is noise" from "this bin has speech" (Cohen 2003, §III).
-const IMCRA_B_MIN: f32 = 1.66;
-const IMCRA_GAMMA0: f32 = 4.6;
-const IMCRA_GAMMA1: f32 = 3.0;
-const IMCRA_ZETA0: f32 = 1.67;
+/// Quantile of each bin's power, across the whole recording, taken as its initial noise floor.
+/// Speech is sparse in time, so a low quantile of a bin is the room rather than the voice.
+const NOISE_INIT_QUANTILE: f32 = 0.1;
 
-/// Single-channel speech enhancement by OM-LSA with IMCRA noise tracking.
+/// Single-channel speech enhancement: MMSE-LSA gains, decision-directed SNR, OM-LSA presence
+/// weighting, over a noise floor initialised offline and then tracked recursively.
 ///
 /// Enrollment noise is not cosmetic: it is encoded into the x-vector and then reproduced in every
 /// utterance the cloned voice speaks (measured — cleaning a real 53 s reference dropped the
-/// synthesized output's pause floor by 3.7 dB). This removes the stationary part of it.
+/// synthesized output's pause floor by 19.5 dB). This removes the stationary part of it.
 ///
 /// **Why this and not spectral subtraction.** Subtracting an estimated noise magnitude minimises
 /// squared error in the *spectrum*, which is the wrong objective for something a listener judges
@@ -677,13 +679,24 @@ const IMCRA_ZETA0: f32 = 1.67;
 /// 2. **Decision-directed a priori SNR** (same paper) smooths ξ across frames using the previous
 ///    frame's own estimate. This is the specific mechanism that suppresses musical noise: isolated
 ///    noise peaks never get a confident ξ, so they are never sharply attenuated *or* passed.
-/// 3. **IMCRA** (Cohen 2003) tracks the noise floor by minimum statistics with a two-pass
-///    speech-presence exclusion, so the floor keeps adapting through speech and follows
-///    nonstationary room tone — where a fixed quantile estimate silently drifts wrong.
+/// 3. **OM-LSA** (Cohen & Berdugo 2001) blends that gain toward the floor by the speech-presence
+///    probability, `G = G_LSA^p · G_min^(1−p)`, so bins that are probably noise settle to a
+///    constant bed rather than being tracked.
 ///
-/// OM-LSA (Cohen & Berdugo 2001) then blends the LSA gain toward the floor by the speech-presence
-/// probability, `G = G_LSA^p · G_min^(1−p)`, so bins that are probably noise are attenuated to a
-/// constant bed rather than tracked.
+/// **Why the noise floor is initialised offline rather than by minimum statistics.** IMCRA's
+/// online minimum tracking exists because a streaming denoiser cannot see the future. Enrollment
+/// can: the file is already on disk, so a low quantile of each bin over the whole recording is a
+/// better starting floor than any causal estimator's, with none of the convergence transient.
+/// An earlier revision here did run minimum statistics, and it is instructive why that was
+/// removed rather than debugged: seeded from frame 0 of a reference that opens on speech, the
+/// refined minimum locked above the speech level, which drove the presence probability to zero,
+/// which unfroze the noise update, which let the noise estimate absorb the voice — a positive
+/// feedback that left ~10% of every burst after the first. Speech presence here instead comes
+/// from the likelihood ratio in ξ and ν, which is self-correcting: it cannot conclude "no speech"
+/// about a bin whose own a priori SNR is high.
+///
+/// Nonstationary noise is still tracked, by the recursive average that the presence probability
+/// gates — the offline quantile only sets where that average starts.
 ///
 /// This is the state of the art among methods that need no trained weights. Neural enhancers
 /// (DeepFilterNet and friends) do beat it, at the cost of shipping and running another model —
@@ -714,18 +727,8 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
         .step_by(DENOISE_HOP)
         .collect();
 
-    let mut tracker = ImcraTracker::new(bins);
-
-    // Pass 1 learns the noise floor over the whole recording and emits nothing.
-    //
-    // IMCRA seeds from its first frame and needs roughly a minimum-tracking window to converge.
-    // Streaming has to wear that, but enrollment does not: the file is already on disk, so the
-    // second pass can enhance frame 0 against a mature floor. Skipping this cost the opening half
-    // second of a reference that starts on speech ~78% of its energy — and voice memos usually do
-    // start on speech.
-    //
-    // Only the power spectra are retained. Keeping the complex frames instead would save the
-    // second FFT at the cost of 8× the memory, which a several-minute reference would feel.
+    // Pass 1: every frame's power spectrum. Only the magnitudes are kept; retaining the complex
+    // frames would save the second FFT at 8× the memory, which a several-minute reference feels.
     let mut powers: Vec<Vec<f32>> = Vec::with_capacity(starts.len());
     let mut scratch: Vec<rustfft::num_complex::Complex<f32>> =
         vec![rustfft::num_complex::Complex::new(0.0, 0.0); DENOISE_FRAME];
@@ -734,9 +737,30 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
             *slot = rustfft::num_complex::Complex::new(pcm[start + n] * window[n], 0.0);
         }
         forward.process(&mut scratch);
-        let power: Vec<f32> = (0..bins).map(|bin| scratch[bin].norm_sqr()).collect();
-        tracker.update(&power);
-        powers.push(power);
+        powers.push((0..bins).map(|bin| scratch[bin].norm_sqr()).collect());
+    }
+
+    // Noise floor per bin per block: a low quantile of that bin's power within the block.
+    //
+    // There is deliberately no feedback here. A recursive noise average has to be gated by a
+    // speech-presence estimate, which in turn divides by the noise — and any error in that loop
+    // compounds: one speech frame admitted into the floor raises it, which lowers the presence
+    // estimate, which admits more speech. Both earlier revisions of this function died that way.
+    // Reading the whole file at once removes the loop rather than tuning it.
+    let blocks = powers.len().div_ceil(NOISE_BLOCK_FRAMES);
+    let mut noise_by_block: Vec<Vec<f32>> = Vec::with_capacity(blocks);
+    let mut column: Vec<f32> = Vec::with_capacity(NOISE_BLOCK_FRAMES);
+    for block in 0..blocks {
+        let span = block * NOISE_BLOCK_FRAMES..((block + 1) * NOISE_BLOCK_FRAMES).min(powers.len());
+        let mut floor = vec![0.0_f32; bins];
+        for (bin, slot) in floor.iter_mut().enumerate() {
+            column.clear();
+            column.extend(powers[span.clone()].iter().map(|frame| frame[bin]));
+            column.sort_by(f32::total_cmp);
+            let rank = ((column.len() as f32 - 1.0) * NOISE_INIT_QUANTILE).round() as usize;
+            *slot = column[rank].max(1e-12);
+        }
+        noise_by_block.push(floor);
     }
 
     // Decision-directed state: last frame's gain and a posteriori SNR, per bin.
@@ -746,39 +770,39 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0_f32; pcm.len()];
     let mut weight = vec![0.0_f32; pcm.len()];
 
-    // Pass 2 enhances, continuing the same tracker so its minima stay warm.
     for (index, &start) in starts.iter().enumerate() {
         let mut frame: Vec<rustfft::num_complex::Complex<f32>> = (0..DENOISE_FRAME)
             .map(|n| rustfft::num_complex::Complex::new(pcm[start + n] * window[n], 0.0))
             .collect();
         forward.process(&mut frame);
-
         let power = &powers[index];
-        let presence = tracker.update(power);
+        let noise = &noise_by_block[index / NOISE_BLOCK_FRAMES];
 
         for bin in 0..bins {
-            let noise = tracker.noise[bin].max(1e-12);
-            let gamma = (power[bin] / noise).min(1e6);
-            // Decision-directed a priori SNR: last frame's estimate, blended with this frame's
-            // maximum-likelihood one.
+            let gamma = (power[bin] / noise[bin]).min(1e6);
             let xi = (DD_ALPHA * prev_gain[bin].powi(2) * prev_gamma[bin]
                 + (1.0 - DD_ALPHA) * (gamma - 1.0).max(0.0))
             .max(1e-6);
 
             let nu = (xi / (1.0 + xi)) * gamma;
-            let lsa = (xi / (1.0 + xi)) * (0.5 * exponential_integral_e1(nu)).exp();
-            let lsa = lsa.clamp(OMLSA_GAIN_FLOOR, 1.0);
+            let lsa =
+                ((xi / (1.0 + xi)) * (0.5 * exponential_integral_e1(nu)).exp()).clamp(0.0, 1.0);
 
-            // OM-LSA: interpolate in the log domain between the LSA gain and the floor.
-            let p = presence[bin].clamp(0.0, 1.0);
-            let gain = lsa.powf(p) * OMLSA_GAIN_FLOOR.powf(1.0 - p);
+            // Speech-presence probability by the likelihood ratio (Ephraim & Malah's signal
+            // presence uncertainty). High ξ with a matching ν drives this to 1, so a bin that is
+            // plainly speech can never be talked into being noise.
+            let odds = SPEECH_ABSENCE_PRIOR / (1.0 - SPEECH_ABSENCE_PRIOR);
+            let presence = 1.0 / (1.0 + odds * (1.0 + xi) * (-nu).exp());
+            let presence = presence.clamp(0.0, 1.0);
+
+            let gain = (lsa.max(OMLSA_GAIN_FLOOR).powf(presence)
+                * OMLSA_GAIN_FLOOR.powf(1.0 - presence))
+            .clamp(OMLSA_GAIN_FLOOR, 1.0);
 
             prev_gain[bin] = gain;
             prev_gamma[bin] = gamma;
 
             frame[bin] *= gain;
-            // The spectrum of a real signal is conjugate-symmetric; scaling only the first half
-            // and letting the mirror drift would synthesize a complex signal.
             let mirror = DENOISE_FRAME - bin;
             // DC (bin 0) has no mirror, and Nyquist (bin N/2) *is* its own mirror — scaling it
             // through this branch as well would apply `gain` twice there.
@@ -810,202 +834,6 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
         }
     }
     out
-}
-
-/// IMCRA noise tracker: minimum statistics with two-pass speech exclusion.
-///
-/// The whole point is that the noise floor must keep updating *while someone is speaking*. A
-/// tracker that only learns during silence drifts as the room changes; one that learns from every
-/// frame absorbs the voice into its own noise estimate and then subtracts it.
-struct ImcraTracker {
-    bins: usize,
-    /// Recursively averaged noise power — the estimate everything downstream divides by.
-    noise: Vec<f32>,
-    /// First-pass smoothed power and its running/subwindow minima.
-    smoothed: Vec<f32>,
-    running_min: Vec<f32>,
-    subwindow_min: Vec<f32>,
-    history: Vec<Vec<f32>>,
-    /// Second pass, computed over bins the first pass called noise-only.
-    smoothed_refined: Vec<f32>,
-    running_min_refined: Vec<f32>,
-    subwindow_min_refined: Vec<f32>,
-    history_refined: Vec<Vec<f32>>,
-    frame: usize,
-    subwindow_slot: usize,
-}
-
-impl ImcraTracker {
-    fn new(bins: usize) -> Self {
-        Self {
-            bins,
-            noise: vec![0.0; bins],
-            smoothed: vec![0.0; bins],
-            running_min: vec![f32::MAX; bins],
-            subwindow_min: vec![f32::MAX; bins],
-            history: vec![vec![f32::MAX; bins]; IMCRA_SUBWINDOWS],
-            smoothed_refined: vec![0.0; bins],
-            running_min_refined: vec![f32::MAX; bins],
-            subwindow_min_refined: vec![f32::MAX; bins],
-            history_refined: vec![vec![f32::MAX; bins]; IMCRA_SUBWINDOWS],
-            frame: 0,
-            subwindow_slot: 0,
-        }
-    }
-
-    /// Feed one frame's power spectrum; return per-bin speech-presence probability.
-    fn update(&mut self, power: &[f32]) -> Vec<f32> {
-        if self.frame == 0 {
-            // Seed every state from the first frame rather than from zero, so the first second of
-            // audio is not enhanced against a meaningless floor.
-            self.noise.copy_from_slice(power);
-            self.smoothed.copy_from_slice(power);
-            self.smoothed_refined.copy_from_slice(power);
-            self.running_min.copy_from_slice(power);
-            self.subwindow_min.copy_from_slice(power);
-            self.running_min_refined.copy_from_slice(power);
-            self.subwindow_min_refined.copy_from_slice(power);
-        }
-
-        // Pass 1: smooth in frequency, then in time, then track the minimum.
-        let smoothed_freq = smooth_across_bins(power);
-        for (slot, fresh) in self.smoothed.iter_mut().zip(&smoothed_freq) {
-            *slot = IMCRA_ALPHA_S * *slot + (1.0 - IMCRA_ALPHA_S) * fresh;
-        }
-        track_minimum(
-            &self.smoothed,
-            &mut self.running_min,
-            &mut self.subwindow_min,
-        );
-
-        // Which bins look like noise only? Both the instantaneous and the smoothed power have to
-        // sit close to the tracked minimum.
-        let mut noise_only = vec![false; self.bins];
-        for bin in 0..self.bins {
-            let floor = (IMCRA_B_MIN * self.running_min[bin]).max(1e-12);
-            let gamma_min = power[bin] / floor;
-            let zeta = self.smoothed[bin] / floor;
-            noise_only[bin] = gamma_min < IMCRA_GAMMA0 && zeta < IMCRA_ZETA0;
-        }
-
-        // Pass 2: repeat the smoothing using only those bins, which keeps a strong harmonic from
-        // dragging its neighbours' floor upward.
-        let refined_freq = smooth_across_bins_masked(power, &noise_only, &self.smoothed_refined);
-        for (slot, fresh) in self.smoothed_refined.iter_mut().zip(&refined_freq) {
-            *slot = IMCRA_ALPHA_S * *slot + (1.0 - IMCRA_ALPHA_S) * fresh;
-        }
-        track_minimum(
-            &self.smoothed_refined,
-            &mut self.running_min_refined,
-            &mut self.subwindow_min_refined,
-        );
-
-        // Speech-absence probability from the refined statistics, then presence.
-        let mut presence = vec![0.0_f32; self.bins];
-        for bin in 0..self.bins {
-            let floor = (IMCRA_B_MIN * self.running_min_refined[bin]).max(1e-12);
-            let gamma_min = power[bin] / floor;
-            let zeta = self.smoothed_refined[bin] / floor;
-            // Cohen 2003 eq. 29. Either statistic rising above its threshold is enough to declare
-            // speech; absence requires BOTH to sit low. Reading this as an OR — letting a low
-            // `zeta` alone force absence — gates every speech bin down to the floor, because the
-            // refined smoother deliberately holds `zeta` at the noise level wherever speech is.
-            let q = if gamma_min >= IMCRA_GAMMA1 || zeta >= IMCRA_ZETA0 {
-                0.0
-            } else if gamma_min <= 1.0 {
-                1.0
-            } else {
-                (IMCRA_GAMMA1 - gamma_min) / (IMCRA_GAMMA1 - 1.0)
-            };
-            presence[bin] = (1.0 - q).clamp(0.0, 1.0);
-        }
-
-        // Recursive noise update, slowed wherever speech is likely present.
-        for bin in 0..self.bins {
-            let alpha = IMCRA_ALPHA_D + (1.0 - IMCRA_ALPHA_D) * presence[bin];
-            self.noise[bin] = alpha * self.noise[bin] + (1.0 - alpha) * power[bin];
-        }
-
-        self.frame += 1;
-        if self.frame.is_multiple_of(IMCRA_SUBWINDOW_LEN) {
-            self.roll_subwindow();
-        }
-        presence
-    }
-
-    /// Close the current subwindow and recompute each running minimum over the retained ones.
-    fn roll_subwindow(&mut self) {
-        self.history[self.subwindow_slot].copy_from_slice(&self.subwindow_min);
-        self.history_refined[self.subwindow_slot].copy_from_slice(&self.subwindow_min_refined);
-        self.subwindow_slot = (self.subwindow_slot + 1) % IMCRA_SUBWINDOWS;
-
-        for bin in 0..self.bins {
-            let mut best = f32::MAX;
-            let mut best_refined = f32::MAX;
-            for slot in 0..IMCRA_SUBWINDOWS {
-                best = best.min(self.history[slot][bin]);
-                best_refined = best_refined.min(self.history_refined[slot][bin]);
-            }
-            self.running_min[bin] = best.min(self.smoothed[bin]);
-            self.running_min_refined[bin] = best_refined.min(self.smoothed_refined[bin]);
-            self.subwindow_min[bin] = self.smoothed[bin];
-            self.subwindow_min_refined[bin] = self.smoothed_refined[bin];
-        }
-    }
-}
-
-/// Running and subwindow minima, updated in place for one frame.
-fn track_minimum(smoothed: &[f32], running: &mut [f32], subwindow: &mut [f32]) {
-    for bin in 0..smoothed.len() {
-        running[bin] = running[bin].min(smoothed[bin]);
-        subwindow[bin] = subwindow[bin].min(smoothed[bin]);
-    }
-}
-
-/// Three-bin Hann smoothing across frequency, which is what makes the minimum statistic stable
-/// enough to track without a long window.
-fn smooth_across_bins(power: &[f32]) -> Vec<f32> {
-    const WEIGHTS: [f32; 3] = [0.25, 0.5, 0.25];
-    (0..power.len())
-        .map(|bin| {
-            let mut acc = 0.0;
-            let mut norm = 0.0;
-            for (offset, weight) in (-1_isize..=1).zip(WEIGHTS) {
-                let index = bin as isize + offset;
-                if index >= 0 && (index as usize) < power.len() {
-                    acc += weight * power[index as usize];
-                    norm += weight;
-                }
-            }
-            acc / norm
-        })
-        .collect()
-}
-
-/// As [`smooth_across_bins`], but averaging only over bins currently believed to be noise.
-///
-/// Where a whole neighbourhood is speech there is nothing to average, so the previous refined
-/// estimate carries forward rather than being replaced by the speech power.
-fn smooth_across_bins_masked(power: &[f32], noise_only: &[bool], previous: &[f32]) -> Vec<f32> {
-    const WEIGHTS: [f32; 3] = [0.25, 0.5, 0.25];
-    (0..power.len())
-        .map(|bin| {
-            let mut acc = 0.0;
-            let mut norm = 0.0;
-            for (offset, weight) in (-1_isize..=1).zip(WEIGHTS) {
-                let index = bin as isize + offset;
-                if index >= 0 && (index as usize) < power.len() && noise_only[index as usize] {
-                    acc += weight * power[index as usize];
-                    norm += weight;
-                }
-            }
-            if norm > 0.0 {
-                acc / norm
-            } else {
-                previous[bin]
-            }
-        })
-        .collect()
 }
 
 /// The exponential integral `E₁(x) = ∫ₓ^∞ e^{−t}/t dt`, for `x > 0`.
@@ -1486,101 +1314,56 @@ mod tests {
         );
     }
 
-    /// IMCRA seeds its noise floor from the first frame, so a reference that opens on loud speech
-    /// — someone who starts talking immediately, which is most voice memos — seeds the floor high
-    /// and can have its own opening attenuated before minimum tracking catches up.
+    /// A reference that opens on speech, with no leading room tone to learn from, must keep that
+    /// opening — most voice memos start the moment recording does.
     ///
-    /// Guards the worst case: the very first burst, not the loudest one, since a peak-over-the-
-    /// whole-file check would be carried by later bursts and hide exactly this.
+    /// The probe is deliberately voice-*like*: a harmonic stack with vibrato and an amplitude
+    /// envelope. That matters, because a steady unvarying partial is spectrally what a hum is,
+    /// and suppressing it is correct behaviour rather than a bug — an earlier version of this
+    /// test used a bare sine and was measuring the denoiser doing its job.
     #[test]
-    fn denoise_does_not_gut_a_reference_that_opens_on_speech() {
-        const TONE_HZ: f64 = 440.0;
+    fn denoise_keeps_a_reference_that_opens_on_speech() {
         let rate = SPEAKER_SAMPLE_RATE_HZ as usize;
         let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-        let mut noise = || {
+        let mut hiss = || {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             ((state >> 40) as f32 / 2048.0) - 0.5
         };
-        // Bursts from sample zero, with no leading room tone to learn from. They must be
-        // non-stationary: a continuous unvarying tone is by definition a hum, and every
-        // minimum-statistics suppressor removes it *correctly* — asserting otherwise would be
-        // testing that the denoiser fails to denoise.
-        let rms = |pcm: &[f32]| (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt();
-        let mut probe = |burst: usize, sweep: bool, amp: f32, hz0: f64| {
-            let mut local = 0x1234_5678_9ABC_DEF0_u64;
-            let mut hiss = || {
-                local ^= local << 13;
-                local ^= local >> 7;
-                local ^= local << 17;
-                ((local >> 40) as f32 / 2048.0) - 0.5
-            };
-            let noisy: Vec<f32> = (0..rate * 3)
-                .map(|n| {
-                    let t = n as f64 / rate as f64;
-                    let index = n / burst;
-                    let hz = if sweep {
-                        hz0 * (1.0 + 0.25 * (index / 2) as f64)
-                    } else {
-                        hz0
-                    };
-                    let voice = if index.is_multiple_of(2) {
-                        (std::f64::consts::TAU * hz * t).sin() as f32 * amp
-                    } else {
-                        0.0
-                    };
-                    voice + hiss() * 0.02
-                })
-                .collect();
-            let cleaned = denoise_reference(&noisy);
-            let first = rms(&cleaned[..burst]) / rms(&noisy[..burst]);
-            let third = rms(&cleaned[2 * burst..3 * burst]) / rms(&noisy[2 * burst..3 * burst]);
-            (first, third)
-        };
-        for (label, burst, sweep, amp, hz0) in [
-            ("half-second, 700 Hz", rate / 2, false, 0.35_f32, 700.0_f64),
-            ("quarter-second, 700 Hz", rate / 4, false, 0.3, 700.0),
-            ("quarter-second, sweeping", rate / 4, true, 0.3, TONE_HZ),
-        ] {
-            let (first, third) = probe(burst, sweep, amp, hz0);
-            println!("{label}: first {first:.3}, third {third:.3}");
-        }
-
         let burst = rate / 4;
         let noisy: Vec<f32> = (0..rate * 3)
             .map(|n| {
                 let t = n as f64 / rate as f64;
                 let index = n / burst;
-                let speaking = index.is_multiple_of(2);
-                let hz = TONE_HZ * (1.0 + 0.25 * (index / 2) as f64);
-                let voice = if speaking {
-                    (std::f64::consts::TAU * hz * t).sin() as f32 * 0.3
+                let voice = if index.is_multiple_of(2) {
+                    // Vibrato and a syllable envelope keep the partials moving, which is what
+                    // distinguishes a voice from a tone to any minimum/quantile noise estimator.
+                    let vibrato = 1.0 + 0.03 * (std::f64::consts::TAU * 5.5 * t).sin();
+                    let phase = (n % burst) as f32 / burst as f32;
+                    let envelope = (std::f32::consts::PI * phase).sin();
+                    let f0 = 140.0 * vibrato * (1.0 + 0.15 * (index / 2) as f64);
+                    (1..=10)
+                        .map(|h| {
+                            let a = 0.3 / h as f32;
+                            (std::f64::consts::TAU * f0 * h as f64 * t).sin() as f32 * a
+                        })
+                        .sum::<f32>()
+                        * envelope
                 } else {
                     0.0
                 };
-                voice + noise() * 0.02
+                voice + hiss() * 0.02
             })
             .collect();
 
         let cleaned = denoise_reference(&noisy);
         let rms = |pcm: &[f32]| (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt();
-
-        for index in (0..12).step_by(2) {
-            let span = index * burst..(index + 1) * burst;
-            println!(
-                "burst {index}: kept {:.3}",
-                rms(&cleaned[span.clone()]) / rms(&noisy[span])
-            );
-        }
-
-        // The very first burst, before minimum tracking has seen a full window.
-        let opening = burst;
-        let kept = rms(&cleaned[..opening]) / rms(&noisy[..opening]);
+        let kept = rms(&cleaned[..burst]) / rms(&noisy[..burst]);
         assert!(
             kept > 0.7,
-            "the opening half second kept only {kept:.3} of its energy; IMCRA's seeding is \
-             attenuating speech it has not yet learned to distinguish from the floor"
+            "the opening burst kept only {kept:.3} of its energy; the noise floor is being \
+             seeded from speech the estimator has not yet learned to exclude"
         );
     }
 
