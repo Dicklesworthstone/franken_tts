@@ -22,6 +22,7 @@
 //! path, codec convolution, verifier, and batched variant extends that same surface before it
 //! may be selected.
 
+pub mod enhance;
 pub mod f32ref;
 pub mod int8;
 pub mod mmap;

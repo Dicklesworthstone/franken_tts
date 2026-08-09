@@ -322,7 +322,10 @@ pub fn speaker_from_voice(
     let pcm = match denoise {
         Some(report) => {
             let before = pause_floor_dbfs(&pcm);
-            let cleaned = denoise_reference(&pcm);
+            let cleaned = match neural_denoise_reference(bundle, &pcm)? {
+                Some(cleaned) => cleaned,
+                None => denoise_reference(&pcm),
+            };
             *report = Some(DenoiseReport {
                 before_dbfs: before,
                 after_dbfs: pause_floor_dbfs(&cleaned),
@@ -664,12 +667,20 @@ fn resample_to_speaker_rate(mono: Vec<f32>, from_rate: u32) -> Vec<f32> {
     if from_rate == SPEAKER_SAMPLE_RATE_HZ {
         return mono;
     }
+    resample_lanczos(&mono, from_rate, SPEAKER_SAMPLE_RATE_HZ)
+}
+
+/// The Lanczos-6 core, rate-agnostic: also carries the denoiser's 24 <-> 48 kHz round trip.
+fn resample_lanczos(mono: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate {
+        return mono.to_vec();
+    }
     // Six lobes, not three: with the cutoff at the output Nyquist a 3-lobe kernel's transition
     // band sits inside the passband — measured -2.2 dB at 10 kHz for 48->24 kHz and only ~18 dB
     // of alias rejection, right where the speaker encoder reads sibilance. Six lobes halves the
     // transition width and pushes rejection past 40 dB for double the (still trivial) tap count.
     const LOBES: f64 = 6.0;
-    let ratio = f64::from(SPEAKER_SAMPLE_RATE_HZ) / f64::from(from_rate);
+    let ratio = f64::from(to_rate) / f64::from(from_rate);
     let cutoff = ratio.min(1.0);
     let half = (LOBES / cutoff).ceil() as isize;
     let out_len = ((mono.len() as f64) * ratio).round() as usize;
@@ -789,6 +800,55 @@ const NOISE_INIT_QUANTILE: f32 = 0.1;
 /// which can damage speaker identity ships behind a named switch until blind listening clears it.
 ///
 /// Phase is preserved untouched; only per-bin magnitude is scaled.
+/// Where `ftts pull` lands the neural denoiser, relative to the model root.
+pub const DENOISE_ARTIFACT_RELPATH: &str = "denoise/fastenhancer-s-48k.safetensors";
+
+/// The FastEnhancer denoise path: 24 kHz reference up to the model's native 48 kHz,
+/// through the ported network, back down to 24 kHz.
+///
+/// Returns `Ok(None)` when the neural route is unavailable (artifact not pulled) or the
+/// user forced the classic engine with `FTTS_DENOISE_ENGINE=omlsa` — the caller falls back
+/// to the spectral-subtraction reference. A *present but malformed* artifact is an error,
+/// not a silent fallback: repairing it is one `ftts pull --force` away, and quietly handing
+/// the user a different denoiser than the one they pulled would misreport what cleaned
+/// their reference.
+///
+/// The network runs at 48 kHz because that is what its checkpoint was trained on (with
+/// low-pass augmentation down to 24 kHz content, so band-limited input is in-distribution).
+/// The round trip uses the same Lanczos-6 resampler enrollment already trusts, and the
+/// input is zero-padded to the model's hop grid so the STFT round trip returns every
+/// sample, then trimmed back to the original length.
+fn neural_denoise_reference(
+    bundle: &ModelBundle,
+    pcm24k: &[f32],
+) -> Result<Option<Vec<f32>>, FttsError> {
+    let path = bundle.root.join(DENOISE_ARTIFACT_RELPATH);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    if std::env::var("FTTS_DENOISE_ENGINE").is_ok_and(|v| v.eq_ignore_ascii_case("omlsa")) {
+        return Ok(None);
+    }
+    let enhancer = ftts_artifacts::enhance_loader::open_enhancer(&path).map_err(|error| {
+        FttsError::ArtifactFormat(format!(
+            "denoiser artifact {} is unreadable ({error}); re-fetch it with `ftts pull --force`",
+            path.display()
+        ))
+    })?;
+    let enhancer_rate = ftts_kernels::enhance::SAMPLE_RATE_HZ;
+    let mut wav48 = resample_lanczos(pcm24k, SPEAKER_SAMPLE_RATE_HZ, enhancer_rate);
+    let target_len = wav48.len();
+    // Pad to the hop grid: with len % 512 == 0 the enhancer returns exactly len samples.
+    const ENHANCER_HOP: usize = 512;
+    let padded = target_len.div_ceil(ENHANCER_HOP) * ENHANCER_HOP;
+    wav48.resize(padded, 0.0);
+    let mut enhanced = enhancer.enhance_48k(&wav48);
+    enhanced.truncate(target_len);
+    let mut back = resample_lanczos(&enhanced, enhancer_rate, SPEAKER_SAMPLE_RATE_HZ);
+    back.truncate(pcm24k.len());
+    Ok(Some(back))
+}
+
 fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
     // A floor estimated from a handful of frames is just the clip's own spectrum; below ~a
     // quarter second there is nothing honest to subtract, so the clip passes through untouched

@@ -23,6 +23,53 @@ individual commits are intentionally not cited.
 
 ## [Unreleased]
 
+### Added
+
+- Neural enrollment denoise: `ftts enroll --denoise` now runs a pure-Rust port of
+  FastEnhancer-S 48 kHz (207 K parameters, MIT), proven to 114–125 dB SNR parity against
+  its pinned PyTorch reference on every fixture. `ftts pull` fetches the 0.8 MB weight
+  artifact (sha256-pinned) alongside the model; without it, `--denoise` falls back to the
+  existing spectral-subtraction engine, and `FTTS_DENOISE_ENGINE=omlsa` forces that engine
+  explicitly. On a 15 dB-SNR static-hiss reference the neural path lowers the pause floor
+  by 65.5 dB (spectral subtraction: 24.6 dB) and moves the enrolled x-vector closer to the
+  clean-source enrollment (cosine 0.9613 vs 0.9548). The engine is thread-free and
+  mmap-free and compiles unchanged for wasm32. See `docs/DENOISER.md` for the truth pack.
+
+## [0.1.5] - 2026-08-09
+
+Windows gets a real installer, and the terminal stops printing NDJSON at people.
+
+### Added
+
+- `install.ps1`: a PowerShell one-liner for Windows, the platform `install.sh`
+  documents but explicitly declines to cover. It resolves the latest release,
+  downloads the zip, verifies it against the release's own `SHA256SUMS`,
+  installs both binaries under `%LOCALAPPDATA%` with no administrator rights,
+  and optionally adds them to the user PATH (`-EasyMode`). Validated end to end
+  on Windows PowerShell 5.1 against a real published release: download,
+  checksum, extract, install, PATH, already-installed short-circuit, and
+  `ftts --version` responding.
+- `ftts say` renders a human summary when stdout is a terminal — voice, model
+  load, frames, destination, and a real-time factor — instead of the NDJSON
+  event stream. The machine contract is unchanged for every non-terminal
+  consumer, which is the entire point; `--robot` forces NDJSON back on a
+  terminal.
+- `ftts enroll --dereverb`: blind dereverberation by Weighted Prediction Error,
+  for a reference recorded in a live room. Reverb is convolutive, so `--denoise`
+  cannot touch it; the speaker encoder cannot separate voice from room, so a wet
+  reference enrolls the room as part of the speaker.
+
+### Fixed
+
+- `LICENSE` shipped correctly. It had been truncated to zero bytes in the
+  working tree; release artifacts are built from a pinned worktree, which is
+  what kept the published packages intact.
+- Undefined behaviour in the worker team: every worker materialized a `&mut`
+  over the whole output buffer. The writes were disjoint but the references
+  overlapped, which is UB regardless — and `rustc` marks `&mut` `noalias`, so
+  the optimizer was entitled to act on it. Both the linear and attention paths
+  now write through raw pointers or a narrowed per-head span.
+
 ## [0.1.4] - 2026-08-09
 
 The speed release: synthesis now runs faster than real time on an M4 Pro

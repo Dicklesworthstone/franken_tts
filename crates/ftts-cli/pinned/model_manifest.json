@@ -5,6 +5,12 @@
   "repo": "Dicklesworthstone/franken_tts",
   "files": [
     {
+      "asset": "fastenhancer-s-48k-denoise.safetensors",
+      "dest": "denoise/fastenhancer-s-48k.safetensors",
+      "sha256": "28c1807fd9113e4ca09d3aacb2ecb07a742917321bfaced8b92598daffbd098b",
+      "bytes": 838440
+    },
+    {
       "asset": "qwen3-tts-12hz-0.6b-base.fttsq",
       "dest": "qwen3-tts-12hz-0.6b-base.fttsq",
       "sha256": "597f7eb3314a2fe5be74fa10a6a3a28ace9e10e582c641deccd37348a0ccd824",

@@ -3413,7 +3413,7 @@ mod tests {
         assert_eq!(manifest.model_id, "qwen3-tts-12hz-0.6b-base");
         assert_eq!(manifest.release_tag, "model-qwen3-tts-v1");
         assert_eq!(manifest.repo, "Dicklesworthstone/franken_tts");
-        assert_eq!(manifest.files.len(), 7);
+        assert_eq!(manifest.files.len(), 8);
 
         for file in &manifest.files {
             assert!(
