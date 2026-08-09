@@ -17,29 +17,77 @@
  * worse than the problem being solved. `try_reserve_exact` also turns an allocation failure into
  * a thrown error naming the number of bytes, rather than the opaque `unreachable` a wasm abort
  * shows the user.
+ * # Why the two files are staged in sequence rather than together
+ *
+ * The order is the whole optimization. Staging both raw files first and hydrating afterwards
+ * means that at the moment the codec finishes widening, THREE allocations are live at once:
+ *
+ * ```text
+ * artifact raw   1.31 GB   (staged, still untouched)
+ * codec raw      0.68 GB   (source, not yet droppable)
+ * codec f32     ~1.36 GB   (CodecCheckpoint owns Vec<f32> for every tensor)
+ *                =======
+ * peak          ~3.35 GB
+ * ```
+ *
+ * Dropping the codec source after the fact does not help: the peak has already happened. iOS
+ * Safari reclaims the tab somewhere below that, which is why the page died the instant it said
+ * "hydrating" even though the download had just succeeded.
+ *
+ * Hydrating the codec BEFORE the artifact is staged removes the largest term from the peak
+ * instead of from the aftermath:
+ *
+ * ```text
+ * phase 1   codec raw 0.68 + codec f32 1.36  = 2.04 GB, then the source drops -> 1.36 GB
+ * phase 2   codec f32 1.36 + artifact 1.31   = 2.67 GB
+ * ```
+ *
+ * 2.67 GB against 3.35 GB, and nothing is ever read twice. The caller therefore drives:
+ * `new(codec_bytes)` -> `push_codec` xN -> `finish_codec()` -> `reserve_fttsq(bytes)` ->
+ * `push_fttsq` xN -> `WasmEngine::from_staging`. Each step refuses to run out of order.
  */
 export class ModelStaging {
     free(): void;
     [Symbol.dispose](): void;
     /**
      * Bytes accepted so far, so the caller can drive a progress bar without tracking it twice.
+     *
+     * Counts the retired codec source rather than the live buffer, so the number keeps rising
+     * across the phase boundary instead of collapsing when the source is freed.
      */
     filled(): number;
     /**
-     * Reserve exact room for both files before any bytes arrive.
+     * Parse and widen the codec, then free its source bytes.
+     *
+     * This is the phase boundary. After it returns, the 0.68 GB of BF16 is gone and only the
+     * widened checkpoint remains, so the artifact can be staged against a much lower floor.
+     *
+     * # Errors
+     *
+     * Throws when the staged bytes are short of what was reserved, or when the checkpoint does
+     * not parse.
+     */
+    finish_codec(): void;
+    /**
+     * Reserve exact room for the codec checkpoint, the first file staged.
+     *
+     * The artifact is deliberately NOT reserved here — see the type-level note. Reserving it now
+     * would put its 1.31 GB back into the codec-hydration peak and undo the whole point.
      *
      * # Errors
      *
      * Throws when linear memory cannot be reserved, naming the byte count that failed — the
      * honest signal on a device that simply does not have the memory.
      */
-    constructor(fttsq_bytes: number, codec_bytes: number);
+    constructor(codec_bytes: number);
     /**
      * Append one slice of the codec checkpoint, in order.
      *
      * # Errors
      *
-     * As [`ModelStaging::push_fttsq`].
+     * Throws if the slice would exceed the reserved capacity, which means the caller's manifest
+     * and its download disagree — better caught here than as a corrupt tensor later. Also throws
+     * once the codec has been hydrated, when there is nothing left to append to.
      */
     push_codec(chunk: Uint8Array): void;
     /**
@@ -47,10 +95,18 @@ export class ModelStaging {
      *
      * # Errors
      *
-     * Throws if the slice would exceed the reserved capacity, which means the caller's manifest
-     * and its download disagree — better caught here than as a corrupt tensor later.
+     * Throws if the slice would exceed the reserved capacity, or if no reservation was made.
      */
     push_fttsq(chunk: Uint8Array): void;
+    /**
+     * Reserve exact room for the artifact, once the codec no longer needs its source bytes.
+     *
+     * # Errors
+     *
+     * Throws if called before [`ModelStaging::finish_codec`] — which would silently restore the
+     * 3.35 GB peak this type exists to avoid — or when the reservation fails.
+     */
+    reserve_fttsq(fttsq_bytes: number): void;
 }
 
 /**
@@ -223,9 +279,11 @@ export interface InitOutput {
     readonly bench_int8_gemv: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly int8_route: () => [number, number];
     readonly modelstaging_filled: (a: number) => number;
-    readonly modelstaging_new: (a: number, b: number) => [number, number, number];
+    readonly modelstaging_finish_codec: (a: number) => [number, number];
+    readonly modelstaging_new: (a: number) => [number, number, number];
     readonly modelstaging_push_codec: (a: number, b: number, c: number) => [number, number];
     readonly modelstaging_push_fttsq: (a: number, b: number, c: number) => [number, number];
+    readonly modelstaging_reserve_fttsq: (a: number, b: number) => [number, number];
     readonly preset_vector: (a: number, b: number) => [number, number, number, number];
     readonly presets: () => [number, number];
     readonly wasmengine_enroll: (a: number, b: number, c: number) => [number, number, number, number];
