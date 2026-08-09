@@ -81,6 +81,11 @@ const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
         "steady, measured, masculine",
         include_bytes!("../presets/robert.spk"),
     ),
+    (
+        "judy",
+        "bright, articulate, feminine",
+        include_bytes!("../presets/judy.spk"),
+    ),
 ];
 
 /// The preset used when `--voice`, `FTTS_DEFAULT_VOICE`, and MODEL_DIR/default.spk are all
@@ -260,7 +265,7 @@ struct SayArgs {
     model: Option<PathBuf>,
 
     /// Voice source: a .spk vector, reference audio, or a built-in voice name
-    /// (matt, james, leo, robert, aria, ember).
+    /// (matt, james, leo, robert, judy, aria, ember).
     /// Default: MODEL_DIR/default.spk when enrolled, else the built-in "matt".
     #[arg(long, value_name = "PATH|NAME")]
     voice: Option<PathBuf>,

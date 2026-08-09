@@ -35,8 +35,9 @@ proof; the f32 reference route remains one variable away (`FTTS_INT8=0`).
 
 - **Built-in voices, selectable by name.** A fresh install speaks out of the
   box: `ftts pull` then `ftts say "hello" out.wav` uses `matt`, the default.
-  Six voices ship in the binary — `matt`, `james`, `leo`, `robert` (masculine)
-  and `aria`, `ember` (feminine) — each an ordinary enrolled x-vector approved
+  Seven voices ship in the binary — `matt`, `james`, `leo`, `robert`
+  (masculine) and `judy`, `aria`, `ember` (feminine) — each an ordinary
+  enrolled x-vector approved
   by listening before it shipped, chosen with `--voice NAME`. An enrolled
   `default.spk`, `FTTS_DEFAULT_VOICE`, or explicit `--voice` always wins; an
   unknown bare name lists the built-ins. (A first cut of tone-enrolled voices

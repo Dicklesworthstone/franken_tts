@@ -40,12 +40,19 @@ ftts pull                              # one-time: fetch the quantized model (~2
 ftts say "Now is the time for all good men to come to the aid of the agents" out.m4a
 ```
 
-That speaks immediately with **matt**, the built-in default voice. Six built-ins ship in the binary — `matt` (the default), `james`, `leo`, and `robert` (masculine), plus `aria` and `ember` (feminine) — selectable by name. Clone your own voice from any recording you have the right to use, and it becomes the default:
+That speaks immediately with **matt**, the built-in default voice. Seven built-ins ship in the binary — `matt` (the default), `james`, `leo`, and `robert` (masculine), plus `judy`, `aria`, and `ember` (feminine) — selectable by name with `--voice`:
+
+```bash
+ftts say --voice james "Uh, excuse me, I was here first." test.m4a && afplay test.m4a
+ftts say --voice judy  "Same sentence, different voice."   judy.m4a && afplay judy.m4a
+```
+
+Note that `--voice` is an option of `ftts say` (two dashes, before the text), not of your audio player. Clone your own voice from any recording you have the right to use, and it becomes the default:
 
 ```bash
 ftts enroll voice_memo.m4a --default   # your voice replaces the built-in default
 ftts say "Hello in my own voice" hello.m4a
-ftts say --voice aria "And back to a built-in one" aria.m4a
+ftts say --voice matt "And back to a built-in one" matt.m4a
 ```
 
 The built-ins are ordinary enrolled x-vectors, each approved by listening before it shipped. The model installs into `~/.cache/franken_tts/model` and every command finds it there automatically; `--model` and `FTTS_MODEL_DIR` remain available to point elsewhere.
