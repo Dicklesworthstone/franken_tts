@@ -42,7 +42,7 @@ command_env: codec_time example, 32 frames, three interleaved arms (FTTS_INT8_CO
 kill_switch: FTTS_INT8_CODEC=convnext|all|transformer re-arms the int8 arms; off macOS the named BLAS request degrades to the scalar reference
 incumbent: the tree's own previous default (convnext int8 + scalar-then-BLAS transformer dense); historical scalar f32 dense was 57-72 ms/frame on this family
 before_after: all-BLAS f32 20.5/21.1/21.2 ms/frame vs convnext-int8 default 21.1/22.1/22.1 (3/3 rounds); all-int8 19.4-19.9 remains excluded by its failed 1.24 dB spectral gate
-cv_percent: not-gated (loaded host; 3/3 interleaved direction + the fidelity improvement carry the KEEP — quiet-window rerun shared with PERF-003's bead frankentts-866)
+cv_percent: QUIET-WINDOW rerun (load ~5, 4 interleaved super-rounds): all-BLAS 20.5/21.6/20.5/20.0 (mean 20.65, cv 3.3); convnext-int8 20.8/22.7/20.3/20.5 (mean 21.08, cv 5.2 — one flip round); all-int8 18.6-19.1 (mean 18.75, cv 1.3, stays quality-excluded). Honest restatement: vs convnext-int8 the BLAS arm is equal-or-faster WITHIN NOISE on a quiet host (clearly faster under load); the KEEP rests on the fidelity improvement (ratchet tightened at all eight transformer seams, zero quantization) with speed at least at parity
 equivalence: same-seed code stream identical (talker untouched, sample counts equal); codec waveform moves at the pinned f32-reorder level — the codec_decode_l2 ratchet TIGHTENED at all eight transformer seams and is re-pinned to the measured values; streaming==offline green; snake/convnext/gemm bisects green
 disposition: KEEP; the reference's nn.Linear IS addmm (bias-seeded beta=1 BLAS GEMM), so the named BLAS form is the more oracle-faithful arithmetic, not a tolerance concession — quantizing the codec now costs speed AND fidelity, hence int8 arms demoted to opt-in
 tally_w_l_n: 1/0/0
@@ -52,7 +52,7 @@ tally_w_l_n: 1/0/0
 PERF-003
 claim_id: startup-hydration-campaign
 evidence_id: interleaved 3-round load-stage A/B vs installed v0.1.3 binary, 2026-08-09; commits 9478b3c/c311ab1/c883b6c/6c1b80d/4df93f0
-status: KEEP (magnitude PROVISIONAL_LOCAL_WIN — host load average 26-54 throughout; direction consistent 3/3 interleaved rounds; quiet-window rerun owed)
+status: KEEP (quiet-window certified 2026-08-09: load average ~5, interleaved 4 rounds — see before_after)
 model_source_commit: 5d83992436eae1d760afd27aff78a71d676296fc
 fixture_sha256: not-applicable (load-stage wall time, no fixture)
 artifact_sha256: 597f7eb3314a2fe5be74fa10a6a3a28ace9e10e582c641deccd37348a0ccd824
@@ -60,8 +60,8 @@ cpu_features: Apple M4 Pro aarch64
 command_env: ftts say --seed 11 "Hi." (load-stage NDJSON elapsed), new binary interleaved with brew-installed v0.1.3
 kill_switch: FTTS_LOAD_THREADS=1 (serial widen), FTTS_ARTIFACT_Q8=0 (requantize + no elision), FTTS_INT8=0 (f32 reference, elision auto-off)
 incumbent: installed v0.1.3 (pre-campaign hydration; its own ~1.1 s generator-build requantize additionally falls OUTSIDE its load stage, so the shown gap understates the total)
-before_after: load stage 6.3/6.9/8.0 s (v0.1.3) vs 4.8/5.7/5.3 s (campaign) in interleaved pairs under load
-cv_percent: not-gated (host load 26-54 — magnitudes are provisional by rule; the 3/3 direction and the eliminated double-digest-verify (~1.3 GB re-hash, structural) support KEEP)
+before_after: QUIET-WINDOW (load ~5, interleaved): v0.1.3 9547/9173/8895/9271 ms (mean 9222, cv 2.9%) vs campaign 5118(cold)/3695/3841/3612 ms (warm mean 3716, cv 3.1%) = 2.48x load stage; v0.1.3 additionally pays ~1.1 s post-load requantize the campaign eliminated. Earlier loaded-host pairs (6.3/6.9/8.0 vs 4.8/5.7/5.3 s) retained as the under-load corroboration
+cv_percent: 3.1 (campaign warm rounds) / 2.9 (incumbent) — ADMISSIBLE; first campaign round (5118 ms) excluded as the cold round and shown. FTTS_LOAD_THREADS default validated same window: capped mean 3397 ms cv 0.5% vs serial 3527 ms vs uncapped bimodal (3382/6471/3384 — spikes even on a quiet host)
 equivalence: BYTE-IDENTICAL same-seed say across armed+elided, FTTS_ARTIFACT_Q8=0, and FTTS_INT8=0 routes at every step of the campaign
 disposition: KEEP; levers: (1) concurrent tensor widening (capped avail/2 max 6 after uncapped workers measured LOSING ~2x to serial under external load — that interleaved loss is recorded here as the reason for the cap), (2) hot-projection f32 elision when the armed route hydrates artifact-natively, (3) codec/tokenizer load overlapped with talker, (4) parallel codec piece hydration, (5) shared digest-verified mapping (the double MappedFttsq::open was hashing 1.3 GB twice)
 tally_w_l_n: 1/0/0 (campaign; the uncapped-workers sub-lever is the internal L that produced the cap)

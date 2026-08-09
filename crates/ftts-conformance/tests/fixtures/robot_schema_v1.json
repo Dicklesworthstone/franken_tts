@@ -361,6 +361,12 @@
           "required": true,
           "summary": "PCM bytes written",
           "type": "u64"
+        },
+        {
+          "name": "ttfa_ms",
+          "required": false,
+          "summary": "synthesis start to first decoded PCM packet; excludes model load (bounded by the load stage events)",
+          "type": "u64"
         }
       ],
       "kind": "stream",
