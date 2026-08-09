@@ -86,6 +86,29 @@ pub struct QuantizedMatrix {
 }
 
 impl QuantizedMatrix {
+    /// Stacks matrices with a shared reduction length into one taller matrix.
+    ///
+    /// Row bytes and scales are byte-identical to quantizing each part separately — this exists
+    /// so fused projections (QKV, gate‖up) can run as ONE kernel dispatch while every output
+    /// row keeps exactly the per-channel quantization it would have had alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parts disagree on `k` or the list is empty.
+    #[must_use]
+    pub fn concat_rows(parts: &[&Self]) -> Self {
+        let k = parts.first().expect("at least one part").k;
+        assert!(parts.iter().all(|part| part.k == k), "parts must share k");
+        let n = parts.iter().map(|part| part.n).sum();
+        let mut data = Vec::with_capacity(n * k);
+        let mut scales = Vec::with_capacity(n);
+        for part in parts {
+            data.extend_from_slice(&part.data);
+            scales.extend_from_slice(&part.scales);
+        }
+        Self { data, scales, n, k }
+    }
+
     /// Quantizes an `[n, k]` f32 weight matrix one output channel at a time.
     ///
     /// # Panics

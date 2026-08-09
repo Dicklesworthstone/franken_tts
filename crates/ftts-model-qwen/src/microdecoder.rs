@@ -558,18 +558,13 @@ pub fn layer_step_with_rotary(
 /// embeddings are gathers, not GEMMs.
 #[derive(Clone, Debug)]
 pub struct MicroLayerQuant {
-    /// Query projection, `[q_width, hidden]`.
-    pub q_proj: QuantizedMatrix,
-    /// Key projection, `[kv_width, hidden]`.
-    pub k_proj: QuantizedMatrix,
-    /// Value projection, `[kv_width, hidden]`.
-    pub v_proj: QuantizedMatrix,
+    /// Fused Q‖K‖V projection, `[q_width + 2 * kv_width, hidden]` — one dispatch, per-row
+    /// scales unchanged, byte-identical to the split form.
+    pub qkv: QuantizedMatrix,
     /// Output projection, `[hidden, q_width]`.
     pub o_proj: QuantizedMatrix,
-    /// SwiGLU gate projection, `[intermediate, hidden]`.
-    pub gate_proj: QuantizedMatrix,
-    /// SwiGLU up projection, `[intermediate, hidden]`.
-    pub up_proj: QuantizedMatrix,
+    /// Fused SwiGLU gate‖up projection, `[2 * intermediate, hidden]`.
+    pub gate_up: QuantizedMatrix,
     /// SwiGLU down projection, `[hidden, intermediate]`.
     pub down_proj: QuantizedMatrix,
 }
@@ -579,17 +574,15 @@ impl MicroLayerQuant {
     #[must_use]
     pub fn quantize(config: &MicrodecoderConfig, weights: &LayerWeights<'_>) -> Self {
         let hidden = config.hidden_size;
+        let q = QuantizedMatrix::quantize(weights.q_proj, config.q_width(), hidden);
+        let k = QuantizedMatrix::quantize(weights.k_proj, config.kv_width(), hidden);
+        let v = QuantizedMatrix::quantize(weights.v_proj, config.kv_width(), hidden);
+        let gate = QuantizedMatrix::quantize(weights.gate_proj, config.intermediate_size, hidden);
+        let up = QuantizedMatrix::quantize(weights.up_proj, config.intermediate_size, hidden);
         Self {
-            q_proj: QuantizedMatrix::quantize(weights.q_proj, config.q_width(), hidden),
-            k_proj: QuantizedMatrix::quantize(weights.k_proj, config.kv_width(), hidden),
-            v_proj: QuantizedMatrix::quantize(weights.v_proj, config.kv_width(), hidden),
+            qkv: QuantizedMatrix::concat_rows(&[&q, &k, &v]),
             o_proj: QuantizedMatrix::quantize(weights.o_proj, hidden, config.q_width()),
-            gate_proj: QuantizedMatrix::quantize(
-                weights.gate_proj,
-                config.intermediate_size,
-                hidden,
-            ),
-            up_proj: QuantizedMatrix::quantize(weights.up_proj, config.intermediate_size, hidden),
+            gate_up: QuantizedMatrix::concat_rows(&[&gate, &up]),
             down_proj: QuantizedMatrix::quantize(
                 weights.down_proj,
                 hidden,
@@ -620,12 +613,14 @@ pub fn layer_step_q8(
 ) -> Vec<f32> {
     let normed = rms_norm(hidden, weights.input_norm, config.rms_eps);
 
-    let mut q = vec![0.0_f32; config.q_width()];
-    let mut k = vec![0.0_f32; config.kv_width()];
-    let mut v = vec![0.0_f32; config.kv_width()];
-    quant_linear(mode, &normed, &quant.q_proj, None, 1, &mut q);
-    quant_linear(mode, &normed, &quant.k_proj, None, 1, &mut k);
-    quant_linear(mode, &normed, &quant.v_proj, None, 1, &mut v);
+    // Single position: the fused Q‖K‖V output row splits into the role buffers without a
+    // second pass over memory beyond these copies.
+    let (q_width, kv_width) = (config.q_width(), config.kv_width());
+    let mut qkv = vec![0.0_f32; q_width + 2 * kv_width];
+    quant_linear(mode, &normed, &quant.qkv, None, 1, &mut qkv);
+    let mut q = qkv[..q_width].to_vec();
+    let mut k = qkv[q_width..q_width + kv_width].to_vec();
+    let v = qkv[q_width + kv_width..].to_vec();
 
     for head in 0..config.num_q_heads {
         let span = head * config.head_dim..(head + 1) * config.head_dim;
@@ -686,10 +681,10 @@ pub fn layer_step_q8(
         .collect();
 
     let normed = rms_norm(&residual, weights.post_attention_norm, config.rms_eps);
-    let mut gate = vec![0.0_f32; config.intermediate_size];
-    let mut up = vec![0.0_f32; config.intermediate_size];
-    quant_linear(mode, &normed, &quant.gate_proj, None, 1, &mut gate);
-    quant_linear(mode, &normed, &quant.up_proj, None, 1, &mut up);
+    let mut gate_up = vec![0.0_f32; 2 * config.intermediate_size];
+    quant_linear(mode, &normed, &quant.gate_up, None, 1, &mut gate_up);
+    let up = gate_up.split_off(config.intermediate_size);
+    let mut gate = gate_up;
     for (g, u) in gate.iter_mut().zip(up.iter()) {
         *g = silu(*g) * u;
     }

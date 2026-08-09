@@ -619,18 +619,14 @@ pub fn forward_talker(
 /// same borrowed f32 tensors the reference path reads; the f32 path itself is untouched.
 #[derive(Clone, Debug)]
 pub struct TalkerLayerQuant {
-    /// Query projection, `[query_width, hidden]`.
-    pub q_proj: QuantizedMatrix,
-    /// Key projection, `[kv_width, hidden]`.
-    pub k_proj: QuantizedMatrix,
-    /// Value projection, `[kv_width, hidden]`.
-    pub v_proj: QuantizedMatrix,
+    /// Fused Q‖K‖V projection, `[query_width + 2 * kv_width, hidden]` — one kernel dispatch
+    /// instead of three; each output row keeps its own per-channel scale, so the fusion is
+    /// byte-identical to the split form.
+    pub qkv: QuantizedMatrix,
     /// Output projection, `[hidden, query_width]`.
     pub o_proj: QuantizedMatrix,
-    /// SwiGLU gate projection, `[intermediate, hidden]`.
-    pub gate_proj: QuantizedMatrix,
-    /// SwiGLU up projection, `[intermediate, hidden]`.
-    pub up_proj: QuantizedMatrix,
+    /// Fused SwiGLU gate‖up projection, `[2 * intermediate, hidden]`.
+    pub gate_up: QuantizedMatrix,
     /// SwiGLU down projection, `[hidden, intermediate]`.
     pub down_proj: QuantizedMatrix,
 }
@@ -643,13 +639,15 @@ impl TalkerLayerQuant {
         let query_width = config.query_width();
         let kv_width = config.kv_width();
         let intermediate = config.intermediate_size;
+        let q = QuantizedMatrix::quantize(weights.q_proj, query_width, hidden);
+        let k = QuantizedMatrix::quantize(weights.k_proj, kv_width, hidden);
+        let v = QuantizedMatrix::quantize(weights.v_proj, kv_width, hidden);
+        let gate = QuantizedMatrix::quantize(weights.gate_proj, intermediate, hidden);
+        let up = QuantizedMatrix::quantize(weights.up_proj, intermediate, hidden);
         Self {
-            q_proj: QuantizedMatrix::quantize(weights.q_proj, query_width, hidden),
-            k_proj: QuantizedMatrix::quantize(weights.k_proj, kv_width, hidden),
-            v_proj: QuantizedMatrix::quantize(weights.v_proj, kv_width, hidden),
+            qkv: QuantizedMatrix::concat_rows(&[&q, &k, &v]),
             o_proj: QuantizedMatrix::quantize(weights.o_proj, hidden, query_width),
-            gate_proj: QuantizedMatrix::quantize(weights.gate_proj, intermediate, hidden),
-            up_proj: QuantizedMatrix::quantize(weights.up_proj, intermediate, hidden),
+            gate_up: QuantizedMatrix::concat_rows(&[&gate, &up]),
             down_proj: QuantizedMatrix::quantize(weights.down_proj, hidden, intermediate),
         }
     }
@@ -709,12 +707,22 @@ pub fn forward_layer_q8(
         &mut normed,
     );
 
+    // One fused Q‖K‖V dispatch, then split into the per-role buffers the norm/rope steps
+    // mutate. Row r of the fused output holds [queries | keys | values] contiguously.
+    let fused_width = query_width + 2 * kv_width;
+    let mut qkv = vec![0.0f32; seq * fused_width];
+    quant_linear(mode, &normed, &quant.qkv, None, seq, &mut qkv);
     let mut queries = vec![0.0f32; seq * query_width];
     let mut keys = vec![0.0f32; seq * kv_width];
     let mut values = vec![0.0f32; seq * kv_width];
-    quant_linear(mode, &normed, &quant.q_proj, None, seq, &mut queries);
-    quant_linear(mode, &normed, &quant.k_proj, None, seq, &mut keys);
-    quant_linear(mode, &normed, &quant.v_proj, None, seq, &mut values);
+    for row in 0..seq {
+        let fused = &qkv[row * fused_width..(row + 1) * fused_width];
+        queries[row * query_width..(row + 1) * query_width].copy_from_slice(&fused[..query_width]);
+        keys[row * kv_width..(row + 1) * kv_width]
+            .copy_from_slice(&fused[query_width..query_width + kv_width]);
+        values[row * kv_width..(row + 1) * kv_width]
+            .copy_from_slice(&fused[query_width + kv_width..]);
+    }
 
     // QK-Norm over head_dim, then rotary — identical to the f32 reference.
     let mut scratch = vec![0.0f32; head_dim];
@@ -789,10 +797,16 @@ pub fn forward_layer_q8(
     );
 
     let intermediate = config.intermediate_size;
+    // One fused gate‖up dispatch, split the same way.
+    let mut gate_up = vec![0.0f32; seq * 2 * intermediate];
+    quant_linear(mode, &normed, &quant.gate_up, None, seq, &mut gate_up);
     let mut gate = vec![0.0f32; seq * intermediate];
     let mut up = vec![0.0f32; seq * intermediate];
-    quant_linear(mode, &normed, &quant.gate_proj, None, seq, &mut gate);
-    quant_linear(mode, &normed, &quant.up_proj, None, seq, &mut up);
+    for row in 0..seq {
+        let fused = &gate_up[row * 2 * intermediate..(row + 1) * 2 * intermediate];
+        gate[row * intermediate..(row + 1) * intermediate].copy_from_slice(&fused[..intermediate]);
+        up[row * intermediate..(row + 1) * intermediate].copy_from_slice(&fused[intermediate..]);
+    }
     f32ref::silu_mul_in_place(&mut gate, &up);
 
     let mut down = vec![0.0f32; seq * hidden_size];
