@@ -114,7 +114,7 @@ Weights are not bundled with the binary; `ftts pull` fetches this project's pre-
    ftts enroll my_recording.m4a --default
    ```
 
-   Enrollment computes a 1,024-float speaker embedding from the audio alone — **no transcript is needed**. Compressed references (`.m4a`, `.mp3`, `.aac`, `.ogg`, `.opus`) are resampled to the speaker encoder's pinned 24 kHz mono for you, at any source rate (fixed in v0.1.3 — before that, 44.1/48 kHz voice memos were refused). A `.wav` or `.flac` reference is read directly and must already be 24 kHz; convert it first with `ffmpeg -i in.wav -ar 24000 -ac 1 out.wav`. The enroll step warns about recordings that will clone poorly (background noise, clipping, whispering, multiple speakers).
+   Enrollment computes a 1,024-float speaker embedding from the audio alone — **no transcript is needed**. Any container at any sample rate works — 44.1 and 48 kHz phone and Mac voice memos included. Compressed references are converted by the system decoder; `.wav` and `.flac` are read directly and resampled in-process by a windowed-sinc (Lanczos-3) kernel. Audio already at 24 kHz is passed through untouched. The enroll step warns about recordings that will clone poorly (background noise, clipping, whispering, multiple speakers).
 
    `--default` will not overwrite an existing `default.spk`; that guard is deliberate and `--force` does not waive it (`--force` only proceeds past *quality* warnings). To replace a voice, move the old one aside first. Use `-o name.spk` instead of `--default` to keep several voices and select one per run with `--voice name.spk`.
 4. Speak:
