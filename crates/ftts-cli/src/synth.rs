@@ -337,13 +337,19 @@ fn decode_reference_audio_any(path: &Path) -> Result<Vec<f32>, FttsError> {
             .unwrap_or("reference")
     ));
     let attempts: &[(&str, Vec<&std::ffi::OsStr>)] = &[
+        // Both decoders are told to resample to the speaker encoder's pinned 24 kHz mono here
+        // rather than leaving the source rate intact: phone and Mac voice memos default to
+        // 44.1/48 kHz, and a transcode that preserves them would only move the failure to the
+        // enrollment rate check (frankentts-gra).
         (
             "afconvert",
             vec![
                 "-f".as_ref(),
                 "WAVE".as_ref(),
                 "-d".as_ref(),
-                "LEI16".as_ref(),
+                "LEI16@24000".as_ref(),
+                "-c".as_ref(),
+                "1".as_ref(),
                 path.as_os_str(),
                 staging.as_os_str(),
             ],
@@ -358,6 +364,10 @@ fn decode_reference_audio_any(path: &Path) -> Result<Vec<f32>, FttsError> {
                 path.as_os_str(),
                 "-acodec".as_ref(),
                 "pcm_s16le".as_ref(),
+                "-ar".as_ref(),
+                "24000".as_ref(),
+                "-ac".as_ref(),
+                "1".as_ref(),
                 staging.as_os_str(),
             ],
         ),
