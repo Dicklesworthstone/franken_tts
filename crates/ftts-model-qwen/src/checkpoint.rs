@@ -1010,6 +1010,19 @@ impl TalkerCheckpoint {
         &self.path
     }
 
+    /// The digest-verified canonical artifact this checkpoint hydrated from, when it did.
+    ///
+    /// Opening a mapping re-verifies the whole artifact's digests (~1.3 GB of hashing), so
+    /// consumers that need the mapping — artifact-native int8 hydration, cold-embedding gathers —
+    /// must share this one rather than open a second.
+    #[must_use]
+    pub fn artifact(&self) -> Option<&Arc<MappedFttsq>> {
+        match &self.text_embedding_source {
+            TextEmbeddingSource::Safetensors => None,
+            TextEmbeddingSource::Fttsq(artifact) => Some(artifact),
+        }
+    }
+
     /// Gather the cold text-embedding rows an utterance needs.
     ///
     /// Pass every id the prompt can reach: the wrapped target ids plus the three TTS specials.

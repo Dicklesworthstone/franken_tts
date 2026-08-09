@@ -151,7 +151,7 @@ pub struct LoadedModel {
     /// hydrates its Q8 tables straight from this (proven byte-identical to requantizing the
     /// widened f32 copies, scales included); mapping the file twice costs nothing beyond page
     /// cache the first mapping already warmed.
-    artifact: Option<ftts_artifacts::fttsq::MappedFttsq>,
+    artifact: Option<std::sync::Arc<ftts_artifacts::fttsq::MappedFttsq>>,
 }
 
 impl LoadedModel {
@@ -202,22 +202,15 @@ impl LoadedModel {
         let tokenizer = tokenizer
             .map_err(|error| FttsError::ArtifactFormat(format!("tokenizer unusable: {error}")))?;
 
+        let talker = talker.map_err(checkpoint_error)?;
+        // Shared, not re-opened: a second MappedFttsq::open would re-verify the whole artifact's
+        // digests (~1.3 GB of hashing) for a mapping the checkpoint already carries.
+        let artifact = talker.artifact().cloned();
         Ok(Self {
-            talker: talker.map_err(checkpoint_error)?,
+            talker,
             codec: codec.map_err(checkpoint_error)?,
             tokenizer,
-            artifact: bundle
-                .canonical_main
-                .as_deref()
-                .map(|path| {
-                    ftts_artifacts::fttsq::MappedFttsq::open(path).map_err(|error| {
-                        FttsError::ArtifactFormat(format!(
-                            "cannot map canonical artifact {}: {error}",
-                            path.display()
-                        ))
-                    })
-                })
-                .transpose()?,
+            artifact,
         })
     }
 }
@@ -1186,7 +1179,7 @@ pub fn synthesize(
             sampling_mode: SamplingMode::Production,
             seed,
         },
-        model.artifact.as_ref(),
+        model.artifact.as_deref(),
     );
 
     // 5. The engine owns admission, the budget, cancellation, and the frame loop — and the
