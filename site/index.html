@@ -8,7 +8,7 @@
   <meta name="theme-color" content="#020a06">
   <link rel="canonical" href="https://frankentts.com/">
   <meta property="og:title" content="FrankenTTS — The Monster Voice Engine">
-  <meta property="og:description" content="Voice-cloning TTS in pure Rust, running locally in your browser via WASM. No server. No mock. The monster itself.">
+  <meta property="og:description" content="Voice-cloning TTS in pure Rust, running locally in your browser via WASM. Type, pick a voice, clone your own from a mic recording, listen. Nothing leaves the tab.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://frankentts.com/">
   <meta property="og:image" content="https://frankentts.com/assets/img/og.png">
@@ -53,8 +53,41 @@
     .pg-label { font-size: 0.62rem; font-weight: 900; letter-spacing: 0.25em; text-transform: uppercase; color: #10b981; }
     .hidden { display: none !important; }
     audio { width: 100%; filter: invert(0.9) hue-rotate(150deg); }
+    html { scroll-behavior: smooth; }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    section[id], footer { scroll-margin-top: 96px; }
+    :focus-visible { outline: 2px solid rgba(52, 211, 153, 0.6); outline-offset: 2px; }
+    .pg-chip {
+      display: inline-flex; align-items: center;
+      border: 1px solid rgba(52, 211, 153, 0.2); border-radius: 9999px;
+      background: rgba(16, 185, 129, 0.05); color: #94a3b8;
+      font-family: "JetBrains Mono", monospace; font-size: 0.68rem; font-weight: 700;
+      padding: 0.3rem 0.75rem; letter-spacing: 0.02em;
+    }
+    .pg-card { transition: transform .25s ease, border-color .25s ease, box-shadow .25s ease; }
+    .pg-card:hover {
+      transform: translateY(-3px);
+      border-color: rgba(52, 211, 153, 0.3);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35), 0 0 24px rgba(16, 185, 129, 0.06);
+    }
+    @media (prefers-reduced-motion: reduce) { .pg-card, .pg-card:hover { transform: none; transition: none; } }
+    .pg-voice-name { font-weight: 900; font-size: 1.05rem; color: #e2e8f0; margin-bottom: 0.25rem; }
+    .pg-voice-char { min-height: 3.2em; }
+    #wave-canvas {
+      width: 100%; display: block; border-radius: 0.75rem;
+      background: rgba(2, 10, 6, 0.7); border: 1px solid rgba(52, 211, 153, 0.15);
+    }
     #anatomy-viz { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     #anatomy-viz svg { min-width: 720px; display: block; }
+    .pg-rvq-controls { display: flex; align-items: center; gap: 1.2rem; flex-wrap: wrap; margin-top: 0.8rem; }
+    .pg-slider { flex: 1; min-width: 200px; accent-color: #34d399; height: 1.4rem; cursor: pointer; }
+    .pg-rvq-readout { display: flex; align-items: baseline; gap: 0.5rem; white-space: nowrap; }
+    .pg-rvq-big { font-family: "JetBrains Mono", monospace; font-size: 1.8rem; font-weight: 900; color: #34d399; }
+    .pg-rvq-res { color: #64748b; font-size: 0.78rem; font-family: "JetBrains Mono", monospace; margin-left: 0.6rem; }
+    .pg-lad-track { position: relative; height: 20px; border-radius: 10px; }
+    .pg-lad-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: #fbbf24; opacity: 0.85; }
+    .pg-lad-ref { background: linear-gradient(90deg, #334155, #64748b); }
+    .pg-lad-val { flex: 0 0 15rem; white-space: normal; }
     /* Anatomy / receipts cards */
     .pg-card { position: relative; overflow: hidden; }
     .pg-card-num {
@@ -117,6 +150,8 @@
     <nav class="hidden lg:flex items-center gap-1" aria-label="Primary">
       <a href="#playground" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Playground</a>
       <a href="#pipeline" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Anatomy</a>
+      <a href="#model" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Model</a>
+      <a href="#speed" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Speed</a>
       <a href="#receipts" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Receipts</a>
       <a href="#voices" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Voices</a>
       <a href="#install" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Install</a>
@@ -129,7 +164,7 @@
   </header>
 
   <!-- ============================== HERO ============================== -->
-  <section id="top" class="relative px-4 md:px-6 pt-36 md:pt-48 pb-10 md:pb-16 max-w-[1200px] mx-auto text-center">
+  <section id="top" class="relative px-4 md:px-6 pt-36 md:pt-48 pb-10 md:pb-16 max-w-7xl mx-auto text-center">
     <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-6">
       <span class="h-px w-8 bg-emerald-500/40"></span>
       IT SPEAKS · ENTIRELY IN YOUR BROWSER
@@ -144,9 +179,16 @@
       as a native CLI, compiled to WebAssembly and stitched into this page.
       Nothing you type or record ever leaves the tab.
     </p>
-    <div class="flex flex-wrap items-center justify-center gap-3 mb-12">
+    <div class="flex flex-wrap items-center justify-center gap-3 mb-8">
       <a href="#playground" class="pg-btn primary">⚡ Enter the Laboratory</a>
       <a href="https://github.com/Dicklesworthstone/franken_tts" target="_blank" rel="noopener" class="pg-btn">Read the source</a>
+    </div>
+    <div class="flex flex-wrap items-center justify-center gap-2 mb-12" aria-label="Key facts">
+      <span class="pg-chip">100% Rust</span>
+      <span class="pg-chip">no Python, no PyTorch</span>
+      <span class="pg-chip">1.4–1.6× real time native</span>
+      <span class="pg-chip">28/28 layers verified</span>
+      <span class="pg-chip">zero-shot voice cloning</span>
     </div>
     <div class="relative max-w-3xl mx-auto rounded-2xl border border-white/5 overflow-hidden reveal" style="box-shadow: 0 0 60px rgba(16,185,129,0.12)">
       <img src="assets/img/frankentts_illustration.webp" alt="The FrankenTTS monster at its mixing desk, stitching voices together"
@@ -159,14 +201,14 @@
     <div class="text-center mb-12 md:mb-16 reveal">
       <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
         <span class="h-px w-8 bg-emerald-500/40"></span>
-        SPECIMEN_001 · LIVE EXPERIMENT
+        LIVE · IN THIS TAB
         <span class="h-px w-8 bg-emerald-500/40"></span>
       </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">The Operating <span class="text-emerald-400">Theater</span>.</h2>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Try It <span class="text-emerald-400">Live</span>.</h2>
       <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        Download the model once, then type on the left and listen on the right. The <em>actual</em>
-        engine, compiled to WebAssembly and running in a worker in your browser, synthesizes every
-        sample locally. No server. No mock. The monster itself.
+        Download the model once, then type on the left and listen on the right. The actual engine,
+        compiled to WebAssembly and running in a worker in your browser, synthesizes every sample
+        locally. There is no server behind this page and no mocked demo.
       </p>
     </div>
 
@@ -244,18 +286,26 @@
         <div class="grid gap-4 content-start">
           <div class="pg-label">03 · The Utterance</div>
           <textarea id="text" class="pg-input" maxlength="600">The rainbow is a division of white light into many beautiful colors. Now, spoken entirely inside your browser.</textarea>
+          <div class="pg-status" id="char-count" style="text-align: right; margin-top: -0.5rem"></div>
           <div class="flex flex-wrap items-center gap-3">
             <label class="pg-status" for="seed">seed</label>
             <input id="seed" type="text" value="0" size="6" class="pg-input" style="max-width: 90px" />
-            <button id="speak" class="pg-btn primary" disabled>⚡ Synthesize</button>
+            <button id="dice" class="pg-btn" title="Random seed" aria-label="Randomize seed">🎲</button>
+            <button id="speak" class="pg-btn primary" disabled title="Ctrl+Enter or Cmd+Enter">⚡ Synthesize</button>
             <span id="synth-status" class="pg-status"></span>
           </div>
           <div class="pg-progress"><div id="synth-bar"></div></div>
+          <canvas id="wave-canvas" class="hidden" height="72" aria-label="Waveform of the generated audio"></canvas>
           <audio id="player" controls class="hidden"></audio>
           <div class="flex flex-wrap gap-2">
             <button id="download" class="pg-btn hidden">Download WAV</button>
-            <button id="share" class="pg-btn hidden">Copy share link</button>
+            <button id="share" class="pg-btn" title="Copies a link that carries the text, seed, and voice (including a cloned voice's vector and name). Nothing is sent to a server; it all rides in the URL fragment.">🔗 Copy share link</button>
           </div>
+          <p class="pg-note">
+            The share link is stateless: the text, seed, and voice travel inside the URL itself.
+            A preset rides as its name; a cloned voice rides as its full 1,024-float vector plus
+            the name you gave it, in the fragment, so it never touches a server.
+          </p>
           <p id="error" class="pg-error hidden"></p>
           <p class="pg-note">
             Speed honesty, measured: this single-threaded WASM build synthesizes at roughly
@@ -270,28 +320,27 @@
   </section>
 
   <!-- ============================== PIPELINE ============================== -->
-  <section id="pipeline" class="relative px-4 md:px-6 py-16 md:py-24 max-w-[1200px] mx-auto">
+  <section id="pipeline" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
     <div class="text-center mb-12 reveal">
       <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
         <span class="h-px w-8 bg-emerald-500/40"></span>
         THE ANATOMY
         <span class="h-px w-8 bg-emerald-500/40"></span>
       </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Three Organs, <span class="text-emerald-400">One Heartbeat</span>.</h2>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Inside an <span class="text-emerald-400">80 ms</span> Frame.</h2>
       <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        The public story says "a 12.5 Hz model". The truth inside every 80 ms frame is stranger:
-        the famous 28-layer transformer runs once, and a tiny 5-layer organ nobody talks about
-        runs <span class="text-slate-200">fifteen sequential times</span>. Watch a single frame move
-        through the creature.
+        Qwen3-TTS is described as a 12.5 Hz model, which hides its real per-frame cost. The
+        28-layer transformer runs once per frame; a small 5-layer decoder then runs
+        <span class="text-slate-200">fifteen sequential times</span> before the codec ever sees a
+        token. This is what one frame actually does.
       </p>
     </div>
 
     <div class="rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
       <div id="anatomy-viz" aria-label="Animated anatomy of one synthesis frame"></div>
       <p class="pg-note mt-3 text-center">
-        One frame, to scale in work if not in size: the 5-layer microdecoder is small, but rereading
-        its body fifteen times makes it the dominant cost of the whole model. franken_tts treats it
-        as the design center, not a footnote.
+        The microdecoder is small, but rereading its body fifteen times per frame makes it the
+        dominant cost of the whole model. franken_tts treats it as the design center.
       </p>
     </div>
 
@@ -306,8 +355,8 @@
       <div class="pg-card pg-card-accent rounded-2xl border border-emerald-500/25 bg-black/40 p-6">
         <div class="pg-card-num">02</div>
         <div class="pg-label mb-3">The Microdecoder</div>
-        <p class="pg-note">The hidden monster. A 5-layer residual-code predictor with per-depth
-        embeddings and per-depth 2,048-way heads, run <strong>fifteen sequential times inside every
+        <p class="pg-note">A 5-layer residual-code predictor with per-depth embeddings and
+        per-depth 2,048-way heads, run <strong>fifteen sequential times inside every
         frame</strong>. Its body accounts for ~1.18 GB of the ≈1.65 GB of Q8 weight traffic each
         frame touches.</p>
       </div>
@@ -321,19 +370,149 @@
     </div>
   </section>
 
-  <!-- ============================== RECEIPTS ============================== -->
-  <section id="receipts" class="relative px-4 md:px-6 py-16 md:py-24 max-w-[1200px] mx-auto">
+  <!-- ============================== MODEL ============================== -->
+  <section id="model" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
     <div class="text-center mb-12 reveal">
       <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
         <span class="h-px w-8 bg-emerald-500/40"></span>
-        THE EVIDENCE LOCKER
+        THE MODEL
         <span class="h-px w-8 bg-emerald-500/40"></span>
       </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Parity, <span class="text-emerald-400">With Receipts</span>.</h2>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Audio as <span class="text-emerald-400">Tokens</span>.</h2>
       <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        A port is a claim; parity is a measurement. Every stage of this engine is checked against
-        captured activations from the pinned PyTorch reference, and the numbers below are the
-        actual gate results, not aspirations.
+        Most TTS systems predict a spectrogram and hand it to a vocoder. Qwen3-TTS works like a
+        language model instead: it writes speech as discrete tokens, sixteen per 80 ms frame,
+        drawn from a residual codec vocabulary. That difference is where the quality comes from,
+        and it is what franken_tts reimplements from scratch in Rust.
+      </p>
+    </div>
+
+    <div class="grid lg:grid-cols-2 gap-5 mb-10 reveal">
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">Writing sound like text</div>
+        <p class="pg-note mb-3">
+          A neural codec compresses speech into stacks of sixteen code groups per frame. The
+          first code in each stack carries most of the meaning; every later code encodes only
+          what the ones before it missed. The model then generates these codes autoregressively,
+          the way an LLM generates words.
+        </p>
+        <p class="pg-note">
+          Because one transformer models content, prosody, pacing, and breaths jointly, the
+          output sounds like a performance rather than a spectrogram stitched to a vocoder. The
+          cost is the nested loop you saw above: fifteen extra decoder passes per frame.
+        </p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">Zero-shot cloning</div>
+        <p class="pg-note mb-3">
+          A speaker encoder distills roughly ten seconds of reference audio into a single
+          1,024-float x-vector. That vector conditions every frame of generation. There is no
+          fine-tuning and no per-voice training; a new voice is one forward pass of the encoder.
+        </p>
+        <p class="pg-note">
+          This is the same mechanism the playground uses when you record the enrollment script,
+          and the voice vector is small enough to ride inside a share link.
+        </p>
+      </div>
+    </div>
+
+    <div class="rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 reveal">
+      <div class="pg-label mb-2">Coarse to fine, one code at a time</div>
+      <p class="pg-note mb-4">
+        Drag the slider to rebuild a waveform from its residual codes. Early codes sketch the
+        shape; later ones add detail that the previous codes missed. The shapes here are
+        illustrative; the mechanism is exactly how the sixteen code groups divide their labor.
+      </p>
+      <div id="rvq-viz"></div>
+    </div>
+  </section>
+
+  <!-- ============================== SPEED ============================== -->
+  <section id="speed" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
+    <div class="text-center mb-12 reveal">
+      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+        THE PORT
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+      </div>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Making It Fast <span class="text-emerald-400">Without a GPU</span>.</h2>
+      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
+        The arithmetic that makes this hard: at real-time speed the model must stream roughly
+        20.7 GB of weights per second, first order, even after int8 quantization. Bandwidth like
+        that is why models of this class normally live on GPUs. The port attacks the traffic
+        itself, not just the math.
+      </p>
+    </div>
+
+    <div class="rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
+      <div class="pg-label mb-2">Measured, on a Mac Mini M4 Pro</div>
+      <p class="pg-note mb-5">
+        Anything left of the amber line is slower than the audio it produces. The f32 reference
+        route exists for correctness and stays in the tree as the parity oracle.
+      </p>
+      <div id="speed-ladder"></div>
+    </div>
+
+    <div class="grid lg:grid-cols-3 gap-5 reveal">
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">Int8, exactly</div>
+        <p class="pg-note">The talker and microdecoder run W8A8: symmetric per-channel weights,
+        dynamic per-row activations, and exact i32 accumulation, so quantization halves the bytes
+        without touching the argmax parity gate. The inner loops become integer dot products the
+        CPU accelerates natively.</p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">A persistent worker team</div>
+        <p class="pg-note">Six workers stay alive across every layer, every microdecoder pass,
+        and every frame: static partitions, no scheduler, no allocation in the steady state. The
+        partitioning is bit-identical to serial execution at every thread count.</p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">Loading without ceremony</div>
+        <p class="pg-note">The quantized artifact hydrates int8 weights directly, widens tensors
+        concurrently, and loads the codec and tokenizer in parallel with the talker. Warm model
+        load fell from ~9 s to ~3.7 s.</p>
+      </div>
+    </div>
+
+    <div class="rounded-2xl border border-emerald-500/20 bg-black/40 p-6 md:p-8 mt-10 reveal">
+      <div class="pg-label mb-3">Then the browser took the GPU away twice</div>
+      <p class="pg-note mb-5">
+        The wasm build gets one thread, no memory mapping, no BLAS, and a hard 4 GB ceiling.
+        Three measured changes made the same engine run there at all: a compact text-embedding
+        gather that removed a 1.24 GB per-utterance allocation, f32 dot products restructured
+        into eight partial lanes so the compiler can vectorize what was 71% of synthesis time,
+        and an int8 codec arm. In the test harness, codec decode fell from 119.9 s to 9.5 s.
+      </p>
+      <div class="grid lg:grid-cols-3 gap-5">
+        <div class="text-center">
+          <div class="pg-stat"><span data-countup="12.6" data-decimals="1" data-suffix="×">12.6×</span></div>
+          <div class="pg-label">codec speedup in wasm</div>
+        </div>
+        <div class="text-center">
+          <div class="pg-stat"><span data-countup="1.24" data-decimals="2" data-suffix=" GB">1.24 GB</span></div>
+          <div class="pg-label">allocation removed per utterance</div>
+        </div>
+        <div class="text-center">
+          <div class="pg-stat"><span data-countup="4" data-suffix=" GB">4 GB</span></div>
+          <div class="pg-label">total wasm memory ceiling</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== RECEIPTS ============================== -->
+  <section id="receipts" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
+    <div class="text-center mb-12 reveal">
+      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+        MEASURED AGAINST PYTORCH
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+      </div>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">The Parity <span class="text-emerald-400">Numbers</span>.</h2>
+      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
+        Every stage of this engine is checked against captured activations from the pinned
+        PyTorch reference. These are the actual gate results.
       </p>
     </div>
 
@@ -359,8 +538,8 @@
     </div>
 
     <div id="rms-bars" class="rounded-2xl border border-white/5 bg-black/40 p-6 md:p-8 mt-8 reveal">
-      <div class="pg-label mb-2">The closest receipt of all</div>
-      <p class="pg-note mb-5">Peak frame loudness of the finished audio, this engine vs the pinned
+      <div class="pg-label mb-2">Peak frame loudness, both engines</div>
+      <p class="pg-note mb-5">The finished audio's peak frame RMS, this engine vs the pinned
       PyTorch reference. The bars are drawn to scale; the difference is two parts in a thousand.</p>
       <div class="pg-bar-row">
         <span class="pg-bar-name">franken_tts</span>
@@ -376,33 +555,31 @@
   </section>
 
   <!-- ============================== VOICES ============================== -->
-  <section id="voices" class="relative px-4 md:px-6 py-16 md:py-24 max-w-[1200px] mx-auto">
+  <section id="voices" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
     <div class="text-center mb-12 reveal">
       <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
         <span class="h-px w-8 bg-emerald-500/40"></span>
-        THE CHOIR
+        THE PRESETS
         <span class="h-px w-8 bg-emerald-500/40"></span>
       </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Seven Voices <span class="text-emerald-400">In the Jar</span>.</h2>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Seven <span class="text-emerald-400">Built-in</span> Voices.</h2>
       <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        Built-in voices ship inside the binary as 4 KB x-vectors: <span class="text-slate-200">matt</span> (the default),
-        <span class="text-slate-200">james</span>, <span class="text-slate-200">leo</span>,
-        <span class="text-slate-200">robert</span>, <span class="text-slate-200">judy</span>,
-        <span class="text-slate-200">aria</span>, and <span class="text-slate-200">ember</span>.
-        A ten-second recording of your own voice becomes the eighth.
+        Each preset ships inside the binary as a 4 KB x-vector. Pick one below to load it into
+        the playground, or record ten seconds of your own voice and make an eighth.
       </p>
     </div>
+    <div id="voice-cards" class="grid md:grid-cols-2 lg:grid-cols-4 gap-5 reveal"></div>
   </section>
 
   <!-- ============================== INSTALL ============================== -->
-  <section id="install" class="relative px-4 md:px-6 py-16 md:py-24 max-w-[1200px] mx-auto">
+  <section id="install" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
     <div class="text-center mb-12 reveal">
       <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
         <span class="h-px w-8 bg-emerald-500/40"></span>
         TAKE IT HOME
         <span class="h-px w-8 bg-emerald-500/40"></span>
       </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Faster Than Real Time, <span class="text-emerald-400">Natively</span>.</h2>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Faster Than Real Time on the <span class="text-emerald-400">CLI</span>.</h2>
       <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg mb-8">
         The CLI runs the same engine with native int8 kernels and a persistent six-thread worker
         team, faster than real time on Apple Silicon.
@@ -420,7 +597,7 @@
   </section>
 
   <!-- ============================== FOOTER ============================== -->
-  <footer class="relative px-4 md:px-6 py-12 max-w-[1200px] mx-auto text-center">
+  <footer class="relative px-4 md:px-6 py-12 max-w-7xl mx-auto text-center">
     <p class="pg-note">
       MIT + OpenAI/Anthropic rider · model weights Apache-2.0 by Qwen ·
       <a href="https://github.com/Dicklesworthstone/franken_tts" class="text-emerald-400">github.com/Dicklesworthstone/franken_tts</a>

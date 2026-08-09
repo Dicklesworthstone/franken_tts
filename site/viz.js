@@ -214,6 +214,165 @@ for (const el of document.querySelectorAll("[data-countup]")) {
   }, { threshold: 0.4 }).observe(el);
 }
 
+/* -------------------------------------------- RVQ coarse-to-fine slider */
+// Illustrative residual refinement: the target curve is a fixed sum of 16
+// components; the reconstruction uses only the first N. Dragging the slider is
+// the whole lesson: early codes sketch, later codes correct.
+
+const rvq = document.getElementById("rvq-viz");
+
+function buildRvq() {
+  const NS = "http://www.w3.org/2000/svg";
+  const W = 900, H = 240, MID = 110, AMP = 78;
+  const COMPONENTS = 16;
+  const comp = [];
+  for (let k = 0; k < COMPONENTS; k++) {
+    comp.push({
+      amp: 1.0 / (k + 1) ** 1.15,
+      freq: 1.5 + k * 1.9,
+      phase: (k * 2.399963) % (2 * Math.PI), // golden-angle spacing, deterministic
+    });
+  }
+  const totalEnergy = comp.reduce((s, c) => s + c.amp * c.amp, 0);
+  const sample = (t, depth) => {
+    let v = 0;
+    for (let k = 0; k < depth; k++) v += comp[k].amp * Math.sin(2 * Math.PI * comp[k].freq * t + comp[k].phase);
+    return v;
+  };
+  const norm = 1 / comp.reduce((s, c) => s + c.amp, 0) * 1.55;
+  const path = (depth) => {
+    const pts = [];
+    const n = 220;
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      pts.push(`${(t * W).toFixed(1)},${(MID - sample(t, depth) * AMP * norm).toFixed(1)}`);
+    }
+    return pts.join(" ");
+  };
+
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "Waveform rebuilt from a growing number of residual codes");
+  svg.style.width = "100%";
+  svg.style.height = "auto";
+
+  const target = document.createElementNS(NS, "polyline");
+  target.setAttribute("points", path(COMPONENTS));
+  target.setAttribute("fill", "none");
+  target.setAttribute("stroke", "#475569");
+  target.setAttribute("stroke-width", "1.5");
+  target.setAttribute("stroke-dasharray", "5 5");
+  svg.appendChild(target);
+
+  const recon = document.createElementNS(NS, "polyline");
+  recon.setAttribute("fill", "none");
+  recon.setAttribute("stroke", "#34d399");
+  recon.setAttribute("stroke-width", "2.5");
+  recon.setAttribute("stroke-linejoin", "round");
+  svg.appendChild(recon);
+
+  const legend = document.createElementNS(NS, "text");
+  legend.setAttribute("x", 10);
+  legend.setAttribute("y", 22);
+  legend.setAttribute("text-anchor", "start");
+  legend.setAttribute("fill", "#64748b");
+  legend.setAttribute("font-size", "12");
+  legend.setAttribute("font-family", "Inter, sans-serif");
+  legend.textContent = "dashed: the target · solid: what N codes rebuild";
+  svg.appendChild(legend);
+
+  const controls = document.createElement("div");
+  controls.className = "pg-rvq-controls";
+  const slider = document.createElement("input");
+  slider.type = "range";
+  slider.min = "1";
+  slider.max = String(COMPONENTS);
+  slider.value = "3";
+  slider.className = "pg-slider";
+  slider.setAttribute("aria-label", "Number of residual codes used");
+  const readout = document.createElement("div");
+  readout.className = "pg-rvq-readout";
+
+  const update = () => {
+    const depth = Number.parseInt(slider.value, 10);
+    recon.setAttribute("points", path(depth));
+    const used = comp.slice(0, depth).reduce((s, c) => s + c.amp * c.amp, 0);
+    const residual = Math.max(0, (1 - used / totalEnergy) * 100);
+    readout.innerHTML =
+      `<span class="pg-rvq-big">${depth}</span><span class="pg-stat-dim">/16 codes</span>` +
+      `<span class="pg-rvq-res">residual: ${residual.toFixed(1)}%</span>`;
+  };
+  slider.addEventListener("input", update);
+
+  controls.append(slider, readout);
+  rvq.append(svg, controls);
+  update();
+}
+
+if (rvq) {
+  new IntersectionObserver((entries, observer) => {
+    if (entries.some((e) => e.isIntersecting)) {
+      observer.disconnect();
+      buildRvq();
+    }
+  }, { rootMargin: "150px" }).observe(rvq);
+}
+
+/* ---------------------------------------------------- speed ladder bars */
+// Measured real-time factors, linear scale, with the 1x line marked. Bars
+// animate to width on reveal; reduced motion renders them at rest.
+
+const ladder = document.getElementById("speed-ladder");
+
+function buildLadder() {
+  const MAX = 1.8; // x real time, right edge of the scale
+  const rows = [
+    { name: "f32 reference", value: 0.15, label: "≈0.15×", cls: "pg-lad-ref" },
+    { name: "int8 + team", value: 1.5, label: "1.4–1.6×", cls: "" },
+    { name: "browser wasm", value: 0.04, label: "0.03–0.05×", cls: "pg-lad-ref" },
+  ];
+  for (const row of rows) {
+    const line = document.createElement("div");
+    line.className = "pg-bar-row";
+    const name = document.createElement("span");
+    name.className = "pg-bar-name";
+    name.textContent = row.name;
+    const track = document.createElement("div");
+    track.className = "pg-bar-track pg-lad-track";
+    const fill = document.createElement("div");
+    fill.className = `pg-bar-fill ${row.cls}`.trim();
+    fill.dataset.width = `${(row.value / MAX) * 100}%`;
+    fill.style.width = "0";
+    const marker = document.createElement("div");
+    marker.className = "pg-lad-marker";
+    marker.style.left = `${(1.0 / MAX) * 100}%`;
+    track.append(fill, marker);
+    const val = document.createElement("span");
+    val.className = "pg-bar-val pg-lad-val";
+    val.textContent = row.label;
+    line.append(name, track, val);
+    ladder.appendChild(line);
+  }
+  const key = document.createElement("p");
+  key.className = "pg-note";
+  key.style.marginTop = "0.6rem";
+  key.innerHTML = 'The <span style="color:#fbbf24">amber line</span> is 1× real time: audio produced exactly as fast as it plays. ' +
+    'The f32 route is 6–7× slower than real time by design; the wasm figure is single-threaded.';
+  ladder.appendChild(key);
+
+  new IntersectionObserver((entries, observer) => {
+    if (!entries.some((e) => e.isIntersecting)) return;
+    observer.disconnect();
+    for (const bar of ladder.querySelectorAll("[data-width]")) {
+      bar.style.transition = reducedMotion ? "none" : "width 1.2s cubic-bezier(.2,.8,.2,1)";
+      requestAnimationFrame(() => { bar.style.width = bar.dataset.width; });
+    }
+  }, { threshold: 0.4 }).observe(ladder);
+}
+
+if (ladder) buildLadder();
+
 /* ------------------------------------------------- RMS juxtaposition bars */
 
 const rms = document.getElementById("rms-bars");

@@ -28,6 +28,10 @@ const ui = Object.fromEntries(
     "share",
     "error",
     "clear-cache",
+    "char-count",
+    "dice",
+    "wave-canvas",
+    "voice-cards",
   ].map((id) => [id.replace(/-([a-z])/g, (_, c) => c.toUpperCase()), document.getElementById(id)]),
 );
 
@@ -70,27 +74,43 @@ function clearError() {
 
 const gigabytes = (bytes) => (bytes / 1024 ** 3).toFixed(2);
 
-let presetList = [];
+// Mirrors PRESET_VOICES in crates/ftts-wasm/src/lib.rs (names and characters only; the
+// vectors stay inside the wasm module). Static so the voice UI renders instantly and the
+// voices section works even before the worker finishes booting.
+const PRESETS = [
+  { name: "matt", character: "warm, easy, masculine; the out-of-box default" },
+  { name: "james", character: "natural, conversational, masculine" },
+  { name: "leo", character: "relaxed, resonant, masculine" },
+  { name: "robert", character: "steady, measured, masculine" },
+  { name: "judy", character: "bright, articulate, feminine" },
+  { name: "aria", character: "clear, warm, feminine" },
+  { name: "ember", character: "aria's character, a few semitones deeper" },
+];
+
 let clonedVector = null;
 let clonedName = "my voice";
 let lastWavBlob = null;
 
-async function boot() {
-  const { presets } = await call("init");
-  presetList = presets;
-  for (const preset of presets) {
-    const option = document.createElement("option");
-    option.value = preset.name;
-    option.textContent = preset.name;
-    ui.voice.appendChild(option);
-  }
+for (const preset of PRESETS) {
+  const option = document.createElement("option");
+  option.value = preset.name;
+  option.textContent = preset.name;
+  ui.voice.appendChild(option);
+}
+{
   const cloned = document.createElement("option");
   cloned.value = "__cloned__";
   cloned.textContent = "my cloned voice";
   cloned.disabled = true;
   ui.voice.appendChild(cloned);
-  applySharedFragment();
-  updateVoiceCharacter();
+}
+buildVoiceCards(PRESETS);
+applySharedFragment();
+updateVoiceCharacter();
+updateCharCount();
+
+async function boot() {
+  await call("init");
 
   // Persistence contract: the model downloads ONCE and stays in this browser's storage until
   // "Clear model cache". When a complete cache exists, hydrate immediately on page open —
@@ -135,11 +155,102 @@ async function loadFromStore() {
 }
 
 function updateVoiceCharacter() {
-  const preset = presetList.find((p) => p.name === ui.voice.value);
+  const preset = PRESETS.find((p) => p.name === ui.voice.value);
   ui.voiceCharacter.textContent =
     ui.voice.value === "__cloned__" ? `“${clonedName}”, locally cloned` : (preset?.character ?? "");
 }
 ui.voice.addEventListener("change", updateVoiceCharacter);
+
+// The voices section: one card per preset, plus a card for cloning your own. Picking a
+// card selects that voice in the playground and jumps there.
+function buildVoiceCards(presets) {
+  if (!ui.voiceCards) return;
+  const jumpToPlayground = (focusTarget) => {
+    document.getElementById("playground").scrollIntoView();
+    if (focusTarget) focusTarget.focus({ preventScroll: true });
+  };
+  for (const preset of presets) {
+    const card = document.createElement("div");
+    card.className = "pg-card rounded-2xl border border-white/5 bg-black/40 p-6";
+    const name = document.createElement("div");
+    name.className = "pg-voice-name";
+    name.textContent = preset.name;
+    const character = document.createElement("p");
+    character.className = "pg-note pg-voice-char mb-3";
+    character.textContent = preset.character ?? "";
+    const use = document.createElement("button");
+    use.className = "pg-btn";
+    use.textContent = "Use this voice";
+    use.addEventListener("click", () => {
+      ui.voice.value = preset.name;
+      updateVoiceCharacter();
+      jumpToPlayground(ui.text);
+    });
+    card.append(name, character, use);
+    ui.voiceCards.appendChild(card);
+  }
+  const cloneCard = document.createElement("div");
+  cloneCard.className = "pg-card rounded-2xl border border-emerald-500/25 bg-black/40 p-6";
+  const cloneName = document.createElement("div");
+  cloneName.className = "pg-voice-name";
+  cloneName.textContent = "your voice";
+  const cloneNote = document.createElement("p");
+  cloneNote.className = "pg-note pg-voice-char mb-3";
+  cloneNote.textContent =
+    "Read a short script into your microphone; the speaker encoder runs locally and the recording is discarded.";
+  const cloneBtn = document.createElement("button");
+  cloneBtn.className = "pg-btn";
+  cloneBtn.textContent = "Clone it in the playground";
+  cloneBtn.addEventListener("click", () => jumpToPlayground(ui.record));
+  cloneCard.append(cloneName, cloneNote, cloneBtn);
+  ui.voiceCards.appendChild(cloneCard);
+}
+
+function updateCharCount() {
+  if (!ui.charCount) return;
+  ui.charCount.textContent = `${ui.text.value.length} / ${ui.text.maxLength}`;
+}
+ui.text.addEventListener("input", updateCharCount);
+
+ui.dice.addEventListener("click", () => {
+  ui.seed.value = String(Math.floor(Math.random() * 100000));
+});
+
+// Ctrl+Enter / Cmd+Enter synthesizes from anywhere in the playground.
+document.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !ui.speak.disabled) {
+    event.preventDefault();
+    ui.speak.click();
+  }
+});
+
+// Min/max envelope of the finished PCM, drawn once per synthesis.
+function drawWaveform(samples) {
+  const canvas = ui.waveCanvas;
+  if (!canvas) return;
+  const width = Math.max(300, Math.floor(canvas.clientWidth || canvas.parentElement.clientWidth));
+  canvas.width = width * (window.devicePixelRatio || 1);
+  canvas.height = 72 * (window.devicePixelRatio || 1);
+  const ctx = canvas.getContext("2d");
+  ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
+  ctx.clearRect(0, 0, width, 72);
+  const mid = 36;
+  const perPixel = Math.max(1, Math.floor(samples.length / width));
+  ctx.fillStyle = "rgba(52, 211, 153, 0.75)";
+  for (let x = 0; x < width; x += 1) {
+    let lo = 0;
+    let hi = 0;
+    const start = x * perPixel;
+    for (let i = start; i < Math.min(start + perPixel, samples.length); i += 1) {
+      if (samples[i] < lo) lo = samples[i];
+      if (samples[i] > hi) hi = samples[i];
+    }
+    const top = mid - hi * 32;
+    const bottom = mid - lo * 32;
+    ctx.fillRect(x, top, 1, Math.max(1, bottom - top));
+  }
+  canvas.classList.remove("hidden");
+}
 
 // The download is 2 GB: never start it on a bare click. The first button only reveals the
 // consent panel (size, storage location, resumability, removal); the download starts from
@@ -224,10 +335,10 @@ ui.speak.addEventListener("click", async () => {
     const { pcm, sampleRate, elapsedMs } = await call("synthesize", payload);
     const samples = new Float32Array(pcm);
     lastWavBlob = pcmToWavBlob(samples, sampleRate);
+    drawWaveform(samples);
     ui.player.src = URL.createObjectURL(lastWavBlob);
     ui.player.classList.remove("hidden");
     ui.download.classList.remove("hidden");
-    if (navigator.canShare) ui.share.classList.remove("hidden");
     const audioSeconds = samples.length / sampleRate;
     ui.synthStatus.textContent = `${audioSeconds.toFixed(1)}s of audio in ${(elapsedMs / 1000).toFixed(1)}s (${(audioSeconds / (elapsedMs / 1000)).toFixed(2)}× real time)`;
     ui.synthBar.style.width = "100%";
