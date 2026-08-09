@@ -1212,6 +1212,12 @@ fn run_say_events(
         "prepared_token_count".to_owned(),
         json!(audio_result.prepared_token_count),
     );
+    if let Some(ttfa) = audio_result.ttfa {
+        complete.insert(
+            "ttfa_ms".to_owned(),
+            json!(u64::try_from(ttfa.as_millis()).unwrap_or(u64::MAX)),
+        );
+    }
     emit(&Value::Object(complete))?;
     Ok(())
 }

@@ -1125,6 +1125,11 @@ pub struct SynthesizedAudio {
     pub prepared_token_count: usize,
     /// Mono 24 kHz samples in `[-1, 1]`.
     pub pcm: Vec<f32>,
+    /// Time from synthesis start (prompt work + prefill + first frames) to the first decoded
+    /// packet of PCM existing. `None` when the run produced no audio. Time-to-first-audio and
+    /// real-time factor are different products (doctrine: report them separately); this is the
+    /// TTFA half, excluding model load, which the `load` stage event already bounds.
+    pub ttfa: Option<std::time::Duration>,
 }
 
 /// Run one utterance end to end: text, codes, PCM.
@@ -1220,52 +1225,65 @@ pub fn synthesize(
     let preparer = PreparedPassThrough { prepared };
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ftts_core::CodeFrame>(256);
     let codec = &model.codec;
-    let (result, pcm) = std::thread::scope(
-        |scope| -> Result<(ftts_core::SynthesisResult, Vec<f32>), FttsError> {
-            let worker = scope.spawn(move || -> Result<Vec<f32>, FttsError> {
-                // Overlap for real: this thread's int8 ops run serially on a spare core
-                // instead of contending for the generator's worker team.
-                ftts_kernels::team::bypass_team_on_this_thread();
-                const PACKET_FRAMES: usize = 4;
-                let mut state = codec.stream_state();
-                let mut pcm = Vec::new();
-                // `stream_push` REPLACES its output buffer with one packet's samples (see the
-                // streaming==offline test), so packets decode into a scratch and append here.
-                let mut packet_pcm = Vec::new();
-                let mut packet: Vec<i32> = Vec::with_capacity(16 * PACKET_FRAMES);
-                let mut packet_frames = 0_usize;
-                while let Ok(frame) = frame_rx.recv() {
-                    if frame.codes.len() != 16 {
-                        return Err(FttsError::Generic(format!(
-                            "generated frame carries {} codes, expected 16",
-                            frame.codes.len()
-                        )));
+    let synthesis_started = std::time::Instant::now();
+    let (result, pcm, ttfa) = std::thread::scope(
+        |scope| -> Result<
+            (
+                ftts_core::SynthesisResult,
+                Vec<f32>,
+                Option<std::time::Duration>,
+            ),
+            FttsError,
+        > {
+            let worker = scope.spawn(
+                move || -> Result<(Vec<f32>, Option<std::time::Duration>), FttsError> {
+                    // Overlap for real: this thread's int8 ops run serially on a spare core
+                    // instead of contending for the generator's worker team.
+                    ftts_kernels::team::bypass_team_on_this_thread();
+                    const PACKET_FRAMES: usize = 4;
+                    let mut state = codec.stream_state();
+                    let mut pcm = Vec::new();
+                    // `stream_push` REPLACES its output buffer with one packet's samples (see the
+                    // streaming==offline test), so packets decode into a scratch and append here.
+                    let mut packet_pcm = Vec::new();
+                    let mut packet: Vec<i32> = Vec::with_capacity(16 * PACKET_FRAMES);
+                    let mut packet_frames = 0_usize;
+                    let mut first_audio_at: Option<std::time::Duration> = None;
+                    while let Ok(frame) = frame_rx.recv() {
+                        if frame.codes.len() != 16 {
+                            return Err(FttsError::Generic(format!(
+                                "generated frame carries {} codes, expected 16",
+                                frame.codes.len()
+                            )));
+                        }
+                        for code in &frame.codes {
+                            packet.push(i32::try_from(*code).map_err(|_| {
+                                FttsError::Generic(format!(
+                                    "generated code {code} does not fit the codec's i32"
+                                ))
+                            })?);
+                        }
+                        packet_frames += 1;
+                        if packet_frames == PACKET_FRAMES {
+                            codec
+                                .stream_push(&mut state, &packet, packet_frames, &mut packet_pcm)
+                                .map_err(checkpoint_error)?;
+                            pcm.extend_from_slice(&packet_pcm);
+                            first_audio_at.get_or_insert_with(|| synthesis_started.elapsed());
+                            packet.clear();
+                            packet_frames = 0;
+                        }
                     }
-                    for code in &frame.codes {
-                        packet.push(i32::try_from(*code).map_err(|_| {
-                            FttsError::Generic(format!(
-                                "generated code {code} does not fit the codec's i32"
-                            ))
-                        })?);
-                    }
-                    packet_frames += 1;
-                    if packet_frames == PACKET_FRAMES {
+                    if packet_frames > 0 {
                         codec
                             .stream_push(&mut state, &packet, packet_frames, &mut packet_pcm)
                             .map_err(checkpoint_error)?;
                         pcm.extend_from_slice(&packet_pcm);
-                        packet.clear();
-                        packet_frames = 0;
+                        first_audio_at.get_or_insert_with(|| synthesis_started.elapsed());
                     }
-                }
-                if packet_frames > 0 {
-                    codec
-                        .stream_push(&mut state, &packet, packet_frames, &mut packet_pcm)
-                        .map_err(checkpoint_error)?;
-                    pcm.extend_from_slice(&packet_pcm);
-                }
-                Ok(pcm)
-            });
+                    Ok((pcm, first_audio_at))
+                },
+            );
 
             let mut tee = TeeGenerator {
                 inner: &mut generator,
@@ -1286,7 +1304,8 @@ pub fn synthesize(
             // fails too (starved or fed a partial stream), and its complaint would bury the
             // actual cause.
             let result = result?;
-            Ok((result, pcm?))
+            let (pcm, ttfa) = pcm?;
+            Ok((result, pcm, ttfa))
         },
     )?;
 
@@ -1303,6 +1322,7 @@ pub fn synthesize(
         frames: result.generated_frames,
         prepared_token_count: result.prepared_token_count,
         pcm,
+        ttfa,
     })
 }
 
@@ -1483,18 +1503,79 @@ mod tests {
             state ^= state << 17;
             ((state >> 40) as f32 / 2048.0) - 0.5
         };
-        // Speech from sample zero, for two seconds, with no leading room tone to learn from.
-        let noisy: Vec<f32> = (0..rate * 2)
+        // Bursts from sample zero, with no leading room tone to learn from. They must be
+        // non-stationary: a continuous unvarying tone is by definition a hum, and every
+        // minimum-statistics suppressor removes it *correctly* — asserting otherwise would be
+        // testing that the denoiser fails to denoise.
+        let rms = |pcm: &[f32]| (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt();
+        let mut probe = |burst: usize, sweep: bool, amp: f32, hz0: f64| {
+            let mut local = 0x1234_5678_9ABC_DEF0_u64;
+            let mut hiss = || {
+                local ^= local << 13;
+                local ^= local >> 7;
+                local ^= local << 17;
+                ((local >> 40) as f32 / 2048.0) - 0.5
+            };
+            let noisy: Vec<f32> = (0..rate * 3)
+                .map(|n| {
+                    let t = n as f64 / rate as f64;
+                    let index = n / burst;
+                    let hz = if sweep {
+                        hz0 * (1.0 + 0.25 * (index / 2) as f64)
+                    } else {
+                        hz0
+                    };
+                    let voice = if index.is_multiple_of(2) {
+                        (std::f64::consts::TAU * hz * t).sin() as f32 * amp
+                    } else {
+                        0.0
+                    };
+                    voice + hiss() * 0.02
+                })
+                .collect();
+            let cleaned = denoise_reference(&noisy);
+            let first = rms(&cleaned[..burst]) / rms(&noisy[..burst]);
+            let third = rms(&cleaned[2 * burst..3 * burst]) / rms(&noisy[2 * burst..3 * burst]);
+            (first, third)
+        };
+        for (label, burst, sweep, amp, hz0) in [
+            ("half-second, 700 Hz", rate / 2, false, 0.35_f32, 700.0_f64),
+            ("quarter-second, 700 Hz", rate / 4, false, 0.3, 700.0),
+            ("quarter-second, sweeping", rate / 4, true, 0.3, TONE_HZ),
+        ] {
+            let (first, third) = probe(burst, sweep, amp, hz0);
+            println!("{label}: first {first:.3}, third {third:.3}");
+        }
+
+        let burst = rate / 4;
+        let noisy: Vec<f32> = (0..rate * 3)
             .map(|n| {
                 let t = n as f64 / rate as f64;
-                (std::f64::consts::TAU * TONE_HZ * t).sin() as f32 * 0.3 + noise() * 0.02
+                let index = n / burst;
+                let speaking = index.is_multiple_of(2);
+                let hz = TONE_HZ * (1.0 + 0.25 * (index / 2) as f64);
+                let voice = if speaking {
+                    (std::f64::consts::TAU * hz * t).sin() as f32 * 0.3
+                } else {
+                    0.0
+                };
+                voice + noise() * 0.02
             })
             .collect();
 
         let cleaned = denoise_reference(&noisy);
         let rms = |pcm: &[f32]| (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt();
 
-        let opening = rate / 2; // the first half second, before minimum tracking has settled
+        for index in (0..12).step_by(2) {
+            let span = index * burst..(index + 1) * burst;
+            println!(
+                "burst {index}: kept {:.3}",
+                rms(&cleaned[span.clone()]) / rms(&noisy[span])
+            );
+        }
+
+        // The very first burst, before minimum tracking has seen a full window.
+        let opening = burst;
         let kept = rms(&cleaned[..opening]) / rms(&noisy[..opening]);
         assert!(
             kept > 0.7,

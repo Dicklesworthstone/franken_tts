@@ -395,6 +395,13 @@ pub const EVENTS: &[EventSpec] = &[
                 required: true,
                 summary: "PCM bytes written",
             },
+            FieldSpec {
+                name: "ttfa_ms",
+                ty: "u64",
+                required: false,
+                summary: "synthesis start to first decoded PCM packet; excludes model load \
+                          (bounded by the load stage events)",
+            },
         ],
     },
     EventSpec {
