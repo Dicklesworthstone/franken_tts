@@ -859,6 +859,23 @@ impl TalkerCheckpoint {
                     detail: error.to_string(),
                 })?,
             );
+        Self::load_fttsq_mapped(artifact, path, elision)
+    }
+
+    /// [`TalkerCheckpoint::load_fttsq_elided`] over an already-verified mapping.
+    ///
+    /// This is the no-filesystem entry point (wasm hands over a digest-verified in-memory
+    /// artifact); `label` stands in for the path in error messages.
+    ///
+    /// # Errors
+    ///
+    /// As [`TalkerCheckpoint::load_fttsq`].
+    pub fn load_fttsq_mapped(
+        artifact: Arc<MappedFttsq>,
+        label: &Path,
+        elision: HotElision,
+    ) -> Result<Self, CheckpointError> {
+        let path = label;
         let source = TextEmbeddingSource::Fttsq(Arc::clone(&artifact));
         let elide = {
             let artifact = Arc::clone(&artifact);
@@ -1518,10 +1535,21 @@ impl CodecCheckpoint {
     /// If the file cannot be opened, a tensor is missing, or a codebook refuses to materialize.
     pub fn load(path: &Path) -> Result<Self, CheckpointError> {
         let file = open(path)?;
+        Self::load_from_file(&file, path)
+    }
+
+    /// [`CodecCheckpoint::load`] over an already-parsed checkpoint, for callers with no
+    /// filesystem (wasm); `label` stands in for the path in error messages.
+    ///
+    /// # Errors
+    ///
+    /// As [`CodecCheckpoint::load`].
+    pub fn load_from_file(file: &SafetensorsFile, label: &Path) -> Result<Self, CheckpointError> {
+        let path = label;
         let config = CodecConfig::default();
         let materialize = |prefix: &str| -> Result<MaterializedCodebook, CheckpointError> {
-            let sum = widen(&file, path, &format!("{prefix}.embedding_sum"))?;
-            let usage = widen(&file, path, &format!("{prefix}.cluster_usage"))?;
+            let sum = widen(file, path, &format!("{prefix}.embedding_sum"))?;
+            let usage = widen(file, path, &format!("{prefix}.cluster_usage"))?;
             MaterializedCodebook::from_unnormalized(
                 &sum,
                 &usage,
@@ -1533,7 +1561,39 @@ impl CodecCheckpoint {
 
         // The pieces are independent, so the heavyweight groups hydrate on scoped threads while
         // the main thread takes the small convs and singles. Each piece's bytes are computed
-        // exactly as the serial walk computed them; only wall time changes.
+        // exactly as the serial walk computed them; only wall time changes. wasm32 has no
+        // threads, so it takes the same walk serially — same bytes, one lane.
+        #[cfg(target_arch = "wasm32")]
+        let (codebooks, layers, blocks, upsample) = {
+            let codebooks = (|| -> Result<_, CheckpointError> {
+                let first = materialize("decoder.quantizer.rvq_first.vq.layers.0._codebook")?;
+                let rest = (0..CODE_GROUP_COUNT - 1)
+                    .map(|layer| {
+                        materialize(&format!(
+                            "decoder.quantizer.rvq_rest.vq.layers.{layer}._codebook"
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((first, rest))
+            })();
+            let layers = (0..8)
+                .map(|index| OwnedCodecLayer::load(file, path, index))
+                .collect::<Result<Vec<_>, _>>();
+            let blocks = [
+                OwnedBlock::load(file, path, 1, 1_536, 768, 16, 8),
+                OwnedBlock::load(file, path, 2, 768, 384, 10, 5),
+                OwnedBlock::load(file, path, 3, 384, 192, 8, 4),
+                OwnedBlock::load(file, path, 4, 192, 96, 6, 3),
+            ];
+            let upsample = (|| -> Result<_, CheckpointError> {
+                Ok([
+                    OwnedUpsampleStage::load(file, path, 0)?,
+                    OwnedUpsampleStage::load(file, path, 1)?,
+                ])
+            })();
+            (codebooks, layers, blocks, upsample)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
         let (codebooks, layers, blocks, upsample) = std::thread::scope(|scope| {
             let codebooks = scope.spawn(|| -> Result<_, CheckpointError> {
                 let first = materialize("decoder.quantizer.rvq_first.vq.layers.0._codebook")?;
@@ -1548,19 +1608,19 @@ impl CodecCheckpoint {
             });
             let layers = scope.spawn(|| {
                 (0..8)
-                    .map(|index| OwnedCodecLayer::load(&file, path, index))
+                    .map(|index| OwnedCodecLayer::load(file, path, index))
                     .collect::<Result<Vec<_>, _>>()
             });
             let block_handles = [
-                scope.spawn(|| OwnedBlock::load(&file, path, 1, 1_536, 768, 16, 8)),
-                scope.spawn(|| OwnedBlock::load(&file, path, 2, 768, 384, 10, 5)),
-                scope.spawn(|| OwnedBlock::load(&file, path, 3, 384, 192, 8, 4)),
-                scope.spawn(|| OwnedBlock::load(&file, path, 4, 192, 96, 6, 3)),
+                scope.spawn(|| OwnedBlock::load(file, path, 1, 1_536, 768, 16, 8)),
+                scope.spawn(|| OwnedBlock::load(file, path, 2, 768, 384, 10, 5)),
+                scope.spawn(|| OwnedBlock::load(file, path, 3, 384, 192, 8, 4)),
+                scope.spawn(|| OwnedBlock::load(file, path, 4, 192, 96, 6, 3)),
             ];
             let upsample = scope.spawn(|| -> Result<_, CheckpointError> {
                 Ok([
-                    OwnedUpsampleStage::load(&file, path, 0)?,
-                    OwnedUpsampleStage::load(&file, path, 1)?,
+                    OwnedUpsampleStage::load(file, path, 0)?,
+                    OwnedUpsampleStage::load(file, path, 1)?,
                 ])
             });
             let mut blocks = block_handles
@@ -1585,23 +1645,19 @@ impl CodecCheckpoint {
             config,
             first_codebook,
             rest_codebooks,
-            first_output_proj: widen(
-                &file,
-                path,
-                "decoder.quantizer.rvq_first.output_proj.weight",
-            )?,
-            rest_output_proj: widen(&file, path, "decoder.quantizer.rvq_rest.output_proj.weight")?,
-            pre_conv: OwnedConv::load(&file, path, "decoder.pre_conv.conv")?,
-            input_proj: OwnedConv::load(&file, path, "decoder.pre_transformer.input_proj")?,
+            first_output_proj: widen(file, path, "decoder.quantizer.rvq_first.output_proj.weight")?,
+            rest_output_proj: widen(file, path, "decoder.quantizer.rvq_rest.output_proj.weight")?,
+            pre_conv: OwnedConv::load(file, path, "decoder.pre_conv.conv")?,
+            input_proj: OwnedConv::load(file, path, "decoder.pre_transformer.input_proj")?,
             layers: layers?,
-            final_norm: widen(&file, path, "decoder.pre_transformer.norm.weight")?,
-            output_proj: OwnedConv::load(&file, path, "decoder.pre_transformer.output_proj")?,
+            final_norm: widen(file, path, "decoder.pre_transformer.norm.weight")?,
+            output_proj: OwnedConv::load(file, path, "decoder.pre_transformer.output_proj")?,
             upsample: upsample?,
-            decoder_input: OwnedConv::load(&file, path, "decoder.decoder.0.conv")?,
+            decoder_input: OwnedConv::load(file, path, "decoder.decoder.0.conv")?,
             blocks: [block1?, block2?, block3?, block4?],
-            final_alpha: widen(&file, path, "decoder.decoder.5.alpha")?,
-            final_beta: widen(&file, path, "decoder.decoder.5.beta")?,
-            final_conv: OwnedConv::load(&file, path, "decoder.decoder.6.conv")?,
+            final_alpha: widen(file, path, "decoder.decoder.5.alpha")?,
+            final_beta: widen(file, path, "decoder.decoder.5.beta")?,
+            final_conv: OwnedConv::load(file, path, "decoder.decoder.6.conv")?,
         })
     }
 

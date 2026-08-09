@@ -125,6 +125,16 @@ impl MappedFile {
         }
     }
 
+    /// Wraps an in-memory buffer as a mapping, for targets with no filesystem (wasm32).
+    ///
+    /// Only the owned-bytes backing can host this, so it exists exactly where that backing is
+    /// compiled in; the native mmap variant keeps its single `open` entry point.
+    #[cfg(not(all(feature = "native-mmap", unix)))]
+    #[must_use]
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
     #[cfg(all(feature = "native-mmap", unix))]
     fn open_native(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;

@@ -732,6 +732,28 @@ impl MappedFttsq {
         })
     }
 
+    /// Validate an artifact held wholly in memory, for targets with no filesystem (wasm32).
+    ///
+    /// Runs the identical structural-then-digest pipeline as [`MappedFttsq::open`]; only the
+    /// byte source differs, so a buffer that verifies here is exactly a file that would have
+    /// verified there.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same named [`FttsqError`] classes as [`MappedFttsq::open`].
+    #[cfg(not(unix))] // the owned-bytes MappedFile backing (and its from_bytes) exists off-unix
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, FttsqError> {
+        let mapping = MappedFile::from_bytes(bytes);
+        let reader = FttsqReader::parse_directory(mapping.as_slice())?;
+        let page_advice = apply_page_in_plan(&mapping, &reader);
+        reader.verify_digests(mapping.as_slice())?;
+        Ok(Self {
+            mapping,
+            reader,
+            page_advice,
+        })
+    }
+
     /// The fully validated directory over this artifact.
     #[must_use]
     pub const fn reader(&self) -> &FttsqReader {

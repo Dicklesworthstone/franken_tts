@@ -12,5 +12,12 @@ categories = ["multimedia::audio"]
 [dependencies]
 asupersync.workspace = true
 
+# wasm32 builds must pick exactly one asupersync canonical profile; `wasm-browser-prod`
+# is the canonical browser profile (the minimal profile currently fails its own dead-code
+# lint under wasm). Resolver v3
+# scopes this feature to wasm32 targets, so native builds are untouched.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+asupersync = { workspace = true, features = ["wasm-browser-prod"] }
+
 [lints]
 workspace = true

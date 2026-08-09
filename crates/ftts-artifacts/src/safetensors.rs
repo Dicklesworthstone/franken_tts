@@ -899,6 +899,18 @@ impl SafetensorsFile {
         Ok(Self { mapping, index })
     }
 
+    /// Parse a checkpoint held wholly in memory, for targets with no filesystem (wasm32).
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError::Weights`] when the directory is malformed, exactly as [`SafetensorsFile::open`].
+    #[cfg(not(unix))] // the owned-bytes MappedFile backing (and its from_bytes) exists off-unix
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, OpenError> {
+        let mapping = ftts_kernels::mmap::MappedFile::from_bytes(bytes);
+        let index = SafetensorsIndex::parse(mapping.as_slice()).map_err(OpenError::Weights)?;
+        Ok(Self { mapping, index })
+    }
+
     /// Advise the kernel that access to this checkpoint is sparse and random.
     ///
     /// Appropriate for a checkpoint dominated by the cold text embedding, where prefill touches a
