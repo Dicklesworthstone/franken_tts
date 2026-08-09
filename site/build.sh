@@ -9,25 +9,39 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Built with `cargo` + the `wasm-bindgen` CLI directly rather than through wasm-pack.
+#
+# wasm-pack injects its own RUSTFLAGS, which clobbers the target-feature list — and if `+atomics`
+# does not reach `std`, std is rebuilt without TLS, LLD emits no `__wasm_init_tls`, and
+# wasm-bindgen's threading transform fails looking for it. Driving the two steps ourselves is the
+# only way to be certain the flags below apply to every unit, std included.
+#
 # +simd128       : the hand-written int8 island (Int8Tier::WasmSimd128).
-# +atomics,...   : threads. `atomics` alone is not enough — the shared-memory linker flags below
-#                  are what make the resulting memory usable from more than one Worker, and
-#                  bulk-memory/mutable-globals are the companion features the threads proposal
-#                  assumes.
-# --max-memory   : `+atomics` already makes LLD emit a *shared* imported memory, so passing
-#                  --shared-memory/--import-memory by hand is redundant — and harmful: doing so
-#                  dropped `__heap_base` from the exports, and wasm-bindgen needs it to inject
-#                  per-thread ids ("failed to find __heap_base for injecting thread id"). A shared
-#                  memory must still declare its ceiling, and 4 GB is wasm32's hard limit.
-# --export=...   : belt and braces for the two symbols the threading transform looks up.
-# -Z build-std   : std itself must be rebuilt with the atomics feature; the prebuilt std is not
-#                  thread-enabled, which is why this needs nightly and a rust-src component.
+# +atomics,...   : threads. std must be rebuilt with these, which is what -Z build-std is for and
+#                  why this needs nightly plus the rust-src component.
+# --export=...   : symbols wasm-bindgen's threading transform looks up by name.
+#
+# THREADS ARE COMPILED IN BUT NOT YET ARMED, and the runtime notices rather than hanging.
+# Adding `--shared-memory --import-memory` DOES produce the right memory — objdump confirms
+# `memory[0] ... shared <- env.memory` — but wasm-bindgen then fails with "failed to find
+# `__wasm_init_tls`": LLD emitted no TLS segment for it to initialize. That is the one remaining
+# step, and it is a toolchain question (force a `#[thread_local]` symbol so LLD emits the segment,
+# or adopt wasm-bindgen-rayon, which carries this plumbing), not an engine question — the Rust
+# team, the two-phase arm protocol, and the Worker pool are all written and compile.
+#
+# `startTeam` refuses to arm unless the INSTANTIATED memory is really a SharedArrayBuffer, so this
+# ships as a correct serial engine rather than a dispatcher waiting on partitions that never
+# existed.
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 RUSTFLAGS="-C target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals \
   -C link-arg=--max-memory=4294967296 \
   -C link-arg=--export=__heap_base \
   -C link-arg=--export=__tls_base" \
-  wasm-pack build crates/ftts-wasm --target web --release --out-dir ../../site/pkg \
-  -- -Z build-std=std,panic_abort
+  cargo build -p ftts-wasm --target wasm32-unknown-unknown --release \
+    -Z build-std=std,panic_abort
+
+wasm-bindgen "$TARGET_DIR/wasm32-unknown-unknown/release/ftts_wasm.wasm" \
+  --out-dir site/pkg --typescript --target web
 
 # wasm-pack writes a .gitignore that would hide the artifacts from Pages' upload.
 rm -f site/pkg/.gitignore

@@ -92,8 +92,17 @@ self.onmessage = async ({ data }) => {
         // control block means nothing to them.
         const module = await WebAssembly.compileStreaming(fetch(wasmUrl));
         const memory = createSharedMemory();
-        await init({ module_or_path: module, memory: memory ?? undefined });
-        const threads = memory ? await startTeam(module, memory) : 1;
+        const exports = await init({ module_or_path: module, memory: memory ?? undefined });
+        // Arm ONLY if the memory the module actually instantiated against is shared. A build whose
+        // memory is defined-and-exported rather than shared-and-imported silently ignores the
+        // memory passed above, and every Worker would then get its own linear memory — the team's
+        // control block would be a different object in each, the dispatcher would wait forever on
+        // partitions that cannot report, and the page would hang instead of merely being slow.
+        // Checking the instantiated buffer is the only honest test; the build flags are not.
+        const live = exports?.memory ?? memory;
+        const shared =
+          typeof SharedArrayBuffer !== "undefined" && live?.buffer instanceof SharedArrayBuffer;
+        const threads = shared ? await startTeam(module, live) : 1;
         reply("init", {
           ok: true,
           presets: JSON.parse(presets()),

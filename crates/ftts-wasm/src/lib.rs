@@ -424,6 +424,15 @@ impl WasmEngine {
         let codec =
             CodecCheckpoint::load_from_file(&codec_file, Path::new("browser://codec.safetensors"))
                 .map_err(|error| js_error("codec hydration failed", error))?;
+        // Free the codec's source bytes the instant they stop being needed.
+        //
+        // `CodecCheckpoint` materializes every tensor into owned `Vec<f32>`, so the moment it is
+        // built the ~0.68 GB of BF16 behind `codec_file` is dead weight — yet Rust would hold it
+        // until this function returns, which is exactly when the high-water mark occurs: artifact
+        // (1.31 GB) + codec source (0.68) + widened codec f32 (~1.36) ≈ 3.35 GB. That is more than
+        // iOS Safari gives a tab, and it is why hydration dies there while the download now
+        // survives. Dropping here removes 0.68 GB from the peak at no cost to anything.
+        drop(codec_file);
 
         let tokenizer = QwenTokenizer::from_files_using_environment(TokenizerFiles {
             vocab_json,
