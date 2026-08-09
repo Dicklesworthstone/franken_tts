@@ -44,7 +44,8 @@
 //! `causal_conv1d`, which measured that adding the bias after a `beta = 0` GEMM is *not* exact.
 
 use crate::checkpoint::{CheckpointError, open, widen_exact};
-use ftts_artifacts::safetensors::SafetensorsFile;
+/// Fetches a named tensor widened to f32, verifying its exact element count.
+type FetchExact<'a> = &'a mut dyn FnMut(&str, usize) -> Result<Vec<f32>, CheckpointError>;
 use ftts_kernels::f32ref;
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::fmt;
@@ -264,8 +265,7 @@ struct Conv {
 
 impl Conv {
     fn load(
-        file: &SafetensorsFile,
-        path: &Path,
+        fetch: FetchExact<'_>,
         base: &str,
         in_channels: usize,
         out_channels: usize,
@@ -273,13 +273,11 @@ impl Conv {
         dilation: usize,
     ) -> Result<Self, CheckpointError> {
         Ok(Self {
-            weight: widen_exact(
-                file,
-                path,
+            weight: fetch(
                 &format!("{base}.weight"),
                 out_channels * in_channels * kernel,
             )?,
-            bias: widen_exact(file, path, &format!("{base}.bias"), out_channels)?,
+            bias: fetch(&format!("{base}.bias"), out_channels)?,
             in_channels,
             out_channels,
             kernel,
@@ -325,8 +323,7 @@ struct SeRes2NetBlock {
 
 impl SeRes2NetBlock {
     fn load(
-        file: &SafetensorsFile,
-        path: &Path,
+        fetch: FetchExact<'_>,
         index: usize,
         channels: usize,
         kernel: usize,
@@ -337,8 +334,7 @@ impl SeRes2NetBlock {
         let mut res2net = Vec::with_capacity(RES2NET_SCALE - 1);
         for branch in 0..RES2NET_SCALE - 1 {
             res2net.push(Conv::load(
-                file,
-                path,
+                &mut *fetch,
                 &format!("{base}.res2net_block.blocks.{branch}.conv"),
                 split,
                 split,
@@ -348,8 +344,7 @@ impl SeRes2NetBlock {
         }
         Ok(Self {
             tdnn1: Conv::load(
-                file,
-                path,
+                &mut *fetch,
                 &format!("{base}.tdnn1.conv"),
                 channels,
                 channels,
@@ -358,8 +353,7 @@ impl SeRes2NetBlock {
             )?,
             res2net,
             tdnn2: Conv::load(
-                file,
-                path,
+                &mut *fetch,
                 &format!("{base}.tdnn2.conv"),
                 channels,
                 channels,
@@ -367,8 +361,7 @@ impl SeRes2NetBlock {
                 1,
             )?,
             se_conv1: Conv::load(
-                file,
-                path,
+                &mut *fetch,
                 &format!("{base}.se_block.conv1"),
                 channels,
                 SE_CHANNELS,
@@ -376,8 +369,7 @@ impl SeRes2NetBlock {
                 1,
             )?,
             se_conv2: Conv::load(
-                file,
-                path,
+                &mut *fetch,
                 &format!("{base}.se_block.conv2"),
                 SE_CHANNELS,
                 channels,
@@ -507,11 +499,43 @@ impl Encoder {
     /// producing a plausible embedding.
     pub fn load(path: &Path) -> Result<Self, CheckpointError> {
         let file = open(path)?;
+        let path_buf = path.to_path_buf();
+        let mut fetch = move |name: &str, expected: usize| -> Result<Vec<f32>, CheckpointError> {
+            widen_exact(&file, &path_buf, name, expected)
+        };
+        Self::load_with(path, &mut fetch)
+    }
+
+    /// Hydrate the same 76 tensors from a canonical .fttsq artifact.
+    ///
+    /// The recipe stores every speaker-encoder tensor verbatim (bf16), so enrollment from the
+    /// artifact is bit-identical to enrollment from the raw checkpoint by construction.
+    ///
+    /// # Errors
+    ///
+    /// As [`Encoder::load`], plus artifact-integrity failures from the mapped container.
+    pub fn load_fttsq(path: &Path) -> Result<Self, CheckpointError> {
+        let artifact = crate::checkpoint::open_fttsq(path)?;
+        let path_buf = path.to_path_buf();
+        let mut fetch = move |name: &str, expected: usize| -> Result<Vec<f32>, CheckpointError> {
+            let values = crate::checkpoint::widen_fttsq(&artifact, &path_buf, name)?;
+            if values.len() != expected {
+                return Err(CheckpointError::TensorShape {
+                    tensor: name.to_owned(),
+                    expected,
+                    actual: values.len(),
+                });
+            }
+            Ok(values)
+        };
+        Self::load_with(path, &mut fetch)
+    }
+
+    fn load_with(path: &Path, mut fetch: FetchExact<'_>) -> Result<Self, CheckpointError> {
         let mut blocks = Vec::with_capacity(SE_RES2NET_BLOCKS);
         for index in 1..=SE_RES2NET_BLOCKS {
             blocks.push(SeRes2NetBlock::load(
-                &file,
-                path,
+                &mut *fetch,
                 index,
                 ENC_CHANNELS[index],
                 ENC_KERNEL_SIZES[index],
@@ -522,8 +546,7 @@ impl Encoder {
         Ok(Self {
             path: path.to_path_buf(),
             initial: Conv::load(
-                &file,
-                path,
+                &mut fetch,
                 "speaker_encoder.blocks.0.conv",
                 MEL_DIM,
                 ENC_CHANNELS[0],
@@ -532,8 +555,7 @@ impl Encoder {
             )?,
             blocks,
             mfa: Conv::load(
-                &file,
-                path,
+                &mut fetch,
                 "speaker_encoder.mfa.conv",
                 mfa_width,
                 mfa_width,
@@ -541,8 +563,7 @@ impl Encoder {
                 ENC_DILATIONS[4],
             )?,
             asp_tdnn: Conv::load(
-                &file,
-                path,
+                &mut fetch,
                 "speaker_encoder.asp.tdnn.conv",
                 mfa_width * 3,
                 ATTENTION_CHANNELS,
@@ -550,8 +571,7 @@ impl Encoder {
                 1,
             )?,
             asp_conv: Conv::load(
-                &file,
-                path,
+                &mut fetch,
                 "speaker_encoder.asp.conv",
                 ATTENTION_CHANNELS,
                 mfa_width,
@@ -559,8 +579,7 @@ impl Encoder {
                 1,
             )?,
             fc: Conv::load(
-                &file,
-                path,
+                &mut fetch,
                 "speaker_encoder.fc",
                 mfa_width * 2,
                 ENC_DIM,

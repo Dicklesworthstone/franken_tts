@@ -740,10 +740,10 @@ pub fn convert_safetensors_streaming<W: std::io::Write + std::io::Seek>(
         let section = tensor.section_name();
         match tensor.storage {
             TensorStoragePolicy::Verbatim => writer
-                .write_section(&section, matrix_or_values.as_bytes())
+                .write_section(section, matrix_or_values.as_bytes())
                 .map_err(StreamingConversionError::Artifact)?,
             TensorStoragePolicy::Q8PerOutputChannel => {
-                stream_matrix_q8_section(&matrix_or_values, &mut writer, &section)
+                stream_matrix_q8_section(&matrix_or_values, &mut writer, section)
                     .map_err(StreamingConversionError::Quantization)?;
             }
         }

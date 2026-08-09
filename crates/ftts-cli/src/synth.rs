@@ -238,7 +238,11 @@ pub fn speaker_from_voice(bundle: &ModelBundle, path: &Path) -> Result<Vec<f32>,
     let pcm = decode_reference_audio_any(path)?;
     let mel = log_mel_from_24khz_pcm(&pcm)
         .map_err(|error| FttsError::Input(format!("cannot extract speaker features: {error}")))?;
-    let encoder = SpeakerEncoder::load(&bundle.main).map_err(checkpoint_error)?;
+    let encoder = match bundle.canonical_main.as_deref() {
+        Some(artifact) => SpeakerEncoder::load_fttsq(artifact),
+        None => SpeakerEncoder::load(&bundle.main),
+    }
+    .map_err(checkpoint_error)?;
     let vector = encoder.encode(&mel.values, mel.frames);
     if vector.iter().all(|value| value.is_finite()) {
         Ok(vector)

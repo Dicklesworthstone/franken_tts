@@ -304,13 +304,21 @@ fn artifact_f32_values(
         .collect())
 }
 
+/// Open a canonical `.fttsq` artifact with its integrity checks, as a [`CheckpointError`].
+pub(crate) fn open_fttsq(path: &Path) -> Result<MappedFttsq, CheckpointError> {
+    MappedFttsq::open(path).map_err(|error| CheckpointError::Open {
+        path: path.to_path_buf(),
+        detail: error.to_string(),
+    })
+}
+
 /// Widen one canonical-artifact tensor for the f32 baseline engine.
 ///
 /// Q8 matrices use the converter's exact row-major layout: signed payload bytes followed by an
 /// f32 scale for every output channel. Keeping this reconstruction at the accessor boundary lets
 /// the current f32 engine execute canonical artifacts without acquiring a second quantization
 /// recipe or materializing the cold text embedding.
-fn widen_fttsq(
+pub(crate) fn widen_fttsq(
     artifact: &MappedFttsq,
     path: &Path,
     name: &str,
