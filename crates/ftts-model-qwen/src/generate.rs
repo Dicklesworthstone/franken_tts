@@ -302,13 +302,37 @@ impl<'a> QwenGenerator<'a> {
                 "micro" => (false, true),
                 _ => (true, true),
             };
+            let artifact = artifact.filter(|_| artifact_q8_enabled());
             Int8Route {
                 talker: if arm_talker {
                     config
                         .talker_weights
                         .layers
                         .iter()
-                        .map(|layer| TalkerLayerQuant::quantize(&config.talker_config, layer))
+                        .enumerate()
+                        .map(|(index, layer)| {
+                            artifact
+                                .and_then(|artifact| {
+                                    let talker = &config.talker_config;
+                                    fused_layer_from_artifact(
+                                        artifact,
+                                        &format!("talker.model.layers.{index}"),
+                                        talker.hidden_size,
+                                        talker.query_width(),
+                                        talker.kv_width(),
+                                        talker.intermediate_size,
+                                    )
+                                })
+                                .map(|(qkv, o_proj, gate_up, down_proj)| TalkerLayerQuant {
+                                    qkv,
+                                    o_proj,
+                                    gate_up,
+                                    down_proj,
+                                })
+                                .unwrap_or_else(|| {
+                                    TalkerLayerQuant::quantize(&config.talker_config, layer)
+                                })
+                        })
                         .collect()
                 } else {
                     Vec::new()
@@ -318,7 +342,30 @@ impl<'a> QwenGenerator<'a> {
                         .microdecoder_weights
                         .layers
                         .iter()
-                        .map(|layer| MicroLayerQuant::quantize(&config.microdecoder_config, layer))
+                        .enumerate()
+                        .map(|(index, layer)| {
+                            artifact
+                                .and_then(|artifact| {
+                                    let micro = &config.microdecoder_config;
+                                    fused_layer_from_artifact(
+                                        artifact,
+                                        &format!("talker.code_predictor.model.layers.{index}"),
+                                        micro.hidden_size,
+                                        micro.q_width(),
+                                        micro.kv_width(),
+                                        micro.intermediate_size,
+                                    )
+                                })
+                                .map(|(qkv, o_proj, gate_up, down_proj)| MicroLayerQuant {
+                                    qkv,
+                                    o_proj,
+                                    gate_up,
+                                    down_proj,
+                                })
+                                .unwrap_or_else(|| {
+                                    MicroLayerQuant::quantize(&config.microdecoder_config, layer)
+                                })
+                        })
                         .collect()
                 } else {
                     Vec::new()
