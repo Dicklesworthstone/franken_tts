@@ -21,7 +21,9 @@ use ftts_model_qwen::prompt::{CloneMode, PromptMode};
 use ftts_model_qwen::sampler::SamplingMode;
 use ftts_model_qwen::speaker::{Encoder as SpeakerEncoder, log_mel_from_24khz_pcm};
 use ftts_model_qwen::talker::TalkerConfig;
-use ftts_model_qwen::tokenizer::{QwenTokenizer, TokenizerFiles};
+use ftts_model_qwen::tokenizer::QwenTokenizer;
+#[cfg(not(unix))]
+use ftts_model_qwen::tokenizer::TokenizerFiles;
 use std::path::Path;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
@@ -381,7 +383,7 @@ pub fn bench_frame_kernels(rounds: u32) -> String {
         matrices.push((QuantizedMatrix { data, scales, n, k }, calls));
     }
     let x: Vec<i8> = (0..8192)
-        .map(|i| (((i * 29 + 5) % 255) as i32 - 127) as i8)
+        .map(|i| (((i * 29 + 5) % 255) - 127) as i8)
         .collect();
     let mut out = vec![0.0f32; 8192];
 

@@ -1,0 +1,21 @@
+{
+  "name": "ftts-wasm",
+  "type": "module",
+  "description": "franken_tts browser bindings: the Qwen3-TTS pipeline compiled to WASM for the playground",
+  "version": "0.1.4",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Dicklesworthstone/franken_tts"
+  },
+  "files": [
+    "ftts_wasm_bg.wasm",
+    "ftts_wasm.js",
+    "ftts_wasm.d.ts"
+  ],
+  "main": "ftts_wasm.js",
+  "types": "ftts_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

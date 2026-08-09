@@ -1,0 +1,8 @@
+# Cross-origin isolation: required for SharedArrayBuffer once the wasm-threads
+# build lands; harmless (and forward-compatible) for today's single-thread engine.
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/pkg/*
+  Cache-Control: public, max-age=3600
