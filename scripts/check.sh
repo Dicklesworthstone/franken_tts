@@ -166,6 +166,26 @@ fi
 stage_pass
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 3b. The browser loader's SHA-256 still agrees with WebCrypto
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The site ships its own SHA-256 because crypto.subtle needs one contiguous buffer and a 1.3 GB
+# ArrayBuffer kills the tab on iOS. That hash decides whether a downloaded model is accepted, and
+# `digestRange` decides whether a CACHED model is accepted (DISC-004) — a silent break here would
+# either reject every good download or accept a corrupt one. Node is not a build requirement for
+# the Rust product, so a missing runtime SKIPS the stage loudly rather than failing the gate;
+# per Doctrine #0 a skip is reported as a skip and never counted as a pass.
+stage_start "site SHA-256 conformance vs WebCrypto"
+if command -v node >/dev/null 2>&1; then
+    if ! node site/sha256.test.js; then
+        stage_fail "site/sha256.js diverged from crypto.subtle — the model verifier is untrustworthy"
+    fi
+    stage_pass
+else
+    stage_skip "node not installed; site/sha256.test.js NOT run"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 4. Formatting
 # ─────────────────────────────────────────────────────────────────────────────
 stage_start "cargo fmt --check"
