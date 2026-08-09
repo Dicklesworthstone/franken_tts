@@ -116,6 +116,104 @@ pub fn preset_vector(name: &str) -> Result<Vec<f32>, JsValue> {
         .collect())
 }
 
+/// Which int8 route this build actually dispatches in the browser.
+///
+/// Exposed because the browser has no environment variables and no `robot backends`: without a
+/// way to ask, a wasm build that silently fell back to the scalar loop would look exactly like
+/// one running the SIMD128 island, and that difference is most of the frame time.
+#[wasm_bindgen]
+#[must_use]
+pub fn int8_route() -> String {
+    ftts_kernels::int8::Int8Tier::dispatch().as_str().to_owned()
+}
+
+/// Times one int8 GEMV at a real model reduction length and returns nanoseconds per dot.
+///
+/// A kernel benchmark rather than an end-to-end one on purpose: it isolates the thing the SIMD
+/// island changes, needs no 2 GB model, and runs in a second. `tier` takes the route names from
+/// [`ftts_kernels::int8::Int8Tier::as_str`] so a caller can A/B `scalar` against `wasm-simd128`
+/// in the same process — same allocator, same warm caches, same engine — which is the only way
+/// the ratio means anything.
+///
+/// Timing is the caller's job: wasm has no clock, so this returns after `rounds` passes and the
+/// JS side divides by its own `performance.now()` delta.
+///
+/// # Errors
+///
+/// Throws when `tier` is not a route this build can execute.
+#[wasm_bindgen]
+pub fn bench_int8_gemv(tier: &str, k: usize, n: usize, rounds: usize) -> Result<f32, JsValue> {
+    use ftts_kernels::int8::{Int8Tier, QuantizedMatrix, linear_q8, quantize_row_q8};
+
+    let route = Int8Tier::available()
+        .into_iter()
+        .find(|candidate| candidate.as_str() == tier)
+        .ok_or_else(|| js_error("unavailable int8 route", tier))?;
+
+    // Deterministic operands spanning the full [-127, 127] range, so the measurement cannot be
+    // flattered by a sparse or small-magnitude matrix.
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 33) as f32 / f32::from(u16::MAX)) - 0.5
+    };
+    let weight: Vec<f32> = (0..n * k).map(|_| next()).collect();
+    let matrix = QuantizedMatrix::quantize(&weight, n, k);
+    let activation: Vec<f32> = (0..k).map(|_| next()).collect();
+    let mut x_q = vec![0_i8; k];
+    let scale = quantize_row_q8(&activation, &mut x_q);
+    let mut out = vec![0.0_f32; n];
+
+    for _ in 0..rounds {
+        linear_q8(&x_q, &[scale], &matrix, None, 1, &mut out, route);
+    }
+    // Returned so the optimizer cannot delete the loop it was asked to time.
+    Ok(out.iter().sum())
+}
+
+/// Arms the int8 worker team and returns how many Workers the caller must now start.
+///
+/// Call this from the engine Worker — never the page's main thread. The dispatching thread blocks
+/// on a condvar while partitions run, and `atomic.wait` **traps** on the main thread, so arming
+/// there would abort rather than merely stall. Each Worker the caller spawns must instantiate this
+/// same module against the same `WebAssembly.Memory` and then call [`worker_loop_entry`] with its
+/// index, `1..=returned`.
+///
+/// Returns 0 when `partitions <= 1`, which is the honest answer for a browser without
+/// `SharedArrayBuffer` — the engine then runs serially instead of failing.
+#[cfg(not(unix))]
+#[must_use]
+#[wasm_bindgen]
+pub fn arm_worker_team(partitions: usize) -> usize {
+    ftts_kernels::team::install_wasm_team(partitions)
+}
+
+/// The body a spawned Worker runs; never returns.
+///
+/// # Errors
+///
+/// Throws if called before [`arm_worker_team`] published the control block, which is a host
+/// sequencing bug — parking on a block that does not exist would hang silently instead.
+#[cfg(not(unix))]
+#[wasm_bindgen]
+pub fn worker_loop_entry(worker: usize) -> Result<(), JsValue> {
+    if worker == 0 {
+        return Err(js_error("worker index must be >= 1", "0 is the dispatcher"));
+    }
+    ftts_kernels::team::wasm_worker_loop(worker);
+    Ok(())
+}
+
+/// How many partitions the int8 team is running with; 1 means serial.
+#[cfg(not(unix))]
+#[must_use]
+#[wasm_bindgen]
+pub fn worker_team_width() -> usize {
+    ftts_kernels::team::partitions()
+}
+
 /// The loaded model: talker+microdecoder from the canonical artifact, codec from the raw
 /// speech-tokenizer checkpoint, tokenizer from its three text files.
 #[wasm_bindgen]
@@ -127,8 +225,133 @@ pub struct WasmEngine {
     speaker_encoder: Option<SpeakerEncoder>,
 }
 
+/// Model bytes accumulated directly inside wasm linear memory, a slice at a time.
+///
+/// # Why this exists
+///
+/// Passing the artifact as a `Vec<u8>` makes wasm-bindgen copy it out of the JS `ArrayBuffer`
+/// into linear memory, so a 1.3 GB model is **live twice** at the moment of construction. Desktop
+/// Chrome absorbs 2.6 GB; an iPhone does not — the tab is reclaimed and the page "crashes while
+/// loading". Streaming OPFS slices straight into a buffer that already lives in wasm keeps the JS
+/// heap at one slice and the artifact at exactly one copy.
+///
+/// Capacity is reserved once, exactly, up front. That is the load-bearing detail: a `Vec` that
+/// grows by doubling would transiently hold 1.3 GB *plus* its 2.6 GB successor while copying —
+/// worse than the problem being solved. `try_reserve_exact` also turns an allocation failure into
+/// a thrown error naming the number of bytes, rather than the opaque `unreachable` a wasm abort
+/// shows the user.
+#[wasm_bindgen]
+pub struct ModelStaging {
+    fttsq: Vec<u8>,
+    codec: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl ModelStaging {
+    /// Reserve exact room for both files before any bytes arrive.
+    ///
+    /// # Errors
+    ///
+    /// Throws when linear memory cannot be reserved, naming the byte count that failed — the
+    /// honest signal on a device that simply does not have the memory.
+    #[wasm_bindgen(constructor)]
+    pub fn new(fttsq_bytes: usize, codec_bytes: usize) -> Result<ModelStaging, JsValue> {
+        let mut fttsq = Vec::new();
+        fttsq
+            .try_reserve_exact(fttsq_bytes)
+            .map_err(|_| js_error("cannot reserve model memory (bytes)", fttsq_bytes))?;
+        let mut codec = Vec::new();
+        codec
+            .try_reserve_exact(codec_bytes)
+            .map_err(|_| js_error("cannot reserve codec memory (bytes)", codec_bytes))?;
+        Ok(ModelStaging { fttsq, codec })
+    }
+
+    /// Append one slice of the artifact, in order.
+    ///
+    /// # Errors
+    ///
+    /// Throws if the slice would exceed the reserved capacity, which means the caller's manifest
+    /// and its download disagree — better caught here than as a corrupt tensor later.
+    pub fn push_fttsq(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
+        append_exact(&mut self.fttsq, chunk, "artifact")
+    }
+
+    /// Append one slice of the codec checkpoint, in order.
+    ///
+    /// # Errors
+    ///
+    /// As [`ModelStaging::push_fttsq`].
+    pub fn push_codec(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
+        append_exact(&mut self.codec, chunk, "codec")
+    }
+
+    /// Bytes accepted so far, so the caller can drive a progress bar without tracking it twice.
+    #[must_use]
+    pub fn filled(&self) -> usize {
+        self.fttsq.len() + self.codec.len()
+    }
+}
+
+/// Appends without ever letting the vector reallocate.
+fn append_exact(target: &mut Vec<u8>, chunk: &[u8], what: &str) -> Result<(), JsValue> {
+    if target.len() + chunk.len() > target.capacity() {
+        return Err(js_error(
+            "more bytes than reserved for",
+            format!(
+                "{what}: {} + {} exceeds {}",
+                target.len(),
+                chunk.len(),
+                target.capacity()
+            ),
+        ));
+    }
+    target.extend_from_slice(chunk);
+    Ok(())
+}
+
 #[wasm_bindgen]
 impl WasmEngine {
+    /// Hydrate from bytes already resident in wasm memory, consuming the staging buffer.
+    ///
+    /// The streaming counterpart of [`WasmEngine::new`]: identical hydration, but the artifact is
+    /// moved rather than copied, so the peak is one copy instead of two.
+    ///
+    /// # Errors
+    ///
+    /// Throws when staging is incomplete, or with the failing hydration stage named.
+    #[cfg(not(unix))]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn from_staging(
+        staging: ModelStaging,
+        vocab_json: String,
+        merges_txt: String,
+        tokenizer_config_json: String,
+    ) -> Result<WasmEngine, JsValue> {
+        if staging.fttsq.len() != staging.fttsq.capacity()
+            || staging.codec.len() != staging.codec.capacity()
+        {
+            return Err(js_error(
+                "staging is incomplete",
+                format!(
+                    "artifact {}/{}, codec {}/{}",
+                    staging.fttsq.len(),
+                    staging.fttsq.capacity(),
+                    staging.codec.len(),
+                    staging.codec.capacity()
+                ),
+            ));
+        }
+        let ModelStaging { fttsq, codec } = staging;
+        Self::hydrate(
+            fttsq,
+            codec,
+            &vocab_json,
+            &merges_txt,
+            &tokenizer_config_json,
+        )
+    }
+
     /// Hydrate the engine from in-memory buffers.
     ///
     /// `fttsq` is the canonical quantized artifact (digest-verified here before any tensor is
@@ -148,6 +371,24 @@ impl WasmEngine {
         vocab_json: String,
         merges_txt: String,
         tokenizer_config_json: String,
+    ) -> Result<WasmEngine, JsValue> {
+        Self::hydrate(
+            fttsq,
+            codec,
+            &vocab_json,
+            &merges_txt,
+            &tokenizer_config_json,
+        )
+    }
+
+    /// The hydration both constructors share, taking ownership of bytes already in wasm memory.
+    #[cfg(not(unix))]
+    fn hydrate(
+        fttsq: Vec<u8>,
+        codec: Vec<u8>,
+        vocab_json: &str,
+        merges_txt: &str,
+        tokenizer_config_json: &str,
     ) -> Result<WasmEngine, JsValue> {
         let artifact = Arc::new(
             ftts_artifacts::fttsq::MappedFttsq::from_bytes(fttsq)
@@ -169,9 +410,9 @@ impl WasmEngine {
                 .map_err(|error| js_error("codec hydration failed", error))?;
 
         let tokenizer = QwenTokenizer::from_files_using_environment(TokenizerFiles {
-            vocab_json: &vocab_json,
-            merges_txt: &merges_txt,
-            tokenizer_config_json: &tokenizer_config_json,
+            vocab_json,
+            merges_txt,
+            tokenizer_config_json,
         })
         .map_err(|error| js_error("tokenizer unusable", error))?;
 

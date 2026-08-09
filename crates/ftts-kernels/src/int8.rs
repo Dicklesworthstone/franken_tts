@@ -152,6 +152,12 @@ pub enum Int8Tier {
     Autovec,
     /// Hand SDOT island (aarch64 + FEAT_DotProd), four 16-byte accumulator streams.
     NeonSdot,
+    /// Hand SIMD128 island (wasm32 + `simd128`), four 16-byte accumulator streams.
+    ///
+    /// The browser's equivalent of [`Self::NeonSdot`]. Unlike aarch64, wasm has no int8 dot for
+    /// the autovectorizer to find, so without this tier a browser runs the byte-at-a-time
+    /// `Scalar` loop.
+    WasmSimd128,
 }
 
 impl Int8Tier {
@@ -162,6 +168,7 @@ impl Int8Tier {
             Self::Scalar => "scalar",
             Self::Autovec => "autovec",
             Self::NeonSdot => "neon-sdot",
+            Self::WasmSimd128 => "wasm-simd128",
         }
     }
 
@@ -171,6 +178,9 @@ impl Int8Tier {
         let mut tiers = vec![Self::Scalar, Self::Autovec];
         if neon_sdot_available() {
             tiers.push(Self::NeonSdot);
+        }
+        if wasm_simd128_available() {
+            tiers.push(Self::WasmSimd128);
         }
         tiers
     }
@@ -186,6 +196,12 @@ impl Int8Tier {
     /// vectorizer and loses ~15x; it stays only as an A/B datapoint.
     #[must_use]
     pub fn dispatch() -> Self {
+        // wasm32 first and without consulting the environment: there are no environment variables
+        // in a browser, and unlike aarch64 the fallback here is not a vectorized scalar loop but a
+        // byte-at-a-time one, so the island is the only route worth dispatching.
+        if wasm_simd128_available() {
+            return Self::WasmSimd128;
+        }
         match std::env::var("FTTS_INT8_TIER").as_deref() {
             Ok("scalar") => Self::Scalar,
             Ok("autovec") => Self::Autovec,
@@ -327,37 +343,44 @@ pub struct KernelPlanV0 {
 pub fn autotuned_plan() -> KernelPlanV0 {
     static PLAN: OnceLock<KernelPlanV0> = OnceLock::new();
     *PLAN.get_or_init(|| {
-        // wasm32 has no monotonic clock in std (`Instant::now` panics as `unreachable`, which
-        // is exactly how the browser playground's first synthesize died) and only the scalar
-        // tier exists there anyway — the measured-fastest plan IS scalar, no measurement needed.
+        // wasm32 is pinned, never measured: `Instant::now` panics as `unreachable` there (no
+        // monotonic clock in std — exactly how the browser playground's first synthesize died),
+        // and there is nothing to choose between anyway. `dispatch()` names the SIMD128 island
+        // when it is compiled in, which it is for every browser build; an earlier revision of
+        // this pinned `Scalar` on the grounds that no other tier existed on wasm, and that
+        // sentence stopped being true the moment the island landed — leaving the fast kernel
+        // built, dispatchable, and never dispatched.
         #[cfg(target_arch = "wasm32")]
         {
-            return KernelPlanV0 {
-                decode_gemv: Int8Tier::Scalar,
-                batch_gemm: Int8Tier::Scalar,
-            };
+            let tier = Int8Tier::dispatch();
+            KernelPlanV0 {
+                decode_gemv: tier,
+                batch_gemm: tier,
+            }
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if std::env::var("FTTS_INT8_TIER").is_ok() {
-            let forced = Int8Tier::dispatch();
-            return KernelPlanV0 {
-                decode_gemv: forced,
-                batch_gemm: forced,
+        {
+            if std::env::var("FTTS_INT8_TIER").is_ok() {
+                let forced = Int8Tier::dispatch();
+                return KernelPlanV0 {
+                    decode_gemv: forced,
+                    batch_gemm: forced,
+                };
+            }
+            if let Some(cached) = load_persisted_plan() {
+                return cached;
+            }
+            let plan = KernelPlanV0 {
+                // Talker/microdecoder decode: one activation row against tall matrices; K = 1024
+                // and 3072 are the real reduction lengths, 256 output rows keep the probe cheap
+                // while streaming enough weight bytes to reach the bandwidth regime.
+                decode_gemv: fastest_tier(&[(1, 1024, 256), (1, 3072, 256)]),
+                // Verify/prefill/codec batches: sixteen rows, same reduction lengths.
+                batch_gemm: fastest_tier(&[(16, 1024, 128), (16, 3072, 64)]),
             };
+            persist_plan(plan);
+            plan
         }
-        if let Some(cached) = load_persisted_plan() {
-            return cached;
-        }
-        let plan = KernelPlanV0 {
-            // Talker/microdecoder decode: one activation row against tall matrices; K = 1024
-            // and 3072 are the real reduction lengths, 256 output rows keep the probe cheap
-            // while streaming enough weight bytes to reach the bandwidth regime.
-            decode_gemv: fastest_tier(&[(1, 1024, 256), (1, 3072, 256)]),
-            // Verify/prefill/codec batches: sixteen rows, same reduction lengths.
-            batch_gemm: fastest_tier(&[(16, 1024, 128), (16, 3072, 64)]),
-        };
-        persist_plan(plan);
-        plan
     })
 }
 
@@ -478,6 +501,16 @@ pub fn neon_sdot_available() -> bool {
     }
 }
 
+/// Whether the SIMD128 island is compiled in.
+///
+/// Compile-time only, deliberately: `simd128` is a wasm target feature, so a module built with it
+/// either instantiates on an engine that has it or is refused outright. There is no partial
+/// support to detect at runtime the way FEAT_DotProd must be.
+#[must_use]
+pub fn wasm_simd128_available() -> bool {
+    cfg!(all(target_arch = "wasm32", target_feature = "simd128"))
+}
+
 /// Exact i32 dot product of two Q8 rows over the selected route.
 ///
 /// # Panics
@@ -490,7 +523,18 @@ pub fn dot_i32(a: &[i8], b: &[i8], tier: Int8Tier) -> i32 {
         Int8Tier::Scalar => dot_i32_scalar(a, b),
         Int8Tier::Autovec => dot_i32_autovec(a, b),
         Int8Tier::NeonSdot => dot_i32_neon_or_panic(a, b),
+        Int8Tier::WasmSimd128 => dot_i32_wasm_or_panic(a, b),
     }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn dot_i32_wasm_or_panic(a: &[i8], b: &[i8]) -> i32 {
+    wasm_simd128::dot_i32(a, b)
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+fn dot_i32_wasm_or_panic(_a: &[i8], _b: &[i8]) -> i32 {
+    panic!("wasm-simd128 route selected on a build without the island");
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "neon-dotprod"))]
@@ -613,6 +657,197 @@ mod neon_dotprod {
     }
 }
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wasm_simd128 {
+    //! The audited SIMD128 island — the browser's counterpart to the SDOT one above.
+    //!
+    //! Why this exists at all: on wasm32 the dispatch fell through to `Scalar`, and NE-001's
+    //! finding that the scalar shape "vectorizes to memory bandwidth" is an *aarch64* result that
+    //! does not transfer. wasm SIMD128 has no int8 dot instruction for LLVM to pattern-match, so
+    //! the autovectorizer has nothing to reach for and the browser ran a byte-at-a-time loop.
+    //!
+    //! The instruction that replaces it is `i32x4.dot_i16x8_s`: eight i16 products summed
+    //! pairwise into four i32 lanes, one op. Feed it from `i16x8.extend_low/high_i8x16_s` and a
+    //! 16-byte block of int8 costs two widenings per operand, two dots and two adds.
+    //!
+    //! Exactness is free here and that is the point: every product of two `i8` fits `i16`, every
+    //! pairwise sum fits `i32`, and integer addition is associative — so lane order, accumulator
+    //! count and reduction order cannot change the result. This tier is *equal* to `Scalar` in
+    //! i32, not merely close, which is what lets it share the parent module's tier-equality test.
+    //!
+    //! Overflow carries no new obligation: the bound is unchanged from the scalar path at the
+    //! model's real worst-case K (3072 → |sum| ≤ 3072 × 127² ≈ 49.5M, ~43× inside i32).
+    //!
+    //! No runtime detection: `simd128` is a compile-time target feature, and a browser without it
+    //! refuses the module outright rather than mis-executing. Every engine this ships to has had
+    //! it for years (Safari 16.4 / iOS 16.4 being the last holdout).
+
+    use core::arch::wasm32::{
+        i16x8_extend_high_i8x16, i16x8_extend_low_i8x16, i32x4_add, i32x4_dot_i16x8,
+        i32x4_extract_lane, i32x4_splat, v128, v128_load,
+    };
+
+    /// Exact i32 dot product via `i32x4.dot_i16x8_s`, four accumulator streams over 64-byte
+    /// blocks.
+    #[must_use]
+    pub fn dot_i32(a: &[i8], b: &[i8]) -> i32 {
+        // SAFETY: every load below is bounded by the loop conditions against `len`, and the two
+        // slices are asserted equal in length by `super::dot_i32`. `v128_load` requires no
+        // alignment beyond the byte alignment an `&[i8]` already guarantees.
+        unsafe { dot_i32_simd128(a, b) }
+    }
+
+    /// Accumulates one 16-byte block of each operand into `acc`.
+    ///
+    /// # Safety
+    ///
+    /// `a` and `b` must each be valid for a 16-byte read.
+    #[inline]
+    unsafe fn accumulate_block(acc: v128, a: *const i8, b: *const i8) -> v128 {
+        // SAFETY: the caller guarantees both pointers address 16 readable bytes.
+        let (left, right) = unsafe { (v128_load(a.cast()), v128_load(b.cast())) };
+        let low = i32x4_dot_i16x8(i16x8_extend_low_i8x16(left), i16x8_extend_low_i8x16(right));
+        let high = i32x4_dot_i16x8(
+            i16x8_extend_high_i8x16(left),
+            i16x8_extend_high_i8x16(right),
+        );
+        i32x4_add(acc, i32x4_add(low, high))
+    }
+
+    /// Four output columns per pass, sharing one widening of the activation.
+    ///
+    /// Loop order stays weight-stationary — four weight rows are streamed once and reused across
+    /// all `m` activation rows — so this keeps the property the serial form was written for while
+    /// removing the redundant activation widening a per-column dot repeats `n` times.
+    pub fn linear_blocked(
+        x_q: &[i8],
+        x_scales: &[f32],
+        weight: &super::QuantizedMatrix,
+        bias: Option<&[f32]>,
+        m: usize,
+        out: &mut [f32],
+    ) {
+        let (n, k) = (weight.n, weight.k);
+        let mut col = 0;
+        while col + 4 <= n {
+            for row in 0..m {
+                let x_row = &x_q[row * k..(row + 1) * k];
+                // SAFETY: `col + 4 <= n` bounds all four weight rows inside `weight.data`, whose
+                // length is `n * k` by the type's invariant.
+                let acc = unsafe { dot4_simd128(x_row, &weight.data[col * k..], k) };
+                for (lane, accumulated) in acc.iter().enumerate() {
+                    let column = col + lane;
+                    #[allow(clippy::cast_precision_loss)]
+                    let value = *accumulated as f32 * (x_scales[row] * weight.scales[column]);
+                    out[row * n + column] = bias.map_or(value, |values| value + values[column]);
+                }
+            }
+            col += 4;
+        }
+        // Columns past the last full block of four fall back to the single-column kernel.
+        while col < n {
+            let w_row = &weight.data[col * k..(col + 1) * k];
+            for row in 0..m {
+                let x_row = &x_q[row * k..(row + 1) * k];
+                #[allow(clippy::cast_precision_loss)]
+                let value = dot_i32(x_row, w_row) as f32 * (x_scales[row] * weight.scales[col]);
+                out[row * n + col] = bias.map_or(value, |values| value + values[col]);
+            }
+            col += 1;
+        }
+    }
+
+    /// Dots one activation row against four consecutive weight rows.
+    ///
+    /// # Safety
+    ///
+    /// `weights` must be valid for `4 * k` readable bytes and `x` for `k`.
+    unsafe fn dot4_simd128(x: &[i8], weights: &[i8], k: usize) -> [i32; 4] {
+        let x_ptr = x.as_ptr();
+        let w_ptr = weights.as_ptr();
+        let mut acc = [i32x4_splat(0); 4];
+        let mut index = 0_usize;
+        while index + 16 <= k {
+            // SAFETY: `index + 16 <= k` bounds the activation load, and each weight row starts at
+            // `lane * k` inside a region the caller guarantees is `4 * k` long.
+            let (low, high) = unsafe {
+                let block = v128_load(x_ptr.add(index).cast());
+                (
+                    i16x8_extend_low_i8x16(block),
+                    i16x8_extend_high_i8x16(block),
+                )
+            };
+            for (lane, accumulator) in acc.iter_mut().enumerate() {
+                // SAFETY: same bound, offset into this lane's weight row.
+                let w = unsafe { v128_load(w_ptr.add(lane * k + index).cast()) };
+                let products = i32x4_add(
+                    i32x4_dot_i16x8(low, i16x8_extend_low_i8x16(w)),
+                    i32x4_dot_i16x8(high, i16x8_extend_high_i8x16(w)),
+                );
+                *accumulator = i32x4_add(*accumulator, products);
+            }
+            index += 16;
+        }
+        let mut sums = [0_i32; 4];
+        for (lane, sum) in sums.iter_mut().enumerate() {
+            let total = acc[lane];
+            *sum = i32x4_extract_lane::<0>(total)
+                + i32x4_extract_lane::<1>(total)
+                + i32x4_extract_lane::<2>(total)
+                + i32x4_extract_lane::<3>(total);
+            for tail in index..k {
+                // SAFETY: `tail < k` indexes inside this lane's weight row.
+                let w = unsafe { *w_ptr.add(lane * k + tail) };
+                *sum += i32::from(x[tail]) * i32::from(w);
+            }
+        }
+        sums
+    }
+
+    /// # Safety
+    ///
+    /// `a` and `b` must have equal length; the caller asserts this.
+    unsafe fn dot_i32_simd128(a: &[i8], b: &[i8]) -> i32 {
+        let len = a.len();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let mut acc0 = i32x4_splat(0);
+        let mut acc1 = i32x4_splat(0);
+        let mut acc2 = i32x4_splat(0);
+        let mut acc3 = i32x4_splat(0);
+        let mut index = 0_usize;
+        // Four independent streams so the dependent-add latency of one does not stall the next,
+        // mirroring the SDOT island's blocking.
+        while index + 64 <= len {
+            // SAFETY: `index + 64 <= len` bounds all four 16-byte loads inside both slices.
+            unsafe {
+                acc0 = accumulate_block(acc0, a_ptr.add(index), b_ptr.add(index));
+                acc1 = accumulate_block(acc1, a_ptr.add(index + 16), b_ptr.add(index + 16));
+                acc2 = accumulate_block(acc2, a_ptr.add(index + 32), b_ptr.add(index + 32));
+                acc3 = accumulate_block(acc3, a_ptr.add(index + 48), b_ptr.add(index + 48));
+            }
+            index += 64;
+        }
+        while index + 16 <= len {
+            // SAFETY: `index + 16 <= len` bounds this 16-byte load inside both slices.
+            unsafe {
+                acc0 = accumulate_block(acc0, a_ptr.add(index), b_ptr.add(index));
+            }
+            index += 16;
+        }
+        let total = i32x4_add(i32x4_add(acc0, acc1), i32x4_add(acc2, acc3));
+        let mut sum = i32x4_extract_lane::<0>(total)
+            + i32x4_extract_lane::<1>(total)
+            + i32x4_extract_lane::<2>(total)
+            + i32x4_extract_lane::<3>(total);
+        while index < len {
+            sum += i32::from(a[index]) * i32::from(b[index]);
+            index += 1;
+        }
+        sum
+    }
+}
+
 /// W8A8 linear: quantized activations `[m, k]` times a [`QuantizedMatrix`] `[n, k]`, producing
 /// f32 `[m, n]`.
 ///
@@ -656,6 +891,18 @@ pub fn linear_q8(
     // across all m activation rows, so an m>1 call (prefill, the seq-16 verify pass) does not
     // re-read the whole matrix m times. Each output element's dot product is unchanged, so this
     // ordering is bit-identical to the m-outer form.
+    // wasm has no int8 dot instruction, so a lone dot spends four of its eight ops per 16 bytes
+    // just widening i8 to i16 — and half of that widening is the *activation*, which is identical
+    // for every output column. Computing four columns per pass hoists it: 26 ops for 64 MACs
+    // instead of 32, which is the register-blocking lever the doctrine warns is the real one
+    // ("the instruction is not the lever; the blocking is"). Bit-identical by construction — the
+    // same per-element i32 dot, only the loop nest changes.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if matches!(tier, Int8Tier::WasmSimd128) {
+        wasm_simd128::linear_blocked(x_q, x_scales, weight, bias, m, out);
+        return;
+    }
+
     for col in 0..n {
         let w_row = &weight.data[col * k..(col + 1) * k];
         let w_scale = weight.scales[col];

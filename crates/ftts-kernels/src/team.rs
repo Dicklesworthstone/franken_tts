@@ -128,14 +128,79 @@ pub fn thread_bypassed() -> bool {
 /// serial (no threads spawned, no team). Values are clamped to the machine's available
 /// parallelism. Read once.
 pub fn armed() -> Option<&'static Team> {
-    // wasm32 has no std threads; the serial path is the only correct one there, and returning
-    // None before the OnceLock keeps the spawn code monomorphized out of wasm binaries.
+    // wasm32 cannot spawn its own threads: `wasm32-unknown-unknown` has no `std::thread::spawn`,
+    // because only the host can create the Workers that share this module's linear memory. So the
+    // team is *installed* from JS once its Workers are up (see `install_wasm_team`) instead of
+    // being created on first use, and stays `None` until then — which is also the correct answer
+    // for any browser without `SharedArrayBuffer`.
     #[cfg(target_arch = "wasm32")]
     {
-        return None;
+        WASM_TEAM.get().and_then(Option::as_ref)
     }
     #[cfg(not(target_arch = "wasm32"))]
     armed_native()
+}
+
+/// The team installed by the host, once its Workers exist.
+#[cfg(target_arch = "wasm32")]
+static WASM_TEAM: OnceLock<Option<Team>> = OnceLock::new();
+
+/// The shared control block Workers park on, published before any of them starts.
+#[cfg(target_arch = "wasm32")]
+static WASM_SHARED: OnceLock<&'static Shared> = OnceLock::new();
+
+/// Publishes the shared control block and arms a `partitions`-way team.
+///
+/// Call once, from the thread that will own dispatch, before spawning `partitions - 1` Workers
+/// that each call [`wasm_worker_loop`]. Returns the number of Workers the caller must start.
+///
+/// # Why this shape
+///
+/// The caller is partition 0 and blocks on a condvar until the others report done. `atomic.wait`
+/// **traps on a browser's main thread**, so the owning thread must itself be a Worker — in this
+/// project, the engine Worker that already runs synthesis. Arming from the main thread would not
+/// merely be slow, it would abort.
+///
+/// Returns 0 (and arms nothing) when `partitions <= 1`, which is the serial fallback.
+#[cfg(target_arch = "wasm32")]
+pub fn install_wasm_team(partitions: usize) -> usize {
+    if partitions <= 1 {
+        let _ = WASM_TEAM.set(None);
+        return 0;
+    }
+    let shared: &'static Shared = *WASM_SHARED.get_or_init(|| {
+        Box::leak(Box::new(Shared {
+            control: Mutex::new(Control {
+                generation: 0,
+                job: None,
+                remaining: 0,
+                panicked: false,
+            }),
+            go: Condvar::new(),
+            done: Condvar::new(),
+        }))
+    });
+    let _ = WASM_TEAM.set(Some(Team {
+        shared,
+        partitions,
+        dispatch_gate: Mutex::new(()),
+    }));
+    partitions - 1
+}
+
+/// The body every spawned Worker runs, forever.
+///
+/// # Panics
+///
+/// Panics if called before [`install_wasm_team`] published the control block — a Worker that
+/// started before its team is a host wiring bug, and parking on a block that does not exist yet
+/// would hang instead of saying so.
+#[cfg(target_arch = "wasm32")]
+pub fn wasm_worker_loop(worker: usize) {
+    let shared = *WASM_SHARED
+        .get()
+        .expect("worker started before install_wasm_team published the control block");
+    worker_loop(shared, worker)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

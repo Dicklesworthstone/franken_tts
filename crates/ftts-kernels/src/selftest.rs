@@ -37,6 +37,8 @@ pub enum KernelTier {
     Autovec,
     /// The aarch64 SDOT island (`neon-dotprod` feature + runtime FEAT_DotProd).
     NeonSdot,
+    /// The wasm32 SIMD128 island (`simd128` target feature).
+    WasmSimd128,
 }
 
 impl KernelTier {
@@ -47,6 +49,7 @@ impl KernelTier {
             Self::Scalar => "scalar",
             Self::Autovec => "autovec",
             Self::NeonSdot => "neon-sdot",
+            Self::WasmSimd128 => "wasm-simd128",
         }
     }
 
@@ -55,6 +58,7 @@ impl KernelTier {
             crate::int8::Int8Tier::Scalar => Self::Scalar,
             crate::int8::Int8Tier::Autovec => Self::Autovec,
             crate::int8::Int8Tier::NeonSdot => Self::NeonSdot,
+            crate::int8::Int8Tier::WasmSimd128 => Self::WasmSimd128,
         }
     }
 }
