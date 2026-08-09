@@ -53,6 +53,9 @@
     .pg-label { font-size: 0.7rem; font-weight: 900; letter-spacing: 0.25em; text-transform: uppercase; color: #10b981; }
     .hidden { display: none !important; }
     audio { width: 100%; filter: invert(0.9) hue-rotate(150deg); }
+    /* The glow orbs hang past the right edge; without this the page gains ~100px of
+       phantom width on narrow screens and every centered block renders clipped. */
+    html, body { overflow-x: hidden; }
     html { scroll-behavior: smooth; }
     @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
     section[id], footer { scroll-margin-top: 96px; }
@@ -84,6 +87,46 @@
     .pg-rvq-readout { display: flex; align-items: baseline; gap: 0.5rem; white-space: nowrap; }
     .pg-rvq-big { font-family: "JetBrains Mono", monospace; font-size: 1.8rem; font-weight: 900; color: #34d399; }
     .pg-rvq-res { color: #94a3b8; font-size: 0.85rem; font-family: "JetBrains Mono", monospace; margin-left: 0.6rem; }
+    /* Franken bolts on the big visualization panels: two stitched studs per panel. */
+    .pg-panel { position: relative; }
+    .pg-panel::before, .pg-panel::after {
+      content: ""; position: absolute; width: 14px; height: 14px; border-radius: 9999px;
+      background:
+        linear-gradient(45deg, transparent 44%, #1e293b 44%, #1e293b 56%, transparent 56%),
+        linear-gradient(-45deg, transparent 44%, #1e293b 44%, #1e293b 56%, transparent 56%),
+        radial-gradient(circle at 35% 30%, #475569, #0f172a 70%);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      box-shadow: 0 0 8px rgba(16, 185, 129, 0.25);
+      z-index: 5;
+    }
+    .pg-panel::before { left: -6px; top: -6px; }
+    .pg-panel::after { right: -6px; bottom: -6px; }
+    .pg-step-header { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.1rem; }
+    .pg-step-counter { font-family: "JetBrains Mono", monospace; font-size: 0.85rem; font-weight: 700; color: #64748b; }
+    .pg-step-title { font-size: 1.35rem; font-weight: 900; color: #e2e8f0; }
+    .pg-step-stat { font-family: "JetBrains Mono", monospace; font-size: 0.95rem; font-weight: 700; color: #34d399; margin-left: auto; }
+    .pg-step-body { min-height: 10.5em; }
+    .pg-step-row { display: flex; gap: 0.9rem; margin-bottom: 0.9rem; align-items: baseline; }
+    .pg-step-kind {
+      flex: 0 0 6.6rem; text-align: right;
+      font-size: 0.72rem; font-weight: 900; letter-spacing: 0.18em; text-transform: uppercase;
+    }
+    @media (max-width: 640px) {
+      .pg-step-row { display: block; }
+      .pg-step-kind { display: block; text-align: left; margin-bottom: 0.2rem; }
+      .pg-step-body { min-height: 0; }
+      .pg-step-stat { margin-left: 0; flex-basis: 100%; }
+    }
+    .pg-step-kind-symptom { color: #f87171; }
+    .pg-step-kind-diagnosis { color: #fbbf24; }
+    .pg-step-kind-fix { color: #34d399; }
+    .pg-step-nav { display: flex; align-items: center; gap: 1rem; margin-top: 0.4rem; }
+    .pg-step-dots { display: flex; gap: 0.5rem; margin: 0 auto; }
+    .pg-step-dot {
+      width: 10px; height: 10px; border-radius: 9999px; border: 1px solid rgba(52, 211, 153, 0.4);
+      background: transparent; cursor: pointer; padding: 0;
+    }
+    .pg-step-dot.active { background: #34d399; }
     .pg-lad-track { position: relative; height: 20px; border-radius: 10px; }
     .pg-lad-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: #fbbf24; opacity: 0.85; }
     .pg-lad-ref { background: linear-gradient(90deg, #334155, #64748b); }
@@ -152,6 +195,7 @@
       <a href="#pipeline" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Anatomy</a>
       <a href="#model" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Model</a>
       <a href="#speed" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Speed</a>
+      <a href="#wasm" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">WASM</a>
       <a href="#receipts" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Receipts</a>
       <a href="#voices" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Voices</a>
       <a href="#install" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Install</a>
@@ -339,7 +383,7 @@
       </p>
     </div>
 
-    <div class="rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
+    <div class="pg-panel rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
       <div id="anatomy-viz" aria-label="Animated anatomy of one synthesis frame"></div>
       <p class="pg-note mt-3 text-center">
         The microdecoder is small, but rereading its body fifteen times per frame makes it the
@@ -382,15 +426,23 @@
         <span class="h-px w-8 bg-emerald-500/40"></span>
       </div>
       <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Audio as <span class="text-emerald-400">Tokens</span>.</h2>
-      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
+      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg mb-6">
         Most TTS systems predict a spectrogram and hand it to a vocoder. Qwen3-TTS works like a
         language model instead: it writes speech as discrete tokens, sixteen per 80 ms frame,
         drawn from a residual codec vocabulary. That difference is where the quality comes from,
         and it is what franken_tts reimplements from scratch in Rust.
       </p>
+      <div class="flex flex-wrap items-center justify-center gap-2" aria-label="Model facts">
+        <span class="pg-chip">0.6B parameters</span>
+        <span class="pg-chip">12.5 frames per second</span>
+        <span class="pg-chip">16 codes per frame</span>
+        <span class="pg-chip">24 kHz output</span>
+        <span class="pg-chip">2.0 GB int8 artifact</span>
+        <span class="pg-chip">no diffusion loop</span>
+      </div>
     </div>
 
-    <div class="rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
+    <div class="pg-panel rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
       <div class="pg-label mb-2">Fewer seams, better sound</div>
       <p class="pg-note mb-4">
         A classic TTS stack is several separately trained models handing fragile intermediate
@@ -431,7 +483,7 @@
       </div>
     </div>
 
-    <div class="grid lg:grid-cols-2 gap-5 mb-10 reveal">
+    <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-5 mb-10 reveal">
       <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
         <div class="pg-label mb-3">Writing sound like text</div>
         <p class="pg-note mb-3">
@@ -444,6 +496,18 @@
           Because one transformer models content, prosody, pacing, and breaths jointly, the
           output sounds like a performance rather than a spectrogram stitched to a vocoder. The
           cost is the nested loop you saw above: fifteen extra decoder passes per frame.
+        </p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">Why it sounds good</div>
+        <p class="pg-note mb-3">
+          At 12.5 frames per second, a ten-second utterance is only 125 positions of sequence.
+          The whole sentence sits inside the talker's attention window at once, so pitch arcs,
+          emphasis, and pauses are planned across the full line instead of guessed locally.
+        </p>
+        <p class="pg-note">
+          Sampling runs at temperature 0.9 with top-k 50, seeded. The same text, voice, and seed
+          reproduce the same audio, which is why a share link can stand in for the clip itself.
         </p>
       </div>
       <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
@@ -460,7 +524,7 @@
       </div>
     </div>
 
-    <div class="rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 reveal">
+    <div class="pg-panel rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 reveal">
       <div class="pg-label mb-2">Coarse to fine, one code at a time</div>
       <p class="pg-note mb-4">
         Drag the slider to rebuild a waveform from its residual codes. Early codes sketch the
@@ -488,7 +552,7 @@
       </p>
     </div>
 
-    <div class="rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
+    <div class="pg-panel rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
       <div class="pg-label mb-2">Measured, on a Mac Mini M4 Pro</div>
       <p class="pg-note mb-5">
         Anything left of the amber line is slower than the audio it produces. The f32 reference
@@ -519,28 +583,48 @@
       </div>
     </div>
 
-    <div class="rounded-2xl border border-emerald-500/20 bg-black/40 p-6 md:p-8 mt-10 reveal">
-      <div class="pg-label mb-3">Then it had to fit in a browser</div>
-      <p class="pg-note mb-5">
-        The wasm build gets one thread, no memory mapping, no BLAS, and a hard 4 GB ceiling.
-        Three measured changes made the same engine run there at all: a compact text-embedding
-        gather that removed a 1.24 GB per-utterance allocation, f32 dot products restructured
-        into eight partial lanes so the compiler can vectorize what was 71% of synthesis time,
-        and an int8 codec arm. In the test harness, codec decode fell from 119.9 s to 9.5 s.
+  </section>
+
+  <!-- ============================== WASM ============================== -->
+  <section id="wasm" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
+    <div class="text-center mb-12 reveal">
+      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+        THE BROWSER PORT
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+      </div>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">What It Took to Run in a <span class="text-emerald-400">Tab</span>.</h2>
+      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
+        WebAssembly hands the engine one thread, no memory mapping, no BLAS, no clock in the
+        standard library, and a hard 4 GB ceiling. Getting a 2 GB model to speak under those
+        rules took four separate fixes, each found the hard way. Step through them.
       </p>
-      <div class="grid lg:grid-cols-3 gap-5">
-        <div class="text-center">
-          <div class="pg-stat"><span data-countup="12.6" data-decimals="1" data-suffix="×">12.6×</span></div>
-          <div class="pg-label">codec speedup in wasm</div>
-        </div>
-        <div class="text-center">
-          <div class="pg-stat"><span data-countup="1.24" data-decimals="2" data-suffix=" GB">1.24 GB</span></div>
-          <div class="pg-label">allocation removed per utterance</div>
-        </div>
-        <div class="text-center">
-          <div class="pg-stat"><span data-countup="4" data-suffix=" GB">4 GB</span></div>
-          <div class="pg-label">total wasm memory ceiling</div>
-        </div>
+    </div>
+
+    <div class="pg-panel rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
+      <div id="wasm-stepper"></div>
+    </div>
+
+    <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-5 reveal">
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">2 GB, delivered politely</div>
+        <p class="pg-note">GitHub release downloads send no CORS headers, so a small same-origin
+        proxy forwards 32 MiB Range requests. Chunks stage into the browser's private origin
+        file system, survive a closed tab, verify against pinned SHA-256 digests, and resume
+        where they stopped.</p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">Zero-copy handoff</div>
+        <p class="pg-note">The model bytes transfer into the worker rather than being copied,
+        and the engine hydrates straight from those bytes. On native the artifact is memory
+        mapped; wasm has no files, so the same loader runs from a byte slice instead.</p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">Ready for threads</div>
+        <p class="pg-note">The page already serves the cross-origin isolation headers that
+        unlock SharedArrayBuffer. When the engine's worker team lands in wasm, multi-threaded
+        synthesis needs no infrastructure change. That, plus relaxed SIMD, is the tracked path
+        toward real time in the tab.</p>
       </div>
     </div>
   </section>
@@ -602,7 +686,7 @@
       </div>
     </div>
 
-    <div id="rms-bars" class="rounded-2xl border border-white/5 bg-black/40 p-6 md:p-8 mt-8 reveal">
+    <div id="rms-bars" class="pg-panel rounded-2xl border border-white/5 bg-black/40 p-6 md:p-8 mt-8 reveal">
       <div class="pg-label mb-2">Peak frame loudness, both engines</div>
       <p class="pg-note mb-5">The finished audio's peak frame RMS, this engine vs the pinned
       PyTorch reference. The bars are drawn to scale; the difference is two parts in a thousand.</p>

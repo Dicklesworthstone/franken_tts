@@ -51,8 +51,8 @@ function buildAnatomy() {
   const talkerX = 30, talkerY = 60, talkerW = 150, layerH = 6.5;
   make("rect", { x: talkerX - 12, y: talkerY - 34, width: talkerW + 24, height: 268, rx: 14, fill: "rgba(255,255,255,0.02)", stroke: "rgba(255,255,255,0.07)" });
   label(talkerX + talkerW / 2, talkerY - 12, "TALKER", 12, "#10b981", "900");
-  label(talkerX + talkerW / 2, talkerY + 220, "28 layers · runs once", 11.5, "#64748b");
-  label(talkerX + talkerW / 2, talkerY + 238, "predicts code #0", 11.5, "#64748b");
+  label(talkerX + talkerW / 2, talkerY + 220, "28 layers · runs once", 13, "#94a3b8");
+  label(talkerX + talkerW / 2, talkerY + 238, "predicts code #0", 13, "#94a3b8");
   const talkerLayers = [];
   for (let i = 0; i < 28; i++) {
     talkerLayers.push(make("rect", {
@@ -66,7 +66,7 @@ function buildAnatomy() {
   make("rect", { x: microX - 12, y: talkerY - 34, width: microW + 24, height: 268, rx: 14, fill: "rgba(16,185,129,0.035)", stroke: "rgba(52,211,153,0.22)" });
   label(microX + microW / 2, talkerY - 12, "MICRODECODER", 12, "#34d399", "900");
   const passCounter = label(microX + microW / 2, microY + 22, "", 30, "#34d399", "900");
-  label(microX + microW / 2, microY + 44, "sequential passes", 11.5, "#64748b");
+  label(microX + microW / 2, microY + 44, "sequential passes", 13, "#94a3b8");
   const microLayers = [];
   for (let i = 0; i < 5; i++) {
     microLayers.push(make("rect", {
@@ -74,13 +74,13 @@ function buildAnatomy() {
       rx: 3, fill: "rgba(52,211,153,0.12)", stroke: "rgba(52,211,153,0.3)", "stroke-width": 0.7,
     }));
   }
-  label(microX + microW / 2, microY + 152, "5 layers, rerun per pass", 11.5, "#64748b");
-  label(microX + microW / 2, microY + 196, "the body is reread 15×:", 11.5, "#64748b");
-  label(microX + microW / 2, microY + 214, "≈1.18 GB of the frame's traffic", 11.5, "#94a3b8");
+  label(microX + microW / 2, microY + 152, "5 layers, rerun per pass", 13, "#94a3b8");
+  label(microX + microW / 2, microY + 196, "the body is reread 15×:", 13, "#94a3b8");
+  label(microX + microW / 2, microY + 214, "≈1.18 GB of the frame's traffic", 13, "#cbd5e1");
 
   // ---- code slots between micro and codec
   const slotX = 520, slotY = 52;
-  label(slotX + 24, slotY - 14, "16 codes", 11.5, "#64748b");
+  label(slotX + 24, slotY - 14, "16 codes", 13, "#94a3b8");
   const slots = [];
   for (let i = 0; i < 16; i++) {
     const s = make("rect", {
@@ -94,8 +94,8 @@ function buildAnatomy() {
   const codecX = 640, codecY = 60, codecW = 230;
   make("rect", { x: codecX - 12, y: talkerY - 34, width: codecW + 24, height: 268, rx: 14, fill: "rgba(255,255,255,0.02)", stroke: "rgba(255,255,255,0.07)" });
   label(codecX + codecW / 2, talkerY - 12, "CODEC", 12, "#10b981", "900");
-  label(codecX + codecW / 2, codecY + 30, "causal decoder", 11.5, "#64748b");
-  label(codecX + codecW / 2, codecY + 48, "upsample 8·5·4·3", 11.5, "#64748b");
+  label(codecX + codecW / 2, codecY + 30, "causal decoder", 13, "#94a3b8");
+  label(codecX + codecW / 2, codecY + 48, "upsample 8·5·4·3", 13, "#94a3b8");
   const wave = make("polyline", {
     points: "", fill: "none", stroke: "#34d399", "stroke-width": 2, "stroke-linejoin": "round",
     opacity: 0,
@@ -103,7 +103,7 @@ function buildAnatomy() {
   const samplesLabel = label(codecX + codecW / 2, codecY + 218, "", 12.5, "#94a3b8", "700");
 
   // ---- traffic counter
-  const traffic = label(450, 348, "", 14, "#cbd5e1", "700");
+  const traffic = label(450, 348, "", 15, "#e2e8f0", "700");
 
   const wavePoints = (progress) => {
     const points = [];
@@ -222,7 +222,7 @@ const seams = document.getElementById("seams-viz");
 
 function buildSeams() {
   const NS = "http://www.w3.org/2000/svg";
-  const W = 900, H = 330;
+  const W = 900, H = 312;
   const svg = document.createElementNS(NS, "svg");
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   svg.setAttribute("role", "img");
@@ -256,8 +256,8 @@ function buildSeams() {
       const w = box.w;
       const x = box.x - w / 2;
       make("rect", { x, y: y - boxH / 2, width: w, height: boxH, rx: 10, fill, stroke, "stroke-width": 1.2 });
-      label(box.x, y - (box.sub ? 4 : -5), box.name, 13.5, textFill, "700");
-      if (box.sub) label(box.x, y + 14, box.sub, 10.5, "#64748b");
+      label(box.x, y - (box.sub ? 4 : -5), box.name, 14.5, textFill, "700");
+      if (box.sub) label(box.x, y + 15, box.sub, 12, "#94a3b8");
       centers.push({ x: box.x, w });
     }
     for (let i = 0; i < centers.length - 1; i += 1) {
@@ -268,7 +268,7 @@ function buildSeams() {
       if (boxes[i].seamAfter) {
         const mid = (from + to) / 2;
         make("line", { x1: mid, y1: y - 14, x2: mid, y2: y + 14, stroke: "#fbbf24", "stroke-width": 2, opacity: 0.85 });
-        label(mid, y - 20, "seam", 10, "#fbbf24", "700");
+        label(mid, y - 20, "seam", 11.5, "#fbbf24", "800");
       }
     }
     return centers;
@@ -284,14 +284,14 @@ function buildSeams() {
     { x: 668, w: 130, name: "vocoder", seamAfter: true },
     { x: 830, w: 100, name: "audio" },
   ], "them");
-  label(450, 137, "three seams, three separately trained models, errors compound left to right", 11.5, "#64748b");
+  label(450, 137, "three seams, three separately trained models, errors compound left to right", 13, "#94a3b8");
   lane(y2, [
     { x: 118, w: 176, name: "text + voice vector" },
     { x: 388, w: 236, name: "one transformer", sub: "talker + microdecoder", seamAfter: true },
     { x: 640, w: 156, name: "discrete codes", sub: "the codec's native input" },
     { x: 830, w: 100, name: "audio" },
   ], "us");
-  label(450, 297, "one seam, and the tokens crossing it are exactly what the codec was trained on", 11.5, "#64748b");
+  label(450, 297, "one seam, and the tokens crossing it are exactly what the codec was trained on", 13, "#94a3b8");
 
   // Flow dots (skipped under reduced motion).
   if (!reducedMotion) {
@@ -388,8 +388,8 @@ function buildRvq() {
   legend.setAttribute("x", 10);
   legend.setAttribute("y", 22);
   legend.setAttribute("text-anchor", "start");
-  legend.setAttribute("fill", "#64748b");
-  legend.setAttribute("font-size", "12");
+  legend.setAttribute("fill", "#94a3b8");
+  legend.setAttribute("font-size", "13.5");
   legend.setAttribute("font-family", "Inter, sans-serif");
   legend.textContent = "dashed: the target · solid: what N codes rebuild";
   svg.appendChild(legend);
@@ -484,6 +484,126 @@ function buildLadder() {
 }
 
 if (ladder) buildLadder();
+
+/* ----------------------------------------------- wasm debugging stepper */
+// Four real problems, in the order they were hit. Each step: what broke, what the
+// diagnosis showed, what fixed it, with the measured before/after where one exists.
+
+const stepper = document.getElementById("wasm-stepper");
+
+function buildStepper() {
+  const STEPS = [
+    {
+      title: "The 1 GB ceiling",
+      stat: "1 GB → 4 GB",
+      symptom: "The engine died before finishing its first load. The model artifact alone is 2 GB.",
+      diagnosis: "rustc caps a wasm module's linear memory at 1 GB unless told otherwise. The " +
+        "runtime ceiling for wasm32 is 4 GB, but nothing asks for it by default.",
+      fix: "Link with the memory maximum raised to the full 4 GB and budget everything else " +
+        "against what remains after the model and its working set.",
+    },
+    {
+      title: "The 1.24 GB gather",
+      stat: "1.24 GB → under 1 MB",
+      symptom: "First synthesis crashed with an opaque RuntimeError: unreachable near 3.5 GB resident.",
+      diagnosis: "Every synthesis materialized a text-embedding buffer strided for the full " +
+        "151,936-token vocabulary: 1.24 GB for a one-line prompt, against a memory model where " +
+        "every allocated page is committed for real.",
+      fix: "Store only the rows the prompt actually uses and find them by binary search over " +
+        "sorted token ids. For a typical sentence that is under a megabyte, and the result was " +
+        "verified against the reference model's own embedding output.",
+    },
+    {
+      title: "The clock that isn't there",
+      stat: "Instant::now() → fixed plan",
+      symptom: "Still RuntimeError: unreachable, now with plenty of free memory. Same button, same crash.",
+      diagnosis: "A panic hook that routes Rust panics to the console showed the real message: " +
+        "wasm's standard library has no monotonic clock, and the kernel autotuner benchmarks " +
+        "candidate kernels by timing them at load.",
+      fix: "On wasm the autotuner is skipped entirely in favor of a precomputed kernel plan. " +
+        "The whole pipeline was then re-run in Node against the real 2 GB model to prove the " +
+        "browser path clean end to end.",
+    },
+    {
+      title: "The 71% dot product",
+      stat: "codec 119.9 s → 9.5 s",
+      symptom: "It finally spoke, at 0.012× real time. Four seconds of audio took over five minutes.",
+      diagnosis: "A V8 profile plus wasm disassembly pinned 71% of synthesis time on one f32 " +
+        "dot-product routine. Floating-point addition cannot be reordered by the compiler, so " +
+        "a single running sum compiles to a scalar chain no SIMD unit can help.",
+      fix: "Restructure the sum into eight independent partial lanes the compiler can " +
+        "vectorize, and route the codec through an int8 arm whose integer sums reorder freely. " +
+        "Codec decode fell from 119.9 s to 9.5 s, and the page now measures 0.03–0.05× real " +
+        "time on one thread.",
+    },
+  ];
+
+  let index = 0;
+  const header = document.createElement("div");
+  header.className = "pg-step-header";
+  const counter = document.createElement("span");
+  counter.className = "pg-step-counter";
+  const title = document.createElement("span");
+  title.className = "pg-step-title";
+  const stat = document.createElement("span");
+  stat.className = "pg-step-stat";
+  header.append(counter, title, stat);
+
+  const body = document.createElement("div");
+  body.className = "pg-step-body";
+  body.setAttribute("aria-live", "polite");
+
+  const nav = document.createElement("div");
+  nav.className = "pg-step-nav";
+  const prev = document.createElement("button");
+  prev.className = "pg-btn";
+  prev.textContent = "← Previous";
+  const dots = document.createElement("div");
+  dots.className = "pg-step-dots";
+  const dotEls = STEPS.map((_, i) => {
+    const dot = document.createElement("button");
+    dot.className = "pg-step-dot";
+    dot.setAttribute("aria-label", `Step ${i + 1}: ${STEPS[i].title}`);
+    dot.addEventListener("click", () => render(i));
+    dots.appendChild(dot);
+    return dot;
+  });
+  const next = document.createElement("button");
+  next.className = "pg-btn primary";
+  next.textContent = "Next →";
+  nav.append(prev, dots, next);
+
+  const row = (kind, text) => `
+    <div class="pg-step-row">
+      <span class="pg-step-kind pg-step-kind-${kind.toLowerCase()}">${kind}</span>
+      <span class="pg-note">${text}</span>
+    </div>`;
+
+  function render(i) {
+    index = i;
+    counter.textContent = `${i + 1} / ${STEPS.length}`;
+    title.textContent = STEPS[i].title;
+    stat.textContent = STEPS[i].stat;
+    body.innerHTML =
+      row("Symptom", STEPS[i].symptom) +
+      row("Diagnosis", STEPS[i].diagnosis) +
+      row("Fix", STEPS[i].fix);
+    prev.disabled = i === 0;
+    next.disabled = i === STEPS.length - 1;
+    dotEls.forEach((d, j) => d.classList.toggle("active", j === i));
+  }
+  prev.addEventListener("click", () => index > 0 && render(index - 1));
+  next.addEventListener("click", () => index < STEPS.length - 1 && render(index + 1));
+  stepper.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowLeft" && index > 0) { event.preventDefault(); render(index - 1); }
+    if (event.key === "ArrowRight" && index < STEPS.length - 1) { event.preventDefault(); render(index + 1); }
+  });
+
+  stepper.append(header, body, nav);
+  render(0);
+}
+
+if (stepper) buildStepper();
 
 /* ------------------------------------------------- RMS juxtaposition bars */
 
