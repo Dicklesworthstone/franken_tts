@@ -1,307 +1,348 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>franken_tts — voice cloning TTS in your browser</title>
-    <style>
-      :root {
-        color-scheme: light;
-        --bg: #f6f7f9;
-        --panel: #ffffff;
-        --panel-2: #f0f3f7;
-        --text: #16181d;
-        --muted: #626a78;
-        --line: #d9dee7;
-        --accent: #1769aa;
-        --accent-2: #0f7f68;
-        --danger: #a61b3c;
-        --shadow: 0 14px 30px rgba(33, 42, 55, 0.1);
-      }
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FrankenTTS — The Monster Voice Engine</title>
+  <meta name="description" content="A pure-Rust, CPU-only port of Qwen3-TTS voice cloning — compiled to WebAssembly and running entirely in your browser. Type, pick a voice, clone your own, listen. Nothing leaves the tab.">
+  <meta name="theme-color" content="#020a06">
+  <link rel="canonical" href="https://frankentts.com/">
+  <meta property="og:title" content="FrankenTTS — The Monster Voice Engine">
+  <meta property="og:description" content="Voice-cloning TTS in pure Rust, running locally in your browser via WASM. No server. No mock. The monster itself.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://frankentts.com/">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23020a06'/%3E%3Crect width='64' height='64' rx='14' fill='none' stroke='%2310b981' stroke-opacity='0.5' stroke-width='2'/%3E%3Ctext x='32' y='44' font-family='monospace' font-size='36' font-weight='900' fill='%2334d399' text-anchor='middle'%3EF%3C/text%3E%3C/svg%3E">
+  <link rel="preload" href="assets/fonts/inter-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="assets/fonts/jetbrains-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="assets/css/site.css?v=1">
+  <style>
+    /* Playground controls in the site's own vocabulary — small additions the compiled
+       Tailwind build doesn't carry. */
+    .pg-input {
+      width: 100%;
+      background: rgba(2, 10, 6, 0.7);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 0.75rem;
+      color: #e2e8f0;
+      padding: 0.65rem 0.8rem;
+      font-size: 0.95rem;
+    }
+    .pg-input:focus { outline: 1px solid rgba(52, 211, 153, 0.5); }
+    textarea.pg-input { min-height: 130px; resize: vertical; font-family: inherit; }
+    .pg-btn {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      border-radius: 9999px; padding: 0.55rem 1.1rem;
+      font-size: 0.72rem; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase;
+      border: 1px solid rgba(255, 255, 255, 0.1); color: #94a3b8; cursor: pointer;
+      background: rgba(255, 255, 255, 0.02); transition: color .2s, border-color .2s, background .2s;
+    }
+    .pg-btn:hover { color: #34d399; border-color: rgba(52, 211, 153, 0.4); }
+    .pg-btn:disabled { opacity: 0.45; cursor: wait; }
+    .pg-btn.primary { background: linear-gradient(135deg, #004225, #059669); color: #eafff5; border-color: rgba(52,211,153,.35); }
+    .pg-btn.primary:hover { color: #ffffff; }
+    .pg-btn.danger { border-color: rgba(248, 113, 113, 0.35); color: #f87171; }
+    .pg-progress { height: 9px; border-radius: 6px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.07); overflow: hidden; }
+    .pg-progress > div { height: 100%; width: 0%; background: linear-gradient(90deg, #059669, #34d399); transition: width .25s ease; }
+    .pg-status { color: #64748b; font-size: 0.78rem; font-family: "JetBrains Mono", monospace; }
+    .pg-note { color: #64748b; font-size: 0.82rem; line-height: 1.6; }
+    .pg-note strong { color: #cbd5e1; }
+    .pg-error { color: #f87171; font-size: 0.85rem; white-space: pre-wrap; }
+    .pg-label { font-size: 0.62rem; font-weight: 900; letter-spacing: 0.25em; text-transform: uppercase; color: #10b981; }
+    .hidden { display: none !important; }
+    audio { width: 100%; filter: invert(0.9) hue-rotate(150deg); }
+  </style>
+</head>
+<body class="min-h-screen">
+  <a href="#playground" class="skip-link">Skip to the playground</a>
 
-      * {
-        box-sizing: border-box;
-      }
+  <!-- Ambient glow orbs -->
+  <div class="glow-orb h-[420px] w-[420px] left-[-120px] top-[-80px]" style="background: radial-gradient(circle, rgba(16,185,129,0.16), transparent 70%)"></div>
+  <div class="glow-orb h-[520px] w-[520px] right-[-160px] top-[30vh]" style="background: radial-gradient(circle, rgba(0,66,37,0.5), transparent 70%); animation-delay: -9s"></div>
+  <div class="glow-orb h-[380px] w-[380px] left-[30vw] bottom-[-140px]" style="background: radial-gradient(circle, rgba(251,191,36,0.07), transparent 70%); animation-delay: -17s"></div>
 
-      body {
-        margin: 0;
-        min-height: 100vh;
-        background: var(--bg);
-        color: var(--text);
-        font-family:
-          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-          "Segoe UI", sans-serif;
-      }
-
-      button,
-      input,
-      select,
-      textarea {
-        font: inherit;
-      }
-
-      .app {
-        min-height: 100vh;
-        display: grid;
-        grid-template-rows: auto 1fr;
-      }
-
-      .topbar {
-        display: grid;
-        grid-template-columns: minmax(210px, 1fr) auto;
-        gap: 12px;
-        align-items: center;
-        padding: 12px 16px;
-        border-bottom: 1px solid var(--line);
-        background: var(--panel);
-      }
-
-      .brand {
-        min-width: 0;
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px 12px;
-        align-items: baseline;
-      }
-
-      .brand strong {
-        font-size: 15px;
-      }
-
-      .brand span,
-      .status {
-        color: var(--muted);
-        font-size: 12px;
-      }
-
-      .actions {
-        display: flex;
-        gap: 8px;
-        align-items: center;
-      }
-
-      .button {
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        background: var(--panel);
-        color: var(--text);
-        min-height: 34px;
-        padding: 0 12px;
-        cursor: pointer;
-      }
-
-      .button.primary {
-        border-color: var(--accent);
-        background: var(--accent);
-        color: #ffffff;
-      }
-
-      .button.secondary {
-        border-color: var(--accent-2);
-        color: var(--accent-2);
-      }
-
-      .button.danger {
-        border-color: var(--danger);
-        color: var(--danger);
-      }
-
-      .button:disabled {
-        cursor: wait;
-        opacity: 0.62;
-      }
-
-      .workspace {
-        display: grid;
-        grid-template-columns: minmax(300px, 0.9fr) minmax(340px, 1.1fr);
-        gap: 12px;
-        padding: 12px;
-        align-items: start;
-      }
-
-      @media (max-width: 860px) {
-        .workspace {
-          grid-template-columns: 1fr;
-        }
-      }
-
-      .pane {
-        background: var(--panel);
-        border: 1px solid var(--line);
-        border-radius: 10px;
-        box-shadow: var(--shadow);
-        padding: 14px;
-        display: grid;
-        gap: 12px;
-      }
-
-      .pane h2 {
-        margin: 0;
-        font-size: 14px;
-        letter-spacing: 0.02em;
-        text-transform: uppercase;
-        color: var(--muted);
-      }
-
-      textarea {
-        width: 100%;
-        min-height: 130px;
-        resize: vertical;
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        padding: 10px;
-        background: var(--panel-2);
-      }
-
-      select,
-      input[type="text"] {
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        min-height: 34px;
-        padding: 0 8px;
-        background: var(--panel);
-      }
-
-      .row {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        align-items: center;
-      }
-
-      .progress {
-        height: 10px;
-        border-radius: 5px;
-        background: var(--panel-2);
-        border: 1px solid var(--line);
-        overflow: hidden;
-      }
-
-      .progress > div {
-        height: 100%;
-        width: 0%;
-        background: linear-gradient(90deg, var(--accent), var(--accent-2));
-        transition: width 0.2s ease;
-      }
-
-      .note {
-        color: var(--muted);
-        font-size: 12.5px;
-        line-height: 1.5;
-        margin: 0;
-      }
-
-      .note strong {
-        color: var(--text);
-      }
-
-      audio {
-        width: 100%;
-      }
-
-      .error {
-        color: var(--danger);
-        font-size: 13px;
-        white-space: pre-wrap;
-      }
-
-      .hidden {
-        display: none;
-      }
-
-      .voicechip {
-        font-size: 12px;
-        color: var(--accent-2);
-      }
-    </style>
-  </head>
-  <body>
-    <div class="app">
-      <header class="topbar">
-        <div class="brand">
-          <strong>franken_tts</strong>
-          <span>Qwen3-TTS voice cloning, pure Rust → WASM, entirely in your browser</span>
+  <!-- ============================== HEADER ============================== -->
+  <header id="site-header"
+    class="fixed top-4 md:top-6 left-1/2 -translate-x-1/2 z-50 w-[94%] lg:w-[1200px] h-14 md:h-16 px-4 md:px-8 rounded-full border border-transparent transition-all duration-500 flex items-center justify-between">
+    <a href="#top" class="flex items-center gap-3 group">
+      <div class="relative h-9 w-9 rounded-lg bg-gradient-to-tr from-[#004225] to-emerald-400 flex items-center justify-center font-mono font-black text-black text-lg shadow-[0_0_20px_rgba(16,185,129,0.25)]">
+        F
+        <div class="franken-bolt absolute -left-1 -top-1 h-2.5 w-2.5 rounded-full bg-gradient-to-br from-slate-700 via-slate-900 to-black border border-white/10 flex items-center justify-center">
+          <div class="h-[60%] w-px bg-slate-800 rotate-45 absolute"></div>
+          <div class="h-[60%] w-px bg-slate-800 -rotate-45 absolute"></div>
         </div>
-        <div class="actions">
-          <a class="button" href="https://github.com/Dicklesworthstone/franken_tts">GitHub</a>
-          <button id="clear-cache" class="button danger" title="Remove the downloaded model from this browser's storage">
-            Clear model cache
-          </button>
+        <div class="franken-bolt absolute -right-1 -bottom-1 h-2.5 w-2.5 rounded-full bg-gradient-to-br from-slate-700 via-slate-900 to-black border border-white/10 flex items-center justify-center">
+          <div class="h-[60%] w-px bg-slate-800 rotate-45 absolute"></div>
+          <div class="h-[60%] w-px bg-slate-800 -rotate-45 absolute"></div>
         </div>
-      </header>
+      </div>
+      <div class="leading-none">
+        <div class="font-black tracking-tight text-sm md:text-base">FrankenTTS</div>
+        <div class="text-[7px] font-black text-emerald-500 uppercase tracking-widest animate-pulse mt-1">VOICE_ALIVE</div>
+      </div>
+    </a>
 
-      <main class="workspace">
-        <section class="pane">
-          <h2>1 · Model</h2>
-          <p class="note">
-            The playground runs the real model locally — nothing you type or record leaves this
-            tab. First use downloads the quantized model
-            (<strong>≈2.0&nbsp;GB</strong>, resumable, cached in this browser) and verifies every
-            byte against pinned SHA-256 digests.
-          </p>
-          <div id="consent" class="hidden">
-            <p class="note">
-              <strong>Before downloading:</strong> the model is
-              <strong id="consent-size">2.0&nbsp;GB</strong>. It will be stored in this
-              browser's private storage for this site only (nothing is installed on your
-              computer's filesystem), it stays on your device, the download resumes if
-              interrupted, and you can remove it any time with “Clear model cache”. On a
-              typical 100&nbsp;Mbps connection this takes about three minutes.
+    <nav class="hidden lg:flex items-center gap-1" aria-label="Primary">
+      <a href="#playground" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Playground</a>
+      <a href="#pipeline" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Pipeline</a>
+      <a href="#voices" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Voices</a>
+      <a href="#install" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Install</a>
+    </nav>
+
+    <div class="flex items-center gap-3">
+      <a href="https://github.com/Dicklesworthstone/franken_tts" target="_blank" rel="noopener"
+        class="pg-btn">GitHub</a>
+    </div>
+  </header>
+
+  <!-- ============================== HERO ============================== -->
+  <section id="top" class="relative px-4 md:px-6 pt-36 md:pt-48 pb-10 md:pb-16 max-w-[1200px] mx-auto text-center">
+    <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-6">
+      <span class="h-px w-8 bg-emerald-500/40"></span>
+      IT SPEAKS · ENTIRELY IN YOUR BROWSER
+      <span class="h-px w-8 bg-emerald-500/40"></span>
+    </div>
+    <h1 class="text-5xl md:text-7xl font-black tracking-tight mb-6">
+      The Monster <span class="text-emerald-400">Voice</span> Engine.
+    </h1>
+    <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg mb-8">
+      A clean-room, pure-Rust port of <span class="text-slate-200">Qwen3-TTS-12Hz-0.6B</span> voice cloning —
+      no Python, no PyTorch, no GPU, no server. The same engine that runs faster than real time
+      as a native CLI, compiled to WebAssembly and stitched into this page.
+      Nothing you type or record ever leaves the tab.
+    </p>
+    <div class="flex flex-wrap items-center justify-center gap-3 mb-12">
+      <a href="#playground" class="pg-btn primary">⚡ Enter the Laboratory</a>
+      <a href="https://github.com/Dicklesworthstone/franken_tts" target="_blank" rel="noopener" class="pg-btn">Read the source</a>
+    </div>
+    <div class="relative max-w-3xl mx-auto rounded-2xl border border-white/5 overflow-hidden reveal" style="box-shadow: 0 0 60px rgba(16,185,129,0.12)">
+      <img src="assets/img/frankentts_illustration.webp" alt="The FrankenTTS monster at its mixing desk, stitching voices together"
+        style="display:block; width:100%; height:auto" loading="lazy">
+    </div>
+  </section>
+
+  <!-- ============================== PLAYGROUND ============================== -->
+  <section id="playground" class="relative px-4 md:px-6 py-16 md:py-24 max-w-[1400px] mx-auto">
+    <div class="text-center mb-12 md:mb-16 reveal">
+      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+        SPECIMEN_001 · LIVE EXPERIMENT
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+      </div>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">The Operating <span class="text-emerald-400">Theater</span>.</h2>
+      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
+        Download the model once, then type on the left and listen on the right. The <em>actual</em>
+        engine — compiled to WebAssembly, running in a worker in your browser — synthesizes every
+        sample locally. No server. No mock. The monster itself.
+      </p>
+    </div>
+
+    <div id="pg-root" class="group relative rounded-2xl border border-white/5 bg-black/40 reveal">
+      <div class="absolute inset-0 overflow-hidden rounded-[inherit] pointer-events-none z-0">
+        <div class="absolute inset-0 stitch-skin opacity-[0.05]"></div>
+      </div>
+      <div class="franken-bolt absolute -left-1.5 -top-1.5 z-30 h-3.5 w-3.5 rounded-full bg-gradient-to-br from-slate-700 via-slate-900 to-black border border-white/10 flex items-center justify-center">
+        <div class="h-[60%] w-[1.5px] bg-slate-800 rotate-45 absolute"></div><div class="h-[60%] w-[1.5px] bg-slate-800 -rotate-45 absolute"></div>
+      </div>
+      <div class="franken-bolt absolute -right-1.5 -top-1.5 z-30 h-3.5 w-3.5 rounded-full bg-gradient-to-br from-slate-700 via-slate-900 to-black border border-white/10 flex items-center justify-center">
+        <div class="h-[60%] w-[1.5px] bg-slate-800 rotate-45 absolute"></div><div class="h-[60%] w-[1.5px] bg-slate-800 -rotate-45 absolute"></div>
+      </div>
+      <div class="franken-bolt absolute -left-1.5 -bottom-1.5 z-30 h-3.5 w-3.5 rounded-full bg-gradient-to-br from-slate-700 via-slate-900 to-black border border-white/10 flex items-center justify-center">
+        <div class="h-[60%] w-[1.5px] bg-slate-800 rotate-45 absolute"></div><div class="h-[60%] w-[1.5px] bg-slate-800 -rotate-45 absolute"></div>
+      </div>
+      <div class="franken-bolt absolute -right-1.5 -bottom-1.5 z-30 h-3.5 w-3.5 rounded-full bg-gradient-to-br from-slate-700 via-slate-900 to-black border border-white/10 flex items-center justify-center">
+        <div class="h-[60%] w-[1.5px] bg-slate-800 rotate-45 absolute"></div><div class="h-[60%] w-[1.5px] bg-slate-800 -rotate-45 absolute"></div>
+      </div>
+
+      <div class="relative z-10 grid md:grid-cols-2 gap-6 p-5 md:p-8">
+        <!-- Left column: model + voice -->
+        <div class="grid gap-5 content-start">
+          <div>
+            <div class="pg-label mb-3">01 · The Specimen (model)</div>
+            <p class="pg-note mb-3">
+              First use downloads the quantized model (<strong>≈2.0 GB</strong>) into this
+              browser's private storage — verified against pinned SHA-256 digests, resumable,
+              cached until you clear it. After that, the page loads it straight from storage.
             </p>
-            <div class="row">
-              <button id="consent-yes" class="button primary">Start the 2.0&nbsp;GB download</button>
-              <button id="consent-no" class="button">Not now</button>
+            <div id="consent" class="hidden mb-3">
+              <p class="pg-note mb-3">
+                <strong>Before downloading:</strong> the model is
+                <strong id="consent-size">2.0 GB</strong>. It lives only in this browser's private
+                storage for this site (nothing is installed on your filesystem), it stays on your
+                device, the download resumes if interrupted, and “Clear model cache” removes it.
+                On a typical 100 Mbps connection this takes about three minutes.
+              </p>
+              <div class="flex flex-wrap gap-2">
+                <button id="consent-yes" class="pg-btn primary">Start the 2.0 GB download</button>
+                <button id="consent-no" class="pg-btn">Not now</button>
+              </div>
+            </div>
+            <div class="pg-progress mb-2"><div id="dl-bar"></div></div>
+            <div class="pg-status mb-3" id="dl-status">Model not loaded.</div>
+            <div class="flex flex-wrap gap-2">
+              <button id="load-model" class="pg-btn primary">Download &amp; load model…</button>
+              <button id="clear-cache" class="pg-btn danger" title="Remove the downloaded model from this browser's storage">Clear model cache</button>
             </div>
           </div>
-          <div class="progress"><div id="dl-bar"></div></div>
-          <div class="row">
-            <span id="dl-status" class="status">Model not loaded.</span>
-          </div>
-          <div class="row">
-            <button id="load-model" class="button primary">Download &amp; load model…</button>
-          </div>
 
-          <h2>2 · Voice</h2>
-          <div class="row">
-            <select id="voice"></select>
-            <span id="voice-character" class="voicechip"></span>
+          <div>
+            <div class="pg-label mb-3">02 · The Voice</div>
+            <div class="flex flex-wrap items-center gap-3 mb-3">
+              <select id="voice" class="pg-input" style="max-width: 220px"></select>
+              <span id="voice-character" class="pg-status"></span>
+            </div>
+            <div class="flex flex-wrap items-center gap-3 mb-2">
+              <button id="record" class="pg-btn">🎙 Record 10 s &amp; clone my voice</button>
+              <span id="record-status" class="pg-status"></span>
+            </div>
+            <p class="pg-note">
+              Cloning runs the speaker encoder locally on your recording; the audio is discarded
+              once the 4 KB voice vector exists. Clone only voices you have the right to use.
+            </p>
           </div>
-          <div class="row">
-            <button id="record" class="button secondary">🎙 Record 10 s &amp; clone my voice</button>
-            <span id="record-status" class="status"></span>
-          </div>
-          <p class="note">
-            Cloning runs the speaker encoder locally on your recording; the recording itself is
-            discarded after the 4&nbsp;KB voice vector is computed. Clone only voices you have the
-            right to use.
-          </p>
-        </section>
+        </div>
 
-        <section class="pane">
-          <h2>3 · Speak</h2>
-          <textarea id="text" maxlength="600">The rainbow is a division of white light into many beautiful colors. Now, spoken entirely inside your browser.</textarea>
-          <div class="row">
-            <label class="status" for="seed">seed</label>
-            <input id="seed" type="text" value="0" size="6" />
-            <button id="speak" class="button primary" disabled>Synthesize</button>
-            <span id="synth-status" class="status"></span>
+        <!-- Right column: speak -->
+        <div class="grid gap-4 content-start">
+          <div class="pg-label">03 · The Utterance</div>
+          <textarea id="text" class="pg-input" maxlength="600">The rainbow is a division of white light into many beautiful colors. Now, spoken entirely inside your browser.</textarea>
+          <div class="flex flex-wrap items-center gap-3">
+            <label class="pg-status" for="seed">seed</label>
+            <input id="seed" type="text" value="0" size="6" class="pg-input" style="max-width: 90px" />
+            <button id="speak" class="pg-btn primary" disabled>⚡ Synthesize</button>
+            <span id="synth-status" class="pg-status"></span>
           </div>
-          <div class="progress"><div id="synth-bar"></div></div>
+          <div class="pg-progress"><div id="synth-bar"></div></div>
           <audio id="player" controls class="hidden"></audio>
-          <div class="row">
-            <button id="download" class="button hidden">Download WAV</button>
-            <button id="share" class="button hidden">Share</button>
+          <div class="flex flex-wrap gap-2">
+            <button id="download" class="pg-btn hidden">Download WAV</button>
+            <button id="share" class="pg-btn hidden">Share</button>
           </div>
-          <p id="error" class="error hidden"></p>
-          <p class="note">
-            Speed honesty: this build is single-threaded WASM and synthesizes at roughly
-            <strong>0.2–0.3× real time</strong> on a fast laptop — a five-second line takes
-            twenty-odd seconds. The native CLI runs faster than real time; browser threads are the
-            roadmap. Desktop browsers only: the engine needs ~2&nbsp;GB of memory.
+          <p id="error" class="pg-error hidden"></p>
+          <p class="pg-note">
+            Speed honesty: this build is single-threaded WASM at roughly
+            <strong>0.2–0.3× real time</strong> — a five-second line takes twenty-odd seconds.
+            The native CLI runs faster than real time; browser threads are the roadmap.
+            Desktop browsers only: the engine needs several GB of memory.
           </p>
-        </section>
-      </main>
+        </div>
+      </div>
     </div>
-    <script type="module" src="./app.js"></script>
-  </body>
+  </section>
+
+  <!-- ============================== PIPELINE ============================== -->
+  <section id="pipeline" class="relative px-4 md:px-6 py-16 md:py-24 max-w-[1200px] mx-auto">
+    <div class="text-center mb-12 reveal">
+      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+        THE ANATOMY
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+      </div>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Three Organs, <span class="text-emerald-400">One Heartbeat</span>.</h2>
+      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
+        Every 80 ms frame of speech passes through the whole creature — and the hidden middle organ
+        is the real monster.
+      </p>
+    </div>
+    <div class="grid md:grid-cols-3 gap-5 reveal">
+      <div class="rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">01 · The Talker</div>
+        <p class="pg-note">A 28-layer transformer predicts each frame's first, semantic-rich codec
+        token — int8 kernels with exact i32 accumulation, argmax-verified against the PyTorch
+        oracle through every layer.</p>
+      </div>
+      <div class="rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">02 · The Microdecoder</div>
+        <p class="pg-note">The hidden monster: a 5-layer residual-code predictor that runs
+        <strong>fifteen sequential times inside every frame</strong> — per-depth embeddings,
+        per-depth 2,048-way heads. franken_tts treats it as the design center, not a liability.</p>
+      </div>
+      <div class="rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">03 · The Codec</div>
+        <p class="pg-note">A fully causal decoder turns 16 code groups into 1,920 samples of
+        24 kHz audio per frame — streaming output bit-identical to offline decoding under every
+        packet schedule.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== VOICES ============================== -->
+  <section id="voices" class="relative px-4 md:px-6 py-16 md:py-24 max-w-[1200px] mx-auto">
+    <div class="text-center mb-12 reveal">
+      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+        THE CHOIR
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+      </div>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Seven Voices <span class="text-emerald-400">In the Jar</span>.</h2>
+      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
+        Built-in voices ship inside the binary as 4 KB x-vectors — <span class="text-slate-200">matt</span> (the default),
+        <span class="text-slate-200">james</span>, <span class="text-slate-200">leo</span>,
+        <span class="text-slate-200">robert</span>, <span class="text-slate-200">judy</span>,
+        <span class="text-slate-200">aria</span>, and <span class="text-slate-200">ember</span> —
+        and a ten-second recording of your own voice becomes the eighth.
+      </p>
+    </div>
+  </section>
+
+  <!-- ============================== INSTALL ============================== -->
+  <section id="install" class="relative px-4 md:px-6 py-16 md:py-24 max-w-[1200px] mx-auto">
+    <div class="text-center mb-12 reveal">
+      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+        TAKE IT HOME
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+      </div>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Faster Than Real Time, <span class="text-emerald-400">Natively</span>.</h2>
+      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg mb-8">
+        The CLI runs the same engine with native int8 kernels and a persistent worker team —
+        faster than real time on Apple Silicon.
+      </p>
+      <div class="max-w-2xl mx-auto text-left rounded-2xl border border-white/5 bg-black/60 p-6 font-mono text-sm text-slate-300 overflow-x-auto">
+        <div class="text-slate-500"># macOS / Linux</div>
+        <div>brew install dicklesworthstone/tap/franken-tts</div>
+        <div class="text-slate-500 mt-3"># or the installer</div>
+        <div>curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_tts/main/install.sh | bash</div>
+        <div class="text-slate-500 mt-3"># then</div>
+        <div>ftts pull</div>
+        <div>ftts say "Now is the time for all good men to come to the aid of the agents" out.m4a</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== FOOTER ============================== -->
+  <footer class="relative px-4 md:px-6 py-12 max-w-[1200px] mx-auto text-center">
+    <p class="pg-note">
+      MIT + OpenAI/Anthropic rider · model weights Apache-2.0 by Qwen ·
+      <a href="https://github.com/Dicklesworthstone/franken_tts" class="text-emerald-400">github.com/Dicklesworthstone/franken_tts</a>
+      · sibling of <a href="https://franken-markdown.com" class="text-emerald-400">FrankenMarkdown</a>
+    </p>
+  </footer>
+
+  <script type="module">
+    // Minimal site chrome (header glass + scroll reveals), from the reference site's main.js.
+    const header = document.getElementById("site-header");
+    if (header) {
+      const apply = () => {
+        const scrolled = window.scrollY > 20;
+        header.classList.toggle("glass-modern", scrolled);
+        header.classList.toggle("shadow-2xl", scrolled);
+        header.classList.toggle("border-emerald-500/20", scrolled);
+        header.classList.toggle("border-transparent", !scrolled);
+      };
+      window.addEventListener("scroll", () => requestAnimationFrame(apply), { passive: true });
+      apply();
+    }
+    const revealables = document.querySelectorAll(".reveal");
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          entry.target.classList.add("revealed");
+          observer.unobserve(entry.target);
+        }
+      }
+    }, { threshold: 0.08 });
+    for (const el of revealables) observer.observe(el);
+  </script>
+  <script type="module" src="./app.js"></script>
+</body>
 </html>
