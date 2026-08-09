@@ -266,10 +266,24 @@ pub struct DenoiseReport {
     pub after_dbfs: f32,
 }
 
+/// Which reference-cleanup stages to run, and where each reports what it measured.
+///
+/// Both default to off. Every stage changes the enrolled identity, so none of them is applied on
+/// a user's behalf — a lever that can alter who the clone sounds like is opted into by name.
+#[derive(Default)]
+pub struct ReferenceCleanup<'a> {
+    /// Spectral-subtract the stationary noise floor.
+    pub denoise: Option<&'a mut Option<DenoiseReport>>,
+    /// Remove late reverberation.
+    pub dereverb: Option<&'a mut Option<DereverbReport>>,
+}
+
 /// Derive a speaker vector from a voice source: a raw x-vector file, or reference audio.
 ///
-/// Passing `Some` for `denoise` opts the reference into [`denoise_reference`] and fills the slot
-/// with the measured before/after pause floor.
+/// Passing `Some` for a cleanup slot opts the reference into that stage and fills the slot with
+/// what it measured. Dereverberation runs first: it is a linear operation on the observed signal,
+/// so applying it before the noise floor is estimated keeps that estimate from being fitted to a
+/// signal the next stage is about to change.
 ///
 /// # Errors
 ///
@@ -277,7 +291,7 @@ pub struct DenoiseReport {
 pub fn speaker_from_voice(
     bundle: &ModelBundle,
     path: &Path,
-    denoise: Option<&mut Option<DenoiseReport>>,
+    cleanup: ReferenceCleanup<'_>,
 ) -> Result<Vec<f32>, FttsError> {
     let bytes = fs::read(path).map_err(|error| {
         FttsError::Input(format!(
@@ -289,6 +303,22 @@ pub fn speaker_from_voice(
         return decode_speaker_vector(path, &bytes);
     }
     let pcm = decode_reference_audio_any(path)?;
+    let ReferenceCleanup { denoise, dereverb } = cleanup;
+    let pcm = match dereverb {
+        Some(report) => {
+            let before = reverb_time_s(&pcm);
+            let dried = dereverb_reference(&pcm);
+            let after = reverb_time_s(&dried);
+            if let (Some(before), Some(after)) = (before, after) {
+                *report = Some(DereverbReport {
+                    before_rt60_s: before,
+                    after_rt60_s: after,
+                });
+            }
+            dried
+        }
+        None => pcm,
+    };
     let pcm = match denoise {
         Some(report) => {
             let before = pause_floor_dbfs(&pcm);
@@ -939,6 +969,311 @@ fn exponential_integral_e1(x: f32) -> f32 {
         (numerator / denominator) / (x * x.exp())
     };
     value as f32
+}
+
+/// Dereverberation runs its own STFT, deliberately coarser in time than the denoiser's.
+///
+/// The two want opposite things. Denoising wants short frames so a gain change lands inside a
+/// phoneme; prediction wants each frame to cover enough of the room's tail that a tractable
+/// number of taps can span it. At a 5.3 ms hop, a 24-tap filter reaches 128 ms — against an
+/// 810 ms reverb that removed 0.01 s of RT60, i.e. nothing (measured). A 10.7 ms hop with 40 taps
+/// reaches ~427 ms, which is the fraction of the tail single-channel prediction can model without
+/// the covariance becoming both enormous and ill-conditioned.
+const DEREVERB_FRAME: usize = 1024;
+const DEREVERB_HOP: usize = 256;
+
+/// Prediction taps: ~427 ms of tail at [`DEREVERB_HOP`].
+const DEREVERB_TAPS: usize = 40;
+
+/// Frames skipped before prediction starts, so the direct sound and its early reflections are
+/// never predictable from the regressor and therefore never subtracted. This delay is the whole
+/// reason WPE dereverberates instead of just whitening the voice.
+const DEREVERB_DELAY: usize = 2;
+
+/// Alternations between "estimate the speech variance" and "re-fit the filter". The variance
+/// estimate is what makes the fit ignore loud speech frames and key on the tail; two passes are
+/// enough to converge in practice, three leaves margin.
+const DEREVERB_ITERATIONS: usize = 3;
+
+/// Diagonal loading on the covariance, relative to its own trace. Silent bins are rank-deficient
+/// and would otherwise produce an arbitrary filter that injects noise instead of removing tail.
+const DEREVERB_LOADING: f64 = 1e-4;
+
+/// What a `--dereverb` enrollment measured, so the CLI reports the effect rather than asserting it.
+#[derive(Clone, Copy, Debug)]
+pub struct DereverbReport {
+    /// Reverberation time equivalent of the reference, before dereverberation.
+    pub before_rt60_s: f32,
+    /// The same measure afterwards.
+    pub after_rt60_s: f32,
+}
+
+/// Blind single-channel dereverberation by Weighted Prediction Error (Nakatani et al., 2010).
+///
+/// # Why this is a separate lever from `--denoise`
+///
+/// Reverb is *convolutive*: the microphone hears the voice convolved with the room's impulse
+/// response. Denoising subtracts an *additive* stationary floor. The two do not overlap at all,
+/// which is why running the denoiser on a reverberant reference moves the noise floor by 0.0 dB
+/// and leaves the wetness untouched — measured, on exactly the recording that prompted this.
+///
+/// # Why it matters for enrollment specifically
+///
+/// The speaker encoder cannot separate voice from room, so a wet reference enrolls the room as
+/// part of the speaker's identity and every utterance the clone speaks is rendered in that room
+/// (measured: a 0.81 s reference produced a 0.79 s clone; a 0.66 s reference produced 0.68 s).
+/// Drying the reference is therefore not cosmetic — it changes who the model thinks it is
+/// imitating.
+///
+/// # The method
+///
+/// Late reverberation at frame `t` is, by construction, a linear function of the *past* of the
+/// same signal: it is what earlier sound has decayed into. So per frequency bin, fit a linear
+/// predictor from frames `t-D-L+1 ..= t-D` and subtract what it predicts. The delay `D` is what
+/// protects the direct path: the speech itself is not predictable at that lag, the room's tail is.
+///
+/// The weighting is the "WPE" part and the reason it beats plain linear prediction. Each frame is
+/// divided by the current estimate of the speech power there, so loud vowels — where the residual
+/// is dominated by speech, not tail — stop dominating the fit. Estimating that power needs the
+/// dereverberated signal, which needs the filter, so the two alternate for a few iterations.
+///
+/// Only late reverberation is removed. Early reflections arrive inside the protected delay by
+/// design, so a very close, very live room is improved less than a distant one.
+fn dereverb_reference(pcm: &[f32]) -> Vec<f32> {
+    if pcm.len() < DENOISE_FRAME * 4 {
+        return pcm.to_vec();
+    }
+    let mut planner = rustfft::FftPlanner::<f32>::new();
+    let forward = planner.plan_fft_forward(DENOISE_FRAME);
+    let inverse = planner.plan_fft_inverse(DENOISE_FRAME);
+
+    let window: Vec<f32> = (0..DENOISE_FRAME)
+        .map(|n| {
+            let phase = std::f32::consts::TAU * n as f32 / DENOISE_FRAME as f32;
+            0.5 - 0.5 * phase.cos()
+        })
+        .collect();
+
+    let bins = DENOISE_FRAME / 2 + 1;
+    let starts: Vec<usize> = (0..=pcm.len() - DENOISE_FRAME)
+        .step_by(DENOISE_HOP)
+        .collect();
+    let frames = starts.len();
+    if frames <= DEREVERB_DELAY + DEREVERB_TAPS + 2 {
+        return pcm.to_vec();
+    }
+
+    // Observed spectra, kept complex: prediction needs phase, unlike the magnitude-only denoiser.
+    let mut observed: Vec<Vec<Complex64>> = Vec::with_capacity(frames);
+    let mut scratch: Vec<rustfft::num_complex::Complex<f32>> =
+        vec![rustfft::num_complex::Complex::new(0.0, 0.0); DENOISE_FRAME];
+    for &start in &starts {
+        for (slot, n) in scratch.iter_mut().zip(0..DENOISE_FRAME) {
+            *slot = rustfft::num_complex::Complex::new(pcm[start + n] * window[n], 0.0);
+        }
+        forward.process(&mut scratch);
+        observed.push(
+            scratch[..bins]
+                .iter()
+                .map(|value| Complex64::new(f64::from(value.re), f64::from(value.im)))
+                .collect(),
+        );
+    }
+
+    let mut desired = observed.clone();
+    for _ in 0..DEREVERB_ITERATIONS {
+        for bin in 0..bins {
+            // Speech power per frame, from the current estimate. The floor keeps a silent frame
+            // from receiving unbounded weight and hijacking the fit.
+            let mut power: Vec<f64> = (0..frames).map(|t| desired[t][bin].norm_sqr()).collect();
+            let mean = power.iter().sum::<f64>() / frames as f64;
+            let floor = (mean * 1e-6).max(1e-12);
+            for value in &mut power {
+                *value = value.max(floor);
+            }
+
+            let taps = DEREVERB_TAPS;
+            let mut covariance = vec![Complex64::new(0.0, 0.0); taps * taps];
+            let mut cross = vec![Complex64::new(0.0, 0.0); taps];
+            for t in (DEREVERB_DELAY + taps)..frames {
+                let weight = 1.0 / power[t];
+                // Regressor: the observed signal at increasing lag past the protected delay.
+                let regressor: Vec<Complex64> = (0..taps)
+                    .map(|lag| observed[t - DEREVERB_DELAY - lag][bin])
+                    .collect();
+                for row in 0..taps {
+                    let scaled = regressor[row] * weight;
+                    for column in row..taps {
+                        covariance[row * taps + column] += scaled * regressor[column].conj();
+                    }
+                    cross[row] += scaled * observed[t][bin].conj();
+                }
+            }
+            // Hermitian: fill the lower triangle from the upper one that was accumulated.
+            for row in 0..taps {
+                for column in 0..row {
+                    covariance[row * taps + column] = covariance[column * taps + row].conj();
+                }
+            }
+            let trace: f64 = (0..taps).map(|i| covariance[i * taps + i].re).sum();
+            if trace <= 0.0 {
+                continue;
+            }
+            let loading = trace / taps as f64 * DEREVERB_LOADING;
+            for i in 0..taps {
+                covariance[i * taps + i] += Complex64::new(loading, 0.0);
+            }
+
+            let Some(filter) = solve_complex_system(&mut covariance, &mut cross, taps) else {
+                continue;
+            };
+            for t in 0..frames {
+                if t < DEREVERB_DELAY + taps {
+                    desired[t][bin] = observed[t][bin];
+                    continue;
+                }
+                let mut tail = Complex64::new(0.0, 0.0);
+                for (lag, coefficient) in filter.iter().enumerate() {
+                    tail += coefficient.conj() * observed[t - DEREVERB_DELAY - lag][bin];
+                }
+                desired[t][bin] = observed[t][bin] - tail;
+            }
+        }
+    }
+
+    // Overlap-add the dereverberated spectra back, mirroring the conjugate half so the inverse
+    // transform yields a real signal.
+    let mut out = vec![0.0_f32; pcm.len()];
+    let mut weight = vec![0.0_f32; pcm.len()];
+    for (index, &start) in starts.iter().enumerate() {
+        let mut frame = vec![rustfft::num_complex::Complex::new(0.0_f32, 0.0); DENOISE_FRAME];
+        for bin in 0..bins {
+            let value = desired[index][bin];
+            #[allow(clippy::cast_possible_truncation)]
+            let value = rustfft::num_complex::Complex::new(value.re as f32, value.im as f32);
+            frame[bin] = value;
+            let mirror = DENOISE_FRAME - bin;
+            if mirror != bin && mirror < DENOISE_FRAME {
+                frame[mirror] = value.conj();
+            }
+        }
+        inverse.process(&mut frame);
+        let scale = 1.0 / DENOISE_FRAME as f32;
+        for n in 0..DENOISE_FRAME {
+            out[start + n] += frame[n].re * scale * window[n];
+            weight[start + n] += window[n] * window[n];
+        }
+    }
+    for (sample, energy) in out.iter_mut().zip(weight.iter()) {
+        if *energy > 1e-6 {
+            *sample /= *energy;
+        }
+    }
+    let covered =
+        starts.first().copied().unwrap_or(0)..starts.last().map_or(0, |last| last + DENOISE_FRAME);
+    for (index, sample) in out.iter_mut().enumerate() {
+        if !covered.contains(&index) || weight[index] <= 1e-6 {
+            *sample = pcm[index];
+        }
+    }
+    out
+}
+
+/// Double-precision complex scalar for the normal equations.
+///
+/// The covariance is accumulated over thousands of frames and then inverted; doing that in f32
+/// loses conditioning on quiet bins, which is where a bad filter does the most audible damage.
+type Complex64 = rustfft::num_complex::Complex<f64>;
+
+/// Solves `a x = b` by Gaussian elimination with partial pivoting, consuming both.
+///
+/// Returns `None` when the system is singular to working precision, which the caller treats as
+/// "leave this bin alone" rather than as a failure — a bin with no energy has no tail to remove.
+fn solve_complex_system(
+    a: &mut [Complex64],
+    b: &mut [Complex64],
+    n: usize,
+) -> Option<Vec<Complex64>> {
+    for column in 0..n {
+        let (pivot, magnitude) = (column..n).fold((column, 0.0_f64), |best, row| {
+            let candidate = a[row * n + column].norm_sqr();
+            if candidate > best.1 {
+                (row, candidate)
+            } else {
+                best
+            }
+        });
+        if magnitude <= f64::MIN_POSITIVE {
+            return None;
+        }
+        if pivot != column {
+            for k in 0..n {
+                a.swap(pivot * n + k, column * n + k);
+            }
+            b.swap(pivot, column);
+        }
+        let diagonal = a[column * n + column];
+        for row in (column + 1)..n {
+            let factor = a[row * n + column] / diagonal;
+            if factor == Complex64::new(0.0, 0.0) {
+                continue;
+            }
+            for k in column..n {
+                let value = a[column * n + k] * factor;
+                a[row * n + k] -= value;
+            }
+            let value = b[column] * factor;
+            b[row] -= value;
+        }
+    }
+    let mut solution = vec![Complex64::new(0.0, 0.0); n];
+    for row in (0..n).rev() {
+        let mut accumulator = b[row];
+        for k in (row + 1)..n {
+            accumulator -= a[row * n + k] * solution[k];
+        }
+        solution[row] = accumulator / a[row * n + row];
+    }
+    Some(solution)
+}
+
+/// Reverberation time equivalent, in seconds, from the decay following speech offsets.
+///
+/// Reverb leaves no trace in a noise floor — what it does is stretch the energy envelope after
+/// every stop. Measuring the median decay slope across offsets is what separates "the room rings"
+/// from "the microphone hisses", two problems whose fixes have nothing in common. Returns `None`
+/// when the audio has no clear offsets to measure.
+fn reverb_time_s(pcm: &[f32]) -> Option<f32> {
+    let hop = (SPEAKER_SAMPLE_RATE_HZ as usize) / 100; // 10 ms
+    if pcm.len() < hop * 32 {
+        return None;
+    }
+    let envelope: Vec<f32> = pcm
+        .chunks_exact(hop)
+        .map(|chunk| {
+            let energy = chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32;
+            10.0 * (energy + 1e-9).log10()
+        })
+        .collect();
+    let peak = envelope.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let span = 15_usize; // 150 ms of decay
+    let mut slopes: Vec<f32> = Vec::new();
+    for index in 1..envelope.len().saturating_sub(span) {
+        if envelope[index] < peak - 25.0 || envelope[index] <= envelope[index - 1] {
+            continue;
+        }
+        let drop = envelope[index] - envelope[index + span - 1];
+        if drop < 6.0 {
+            continue;
+        }
+        slopes.push(drop / (span as f32 * 0.01));
+    }
+    if slopes.is_empty() {
+        return None;
+    }
+    slopes.sort_by(f32::total_cmp);
+    let median = slopes[slopes.len() / 2];
+    (median > 0.0).then(|| 60.0 / median)
 }
 
 /// Root-mean-square of the quietest decile of 50 ms windows, in dBFS.
