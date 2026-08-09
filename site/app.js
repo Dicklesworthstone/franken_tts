@@ -97,10 +97,10 @@ async function boot() {
   // consent is for the download, not for using what was already approved and downloaded.
   const cached = await cachedBytes();
   if (cached >= TOTAL_BYTES) {
-    ui.dlStatus.textContent = "Model cached — verifying and loading…";
+    ui.dlStatus.textContent = "Model cached. Verifying and loading…";
     await loadFromStore();
   } else if (cached > 0) {
-    ui.dlStatus.textContent = `${gigabytes(cached)} GB of a partial download cached — click to resume.`;
+    ui.dlStatus.textContent = `${gigabytes(cached)} GB of a partial download cached; click to resume.`;
   }
 }
 
@@ -110,7 +110,7 @@ async function loadFromStore() {
   try {
     const files = await ensureModel(({ bytesDone, bytesTotal, phase, asset }) => {
       ui.dlBar.style.width = `${((bytesDone / bytesTotal) * 100).toFixed(1)}%`;
-      ui.dlStatus.textContent = `${phase} ${asset ?? ""} — ${gigabytes(bytesDone)} / ${gigabytes(bytesTotal)} GB`;
+      ui.dlStatus.textContent = `${phase} ${asset ?? ""}: ${gigabytes(bytesDone)} / ${gigabytes(bytesTotal)} GB`;
     });
     ui.dlStatus.textContent = "Hydrating the engine (this takes a minute at wasm speed)…";
     await call(
@@ -137,7 +137,7 @@ async function loadFromStore() {
 function updateVoiceCharacter() {
   const preset = presetList.find((p) => p.name === ui.voice.value);
   ui.voiceCharacter.textContent =
-    ui.voice.value === "__cloned__" ? `“${clonedName}” — locally cloned` : (preset?.character ?? "");
+    ui.voice.value === "__cloned__" ? `“${clonedName}”, locally cloned` : (preset?.character ?? "");
 }
 ui.voice.addEventListener("change", updateVoiceCharacter);
 
@@ -177,7 +177,7 @@ ui.consentYes.addEventListener("click", async () => {
     const files = await ensureModel(({ bytesDone, bytesTotal, phase, asset }) => {
       ui.dlBar.style.width = `${((bytesDone / bytesTotal) * 100).toFixed(1)}%`;
       const tail = phase === "downloading" ? eta(bytesDone, bytesTotal) : "";
-      ui.dlStatus.textContent = `${phase} ${asset ?? ""} — ${gigabytes(bytesDone)} / ${gigabytes(bytesTotal)} GB${tail}`;
+      ui.dlStatus.textContent = `${phase} ${asset ?? ""}: ${gigabytes(bytesDone)} / ${gigabytes(bytesTotal)} GB${tail}`;
     });
     ui.dlStatus.textContent = "Hydrating the engine (this takes a minute at wasm speed)…";
     await call(
@@ -208,7 +208,7 @@ ui.speak.addEventListener("click", async () => {
   const startedAt = performance.now();
   const ticker = setInterval(() => {
     const seconds = ((performance.now() - startedAt) / 1000).toFixed(0);
-    ui.synthStatus.textContent = `synthesizing… ${seconds}s (single-thread wasm runs ~0.03–0.05× real time — a sentence takes a couple of minutes)`;
+    ui.synthStatus.textContent = `synthesizing… ${seconds}s (single-thread wasm runs ~0.03–0.05× real time, so a sentence takes a couple of minutes)`;
     ui.synthBar.style.width = `${Math.min(90, 10 + seconds * 2)}%`;
   }, 500);
   try {
@@ -279,7 +279,7 @@ ui.record.addEventListener("click", async () => {
     ui.record.textContent = "⏹ Stop recording";
     const startedAt = performance.now();
     const ticker = setInterval(() => {
-      ui.recordStatus.textContent = `recording… ${((performance.now() - startedAt) / 1000).toFixed(0)}s — read the script aloud, then press Stop`;
+      ui.recordStatus.textContent = `recording… ${((performance.now() - startedAt) / 1000).toFixed(0)}s. Read the script aloud, then press Stop`;
     }, 500);
 
     const finish = async () => {
@@ -295,7 +295,7 @@ ui.record.addEventListener("click", async () => {
       const total = chunks.reduce((n, c) => n + c.length, 0);
       if (total < 24000 * 3) {
         ui.recordStatus.textContent = "";
-        throw new Error("recording too short — read at least a few seconds of the script");
+        throw new Error("recording too short; read at least a few seconds of the script");
       }
       const pcm = new Float32Array(total);
       let offset = 0;
@@ -312,7 +312,7 @@ ui.record.addEventListener("click", async () => {
       clonedOption.textContent = clonedName;
       ui.voice.value = "__cloned__";
       updateVoiceCharacter();
-      ui.recordStatus.textContent = `cloned — “${clonedName}” is selected.`;
+      ui.recordStatus.textContent = `cloned: “${clonedName}” is selected.`;
     };
     recorder = { stop: () => finish().catch(showError) };
     // Backstop: the full script takes under a minute; stop automatically at 60 s.
@@ -365,7 +365,7 @@ ui.share.addEventListener("click", async () => {
   const url = buildShareUrl();
   try {
     await navigator.clipboard.writeText(url);
-    ui.synthStatus.textContent = "share link copied — it carries the text, seed, and voice.";
+    ui.synthStatus.textContent = "share link copied; it carries the text, seed, and voice.";
   } catch (error) {
     showError(error);
   }
@@ -393,7 +393,7 @@ function applySharedFragment() {
       ui.voice.value = params.get("voice");
     }
     updateVoiceCharacter();
-    ui.synthStatus.textContent = "loaded a shared utterance — load the model, then Synthesize.";
+    ui.synthStatus.textContent = "loaded a shared utterance. Load the model, then Synthesize.";
   } catch {
     /* a malformed fragment is ignored, never fatal */
   }

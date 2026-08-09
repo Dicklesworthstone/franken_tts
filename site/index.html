@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>FrankenTTS — The Monster Voice Engine</title>
-  <meta name="description" content="A pure-Rust, CPU-only port of Qwen3-TTS voice cloning — compiled to WebAssembly and running entirely in your browser. Type, pick a voice, clone your own, listen. Nothing leaves the tab.">
+  <meta name="description" content="A pure-Rust, CPU-only port of Qwen3-TTS voice cloning, compiled to WebAssembly and running entirely in your browser. Type, pick a voice, clone your own, listen. Nothing leaves the tab.">
   <meta name="theme-color" content="#020a06">
   <link rel="canonical" href="https://frankentts.com/">
   <meta property="og:title" content="FrankenTTS — The Monster Voice Engine">
@@ -53,6 +53,36 @@
     .pg-label { font-size: 0.62rem; font-weight: 900; letter-spacing: 0.25em; text-transform: uppercase; color: #10b981; }
     .hidden { display: none !important; }
     audio { width: 100%; filter: invert(0.9) hue-rotate(150deg); }
+    #anatomy-viz { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    #anatomy-viz svg { min-width: 720px; display: block; }
+    /* Anatomy / receipts cards */
+    .pg-card { position: relative; overflow: hidden; }
+    .pg-card-num {
+      position: absolute; top: 0.4rem; right: 0.9rem;
+      font-family: "JetBrains Mono", monospace; font-size: 2.6rem; font-weight: 900;
+      color: rgba(52, 211, 153, 0.10); line-height: 1; pointer-events: none;
+    }
+    .pg-card-accent { box-shadow: 0 0 40px rgba(16, 185, 129, 0.07) inset; }
+    .pg-stat {
+      font-family: "JetBrains Mono", monospace; font-size: 3rem; font-weight: 900;
+      color: #34d399; line-height: 1.1; margin-bottom: 0.6rem;
+    }
+    .pg-stat-dim { color: #64748b; font-size: 1.6rem; font-weight: 700; }
+    .pg-bar-row { display: flex; align-items: center; gap: 0.9rem; margin-bottom: 0.7rem; }
+    .pg-bar-name {
+      flex: 0 0 6.5rem; text-align: right; color: #94a3b8;
+      font-size: 0.75rem; font-weight: 700; font-family: "JetBrains Mono", monospace;
+    }
+    .pg-bar-track {
+      flex: 1; height: 14px; border-radius: 7px;
+      background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.07); overflow: hidden;
+    }
+    .pg-bar-fill { height: 100%; background: linear-gradient(90deg, #059669, #34d399); }
+    .pg-bar-fill-ref { background: linear-gradient(90deg, #334155, #64748b); }
+    .pg-bar-val {
+      flex: 0 0 5rem; color: #cbd5e1; font-size: 0.78rem;
+      font-family: "JetBrains Mono", monospace; font-weight: 700;
+    }
   </style>
 </head>
 <body class="min-h-screen">
@@ -86,7 +116,8 @@
 
     <nav class="hidden lg:flex items-center gap-1" aria-label="Primary">
       <a href="#playground" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Playground</a>
-      <a href="#pipeline" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Pipeline</a>
+      <a href="#pipeline" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Anatomy</a>
+      <a href="#receipts" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Receipts</a>
       <a href="#voices" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Voices</a>
       <a href="#install" class="px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-[0.15em] text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors">Install</a>
     </nav>
@@ -108,8 +139,8 @@
       The Monster <span class="text-emerald-400">Voice</span> Engine.
     </h1>
     <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg mb-8">
-      A clean-room, pure-Rust port of <span class="text-slate-200">Qwen3-TTS-12Hz-0.6B</span> voice cloning —
-      no Python, no PyTorch, no GPU, no server. The same engine that runs faster than real time
+      A clean-room, pure-Rust port of <span class="text-slate-200">Qwen3-TTS-12Hz-0.6B</span> voice cloning.
+      No Python, no PyTorch, no GPU, no server. The same engine that runs faster than real time
       as a native CLI, compiled to WebAssembly and stitched into this page.
       Nothing you type or record ever leaves the tab.
     </p>
@@ -134,7 +165,7 @@
       <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">The Operating <span class="text-emerald-400">Theater</span>.</h2>
       <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
         Download the model once, then type on the left and listen on the right. The <em>actual</em>
-        engine — compiled to WebAssembly, running in a worker in your browser — synthesizes every
+        engine, compiled to WebAssembly and running in a worker in your browser, synthesizes every
         sample locally. No server. No mock. The monster itself.
       </p>
     </div>
@@ -163,7 +194,7 @@
             <div class="pg-label mb-3">01 · The Specimen (model)</div>
             <p class="pg-note mb-3">
               First use downloads the quantized model (<strong>≈2.0 GB</strong>) into this
-              browser's private storage — verified against pinned SHA-256 digests, resumable,
+              browser's private storage: verified against pinned SHA-256 digests, resumable,
               cached until you clear it. After that, the page loads it straight from storage.
             </p>
             <div id="consent" class="hidden mb-3">
@@ -228,9 +259,9 @@
           <p id="error" class="pg-error hidden"></p>
           <p class="pg-note">
             Speed honesty, measured: this single-threaded WASM build synthesizes at roughly
-            <strong>0.03–0.05× real time</strong> — a full sentence takes a couple of minutes,
+            <strong>0.03–0.05× real time</strong>, so a full sentence takes a couple of minutes,
             with live progress. The native CLI runs the same engine faster than real time;
-            browser threads and int8 conv kernels are the tracked path. Desktop browsers only:
+            browser threads are the tracked path to closing the gap. Desktop browsers only:
             the engine needs several GB of memory.
           </p>
         </div>
@@ -248,28 +279,98 @@
       </div>
       <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Three Organs, <span class="text-emerald-400">One Heartbeat</span>.</h2>
       <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        Every 80 ms frame of speech passes through the whole creature — and the hidden middle organ
-        is the real monster.
+        The public story says "a 12.5 Hz model". The truth inside every 80 ms frame is stranger:
+        the famous 28-layer transformer runs once, and a tiny 5-layer organ nobody talks about
+        runs <span class="text-slate-200">fifteen sequential times</span>. Watch a single frame move
+        through the creature.
       </p>
     </div>
-    <div class="grid md:grid-cols-3 gap-5 reveal">
-      <div class="rounded-2xl border border-white/5 bg-black/40 p-6">
-        <div class="pg-label mb-3">01 · The Talker</div>
+
+    <div class="rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
+      <div id="anatomy-viz" aria-label="Animated anatomy of one synthesis frame"></div>
+      <p class="pg-note mt-3 text-center">
+        One frame, to scale in work if not in size: the 5-layer microdecoder is small, but rereading
+        its body fifteen times makes it the dominant cost of the whole model. franken_tts treats it
+        as the design center, not a footnote.
+      </p>
+    </div>
+
+    <div class="grid lg:grid-cols-3 gap-5 reveal">
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-card-num">01</div>
+        <div class="pg-label mb-3">The Talker</div>
         <p class="pg-note">A 28-layer transformer predicts each frame's first, semantic-rich codec
-        token — int8 kernels with exact i32 accumulation, argmax-verified against the PyTorch
-        oracle through every layer.</p>
+        token. Runs on int8 kernels with exact i32 accumulation, and its output is argmax-verified
+        against the PyTorch oracle through every layer.</p>
       </div>
-      <div class="rounded-2xl border border-white/5 bg-black/40 p-6">
-        <div class="pg-label mb-3">02 · The Microdecoder</div>
-        <p class="pg-note">The hidden monster: a 5-layer residual-code predictor that runs
-        <strong>fifteen sequential times inside every frame</strong> — per-depth embeddings,
-        per-depth 2,048-way heads. franken_tts treats it as the design center, not a liability.</p>
+      <div class="pg-card pg-card-accent rounded-2xl border border-emerald-500/25 bg-black/40 p-6">
+        <div class="pg-card-num">02</div>
+        <div class="pg-label mb-3">The Microdecoder</div>
+        <p class="pg-note">The hidden monster. A 5-layer residual-code predictor with per-depth
+        embeddings and per-depth 2,048-way heads, run <strong>fifteen sequential times inside every
+        frame</strong>. Its body accounts for ~1.18 GB of the ≈1.65 GB of Q8 weight traffic each
+        frame touches.</p>
       </div>
-      <div class="rounded-2xl border border-white/5 bg-black/40 p-6">
-        <div class="pg-label mb-3">03 · The Codec</div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-card-num">03</div>
+        <div class="pg-label mb-3">The Codec</div>
         <p class="pg-note">A fully causal decoder turns 16 code groups into 1,920 samples of
-        24 kHz audio per frame — streaming output bit-identical to offline decoding under every
+        24 kHz audio per frame. Streaming output is bit-identical to offline decoding under every
         packet schedule.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== RECEIPTS ============================== -->
+  <section id="receipts" class="relative px-4 md:px-6 py-16 md:py-24 max-w-[1200px] mx-auto">
+    <div class="text-center mb-12 reveal">
+      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+        THE EVIDENCE LOCKER
+        <span class="h-px w-8 bg-emerald-500/40"></span>
+      </div>
+      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Parity, <span class="text-emerald-400">With Receipts</span>.</h2>
+      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
+        A port is a claim; parity is a measurement. Every stage of this engine is checked against
+        captured activations from the pinned PyTorch reference, and the numbers below are the
+        actual gate results, not aspirations.
+      </p>
+    </div>
+
+    <div class="grid lg:grid-cols-3 gap-5 reveal">
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6 text-center">
+        <div class="pg-stat"><span data-countup="28">28</span><span class="pg-stat-dim">/28</span></div>
+        <div class="pg-label mb-2">Layers argmax-exact</div>
+        <p class="pg-note">The talker's next-token choice matches the oracle exactly, verified
+        layer by layer through the full stack against captured activations.</p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6 text-center">
+        <div class="pg-stat"><span data-countup="100">100</span><span class="pg-stat-dim">%</span></div>
+        <div class="pg-label mb-2">Codec codes exact</div>
+        <p class="pg-note">Whole-utterance codec code sequences match the oracle token for token,
+        and streamed audio is bit-identical to offline decode under all packet schedules.</p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6 text-center">
+        <div class="pg-stat"><span data-countup="1.6" data-decimals="1" data-suffix="×">1.6×</span></div>
+        <div class="pg-label mb-2">Real time, natively</div>
+        <p class="pg-note">The int8 route measures 1.4–1.6× real time on a Mac Mini M4 Pro with
+        first audio about 450 ms after synthesis starts, and warm model load at ~3.7 s.</p>
+      </div>
+    </div>
+
+    <div id="rms-bars" class="rounded-2xl border border-white/5 bg-black/40 p-6 md:p-8 mt-8 reveal">
+      <div class="pg-label mb-2">The closest receipt of all</div>
+      <p class="pg-note mb-5">Peak frame loudness of the finished audio, this engine vs the pinned
+      PyTorch reference. The bars are drawn to scale; the difference is two parts in a thousand.</p>
+      <div class="pg-bar-row">
+        <span class="pg-bar-name">franken_tts</span>
+        <div class="pg-bar-track"><div class="pg-bar-fill" data-width="99.77%" style="width:0"></div></div>
+        <span class="pg-bar-val">0.08578</span>
+      </div>
+      <div class="pg-bar-row">
+        <span class="pg-bar-name">PyTorch</span>
+        <div class="pg-bar-track"><div class="pg-bar-fill pg-bar-fill-ref" data-width="100%" style="width:0"></div></div>
+        <span class="pg-bar-val">0.08597</span>
       </div>
     </div>
   </section>
@@ -284,11 +385,11 @@
       </div>
       <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Seven Voices <span class="text-emerald-400">In the Jar</span>.</h2>
       <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        Built-in voices ship inside the binary as 4 KB x-vectors — <span class="text-slate-200">matt</span> (the default),
+        Built-in voices ship inside the binary as 4 KB x-vectors: <span class="text-slate-200">matt</span> (the default),
         <span class="text-slate-200">james</span>, <span class="text-slate-200">leo</span>,
         <span class="text-slate-200">robert</span>, <span class="text-slate-200">judy</span>,
-        <span class="text-slate-200">aria</span>, and <span class="text-slate-200">ember</span> —
-        and a ten-second recording of your own voice becomes the eighth.
+        <span class="text-slate-200">aria</span>, and <span class="text-slate-200">ember</span>.
+        A ten-second recording of your own voice becomes the eighth.
       </p>
     </div>
   </section>
@@ -303,8 +404,8 @@
       </div>
       <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Faster Than Real Time, <span class="text-emerald-400">Natively</span>.</h2>
       <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg mb-8">
-        The CLI runs the same engine with native int8 kernels and a persistent worker team —
-        faster than real time on Apple Silicon.
+        The CLI runs the same engine with native int8 kernels and a persistent six-thread worker
+        team, faster than real time on Apple Silicon.
       </p>
       <div class="max-w-2xl mx-auto text-left rounded-2xl border border-white/5 bg-black/60 p-6 font-mono text-sm text-slate-300 overflow-x-auto">
         <div class="text-slate-500"># macOS / Linux</div>
@@ -353,5 +454,6 @@
     for (const el of revealables) observer.observe(el);
   </script>
   <script type="module" src="./app.js"></script>
+  <script type="module" src="./viz.js"></script>
 </body>
 </html>
