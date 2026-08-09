@@ -6,7 +6,7 @@
 
 [![License: MIT + rider](https://img.shields.io/badge/license-MIT%20%2B%20rider-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-0.1.3-green.svg)](https://github.com/Dicklesworthstone/franken_tts/releases)
+[![Version](https://img.shields.io/badge/version-0.1.4-green.svg)](https://github.com/Dicklesworthstone/franken_tts/releases)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_tts/main/install.sh | bash
@@ -59,9 +59,9 @@ The built-ins are ordinary enrolled x-vectors, each approved by listening before
 
 The output format follows the extension. `.wav` comes straight from the built-in pure-Rust encoder; `.m4a`, `.mp3`, and `.flac` are converted from that WAV by whichever system encoder is present (`afconvert` on macOS, `ffmpeg`, `lame`, `flac`), and if none is found you get an error naming the tools rather than a silently different format. Generation stops at the model's EOS, with a text-proportional frame cap as a backstop; set `FTTS_MAX_FRAMES` only when you want an exact cap. `--model`, `--voice`, and `-o` remain available for explicit control.
 
-## Status: v0.1.3, optimized route by default
+## Status: v0.1.4, faster than real time
 
-Four releases in, all on 2026-08-08/09 (see [CHANGELOG](CHANGELOG.md)): v0.1.0 shipped the f32 reference engine, v0.1.1 made the model a one-command download, v0.1.2 moved that download to a pre-quantized artifact, and v0.1.3 made the optimized int8 route the library-wide default. What works now:
+Five releases in, all on 2026-08-08/09 (see [CHANGELOG](CHANGELOG.md)): v0.1.0 shipped the f32 reference engine, v0.1.1 made the model a one-command download, v0.1.2 moved that download to a pre-quantized artifact, v0.1.3 made the optimized int8 route the library-wide default, and v0.1.4 crossed real time and shipped seven built-in voices. What works now:
 
 - **Real speech out.** `ftts say` synthesizes complete utterances on Apple Silicon with the production sampling stack matching upstream runtime defaults: do_sample, temperature 0.9, top-k 50, repetition penalty 1.05, sampled subtalker.
 - **Parity receipts.**
