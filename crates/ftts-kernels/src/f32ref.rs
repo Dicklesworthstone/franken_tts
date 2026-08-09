@@ -923,6 +923,51 @@ pub fn gqa_attention_with_arithmetic(
         return;
     }
 
+    gqa_attention_head_range_with_arithmetic(
+        queries,
+        keys,
+        values,
+        additive_mask,
+        query_positions,
+        key_positions,
+        q_heads,
+        kv_heads,
+        head_dim,
+        softmax_arithmetic,
+        accumulation,
+        0..q_heads,
+        out,
+    );
+}
+
+/// The scalar GQA loop restricted to `q_head_range`, writing only those heads' output spans.
+///
+/// This is the SAME loop [`gqa_attention_with_arithmetic`] runs — extracted, not duplicated —
+/// so a partitioned caller (the worker team) composes the identical arithmetic per head and the
+/// full-range serial call remains the reference. Heads are independent: no reduction crosses a
+/// head, which is why partitioning here is bit-exact rather than merely close.
+///
+/// # Panics
+///
+/// Panics if the range exceeds `q_heads`. Full shape validation is the full-range caller's job;
+/// partitioned callers must have validated once before splitting.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_head_range_with_arithmetic(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    additive_mask: &[f32],
+    query_positions: usize,
+    key_positions: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    softmax_arithmetic: F32SoftmaxArithmetic,
+    accumulation: F32LinearAccumulation,
+    q_head_range: std::ops::Range<usize>,
+    out: &mut [f32],
+) {
+    assert!(q_head_range.end <= q_heads, "head range exceeds q_heads");
     let scale = (head_dim as f32).sqrt().recip();
     let kv_group = q_heads / kv_heads;
     let mut scores = vec![0.0f32; key_positions];
@@ -930,11 +975,10 @@ pub fn gqa_attention_with_arithmetic(
     for query_position in 0..query_positions {
         let mask =
             &additive_mask[query_position * key_positions..(query_position + 1) * key_positions];
-        for q_head in 0..q_heads {
+        for q_head in q_head_range.clone() {
             let kv_head = q_head / kv_group;
             let query_base = (query_position * q_heads + q_head) * head_dim;
             let query = &queries[query_base..query_base + head_dim];
-
             for (key_position, score) in scores.iter_mut().enumerate() {
                 let key_base = (key_position * kv_heads + kv_head) * head_dim;
                 let key = &keys[key_base..key_base + head_dim];

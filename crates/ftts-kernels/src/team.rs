@@ -28,7 +28,15 @@ use std::sync::{Condvar, Mutex, OnceLock};
 
 /// One dispatched operation, shared read-only with every worker.
 #[derive(Clone, Copy)]
-struct Job {
+enum Job {
+    /// W8A8 linear partitioned over output columns.
+    Linear(LinearJob),
+    /// f32 GQA attention partitioned over query heads.
+    Attention(AttentionJob),
+}
+
+#[derive(Clone, Copy)]
+struct LinearJob {
     x_q: *const i8,
     x_scales: *const f32,
     w_data: *const i8,
@@ -41,6 +49,26 @@ struct Job {
     k: usize,
     tier: Int8Tier,
     /// Total partitions this dispatch, including the caller's partition 0.
+    partitions: usize,
+}
+
+/// The default-arithmetic GQA attention, partitioned over query heads.
+///
+/// Head independence is the whole safety-and-exactness story: no reduction crosses a head, and
+/// each head writes only its own `head_dim` span of every output row, so any head partition is
+/// bit-identical to the serial full-range call.
+#[derive(Clone, Copy)]
+struct AttentionJob {
+    queries: *const f32,
+    keys: *const f32,
+    values: *const f32,
+    mask: *const f32,
+    query_positions: usize,
+    key_positions: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    out: *mut f32,
     partitions: usize,
 }
 
@@ -186,6 +214,57 @@ fn run_partition(job: &Job, worker: usize) {
     if worker > 0 && tests::PANIC_INJECT.swap(false, std::sync::atomic::Ordering::SeqCst) {
         panic!("injected worker panic for the hang-hardening test");
     }
+    match job {
+        Job::Linear(job) => run_linear_partition(job, worker),
+        Job::Attention(job) => run_attention_partition(job, worker),
+    }
+}
+
+/// One worker's query-head range of an attention job. Same extracted loop the serial reference
+/// runs (`f32ref::gqa_attention_head_range_with_arithmetic` with the default arithmetic).
+fn run_attention_partition(job: &AttentionJob, worker: usize) {
+    let chunk = job.q_heads.div_ceil(job.partitions);
+    let start = (worker * chunk).min(job.q_heads);
+    let end = ((worker + 1) * chunk).min(job.q_heads);
+    if start >= end {
+        return;
+    }
+    // SAFETY: same three facts as the linear job (module docs) — the caller joins before its
+    // slices can die, reads are shared-immutable for the dispatch, and this worker writes only
+    // its own heads' disjoint `head_dim` spans of each output row.
+    let (queries, keys, values, mask, out) = unsafe {
+        (
+            std::slice::from_raw_parts(
+                job.queries,
+                job.query_positions * job.q_heads * job.head_dim,
+            ),
+            std::slice::from_raw_parts(job.keys, job.key_positions * job.kv_heads * job.head_dim),
+            std::slice::from_raw_parts(job.values, job.key_positions * job.kv_heads * job.head_dim),
+            std::slice::from_raw_parts(job.mask, job.query_positions * job.key_positions),
+            std::slice::from_raw_parts_mut(
+                job.out,
+                job.query_positions * job.q_heads * job.head_dim,
+            ),
+        )
+    };
+    crate::f32ref::gqa_attention_head_range_with_arithmetic(
+        queries,
+        keys,
+        values,
+        mask,
+        job.query_positions,
+        job.key_positions,
+        job.q_heads,
+        job.kv_heads,
+        job.head_dim,
+        crate::f32ref::F32SoftmaxArithmetic::ReciprocalMultiply,
+        crate::f32ref::F32LinearAccumulation::Scalar,
+        start..end,
+        out,
+    );
+}
+
+fn run_linear_partition(job: &LinearJob, worker: usize) {
     let chunk = job.n.div_ceil(job.partitions);
     let start = (worker * chunk).min(job.n);
     let end = ((worker + 1) * chunk).min(job.n);
@@ -242,7 +321,7 @@ impl Team {
             assert_eq!(bias.len(), n, "bias must be [n]");
         }
 
-        let job = Job {
+        let job = Job::Linear(LinearJob {
             x_q: x_q.as_ptr(),
             x_scales: x_scales.as_ptr(),
             w_data: weight.data.as_ptr(),
@@ -254,8 +333,70 @@ impl Team {
             k,
             tier,
             partitions: self.partitions,
-        };
+        });
 
+        self.dispatch(job);
+    }
+
+    /// Runs the default-arithmetic GQA attention across the team, partitioned over query
+    /// heads. Bit-identical to the serial `f32ref::gqa_attention` (same extracted loop).
+    ///
+    /// # Panics
+    ///
+    /// Panics on shape mismatches, exactly as the serial reference does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gqa_attention(
+        &self,
+        queries: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        mask: &[f32],
+        query_positions: usize,
+        key_positions: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        out: &mut [f32],
+    ) {
+        assert!(
+            kv_heads > 0 && q_heads.is_multiple_of(kv_heads),
+            "GQA head geometry"
+        );
+        assert_eq!(
+            queries.len(),
+            query_positions * q_heads * head_dim,
+            "queries shape"
+        );
+        assert_eq!(
+            keys.len(),
+            key_positions * kv_heads * head_dim,
+            "keys shape"
+        );
+        assert_eq!(
+            values.len(),
+            key_positions * kv_heads * head_dim,
+            "values shape"
+        );
+        assert_eq!(mask.len(), query_positions * key_positions, "mask shape");
+        assert_eq!(out.len(), query_positions * q_heads * head_dim, "out shape");
+        let job = Job::Attention(AttentionJob {
+            queries: queries.as_ptr(),
+            keys: keys.as_ptr(),
+            values: values.as_ptr(),
+            mask: mask.as_ptr(),
+            query_positions,
+            key_positions,
+            q_heads,
+            kv_heads,
+            head_dim,
+            out: out.as_mut_ptr(),
+            partitions: self.partitions,
+        });
+        self.dispatch(job);
+    }
+
+    /// The shared dispatch/work/join cycle (module-docs facts 1-3).
+    fn dispatch(&self, job: Job) {
         // One dispatch at a time, held through the join (module-docs fact 3). Poison
         // tolerance: a prior caller's panic leaves no dispatch state behind — everything is
         // re-established below.
@@ -443,6 +584,70 @@ mod tests {
         }
         assert!(out_a.iter().all(|value| value.is_finite()));
         assert!(out_b.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn attention_partitioning_is_bit_identical_to_serial_at_talker_geometry() {
+        // Talker decode shape: 16 query heads / 8 KV heads / head_dim 128, growing KV; plus a
+        // prefill-like seq>1 case and a ragged 5-partition split of 16 heads.
+        for &(query_positions, key_positions) in &[(1_usize, 37_usize), (4, 24)] {
+            let (q_heads, kv_heads, head_dim) = (16_usize, 8_usize, 128_usize);
+            let queries = values_of(query_positions * q_heads * head_dim, 21);
+            let keys = values_of(key_positions * kv_heads * head_dim, 22);
+            let values = values_of(key_positions * kv_heads * head_dim, 23);
+            let mut mask = vec![0.0_f32; query_positions * key_positions];
+            for (index, slot) in mask.iter_mut().enumerate() {
+                if index % 11 == 3 {
+                    *slot = f32::NEG_INFINITY;
+                }
+            }
+            let mut serial = vec![0.0_f32; queries.len()];
+            crate::f32ref::gqa_attention(
+                &queries,
+                &keys,
+                &values,
+                &mask,
+                query_positions,
+                key_positions,
+                q_heads,
+                kv_heads,
+                head_dim,
+                &mut serial,
+            );
+            for partitions in [2_usize, 5, 8] {
+                let team = test_team(partitions);
+                let mut parallel = vec![0.0_f32; queries.len()];
+                team.gqa_attention(
+                    &queries,
+                    &keys,
+                    &values,
+                    &mask,
+                    query_positions,
+                    key_positions,
+                    q_heads,
+                    kv_heads,
+                    head_dim,
+                    &mut parallel,
+                );
+                assert_eq!(
+                    serial.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    parallel.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "partitions={partitions} qp={query_positions}"
+                );
+            }
+        }
+    }
+
+    fn values_of(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+            })
+            .collect()
     }
 
     #[test]
