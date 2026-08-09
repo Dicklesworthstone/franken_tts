@@ -163,11 +163,11 @@ Weights are not bundled with the binary; `ftts pull` fetches this project's pre-
 
 ### The enrollment passage
 
-Any natural speech works, but a phonetically rich passage measurably beats casual filler — this is to voices what "the quick brown fox" is to fonts. The script below combines the two standards from speech science: the **Rainbow Passage** (built to contain essentially every English phoneme and connected-speech transition) and the Speech Accent Archive's **"Please call Stella"** elicitation paragraph (dense with discriminative consonant clusters and vowels). Read both, in order, as one recording:
+Any natural speech works, but a phonetically rich passage measurably beats casual filler; this is to voices what "the quick brown fox" is to fonts. The script below is the Speech Accent Archive's **"Please call Stella"** elicitation paragraph, which packs most English phonemes and the discriminative consonant clusters into four sentences, followed by the opening of the **Rainbow Passage** for connected, flowing prosody. The speaker encoder pools over the whole recording with no truncation, but the voice information it extracts saturates well before a minute, so about thirty seconds of reading is all it needs:
 
 > Please call Stella. Ask her to bring these things with her from the store: six spoons of fresh snow peas, five thick slabs of blue cheese, and maybe a snack for her brother Bob. We also need a small plastic snake and a big toy frog for the kids. She can scoop these things into three red bags, and we will go meet her Wednesday at the train station.
 >
-> When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow. The rainbow is a division of white light into many beautiful colors. These take the shape of a long round arch, with its path high above, and its two ends apparently beyond the horizon. There is, according to legend, a boiling pot of gold at one end. People look, but no one ever finds it. When a man looks for something beyond his reach, his friends say he is looking for the pot of gold at the end of the rainbow.
+> When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow. The rainbow is a division of white light into many beautiful colors.
 
 Keep a note of exactly what you read: the upcoming higher-quality ICL cloning mode conditions on the reference audio *plus its verbatim transcript*, so a recording of a known passage is already future-proof.
 

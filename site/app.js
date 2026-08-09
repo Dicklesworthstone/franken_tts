@@ -159,7 +159,6 @@ async function loadFromStore() {
         merges: files.merges,
         tokenizerConfig: files.tokenizerConfig,
       },
-      [files.fttsq, files.codec],
     );
     ui.dlBar.style.width = "100%";
     ui.dlStatus.textContent = "Model loaded. Ready to speak.";
@@ -344,7 +343,6 @@ ui.consentYes.addEventListener("click", async () => {
         merges: files.merges,
         tokenizerConfig: files.tokenizerConfig,
       },
-      [files.fttsq, files.codec],
     );
     ui.dlBar.style.width = "100%";
     ui.dlStatus.textContent = "Model loaded. Ready to speak.";
@@ -400,19 +398,18 @@ ui.speak.addEventListener("click", async () => {
   }
 });
 
-// The enrollment script, verbatim from the README: the Rainbow Passage + "Please call
-// Stella" — phonetically rich, and a known transcript is future-proof for ICL cloning.
+// The enrollment script, verbatim from the README: the "Please call Stella" elicitation
+// paragraph (the phonetically densest part) plus the Rainbow Passage's opening for flowing
+// prosody. The encoder pools over everything recorded with no truncation, but its voice
+// information saturates well before a minute, so ~30 s of reading is the sweet spot; the
+// known transcript also stays future-proof for ICL cloning.
 const ENROLLMENT_SCRIPT =
   "Please call Stella. Ask her to bring these things with her from the store: six spoons " +
   "of fresh snow peas, five thick slabs of blue cheese, and maybe a snack for her brother " +
   "Bob. We also need a small plastic snake and a big toy frog for the kids. She can scoop " +
   "these things into three red bags, and we will go meet her Wednesday at the train " +
   "station.\n\nWhen the sunlight strikes raindrops in the air, they act as a prism and " +
-  "form a rainbow. The rainbow is a division of white light into many beautiful colors. " +
-  "These take the shape of a long round arch, with its path high above, and its two ends " +
-  "apparently beyond the horizon. There is, according to legend, a boiling pot of gold at " +
-  "one end. People look, but no one ever finds it. When a man looks for something beyond " +
-  "his reach, his friends say he is looking for the pot of gold at the end of the rainbow.";
+  "form a rainbow. The rainbow is a division of white light into many beautiful colors.";
 
 let recorder = null; // {stop: () => void} while a recording is live
 
@@ -476,8 +473,9 @@ ui.record.addEventListener("click", async () => {
     };
     const session = { stop: () => finish().catch(showError) };
     recorder = session;
-    // Backstop: the full script takes under a minute; stop automatically at 60 s. Guarded
-    // so a stale timer from an earlier recording can never stop a later one.
+    // Backstop: the script reads in about half a minute; stop automatically at 60 s, which
+    // leaves room for slow readers. Guarded so a stale timer from an earlier recording can
+    // never stop a later one.
     setTimeout(() => {
       if (recorder === session) session.stop();
     }, 60_000);
