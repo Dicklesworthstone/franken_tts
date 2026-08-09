@@ -107,6 +107,15 @@ thread_local! {
     static TEAM_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Partitions the armed team runs with, or 1 when execution is serial.
+///
+/// Exposed so a host with no environment variables — a browser — can report whether threading
+/// actually engaged, instead of running serially and looking identical.
+#[must_use]
+pub fn partitions() -> usize {
+    armed().map_or(1, |team| team.partitions)
+}
+
 /// Makes THIS thread run its int8 linears serially, never dispatching to the team.
 ///
 /// The codec pipeline worker sets this: its work is meant to overlap with the generator's

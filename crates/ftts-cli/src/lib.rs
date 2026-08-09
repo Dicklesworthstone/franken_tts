@@ -318,13 +318,20 @@ struct EnrollArgs {
     #[arg(long)]
     dereverb: bool,
 
-    /// Spectral-subtract the stationary noise floor from the reference before enrolling.
+    /// Clean stationary noise from the reference before enrolling.
     ///
-    /// Off by default: room tone and breath are part of what the speaker encoder reads as
-    /// identity, so this changes the enrolled voice and stays opt-in until blind listening
-    /// clears it. Worth trying when a recording has audible hiss or hum.
-    #[arg(long)]
+    /// This is the default whenever the neural denoiser's weights are present (`ftts pull`
+    /// fetches them; measured on a static-hiss reference, the cleaned enrollment lands
+    /// closer to a clean-source enrollment than the raw recording does). Passing the flag
+    /// explicitly additionally engages the classic no-weights spectral subtraction when the
+    /// weights are absent, where the automatic path would skip cleanup rather than swap in
+    /// a different engine unannounced.
+    #[arg(long, overrides_with = "no_denoise")]
     denoise: bool,
+
+    /// Enroll the recording exactly as given, with no noise cleanup.
+    #[arg(long, overrides_with = "denoise")]
+    no_denoise: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1855,11 +1862,19 @@ fn run_enroll(
     };
     let mut denoise_report = None;
     let mut dereverb_report = None;
+    // Denoise resolution: --no-denoise wins, --denoise forces (including the classic engine
+    // when the weights are absent), and the default is neural-when-pulled — never a silent
+    // fallback to a different engine than the one the default advertises.
+    let denoise = if args.no_denoise {
+        false
+    } else {
+        args.denoise || bundle.root.join(synth::DENOISE_ARTIFACT_RELPATH).is_file()
+    };
     let speaker = synth::speaker_from_voice(
         &bundle,
         &args.reference_audio,
         synth::ReferenceCleanup {
-            denoise: args.denoise.then_some(&mut denoise_report),
+            denoise: denoise.then_some(&mut denoise_report),
             dereverb: args.dereverb.then_some(&mut dereverb_report),
         },
     )?;

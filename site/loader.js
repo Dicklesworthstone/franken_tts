@@ -16,14 +16,6 @@ async function opfsRoot() {
 // contiguous buffer: hashing a 1.3 GB asset that way allocates 1.3 GB in the JS heap and is what
 // killed the tab on iOS before the download could finish. Peak memory here is one slice.
 
-async function stagingHandle(root, asset, create) {
-  try {
-    return await root.getFileHandle(`${asset}.part`, { create });
-  } catch {
-    return null;
-  }
-}
-
 async function fetchRange(asset, start, endInclusive) {
   const response = await fetch(`model/${asset}`, {
     headers: { Range: `bytes=${start}-${endInclusive}` },
@@ -81,44 +73,56 @@ export async function ensureModel(onProgress) {
       /* not cached yet */
     }
 
-    // Resume or start the staged download.
-    const staging = await stagingHandle(root, file.asset, true);
-    let offset = (await staging.getFile()).size;
-    if (offset > file.bytes) {
-      // Corrupt staging (e.g. manifest changed): restart.
-      await root.removeEntry(`${file.asset}.part`);
-      offset = 0;
-    }
-    while (offset < file.bytes) {
-      const end = Math.min(offset + CHUNK_BYTES, file.bytes) - 1;
-      report("downloading", file.asset, offset);
-      const chunk = await fetchRange(file.asset, offset, end);
-      const writable = await staging.createWritable({ keepExistingData: true });
-      await writable.write({ type: "write", position: offset, data: chunk });
-      await writable.close();
-      offset += chunk.byteLength;
+    // Download straight into the final name, through ONE writable held open for the whole file.
+    //
+    // Both details are WebKit survival, not tidiness. `createWritable` is implemented with a swap
+    // file, and `keepExistingData: true` copies the *entire* existing file into it on open — so
+    // opening once per chunk meant ~80 full copies of a 1.3 GB artifact, which is what killed the
+    // tab on iOS during download. Staging to `.part` and promoting afterwards then copied the
+    // whole file a second time. One open, positional writes, no promotion.
+    //
+    // Resuming stays safe because completeness is decided by size AND digest, never by the file
+    // merely existing: a short file resumes from its own length, and a full-length file with the
+    // wrong bytes fails verification below and is deleted.
+    const handle = await root.getFileHandle(file.asset, { create: true });
+    let offset = (await handle.getFile()).size;
+    if (offset > file.bytes) offset = 0; // manifest changed under a stale file
+    if (offset < file.bytes) {
+      // A sync access handle (Workers only) writes without any swap file at all; the writable is
+      // the main-thread fallback. Preferring the former keeps this correct if the loader ever
+      // moves into the engine Worker.
+      const sync = handle.createSyncAccessHandle
+        ? await handle.createSyncAccessHandle().catch(() => null)
+        : null;
+      const writable = sync ? null : await handle.createWritable({ keepExistingData: true });
+      try {
+        while (offset < file.bytes) {
+          const end = Math.min(offset + CHUNK_BYTES, file.bytes) - 1;
+          report("downloading", file.asset, offset);
+          const chunk = await fetchRange(file.asset, offset, end);
+          if (sync) {
+            sync.write(chunk, { at: offset });
+          } else {
+            await writable.write({ type: "write", position: offset, data: chunk });
+          }
+          offset += chunk.byteLength;
+        }
+      } finally {
+        if (sync) {
+          sync.flush();
+          sync.close();
+        } else {
+          await writable.close();
+        }
+      }
     }
 
     report("verifying", file.asset, file.bytes);
-    const staged = await staging.getFile();
-    if ((await digestBlob(staged)) !== file.sha256) {
-      await root.removeEntry(`${file.asset}.part`);
+    const written = await handle.getFile();
+    if (written.size !== file.bytes || (await digestBlob(written)) !== file.sha256) {
+      await root.removeEntry(file.asset);
       throw new Error(`${file.asset}: digest mismatch after download; cleared for retry`);
     }
-    // Promote by copying slice-wise, for the same reason the digest streams: reading the staged
-    // file into one buffer to rewrite it would reintroduce the allocation this just removed.
-    const finalHandle = await root.getFileHandle(file.asset, { create: true });
-    const writable = await finalHandle.createWritable();
-    for (let position = 0; position < staged.size; position += CHUNK_BYTES) {
-      const end = Math.min(position + CHUNK_BYTES, staged.size);
-      await writable.write({
-        type: "write",
-        position,
-        data: await staged.slice(position, end).arrayBuffer(),
-      });
-    }
-    await writable.close();
-    await root.removeEntry(`${file.asset}.part`);
 
     out[file.key] = file.text
       ? new TextDecoder().decode(await (await (await root.getFileHandle(file.asset)).getFile()).arrayBuffer())
