@@ -1281,8 +1281,12 @@ pub fn synthesize(
                 )
                 .map_err(engine_error);
             drop(tee); // closes the channel; the worker drains the tail packet and exits
-            let pcm = worker.join().expect("codec worker must not panic")?;
-            Ok((result?, pcm))
+            let pcm = worker.join().expect("codec worker must not panic");
+            // The engine's error wins the report: when generation fails, the worker usually
+            // fails too (starved or fed a partial stream), and its complaint would bury the
+            // actual cause.
+            let result = result?;
+            Ok((result, pcm?))
         },
     )?;
 
@@ -1378,9 +1382,9 @@ mod tests {
     fn the_exponential_integral_matches_its_series_expansion() {
         // (x, E₁(x)) — the series branch, x < 1.
         for (x, expected) in [
-            (0.1_f32, 1.822_923_958_419_f32),
-            (0.5, 0.559_773_594_776),
-            (0.9, 0.260_183_939_326),
+            (0.1_f32, 1.822_923_9_f32),
+            (0.5, 0.559_773_6),
+            (0.9, 0.260_183_94),
         ] {
             let actual = exponential_integral_e1(x);
             let relative = ((actual - expected) / expected).abs();
