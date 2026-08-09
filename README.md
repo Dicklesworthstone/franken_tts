@@ -12,6 +12,10 @@
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_tts/main/install.sh | bash
 ```
 
+```powershell
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/franken_tts/main/install.ps1"))) -EasyMode
+```
+
 Sibling of [franken_ocr](https://github.com/Dicklesworthstone/franken_ocr) and franken_whisper: one fixed model revision, model-specific kernels, and no pretense of being a general speech framework.
 
 ---
