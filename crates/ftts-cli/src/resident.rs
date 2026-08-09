@@ -1,0 +1,652 @@
+//! Resident engine: a per-user background process that keeps the loaded model in memory
+//! so consecutive `ftts say` invocations skip the multi-second model load.
+//!
+//! Shape: `ftts say` connects to a loopback TCP daemon (spawned on demand from the same
+//! binary) and sends one synthesis request; the daemon holds the hydrated [`LoadedModel`]
+//! and [`TtsEngine`](ftts_core::TtsEngine) between requests and exits by itself after a
+//! configurable idle period (default ten minutes). Everything else — argument handling,
+//! voice resolution, robot events, output writing — stays in the client process, so the
+//! observable contract of `ftts say` is unchanged.
+//!
+//! Loopback TCP is the one transport that behaves identically on Linux, macOS, and
+//! Windows with only the standard library. Access control is the state file, not the
+//! port: the daemon binds an ephemeral 127.0.0.1 port and writes `{port, token, …}` to a
+//! file only the invoking user can read (0600 on Unix; the per-user profile directory's
+//! ACL on Windows), and every request must present that token. Texts are sensitive, so
+//! the daemon holds no history: requests are served from memory and dropped.
+//!
+//! Failure philosophy: the resident path may only ever make `say` faster, never break
+//! it. Every transport-level problem (no daemon, stale state file, version or artifact
+//! mismatch, malformed reply) falls back to the classic in-process load. Only a genuine
+//! synthesis error crosses the wire as an error, carrying its exit-code class.
+
+use std::fs;
+use std::hash::{BuildHasher, Hasher, RandomState};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime};
+
+use serde_json::{Value, json};
+
+use crate::error::{FttsError, FttsExitCode};
+use crate::synth::{LoadedModel, ModelBundle, SynthesizedAudio};
+use ftts_core::{NormalizationMode, NormalizationOptions, SynthesisRequest};
+
+/// Default idle unload period. Overridable through `FTTS_RESIDENT_IDLE_SECS`, mostly so
+/// tests can use sub-second daemons.
+const DEFAULT_IDLE: Duration = Duration::from_secs(600);
+
+/// How long the client is willing to wait for a reply. Synthesis of a long paragraph is
+/// minutes at f32-reference speed; ten minutes matches the engine's own budget spirit.
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long the client waits for a freshly spawned daemon to write its state file and
+/// accept. The daemon binds before loading the model, so this covers process start only.
+const SPAWN_WAIT: Duration = Duration::from_secs(10);
+
+const PROTOCOL: u64 = 1;
+
+/// One synthesis request as it crosses the wire. Everything the daemon needs to rebuild
+/// the exact [`SynthesisRequest`] the client would have run inline.
+pub struct WireRequest<'a> {
+    pub text: &'a str,
+    /// `NormalizeMode::as_str` form; parsed back with [`parse_normalize`].
+    pub normalize: &'a str,
+    pub trace: bool,
+    pub speaker: &'a [f32],
+    pub seed: u64,
+}
+
+fn parse_normalize(label: &str) -> Option<NormalizationMode> {
+    match label {
+        "verbatim" => Some(NormalizationMode::Verbatim),
+        "conservative" => Some(NormalizationMode::Conservative),
+        "locale-aware" => Some(NormalizationMode::LocaleAware),
+        _ => None,
+    }
+}
+
+fn idle_period() -> Duration {
+    std::env::var("FTTS_RESIDENT_IDLE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(DEFAULT_IDLE, Duration::from_secs)
+}
+
+/// Whether the resident path is enabled at all: on by default, disabled by the `say`
+/// flag or by `FTTS_NO_RESIDENT=1` for scripts that cannot pass flags.
+pub fn enabled(no_resident_flag: bool) -> bool {
+    if no_resident_flag {
+        return false;
+    }
+    !matches!(
+        std::env::var("FTTS_NO_RESIDENT").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+// ---------------------------------------------------------------------------- state file
+
+fn resident_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("FTTS_RESIDENT_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    #[allow(deprecated)] // un-deprecated in current Rust; the lint fires on older stables
+    std::env::home_dir().map(|home| home.join(".cache/franken_tts"))
+}
+
+/// A short stable digest of the bundle root, so distinct model directories get distinct
+/// daemons. `RandomState` keys vary per process, so this hand-rolls FNV-1a instead.
+fn root_digest(root: &Path) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in root.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn state_path(root: &Path) -> Option<PathBuf> {
+    resident_dir().map(|dir| dir.join(format!("resident-{:016x}.json", root_digest(root))))
+}
+
+struct DaemonState {
+    port: u16,
+    token: String,
+}
+
+fn read_state(root: &Path) -> Option<DaemonState> {
+    let path = state_path(root)?;
+    let raw = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    Some(DaemonState {
+        port: u16::try_from(value.get("port")?.as_u64()?).ok()?,
+        token: value.get("token")?.as_str()?.to_owned(),
+    })
+}
+
+fn write_state(root: &Path, port: u16, token: &str) -> std::io::Result<PathBuf> {
+    let path = state_path(root).ok_or_else(|| {
+        std::io::Error::other("no home directory and no FTTS_RESIDENT_DIR; cannot go resident")
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = json!({
+        "port": port,
+        "token": token,
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "bundle_root": root.to_string_lossy(),
+    })
+    .to_string();
+    // Write-then-rename so a client never reads a half-written file.
+    let staging = path.with_extension("json.tmp");
+    fs::write(&staging, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o600))?;
+    }
+    fs::rename(&staging, &path)?;
+    Ok(path)
+}
+
+/// 128 bits of `RandomState` entropy (seeded from the OS) as the session token. The real
+/// gate is the 0600 state file; the token binds a socket connection to that file.
+fn fresh_token() -> String {
+    let mut token = String::with_capacity(32);
+    for _ in 0..2 {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u128(std::time::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_nanos()));
+        hasher.write_u32(std::process::id());
+        token.push_str(&format!("{:016x}", hasher.finish()));
+    }
+    token
+}
+
+/// The artifact identity the daemon pins at load: a re-pull or re-convert must not be
+/// served from a stale resident model.
+fn artifact_stamp(bundle: &ModelBundle) -> (u64, u64) {
+    let path = bundle.canonical_main.as_deref().unwrap_or(&bundle.main);
+    let Ok(meta) = fs::metadata(path) else {
+        return (0, 0);
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    (mtime, meta.len())
+}
+
+// ------------------------------------------------------------------------------- client
+
+/// Try to synthesize through a resident daemon, spawning one if none is listening.
+///
+/// `Ok(None)` means "no resident path available, run inline" and is always safe; the
+/// daemon spawned in the background (if any) will serve the NEXT invocation. `Ok(Some)`
+/// is a completed synthesis; `Err` is a genuine synthesis error from the daemon, carrying
+/// the same exit-code class the inline path would have produced.
+pub fn try_synthesize(
+    bundle: &ModelBundle,
+    request: &WireRequest<'_>,
+) -> Result<Option<SynthesizedAudio>, FttsError> {
+    match connect(bundle) {
+        Some(stream) => roundtrip(stream, bundle, request),
+        None => Ok(None),
+    }
+}
+
+fn connect(bundle: &ModelBundle) -> Option<TcpStream> {
+    // A live daemon answers immediately.
+    if let Some(stream) = connect_once(bundle) {
+        return Some(stream);
+    }
+    // None listening: clear any stale state file and spawn one from this same binary.
+    if let Some(path) = state_path(&bundle.root)
+        && path.exists()
+    {
+        let _ = fs::remove_file(&path);
+    }
+    spawn_daemon(&bundle.root)?;
+    let deadline = Instant::now() + SPAWN_WAIT;
+    while Instant::now() < deadline {
+        if let Some(stream) = connect_once(bundle) {
+            return Some(stream);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+fn connect_once(bundle: &ModelBundle) -> Option<TcpStream> {
+    let state = read_state(&bundle.root)?;
+    let stream = TcpStream::connect_timeout(
+        &(Ipv4Addr::LOCALHOST, state.port).into(),
+        Duration::from_millis(500),
+    )
+    .ok()?;
+    stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT)).ok()?;
+    stream.set_nodelay(true).ok();
+    Some(stream)
+}
+
+fn spawn_daemon(root: &Path) -> Option<()> {
+    let exe = std::env::current_exe().ok()?;
+    let mut command = Command::new(exe);
+    command
+        .arg("resident-daemon")
+        .arg("--bundle-root")
+        .arg(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NO_WINDOW: outlive the console, show nothing.
+        command.creation_flags(0x0000_0008 | 0x0800_0000);
+    }
+    command.spawn().ok().map(|_child| ())
+}
+
+fn roundtrip(
+    mut stream: TcpStream,
+    bundle: &ModelBundle,
+    request: &WireRequest<'_>,
+) -> Result<Option<SynthesizedAudio>, FttsError> {
+    let state = match read_state(&bundle.root) {
+        Some(state) => state,
+        None => return Ok(None),
+    };
+    let header = json!({
+        "protocol": PROTOCOL,
+        "op": "synthesize",
+        "token": state.token,
+        "version": env!("CARGO_PKG_VERSION"),
+        "bundle_root": bundle.root.to_string_lossy(),
+        "text": request.text,
+        "normalize": request.normalize,
+        "trace": request.trace,
+        "speaker": request.speaker,
+        "seed": request.seed,
+    });
+    if stream
+        .write_all(format!("{header}\n").as_bytes())
+        .and_then(|()| stream.flush())
+        .is_err()
+    {
+        return Ok(None);
+    }
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+        return Ok(None);
+    }
+    let Ok(reply) = serde_json::from_str::<Value>(&line) else {
+        return Ok(None);
+    };
+    if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        let samples = reply
+            .get("samples")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0);
+        let mut bytes = vec![0u8; samples * 4];
+        if reader.read_exact(&mut bytes).is_err() {
+            return Ok(None);
+        }
+        let (chunks, _remainder) = bytes.as_chunks::<4>();
+        let pcm = chunks
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        return Ok(Some(SynthesizedAudio {
+            pcm,
+            frames: reply.get("frames").and_then(Value::as_u64).unwrap_or(0),
+            prepared_token_count: reply
+                .get("prepared_token_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize,
+            ttfa: reply
+                .get("ttfa_ms")
+                .and_then(Value::as_u64)
+                .map(Duration::from_millis),
+        }));
+    }
+    // A synthesis error is real and final; anything transport-shaped means fallback.
+    match reply.get("kind").and_then(Value::as_str) {
+        Some("synthesis") => {
+            let code = reply
+                .get("exit_code")
+                .and_then(Value::as_u64)
+                .unwrap_or(FttsExitCode::Generic.as_u8().into());
+            let message = reply
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("resident synthesis failed")
+                .to_owned();
+            Err(wire_error(code, message))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn wire_error(exit_code: u64, message: String) -> FttsError {
+    match exit_code {
+        3 => FttsError::ModelNotFound(message),
+        4 => FttsError::Input(message),
+        5 => FttsError::BudgetTimeout(message),
+        7 => FttsError::ArtifactFormat(message),
+        8 => FttsError::EnrollmentQualityRefusal(message),
+        _ => FttsError::Generic(message),
+    }
+}
+
+// ------------------------------------------------------------------------------- daemon
+
+/// Run the resident daemon until the idle period passes without a request.
+///
+/// Binds first and loads the model lazily on the first request, so the process is
+/// connectable within milliseconds of spawning and a daemon that never gets a request
+/// costs no model memory before its idle exit.
+pub fn run_daemon(bundle_root: &Path) -> Result<(), FttsError> {
+    let bundle = ModelBundle::resolve(bundle_root)?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| FttsError::Generic(format!("resident daemon cannot bind: {error}")))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| FttsError::Generic(format!("resident daemon has no address: {error}")))?
+        .port();
+    let token = fresh_token();
+    let state_file = write_state(&bundle.root, port, &token)
+        .map_err(|error| FttsError::Generic(format!("cannot write resident state: {error}")))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| FttsError::Generic(format!("resident daemon socket mode: {error}")))?;
+
+    let idle = idle_period();
+    let mut resident: Option<(LoadedModel, ftts_core::TtsEngine, (u64, u64))> = None;
+    let mut deadline = Instant::now() + idle;
+
+    loop {
+        match listener.accept() {
+            Ok((stream, _peer)) => {
+                // Serve strictly serially; a second client queues in the OS backlog.
+                handle_connection(stream, &bundle, &token, &mut resident);
+                deadline = Instant::now() + idle;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    let _ = fs::remove_file(&state_file);
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&state_file);
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn handle_connection(
+    stream: TcpStream,
+    bundle: &ModelBundle,
+    token: &str,
+    resident: &mut Option<(LoadedModel, ftts_core::TtsEngine, (u64, u64))>,
+) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_nodelay(true);
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return;
+    }
+    let Ok(request) = serde_json::from_str::<Value>(&line) else {
+        return;
+    };
+    let mut stream = reader.into_inner();
+
+    let refuse = |stream: &mut TcpStream, kind: &str, message: &str| {
+        let reply = json!({ "ok": false, "kind": kind, "message": message });
+        let _ = stream.write_all(format!("{reply}\n").as_bytes());
+    };
+
+    // Token first: an unauthenticated peer learns nothing but "no".
+    if request.get("token").and_then(Value::as_str) != Some(token) {
+        refuse(&mut stream, "auth", "bad token");
+        return;
+    }
+    if request.get("protocol").and_then(Value::as_u64) != Some(PROTOCOL)
+        || request.get("version").and_then(Value::as_str) != Some(env!("CARGO_PKG_VERSION"))
+    {
+        // A different binary version must not be served by this process; the client falls
+        // back inline and this daemon retires so the next spawn matches.
+        refuse(&mut stream, "version", "resident daemon version mismatch");
+        std::process::exit(0);
+    }
+
+    // A re-pulled or re-converted artifact invalidates the resident weights.
+    let stamp_now = artifact_stamp(bundle);
+    if let Some((_, _, loaded_stamp)) = resident.as_ref()
+        && *loaded_stamp != stamp_now
+    {
+        refuse(&mut stream, "stale", "model artifact changed since load");
+        std::process::exit(0);
+    }
+
+    let text = request.get("text").and_then(Value::as_str).unwrap_or("");
+    let normalize = request
+        .get("normalize")
+        .and_then(Value::as_str)
+        .and_then(parse_normalize);
+    let trace = request
+        .get("trace")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let seed = request.get("seed").and_then(Value::as_u64).unwrap_or(0);
+    let speaker: Vec<f32> = request
+        .get("speaker")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_f64())
+                .map(|v| v as f32)
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(mode) = normalize else {
+        refuse(&mut stream, "request", "unknown normalize mode");
+        return;
+    };
+    if text.is_empty() || speaker.is_empty() {
+        refuse(&mut stream, "request", "empty text or speaker");
+        return;
+    }
+
+    // Lazy hydration: the expensive part, done once and kept.
+    if resident.is_none() {
+        let loaded = match LoadedModel::load(bundle) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let reply = json!({
+                    "ok": false,
+                    "kind": "synthesis",
+                    "exit_code": error.exit_code().as_u8(),
+                    "message": error.to_string(),
+                });
+                let _ = stream.write_all(format!("{reply}\n").as_bytes());
+                return;
+            }
+        };
+        let engine = match ftts_core::TtsEngine::from_process_environment() {
+            Ok(engine) => engine,
+            Err(error) => {
+                refuse(
+                    &mut stream,
+                    "engine",
+                    &format!("engine start failed: {error}"),
+                );
+                return;
+            }
+        };
+        *resident = Some((loaded, engine, stamp_now));
+    }
+    let (loaded, engine, _) = resident.as_ref().expect("hydrated just above");
+
+    let synthesis_request = SynthesisRequest::new(text.to_owned())
+        .with_normalization_options(NormalizationOptions {
+            mode,
+            ..NormalizationOptions::default()
+        })
+        .with_normalization_trace(trace);
+    let cancellation = ftts_core::CancellationToken::new();
+    let observer = |_event: ftts_core::SynthesisEvent| {};
+    match crate::synth::synthesize(
+        loaded,
+        engine,
+        &synthesis_request,
+        &speaker,
+        seed,
+        &cancellation,
+        &observer,
+    ) {
+        Ok(audio) => {
+            let header = json!({
+                "ok": true,
+                "samples": audio.pcm.len(),
+                "frames": audio.frames,
+                "prepared_token_count": audio.prepared_token_count,
+                "ttfa_ms": audio.ttfa.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            });
+            if stream.write_all(format!("{header}\n").as_bytes()).is_err() {
+                return;
+            }
+            let mut bytes = Vec::with_capacity(audio.pcm.len() * 4);
+            for sample in &audio.pcm {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            let _ = stream.write_all(&bytes);
+            let _ = stream.flush();
+        }
+        Err(error) => {
+            let reply = json!({
+                "ok": false,
+                "kind": "synthesis",
+                "exit_code": error.exit_code().as_u8(),
+                "message": error.to_string(),
+            });
+            let _ = stream.write_all(format!("{reply}\n").as_bytes());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_labels_round_trip() {
+        for label in ["verbatim", "conservative", "locale-aware"] {
+            assert!(parse_normalize(label).is_some(), "{label}");
+        }
+        assert!(parse_normalize("aggressive").is_none());
+    }
+
+    #[test]
+    fn wire_errors_keep_their_exit_class() {
+        let cases = [
+            (3u64, FttsExitCode::ModelNotFound),
+            (4, FttsExitCode::Input),
+            (5, FttsExitCode::BudgetTimeout),
+            (7, FttsExitCode::ArtifactFormat),
+            (8, FttsExitCode::EnrollmentQualityRefusal),
+            (1, FttsExitCode::Generic),
+            (99, FttsExitCode::Generic),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(wire_error(code, String::new()).exit_code(), expected);
+        }
+    }
+
+    #[test]
+    fn root_digest_distinguishes_roots_and_is_stable() {
+        let a = root_digest(Path::new("/tmp/model-a"));
+        let b = root_digest(Path::new("/tmp/model-b"));
+        assert_ne!(a, b);
+        assert_eq!(a, root_digest(Path::new("/tmp/model-a")));
+    }
+
+    #[test]
+    fn tokens_are_distinct_and_hex() {
+        let one = fresh_token();
+        let two = fresh_token();
+        assert_eq!(one.len(), 32);
+        assert!(one.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(one, two, "two RandomState-seeded tokens collided");
+    }
+
+    #[test]
+    fn state_file_round_trips_and_respects_dir_override() {
+        let dir = std::env::temp_dir().join(format!("ftts-resident-test-{}", std::process::id()));
+        // SAFETY-free env mutation: tests in this module run single-threaded per process
+        // under `cargo test` only when isolated; use the dir directly instead of the env.
+        let root = Path::new("/tmp/some-model-root");
+        let path = dir.join(format!("resident-{:016x}.json", root_digest(root)));
+        fs::create_dir_all(&dir).unwrap();
+        let body =
+            json!({"port": 45123, "token": "abc123", "pid": 1, "version": "x", "bundle_root": "y"});
+        fs::write(&path, body.to_string()).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value.get("port").and_then(Value::as_u64), Some(45123));
+        assert_eq!(value.get("token").and_then(Value::as_str), Some("abc123"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The daemon protocol refuses a bad token and answers nothing else. Uses a raw
+    /// socket against `handle_connection` semantics through a real listener thread.
+    #[test]
+    fn daemon_refuses_bad_token() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let bundle = ModelBundle {
+                root: PathBuf::from("/nonexistent"),
+                main: PathBuf::from("/nonexistent/model.safetensors"),
+                canonical_main: None,
+                codec: PathBuf::from("/nonexistent/codec"),
+            };
+            let mut resident = None;
+            handle_connection(stream, &bundle, "right-token", &mut resident);
+        });
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let request = json!({
+            "protocol": PROTOCOL,
+            "op": "synthesize",
+            "token": "wrong-token",
+            "version": env!("CARGO_PKG_VERSION"),
+            "text": "hi",
+            "normalize": "verbatim",
+            "speaker": [0.0],
+            "seed": 0,
+        });
+        stream.write_all(format!("{request}\n").as_bytes()).unwrap();
+        let mut reply = String::new();
+        BufReader::new(&mut stream).read_line(&mut reply).unwrap();
+        let value: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(value.get("kind").and_then(Value::as_str), Some("auth"));
+        handle.join().unwrap();
+    }
+}
