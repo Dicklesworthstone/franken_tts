@@ -1,7 +1,7 @@
 // Playground orchestration: loader → worker-hosted engine → WebAudio playback.
 
-import { ensureModel, clearCache, cachedBytes } from "./loader.js";
-import { TOTAL_BYTES } from "./model-manifest.js";
+import { ensureModel, clearCache, cachedBytes } from "./loader.js?v=@SITEV@";
+import { TOTAL_BYTES } from "./model-manifest.js?v=@SITEV@";
 
 const ui = Object.fromEntries(
   [
@@ -37,7 +37,7 @@ const ui = Object.fromEntries(
   ].map((id) => [id.replace(/-([a-z])/g, (_, c) => c.toUpperCase()), document.getElementById(id)]),
 );
 
-const worker = new Worker("./engine-worker.js", { type: "module" });
+const worker = new Worker("./engine-worker.js?v=@SITEV@", { type: "module" });
 const pending = new Map();
 let requestCounter = 0;
 

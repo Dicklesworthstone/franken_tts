@@ -5,16 +5,16 @@
 // A file only ever reaches the engine after its full SHA-256 matches the pinned digest;
 // a mismatch deletes the staging file and starts that file over.
 
-import { MODEL_FILES, TOTAL_BYTES, CHUNK_BYTES } from "./model-manifest.js";
+import { MODEL_FILES, TOTAL_BYTES, CHUNK_BYTES } from "./model-manifest.js?v=@SITEV@";
+import { digestBlob } from "./sha256.js?v=@SITEV@";
 
 async function opfsRoot() {
   return navigator.storage.getDirectory();
 }
 
-async function sha256Hex(buffer) {
-  const digest = await crypto.subtle.digest("SHA-256", buffer);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
+// Verification reads the file in slices rather than through crypto.subtle, which needs one
+// contiguous buffer: hashing a 1.3 GB asset that way allocates 1.3 GB in the JS heap and is what
+// killed the tab on iOS before the download could finish. Peak memory here is one slice.
 
 async function stagingHandle(root, asset, create) {
   try {
@@ -61,9 +61,11 @@ export async function ensureModel(onProgress) {
       const blob = await done.getFile();
       if (blob.size === file.bytes) {
         report("verifying", file.asset);
-        const buffer = await blob.arrayBuffer();
-        if ((await sha256Hex(buffer)) === file.sha256) {
-          out[file.key] = buffer;
+        if ((await digestBlob(blob)) === file.sha256) {
+          // The engine takes transferable ArrayBuffers, so one contiguous allocation is still
+          // required at hand-off. What streaming removed is the *second* one: verification used
+          // to materialize the whole file too, so a 1.3 GB asset needed 2.6 GB before this.
+          out[file.key] = await blob.arrayBuffer();
           bytesDone += file.bytes;
           assetsDone += 1;
           report("cached", file.asset);
@@ -94,19 +96,27 @@ export async function ensureModel(onProgress) {
     }
 
     report("verifying", file.asset, file.bytes);
-    const buffer = await (await staging.getFile()).arrayBuffer();
-    if ((await sha256Hex(buffer)) !== file.sha256) {
+    const staged = await staging.getFile();
+    if ((await digestBlob(staged)) !== file.sha256) {
       await root.removeEntry(`${file.asset}.part`);
       throw new Error(`${file.asset}: digest mismatch after download; cleared for retry`);
     }
-    // Promote: verified bytes land under the final name; staging is removed.
+    // Promote by copying slice-wise, for the same reason the digest streams: reading the staged
+    // file into one buffer to rewrite it would reintroduce the allocation this just removed.
     const finalHandle = await root.getFileHandle(file.asset, { create: true });
     const writable = await finalHandle.createWritable();
-    await writable.write(buffer);
+    for (let position = 0; position < staged.size; position += CHUNK_BYTES) {
+      const end = Math.min(position + CHUNK_BYTES, staged.size);
+      await writable.write({
+        type: "write",
+        position,
+        data: await staged.slice(position, end).arrayBuffer(),
+      });
+    }
     await writable.close();
     await root.removeEntry(`${file.asset}.part`);
 
-    out[file.key] = buffer;
+    out[file.key] = await (await (await root.getFileHandle(file.asset)).getFile()).arrayBuffer();
     bytesDone += file.bytes;
     assetsDone += 1;
     report("done", file.asset);

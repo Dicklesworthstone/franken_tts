@@ -4,5 +4,29 @@
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
 
+# The page's own scripts and markup must never be served stale: Pages' default
+# max-age=14400 let a fresh index.html pair with a four-hour-old viz.js, which
+# renders every newer visualization container as an empty box. no-cache still
+# permits ETag revalidation, so repeat visits stay cheap. Pages splats must end
+# a pattern, so the site files are listed literally.
+/
+  Cache-Control: no-cache
+/index.html
+  Cache-Control: no-cache
+/app.js
+  Cache-Control: no-cache
+/viz.js
+  Cache-Control: no-cache
+/loader.js
+  Cache-Control: no-cache
+/engine-worker.js
+  Cache-Control: no-cache
+/model-manifest.js
+  Cache-Control: no-cache
+
 /pkg/*
   Cache-Control: no-cache
+
+# The vendored MP3 encoder is versioned by content and effectively immutable.
+/vendor/*
+  Cache-Control: public, max-age=604800

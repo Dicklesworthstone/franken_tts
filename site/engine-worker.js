@@ -2,7 +2,7 @@
 // at wasm speed, and none of that may block the UI thread. Protocol: postMessage
 // {type, ...}; replies mirror the request type with `ok` or `error`.
 
-import init, { WasmEngine, presets, preset_vector } from "./pkg/ftts_wasm.js";
+import init, { WasmEngine, presets, preset_vector } from "./pkg/ftts_wasm.js?v=@SITEV@";
 
 let engine = null;
 
@@ -14,7 +14,7 @@ self.onmessage = async ({ data }) => {
   try {
     switch (data.type) {
       case "init": {
-        await init({ module_or_path: "./pkg/ftts_wasm_bg.wasm" });
+        await init({ module_or_path: "./pkg/ftts_wasm_bg.wasm?v=@SITEV@" });
         reply("init", { ok: true, presets: JSON.parse(presets()) });
         break;
       }

@@ -102,7 +102,8 @@
     .pg-panel::before { left: -6px; top: -6px; }
     .pg-panel::after { right: -6px; bottom: -6px; }
     .pg-step-header { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.1rem; }
-    .pg-step-counter { font-family: "JetBrains Mono", monospace; font-size: 0.85rem; font-weight: 700; color: #64748b; }
+    .pg-step-counter { font-family: "JetBrains Mono", monospace; font-size: 0.85rem; font-weight: 700; color: #94a3b8; }
+    .pg-step-nav .pg-btn:disabled { cursor: default; }
     .pg-step-title { font-size: 1.35rem; font-weight: 900; color: #e2e8f0; }
     .pg-step-stat { font-family: "JetBrains Mono", monospace; font-size: 0.95rem; font-weight: 700; color: #34d399; margin-left: auto; }
     .pg-step-body { min-height: 10.5em; }
@@ -123,7 +124,7 @@
     .pg-step-nav { display: flex; align-items: center; gap: 1rem; margin-top: 0.4rem; }
     .pg-step-dots { display: flex; gap: 0.5rem; margin: 0 auto; }
     .pg-step-dot {
-      width: 10px; height: 10px; border-radius: 9999px; border: 1px solid rgba(52, 211, 153, 0.4);
+      width: 14px; height: 14px; border-radius: 9999px; border: 1px solid rgba(52, 211, 153, 0.4);
       background: transparent; cursor: pointer; padding: 0;
     }
     .pg-step-dot.active { background: #34d399; }
@@ -437,7 +438,7 @@
         <span class="pg-chip">12.5 frames per second</span>
         <span class="pg-chip">16 codes per frame</span>
         <span class="pg-chip">24 kHz output</span>
-        <span class="pg-chip">2.0 GB int8 artifact</span>
+        <span class="pg-chip">2.0 GB model download</span>
         <span class="pg-chip">no diffusion loop</span>
       </div>
     </div>
@@ -778,8 +779,24 @@
       }
     }, { threshold: 0.08 });
     for (const el of revealables) observer.observe(el);
+    // Instant jumps (scrollbar drags, the End key, anchor links on browsers that skip
+    // smooth scrolling) teleport past sections without ever intersecting them, which
+    // left every skipped block at opacity 0. Reveal anything at or above the viewport.
+    let revealSweepQueued = false;
+    const revealSweep = () => {
+      revealSweepQueued = false;
+      for (const el of revealables) {
+        if (!el.classList.contains("revealed") && el.getBoundingClientRect().top < window.innerHeight + 200) {
+          el.classList.add("revealed");
+          observer.unobserve(el);
+        }
+      }
+    };
+    window.addEventListener("scroll", () => {
+      if (!revealSweepQueued) { revealSweepQueued = true; requestAnimationFrame(revealSweep); }
+    }, { passive: true });
   </script>
-  <script type="module" src="./app.js"></script>
-  <script type="module" src="./viz.js"></script>
+  <script type="module" src="./app.js?v=@SITEV@"></script>
+  <script type="module" src="./viz.js?v=@SITEV@"></script>
 </body>
 </html>

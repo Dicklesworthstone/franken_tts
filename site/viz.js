@@ -12,6 +12,25 @@
 
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+// Build lazily on approach, but never rely on intersection alone: an instant scroll
+// jump can skip right past an element without a single intersection callback, so a
+// timeout fallback guarantees every visualization exists within a few seconds.
+function lazyBuild(el, build) {
+  let built = false;
+  const once = () => {
+    if (built) return;
+    built = true;
+    build();
+  };
+  new IntersectionObserver((entries, observer) => {
+    if (entries.some((e) => e.isIntersecting)) {
+      observer.disconnect();
+      once();
+    }
+  }, { rootMargin: "150px" }).observe(el);
+  setTimeout(once, 3000);
+}
+
 /* ---------------------------------------------------------------- frame anatomy */
 
 const anatomy = document.getElementById("anatomy-viz");
@@ -100,7 +119,7 @@ function buildAnatomy() {
     points: "", fill: "none", stroke: "#34d399", "stroke-width": 2, "stroke-linejoin": "round",
     opacity: 0,
   });
-  const samplesLabel = label(codecX + codecW / 2, codecY + 218, "", 12.5, "#94a3b8", "700");
+  const samplesLabel = label(codecX + codecW / 2, codecY + 218, "", 13.5, "#cbd5e1", "700");
 
   // ---- traffic counter
   const traffic = label(450, 348, "", 15, "#e2e8f0", "700");
@@ -179,14 +198,7 @@ function buildAnatomy() {
   }, { rootMargin: "200px" }).observe(anatomy);
 }
 
-if (anatomy) {
-  new IntersectionObserver((entries, observer) => {
-    if (entries.some((e) => e.isIntersecting)) {
-      observer.disconnect();
-      buildAnatomy();
-    }
-  }, { rootMargin: "150px" }).observe(anatomy);
-}
+if (anatomy) lazyBuild(anatomy, buildAnatomy);
 
 /* ---------------------------------------------------------------- receipts count-up */
 
@@ -315,14 +327,7 @@ function buildSeams() {
   }
 }
 
-if (seams) {
-  new IntersectionObserver((entries, observer) => {
-    if (entries.some((e) => e.isIntersecting)) {
-      observer.disconnect();
-      buildSeams();
-    }
-  }, { rootMargin: "150px" }).observe(seams);
-}
+if (seams) lazyBuild(seams, buildSeams);
 
 /* -------------------------------------------- RVQ coarse-to-fine slider */
 // Illustrative residual refinement: the target curve is a fixed sum of 16
@@ -422,14 +427,7 @@ function buildRvq() {
   update();
 }
 
-if (rvq) {
-  new IntersectionObserver((entries, observer) => {
-    if (entries.some((e) => e.isIntersecting)) {
-      observer.disconnect();
-      buildRvq();
-    }
-  }, { rootMargin: "150px" }).observe(rvq);
-}
+if (rvq) lazyBuild(rvq, buildRvq);
 
 /* ---------------------------------------------------- speed ladder bars */
 // Measured real-time factors, linear scale, with the 1x line marked. Bars
