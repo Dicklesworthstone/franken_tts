@@ -595,7 +595,11 @@ fn resample_to_speaker_rate(mono: Vec<f32>, from_rate: u32) -> Vec<f32> {
     if from_rate == SPEAKER_SAMPLE_RATE_HZ {
         return mono;
     }
-    const LOBES: f64 = 3.0;
+    // Six lobes, not three: with the cutoff at the output Nyquist a 3-lobe kernel's transition
+    // band sits inside the passband — measured -2.2 dB at 10 kHz for 48->24 kHz and only ~18 dB
+    // of alias rejection, right where the speaker encoder reads sibilance. Six lobes halves the
+    // transition width and pushes rejection past 40 dB for double the (still trivial) tap count.
+    const LOBES: f64 = 6.0;
     let ratio = f64::from(SPEAKER_SAMPLE_RATE_HZ) / f64::from(from_rate);
     let cutoff = ratio.min(1.0);
     let half = (LOBES / cutoff).ceil() as isize;
@@ -656,6 +660,15 @@ const NOISE_BLOCK_FRAMES: usize = 256;
 /// half so that ambiguous bins lean toward suppression rather than passing noise through.
 const SPEECH_ABSENCE_PRIOR: f32 = 0.6;
 
+/// Bias compensation for reading a low quantile of an exponentially distributed power as its
+/// mean: for `Exp(mu)` the q-quantile is `-mu ln(1-q)`, so the 10th percentile UNDERSTATES the
+/// mean 9.49x. Without this factor, pure-pause frames measure a posteriori SNRs of ~7-10 against
+/// the uncorrected floor, the presence estimator reads them as speech, and the gain never
+/// approaches the floor (measured: 2.5 dB of pause reduction instead of ~20). This is the same
+/// role IMCRA's B_min plays for its minimum statistic, recomputed for the quantile used here.
+#[allow(clippy::excessive_precision)]
+const NOISE_QUANTILE_BIAS: f32 = 9.491_221; // 1 / -ln(1 - NOISE_INIT_QUANTILE)
+
 /// Quantile of each bin's power, across the whole recording, taken as its initial noise floor.
 /// Speech is sparse in time, so a low quantile of a bin is the room rather than the voice.
 const NOISE_INIT_QUANTILE: f32 = 0.1;
@@ -708,7 +721,11 @@ const NOISE_INIT_QUANTILE: f32 = 0.1;
 ///
 /// Phase is preserved untouched; only per-bin magnitude is scaled.
 fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
-    if pcm.len() < DENOISE_FRAME {
+    // A floor estimated from a handful of frames is just the clip's own spectrum; below ~a
+    // quarter second there is nothing honest to subtract, so the clip passes through untouched
+    // (a single-frame "estimate" measured as flattening the whole clip toward the gain floor).
+    const DENOISE_MIN_FRAMES: usize = 32;
+    if pcm.len() < DENOISE_FRAME + (DENOISE_MIN_FRAMES - 1) * DENOISE_HOP {
         return pcm.to_vec();
     }
     let mut planner = rustfft::FftPlanner::<f32>::new();
@@ -740,27 +757,32 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
         powers.push((0..bins).map(|bin| scratch[bin].norm_sqr()).collect());
     }
 
-    // Noise floor per bin per block: a low quantile of that bin's power within the block.
+    // Noise floor per bin: the MINIMUM over blocks of a low within-block quantile.
     //
     // There is deliberately no feedback here. A recursive noise average has to be gated by a
     // speech-presence estimate, which in turn divides by the noise — and any error in that loop
     // compounds: one speech frame admitted into the floor raises it, which lowers the presence
     // estimate, which admits more speech. Both earlier revisions of this function died that way.
     // Reading the whole file at once removes the loop rather than tuning it.
+    //
+    // The min-over-blocks reduction is load-bearing: a bare per-block quantile assumes speech is
+    // sparse WITHIN every 1.4 s block, and a bin that stays voiced across one whole block (a held
+    // vowel, a low harmonic mid-sentence) would have its own signal adopted as that block's floor
+    // and be gated to the floor gain — measured at ~28 dB of deletion on a sustained tone. Taking
+    // the minimum across blocks only requires the bin to be quiet somewhere in the recording,
+    // which is what "noise floor" actually means.
     let blocks = powers.len().div_ceil(NOISE_BLOCK_FRAMES);
-    let mut noise_by_block: Vec<Vec<f32>> = Vec::with_capacity(blocks);
+    let mut noise = vec![f32::INFINITY; bins];
     let mut column: Vec<f32> = Vec::with_capacity(NOISE_BLOCK_FRAMES);
     for block in 0..blocks {
         let span = block * NOISE_BLOCK_FRAMES..((block + 1) * NOISE_BLOCK_FRAMES).min(powers.len());
-        let mut floor = vec![0.0_f32; bins];
-        for (bin, slot) in floor.iter_mut().enumerate() {
+        for (bin, slot) in noise.iter_mut().enumerate() {
             column.clear();
             column.extend(powers[span.clone()].iter().map(|frame| frame[bin]));
             column.sort_by(f32::total_cmp);
             let rank = ((column.len() as f32 - 1.0) * NOISE_INIT_QUANTILE).round() as usize;
-            *slot = column[rank].max(1e-12);
+            *slot = slot.min(column[rank].max(1e-12) * NOISE_QUANTILE_BIAS);
         }
-        noise_by_block.push(floor);
     }
 
     // Decision-directed state: last frame's gain and a posteriori SNR, per bin.
@@ -776,7 +798,6 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
             .collect();
         forward.process(&mut frame);
         let power = &powers[index];
-        let noise = &noise_by_block[index / NOISE_BLOCK_FRAMES];
 
         for bin in 0..bins {
             let gamma = (power[bin] / noise[bin]).min(1e6);
@@ -819,17 +840,23 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
         }
     }
 
+    // A sample under-covered by the window stack cannot be normalized honestly: near the edges
+    // out[n] is dominated by circular-convolution leakage from the rest of the frame, and
+    // dividing that by a window energy as small as ~2e-6 manufactures a spike (measured 1.5x
+    // input peak with a bare non-zero guard). Anything below a tenth of the steady-state COLA
+    // sum (1.5 for periodic Hann at hop N/4) keeps the original PCM instead.
+    const WOLA_MIN_WEIGHT: f32 = 0.15;
     for (sample, energy) in out.iter_mut().zip(weight.iter()) {
-        if *energy > 1e-6 {
+        if *energy > WOLA_MIN_WEIGHT {
             *sample /= *energy;
         }
     }
-    // The head and tail lie outside any full window and keep their original samples rather than
-    // a partially-normalized reconstruction.
+    // The head and tail lie outside any fully-stacked window and keep their original samples
+    // rather than a partially-normalized reconstruction.
     let covered =
         starts.first().copied().unwrap_or(0)..starts.last().map_or(0, |last| last + DENOISE_FRAME);
     for (index, sample) in out.iter_mut().enumerate() {
-        if !covered.contains(&index) || weight[index] <= 1e-6 {
+        if !covered.contains(&index) || weight[index] <= WOLA_MIN_WEIGHT {
             *sample = pcm[index];
         }
     }
@@ -1269,7 +1296,7 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            ((state >> 40) as f32 / 2048.0) - 0.5
+            ((state >> 40) as f32 / 16_777_216.0) - 0.5
         };
 
         // Half-second bursts of tone alternating with silence, all of it under hiss.
@@ -1284,7 +1311,10 @@ mod tests {
                 }
             })
             .collect();
-        let noisy: Vec<f32> = clean.iter().map(|s| s + noise() * 0.02).collect();
+        // Hiss at ~-26 dBFS against a 0.35 tone (~17 dB SNR): the audible-voice-memo regime
+        // this lever exists for. (An earlier revision's generator bug made the "hiss" 4000x
+        // louder than the signal, and the assertions below were calibrated against artifacts.)
+        let noisy: Vec<f32> = clean.iter().map(|s| s + noise() * 0.1).collect();
 
         let cleaned = denoise_reference(&noisy);
         assert_eq!(cleaned.len(), noisy.len(), "denoise must preserve length");
@@ -1329,7 +1359,7 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            ((state >> 40) as f32 / 2048.0) - 0.5
+            ((state >> 40) as f32 / 16_777_216.0) - 0.5
         };
         let burst = rate / 4;
         let noisy: Vec<f32> = (0..rate * 3)
