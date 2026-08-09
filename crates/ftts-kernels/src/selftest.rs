@@ -223,7 +223,10 @@ pub fn run_selftest() -> SelftestReport {
 }
 
 fn run_selftest_inner(fault_row: Option<&str>) -> SelftestReport {
-    let dispatched = KernelTier::from_int8(crate::int8::Int8Tier::dispatch());
+    // The receipt must name the route the process actually RUNS, which is the autotuned plan's
+    // decode pick — Int8Tier::dispatch() reports raw capability (SDOT whenever present) and can
+    // disagree with a measured or persisted plan that chose scalar.
+    let dispatched = KernelTier::from_int8(crate::int8::autotuned_plan().decode_gemv);
     let mut checks = Vec::new();
     for row in OVERFLOW_PROOF_ROWS.iter().copied() {
         // U8S8 envelope: the contract ceiling, on the checked scalar path.

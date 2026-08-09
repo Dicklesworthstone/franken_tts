@@ -60,6 +60,12 @@ pub fn quantize_row_q8(row: &[f32], output: &mut [i8]) -> f32 {
         return 1.0;
     }
     let scale = maximum / 127.0;
+    if scale == 0.0 {
+        // A subnormal maximum can flush the division to zero; value/scale would then be inf or
+        // NaN. A row this close to zero rounds to the zero row it effectively is.
+        output.fill(0);
+        return 1.0;
+    }
     for (&value, slot) in row.iter().zip(output.iter_mut()) {
         let rounded = (value / scale).clamp(-127.0, 127.0).round_ties_even();
         // The clamp bounds the conversion inside i8, and the symmetric contract additionally
@@ -362,7 +368,15 @@ fn plan_cache_key() -> String {
 }
 
 fn load_persisted_plan() -> Option<KernelPlanV0> {
-    let text = std::fs::read_to_string(plan_cache_path()?).ok()?;
+    // A valid plan file is three short lines; reading it bounded keeps a corrupt or hostile
+    // multi-gigabyte file at this user-writable path from ballooning the process.
+    let text = {
+        use std::io::Read as _;
+        let mut text = String::new();
+        let file = std::fs::File::open(plan_cache_path()?).ok()?;
+        file.take(512).read_to_string(&mut text).ok()?;
+        text
+    };
     let mut lines = text.lines();
     if lines.next()? != plan_cache_key() {
         return None;
@@ -408,10 +422,16 @@ fn fastest_tier(probes: &[(usize, usize, usize)]) -> Int8Tier {
     for &tier in &tiers {
         let mut total = 0.0_f64;
         for &(m, k, n) in probes {
-            let x_q: Vec<i8> = (0..m * k).map(|i| ((i * 37 + 11) % 255) as i8).collect();
+            // Shifted into [-127, 127]: `as i8` alone wraps 128..=254 to -128..=-2, and -128 is
+            // outside the pinned S8S8 contract this same file declares.
+            let x_q: Vec<i8> = (0..m * k)
+                .map(|i| (((i * 37 + 11) % 255) as i32 - 127) as i8)
+                .collect();
             let x_scales = vec![1.0_f32; m];
             let weight = QuantizedMatrix {
-                data: (0..n * k).map(|i| ((i * 29 + 5) % 255) as i8).collect(),
+                data: (0..n * k)
+                    .map(|i| (((i * 29 + 5) % 255) as i32 - 127) as i8)
+                    .collect(),
                 scales: vec![1.0_f32; n],
                 n,
                 k,

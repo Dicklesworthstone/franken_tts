@@ -230,9 +230,10 @@ fn run_attention_partition(job: &AttentionJob, worker: usize) {
         return;
     }
     // SAFETY: same three facts as the linear job (module docs) — the caller joins before its
-    // slices can die, reads are shared-immutable for the dispatch, and this worker writes only
-    // its own heads' disjoint `head_dim` spans of each output row.
-    let (queries, keys, values, mask, out) = unsafe {
+    // slices can die, and reads are shared-immutable for the dispatch. The output stays a raw
+    // pointer: every worker turning it into a whole-buffer `&mut` would put several live `&mut`
+    // on one allocation, which is undefined behaviour even though the writes are disjoint.
+    let (queries, keys, values, mask) = unsafe {
         (
             std::slice::from_raw_parts(
                 job.queries,
@@ -241,27 +242,28 @@ fn run_attention_partition(job: &AttentionJob, worker: usize) {
             std::slice::from_raw_parts(job.keys, job.key_positions * job.kv_heads * job.head_dim),
             std::slice::from_raw_parts(job.values, job.key_positions * job.kv_heads * job.head_dim),
             std::slice::from_raw_parts(job.mask, job.query_positions * job.key_positions),
-            std::slice::from_raw_parts_mut(
-                job.out,
-                job.query_positions * job.q_heads * job.head_dim,
-            ),
         )
     };
-    crate::f32ref::gqa_attention_head_range_with_arithmetic(
-        queries,
-        keys,
-        values,
-        mask,
-        job.query_positions,
-        job.key_positions,
-        job.q_heads,
-        job.kv_heads,
-        job.head_dim,
-        crate::f32ref::F32SoftmaxArithmetic::ReciprocalMultiply,
-        crate::f32ref::F32LinearAccumulation::Scalar,
-        start..end,
-        out,
-    );
+    // SAFETY: `out` is valid for the full [query_positions, q_heads, head_dim] span for this
+    // dispatch, and this worker's `start..end` head range is disjoint from every other
+    // partition's, so no two live borrows ever overlap.
+    unsafe {
+        crate::f32ref::gqa_attention_head_range_into(
+            queries,
+            keys,
+            values,
+            mask,
+            job.query_positions,
+            job.key_positions,
+            job.q_heads,
+            job.kv_heads,
+            job.head_dim,
+            crate::f32ref::F32SoftmaxArithmetic::ReciprocalMultiply,
+            crate::f32ref::F32LinearAccumulation::Scalar,
+            start..end,
+            job.out,
+        );
+    }
 }
 
 fn run_linear_partition(job: &LinearJob, worker: usize) {
@@ -272,15 +274,17 @@ fn run_linear_partition(job: &LinearJob, worker: usize) {
         return;
     }
     // SAFETY: module-docs facts 1-3 — pointers outlive the dispatch, reads are shared-immutable,
-    // and this worker writes only columns in its own [start, end) range.
-    let (x_q, x_scales, w_data, w_scales, bias, out) = unsafe {
+    // and this worker writes only columns in its own [start, end) range. The output deliberately
+    // stays a raw pointer: a whole-buffer `&mut` per worker would be several live `&mut` on one
+    // allocation, which is undefined behaviour regardless of the writes being disjoint, and
+    // `rustc` marks `&mut` `noalias` so the optimizer is entitled to act on it.
+    let (x_q, x_scales, w_data, w_scales, bias) = unsafe {
         (
             std::slice::from_raw_parts(job.x_q, job.m * job.k),
             std::slice::from_raw_parts(job.x_scales, job.m),
             std::slice::from_raw_parts(job.w_data, job.n * job.k),
             std::slice::from_raw_parts(job.w_scales, job.n),
             (!job.bias.is_null()).then(|| std::slice::from_raw_parts(job.bias, job.n)),
-            std::slice::from_raw_parts_mut(job.out, job.m * job.n),
         )
     };
     for col in start..end {
@@ -291,7 +295,11 @@ fn run_linear_partition(job: &LinearJob, worker: usize) {
             let x_row = &x_q[row * job.k..(row + 1) * job.k];
             let acc = dot_i32(x_row, w_row, job.tier);
             let value = acc as f32 * (x_scales[row] * w_scale);
-            out[row * job.n + col] = bias_term.map_or(value, |b| value + b);
+            // SAFETY: `col` is inside this partition's exclusive range and `row < m`, so this
+            // address is written by no other partition for the duration of the dispatch.
+            unsafe {
+                *job.out.add(row * job.n + col) = bias_term.map_or(value, |b| value + b);
+            }
         }
     }
 }

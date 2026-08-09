@@ -490,40 +490,11 @@ pub fn layer_step_with_rotary(
 
     state.push(&k, &v);
 
-    let scale = 1.0 / (config.head_dim as f32).sqrt();
-    let positions = state.len();
+    // One definition of the attention reduction, shared with the q8 and blocked schedules —
+    // a drifting private copy here would silently desynchronize the f32 authority from the
+    // routes whose bit-identity proofs cite it.
     let mut context = vec![0.0_f32; config.q_width()];
-    for head in 0..config.num_q_heads {
-        let kv_head = head / config.q_per_kv();
-        let query = &q[head * config.head_dim..(head + 1) * config.head_dim];
-        let keys = &state.keys[kv_head];
-        let values = &state.values[kv_head];
-
-        let mut scores = vec![0.0_f32; positions];
-        for (p, score) in scores.iter_mut().enumerate() {
-            let key = &keys[p * config.head_dim..(p + 1) * config.head_dim];
-            *score = query
-                .iter()
-                .zip(key.iter())
-                .map(|(a, b)| a * b)
-                .sum::<f32>()
-                * scale;
-        }
-        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut total = 0.0_f32;
-        for score in &mut scores {
-            *score = (*score - max).exp();
-            total += *score;
-        }
-        let out = &mut context[head * config.head_dim..(head + 1) * config.head_dim];
-        for (p, weight) in scores.iter().enumerate() {
-            let normalized = weight / total;
-            let value = &values[p * config.head_dim..(p + 1) * config.head_dim];
-            for (slot, v) in out.iter_mut().zip(value.iter()) {
-                *slot += normalized * v;
-            }
-        }
-    }
+    attend_one_position(config, &q, state, &mut context);
 
     let mut attn_out = vec![0.0_f32; config.hidden_size];
     matvec(weights.o_proj, &context, &mut attn_out);
@@ -994,6 +965,23 @@ fn score_head_refined(
 ) {
     let hidden = normed.len();
     let vocab = head_q8.n;
+    // The f32 route's matvec asserts its geometry; this route must too, or a truncated or
+    // mis-shaped head silently scores a partial vocabulary (tokens past `n` become unreachable
+    // with no panic — audio degrades with nothing to point at).
+    assert_eq!(
+        logits.len(),
+        vocab,
+        "refined head must cover the full vocabulary"
+    );
+    assert_eq!(
+        head_f32.len(),
+        vocab * hidden,
+        "refined f32 head must be [vocab, hidden]"
+    );
+    assert_eq!(
+        head_q8.k, hidden,
+        "refined q8 head reduction width mismatch"
+    );
     let mut coarse = vec![0.0_f32; vocab];
     quant_linear(mode, normed, head_q8, None, 1, &mut coarse);
 
@@ -1280,6 +1268,10 @@ pub fn decode_frame_greedy_speculative(
     };
     let accepted_prefix_len = verification.accepted_greedy_prefix_len(&drafted_codes);
     let (codes, repaired) = if accepted_prefix_len == RESIDUAL_DEPTHS {
+        // The sequential decoder's postcondition is "state caches exactly this frame's
+        // positions"; the verifier used its own per-layer caches, so on a full accept the
+        // caller's state would otherwise silently keep the PREVIOUS frame's entries.
+        state.reset();
         (drafted_codes, false)
     } else {
         let sequential = match route {

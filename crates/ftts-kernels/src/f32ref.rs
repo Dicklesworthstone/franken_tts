@@ -967,6 +967,61 @@ pub fn gqa_attention_head_range_with_arithmetic(
     q_head_range: std::ops::Range<usize>,
     out: &mut [f32],
 ) {
+    assert!(
+        out.len() >= query_positions * q_heads * head_dim,
+        "attention output must hold [query_positions, q_heads, head_dim]"
+    );
+    let out = out.as_mut_ptr();
+    // SAFETY: the pointer comes from the `&mut` slice above, whose length was just checked to
+    // cover every index the head range can reach, and it is not used after this call.
+    unsafe {
+        gqa_attention_head_range_into(
+            queries,
+            keys,
+            values,
+            additive_mask,
+            query_positions,
+            key_positions,
+            q_heads,
+            kv_heads,
+            head_dim,
+            softmax_arithmetic,
+            accumulation,
+            q_head_range,
+            out,
+        );
+    }
+}
+
+/// The head-range attention loop, writing through a raw output pointer.
+///
+/// This exists so parallel workers never have to materialize a `&mut [f32]` over the whole output
+/// while a sibling worker holds one too. Disjoint *writes* are not enough for that to be sound:
+/// two live `&mut` into the same allocation is undefined behaviour whatever the access pattern,
+/// and `rustc` marks `&mut` parameters `noalias`, so it is the optimizer — not just the model —
+/// that the overlap would mislead. Here each worker turns the pointer into a `&mut` covering
+/// exactly the one head span it is about to write, and those spans are disjoint by construction.
+///
+/// # Safety
+///
+/// `out` must be valid for writes across `[query_positions, q_heads, head_dim]`, and no other
+/// reference may alias the `head_dim` spans this call's `q_head_range` writes for its duration.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gqa_attention_head_range_into(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    additive_mask: &[f32],
+    query_positions: usize,
+    key_positions: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    softmax_arithmetic: F32SoftmaxArithmetic,
+    accumulation: F32LinearAccumulation,
+    q_head_range: std::ops::Range<usize>,
+    out: *mut f32,
+) {
     assert!(q_head_range.end <= q_heads, "head range exceeds q_heads");
     let scale = (head_dim as f32).sqrt().recip();
     let kv_group = q_heads / kv_heads;
@@ -987,7 +1042,10 @@ pub fn gqa_attention_head_range_with_arithmetic(
             }
             softmax_rows_with_arithmetic(&mut scores, 1, key_positions, softmax_arithmetic);
 
-            let out_base = query_base;
+            // SAFETY: `query_base` indexes [query_position, q_head, head_dim] inside the bounds
+            // the caller guaranteed, and this borrow spans only this head — the one span this
+            // partition owns, disjoint from every other partition's.
+            let head_out = unsafe { std::slice::from_raw_parts_mut(out.add(query_base), head_dim) };
             attention_weighted_sum(
                 &scores,
                 values,
@@ -995,7 +1053,7 @@ pub fn gqa_attention_head_range_with_arithmetic(
                 kv_heads,
                 head_dim,
                 accumulation,
-                &mut out[out_base..out_base + head_dim],
+                head_out,
             );
         }
     }
