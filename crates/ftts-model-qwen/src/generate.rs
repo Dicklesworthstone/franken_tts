@@ -200,20 +200,39 @@ impl<'a> QwenGenerator<'a> {
             std::env::var("FTTS_INT8").as_deref(),
             Ok("1" | "w8a8" | "w8a16")
         )
-        .then(|| Int8Route {
-            talker: config
-                .talker_weights
-                .layers
-                .iter()
-                .map(|layer| TalkerLayerQuant::quantize(&config.talker_config, layer))
-                .collect(),
-            micro: config
-                .microdecoder_weights
-                .layers
-                .iter()
-                .map(|layer| MicroLayerQuant::quantize(&config.microdecoder_config, layer))
-                .collect(),
-            mode: ftts_kernels::int8::quant_mode_from_environment(),
+        .then(|| {
+            // FTTS_INT8_SCOPE narrows the lever for sensitivity attribution: `talker` or
+            // `micro` quantizes one stack and leaves the other on the f32 reference. An empty
+            // table below means "this stack stays f32" at the branch sites.
+            let scope = std::env::var("FTTS_INT8_SCOPE").unwrap_or_default();
+            let (arm_talker, arm_micro) = match scope.as_str() {
+                "talker" => (true, false),
+                "micro" => (false, true),
+                _ => (true, true),
+            };
+            Int8Route {
+                talker: if arm_talker {
+                    config
+                        .talker_weights
+                        .layers
+                        .iter()
+                        .map(|layer| TalkerLayerQuant::quantize(&config.talker_config, layer))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                micro: if arm_micro {
+                    config
+                        .microdecoder_weights
+                        .layers
+                        .iter()
+                        .map(|layer| MicroLayerQuant::quantize(&config.microdecoder_config, layer))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                mode: ftts_kernels::int8::quant_mode_from_environment(),
+            }
         });
 
         Self {
@@ -316,7 +335,7 @@ impl<'a> QwenGenerator<'a> {
             cos: &cos,
             sin: &sin,
         };
-        match &self.int8 {
+        match self.int8.as_ref().filter(|route| !route.talker.is_empty()) {
             Some(route) => talker::forward_talker_q8(
                 &self.talker_config,
                 &self.talker_weights,
@@ -448,7 +467,7 @@ impl FrameGenerator for QwenGenerator<'_> {
                 .expect("RESIDUAL_VOCAB rows are well-formed microdecoder logits")
                 as usize,
         };
-        let residuals = match &self.int8 {
+        let residuals = match self.int8.as_ref().filter(|route| !route.micro.is_empty()) {
             Some(route) => microdecoder::decode_frame_with_selector_q8(
                 &self.microdecoder_config,
                 &self.microdecoder_rope,
@@ -503,7 +522,7 @@ impl FrameGenerator for QwenGenerator<'_> {
             cos: &cos,
             sin: &sin,
         };
-        match &self.int8 {
+        match self.int8.as_ref().filter(|route| !route.talker.is_empty()) {
             Some(route) => talker::forward_talker_q8(
                 &self.talker_config,
                 &self.talker_weights,

@@ -777,6 +777,10 @@ pub fn snake_beta_in_place(values: &mut [f32], frames: usize, alpha_log: &[f32],
     let channels = alpha_log.len();
     assert_eq!(beta_log.len(), channels, "SnakeBeta beta width");
     assert_eq!(values.len(), frames * channels, "SnakeBeta values shape");
+    if fast_snake_armed() {
+        snake_beta_fast(values, frames, alpha_log, beta_log);
+        return;
+    }
     for channel in 0..channels {
         let alpha = alpha_log[channel].exp();
         let beta = beta_log[channel].exp();
@@ -787,6 +791,31 @@ pub fn snake_beta_in_place(values: &mut [f32], frames: usize, alpha_log: &[f32],
             // The reference squares `sin` first (`pow(sin, 2)`) and then applies the reciprocal;
             // associating the scale into the first product lands on different bits.
             values[index] += scale * (sine * sine);
+        }
+    }
+}
+
+/// `FTTS_FAST_SNAKE=1` swaps SnakeBeta's system-libm `sin` for the crate's SLEEF-shaped 1-ulp
+/// polynomial and walks the data frame-major (unit stride) with precomputed per-channel
+/// constants. Default off: the scalar libm walk above is the parity reference. Read once.
+fn fast_snake_armed() -> bool {
+    static ARMED: OnceLock<bool> = OnceLock::new();
+    *ARMED.get_or_init(|| std::env::var("FTTS_FAST_SNAKE").as_deref() == Ok("1"))
+}
+
+fn snake_beta_fast(values: &mut [f32], frames: usize, alpha_log: &[f32], beta_log: &[f32]) {
+    let channels = alpha_log.len();
+    // Per-channel constants once, instead of once per (channel, frame) pair.
+    let alpha: Vec<f32> = alpha_log.iter().map(|log| log.exp()).collect();
+    let scale: Vec<f32> = beta_log
+        .iter()
+        .map(|log| (log.exp() + 1e-9).recip())
+        .collect();
+    for frame in 0..frames {
+        let row = &mut values[frame * channels..(frame + 1) * channels];
+        for ((value, &a), &s) in row.iter_mut().zip(&alpha).zip(&scale) {
+            let sine = ftts_kernels::sleef::sinf_u10(*value * a);
+            *value += s * (sine * sine);
         }
     }
 }
