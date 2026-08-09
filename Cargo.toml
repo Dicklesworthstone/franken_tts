@@ -6,6 +6,7 @@ members = [
     "crates/ftts-kernels",
     "crates/ftts-cli",
     "crates/ftts-conformance",
+    "crates/ftts-wasm",
 ]
 resolver = "3"
 

@@ -128,6 +128,18 @@ pub fn thread_bypassed() -> bool {
 /// serial (no threads spawned, no team). Values are clamped to the machine's available
 /// parallelism. Read once.
 pub fn armed() -> Option<&'static Team> {
+    // wasm32 has no std threads; the serial path is the only correct one there, and returning
+    // None before the OnceLock keeps the spawn code monomorphized out of wasm binaries.
+    #[cfg(target_arch = "wasm32")]
+    {
+        return None;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    armed_native()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn armed_native() -> Option<&'static Team> {
     static TEAM: OnceLock<Option<Team>> = OnceLock::new();
     TEAM.get_or_init(|| {
         let ceiling = std::thread::available_parallelism().map_or(1, usize::from);

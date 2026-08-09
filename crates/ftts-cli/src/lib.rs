@@ -2768,6 +2768,7 @@ mod tests {
                 output: None,
                 stream: None,
                 check: true,
+                robot: false,
             },
             &mut Cursor::new(Vec::<u8>::new()),
         )
@@ -2782,6 +2783,7 @@ mod tests {
                 output: None,
                 stream: None,
                 check: true,
+                robot: false,
             },
             &mut Cursor::new(Vec::<u8>::new()),
         )
@@ -2796,6 +2798,7 @@ mod tests {
                 output: None,
                 stream: None,
                 check: true,
+                robot: false,
             },
             &mut Cursor::new(expected.as_bytes()),
         )
@@ -3238,6 +3241,7 @@ mod tests {
             output: None,
             stream: None,
             check: true,
+            robot: false,
         };
         let mut stdin = Cursor::new(Vec::<u8>::new());
         let mut stdout = Vec::new();
