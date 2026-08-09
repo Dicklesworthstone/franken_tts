@@ -2085,8 +2085,8 @@ mod tests {
             let mut sequential = Vec::with_capacity(FRAME_POSITIONS * config.hidden_size);
             for position in 0..FRAME_POSITIONS {
                 let (cos, sin) = rope.row(position);
-                let row = &hidden
-                    [position * config.hidden_size..(position + 1) * config.hidden_size];
+                let row =
+                    &hidden[position * config.hidden_size..(position + 1) * config.hidden_size];
                 sequential.extend_from_slice(&layer_step_q8(
                     &config, &borrowed, &quant, cos, sin, row, &mut state, mode,
                 ));
