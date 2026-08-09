@@ -214,6 +214,116 @@ for (const el of document.querySelectorAll("[data-countup]")) {
   }, { threshold: 0.4 }).observe(el);
 }
 
+/* ------------------------------------------- pipeline seams comparison */
+// Two lanes: a classic multi-model TTS stack with three lossy seams, and the
+// codec-LM shape with one seam. Flow dots ride each lane; seams get amber ticks.
+
+const seams = document.getElementById("seams-viz");
+
+function buildSeams() {
+  const NS = "http://www.w3.org/2000/svg";
+  const W = 900, H = 330;
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "A classic TTS pipeline with three lossy seams compared to a codec language model with one seam");
+  svg.style.width = "100%";
+  svg.style.height = "auto";
+  seams.appendChild(svg);
+
+  const make = (tag, attrs, parent = svg) => {
+    const el = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    parent.appendChild(el);
+    return el;
+  };
+  const label = (x, y, text, size = 12.5, fill = "#94a3b8", weight = "600", anchor = "middle") => {
+    const t = make("text", {
+      x, y, fill, "font-size": size, "font-weight": weight,
+      "text-anchor": anchor, "font-family": "Inter, sans-serif",
+    });
+    t.textContent = text;
+    return t;
+  };
+
+  // A lane: boxes at given x centers, connectors between them, seam ticks on marked joints.
+  const lane = (y, boxes, tone) => {
+    const boxH = 46, centers = [];
+    const stroke = tone === "us" ? "rgba(52,211,153,0.45)" : "rgba(148,163,184,0.3)";
+    const fill = tone === "us" ? "rgba(16,185,129,0.08)" : "rgba(255,255,255,0.03)";
+    const textFill = tone === "us" ? "#a7f3d0" : "#cbd5e1";
+    for (const box of boxes) {
+      const w = box.w;
+      const x = box.x - w / 2;
+      make("rect", { x, y: y - boxH / 2, width: w, height: boxH, rx: 10, fill, stroke, "stroke-width": 1.2 });
+      label(box.x, y - (box.sub ? 4 : -5), box.name, 13.5, textFill, "700");
+      if (box.sub) label(box.x, y + 14, box.sub, 10.5, "#64748b");
+      centers.push({ x: box.x, w });
+    }
+    for (let i = 0; i < centers.length - 1; i += 1) {
+      const from = centers[i].x + centers[i].w / 2;
+      const to = centers[i + 1].x - centers[i + 1].w / 2;
+      make("line", { x1: from, y1: y, x2: to - 6, y2: y, stroke: "rgba(148,163,184,0.35)", "stroke-width": 1.5 });
+      make("path", { d: `M ${to - 6} ${y - 4} L ${to} ${y} L ${to - 6} ${y + 4}`, fill: "none", stroke: "rgba(148,163,184,0.5)", "stroke-width": 1.5 });
+      if (boxes[i].seamAfter) {
+        const mid = (from + to) / 2;
+        make("line", { x1: mid, y1: y - 14, x2: mid, y2: y + 14, stroke: "#fbbf24", "stroke-width": 2, opacity: 0.85 });
+        label(mid, y - 20, "seam", 10, "#fbbf24", "700");
+      }
+    }
+    return centers;
+  };
+
+  label(16, 30, "MOST TTS STACKS", 12, "#94a3b8", "900", "start");
+  label(16, 190, "A CODEC LANGUAGE MODEL", 12, "#34d399", "900", "start");
+  const y1 = 85, y2 = 245;
+  lane(y1, [
+    { x: 90, w: 120, name: "text" },
+    { x: 265, w: 160, name: "acoustic model", seamAfter: true },
+    { x: 470, w: 170, name: "mel spectrogram", sub: "a lossy picture of sound", seamAfter: true },
+    { x: 668, w: 130, name: "vocoder", seamAfter: true },
+    { x: 830, w: 100, name: "audio" },
+  ], "them");
+  label(450, 137, "three seams, three separately trained models, errors compound left to right", 11.5, "#64748b");
+  lane(y2, [
+    { x: 118, w: 176, name: "text + voice vector" },
+    { x: 388, w: 236, name: "one transformer", sub: "talker + microdecoder", seamAfter: true },
+    { x: 640, w: 156, name: "discrete codes", sub: "the codec's native input" },
+    { x: 830, w: 100, name: "audio" },
+  ], "us");
+  label(450, 297, "one seam, and the tokens crossing it are exactly what the codec was trained on", 11.5, "#64748b");
+
+  // Flow dots (skipped under reduced motion).
+  if (!reducedMotion) {
+    const dot1 = make("circle", { r: 4, cy: y1, fill: "#94a3b8" });
+    const dot2 = make("circle", { r: 4, cy: y2, fill: "#34d399" });
+    const X0 = 40, X1 = 860, PERIOD = 5200;
+    let raf = null;
+    const tick = (now) => {
+      const t = (now % PERIOD) / PERIOD;
+      dot1.setAttribute("cx", X0 + t * (X1 - X0));
+      dot2.setAttribute("cx", X0 + ((t + 0.5) % 1) * (X1 - X0));
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting && raf === null) raf = requestAnimationFrame(tick);
+        if (!e.isIntersecting && raf !== null) { cancelAnimationFrame(raf); raf = null; }
+      }
+    }, { rootMargin: "150px" }).observe(seams);
+  }
+}
+
+if (seams) {
+  new IntersectionObserver((entries, observer) => {
+    if (entries.some((e) => e.isIntersecting)) {
+      observer.disconnect();
+      buildSeams();
+    }
+  }, { rootMargin: "150px" }).observe(seams);
+}
+
 /* -------------------------------------------- RVQ coarse-to-fine slider */
 // Illustrative residual refinement: the target curve is a fixed sum of 16
 // components; the reconstruction uses only the first N. Dragging the slider is

@@ -90,6 +90,18 @@ const PRESETS = [
 let clonedVector = null;
 let clonedName = "my voice";
 let lastWavBlob = null;
+let lastWavUrl = null;
+
+// One object URL per synthesis, shared by the player and the download link; the
+// previous one is revoked so repeated syntheses don't leak blobs.
+function wavObjectUrl() {
+  return lastWavUrl;
+}
+function setWavBlob(blob) {
+  if (lastWavUrl) URL.revokeObjectURL(lastWavUrl);
+  lastWavBlob = blob;
+  lastWavUrl = URL.createObjectURL(blob);
+}
 
 for (const preset of PRESETS) {
   const option = document.createElement("option");
@@ -212,6 +224,31 @@ function updateCharCount() {
 }
 ui.text.addEventListener("input", updateCharCount);
 
+// One-click sample texts; short on purpose, since a wasm sentence costs minutes.
+const SAMPLE_TEXTS = [
+  "Now is the time for all good men to come to the aid of the agents.",
+  "When sunlight strikes raindrops in the air, they act as a prism and form a rainbow.",
+  "I am a voice model running in a browser tab, with no server behind me.",
+];
+{
+  const samplesWrap = document.getElementById("samples");
+  if (samplesWrap) {
+    for (const sample of SAMPLE_TEXTS) {
+      const chip = document.createElement("button");
+      chip.className = "pg-chip";
+      chip.style.cursor = "pointer";
+      chip.textContent = `${sample.slice(0, 34)}…`;
+      chip.title = sample;
+      chip.addEventListener("click", () => {
+        ui.text.value = sample;
+        updateCharCount();
+        ui.text.focus();
+      });
+      samplesWrap.appendChild(chip);
+    }
+  }
+}
+
 ui.dice.addEventListener("click", () => {
   ui.seed.value = String(Math.floor(Math.random() * 100000));
 });
@@ -231,6 +268,8 @@ function drawWaveform(samples) {
   const width = Math.max(300, Math.floor(canvas.clientWidth || canvas.parentElement.clientWidth));
   canvas.width = width * (window.devicePixelRatio || 1);
   canvas.height = 72 * (window.devicePixelRatio || 1);
+  canvas.style.width = `${width}px`;
+  canvas.style.height = "72px";
   const ctx = canvas.getContext("2d");
   ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
   ctx.clearRect(0, 0, width, 72);
@@ -334,9 +373,9 @@ ui.speak.addEventListener("click", async () => {
     }
     const { pcm, sampleRate, elapsedMs } = await call("synthesize", payload);
     const samples = new Float32Array(pcm);
-    lastWavBlob = pcmToWavBlob(samples, sampleRate);
+    setWavBlob(pcmToWavBlob(samples, sampleRate));
     drawWaveform(samples);
-    ui.player.src = URL.createObjectURL(lastWavBlob);
+    ui.player.src = wavObjectUrl();
     ui.player.classList.remove("hidden");
     ui.download.classList.remove("hidden");
     const audioSeconds = samples.length / sampleRate;
@@ -425,9 +464,13 @@ ui.record.addEventListener("click", async () => {
       updateVoiceCharacter();
       ui.recordStatus.textContent = `cloned: “${clonedName}” is selected.`;
     };
-    recorder = { stop: () => finish().catch(showError) };
-    // Backstop: the full script takes under a minute; stop automatically at 60 s.
-    setTimeout(() => recorder?.stop(), 60_000);
+    const session = { stop: () => finish().catch(showError) };
+    recorder = session;
+    // Backstop: the full script takes under a minute; stop automatically at 60 s. Guarded
+    // so a stale timer from an earlier recording can never stop a later one.
+    setTimeout(() => {
+      if (recorder === session) session.stop();
+    }, 60_000);
   } catch (error) {
     showError(error);
     ui.recordStatus.textContent = "";
@@ -439,7 +482,7 @@ ui.record.addEventListener("click", async () => {
 ui.download.addEventListener("click", () => {
   if (!lastWavBlob) return;
   const link = document.createElement("a");
-  link.href = URL.createObjectURL(lastWavBlob);
+  link.href = wavObjectUrl();
   link.download = "franken_tts.wav";
   link.click();
 });

@@ -27,15 +27,15 @@
       border: 1px solid rgba(255, 255, 255, 0.08);
       border-radius: 0.75rem;
       color: #e2e8f0;
-      padding: 0.65rem 0.8rem;
-      font-size: 0.95rem;
+      padding: 0.7rem 0.85rem;
+      font-size: 1rem;
     }
     .pg-input:focus { outline: 1px solid rgba(52, 211, 153, 0.5); }
     textarea.pg-input { min-height: 130px; resize: vertical; font-family: inherit; }
     .pg-btn {
       display: inline-flex; align-items: center; gap: 0.5rem;
-      border-radius: 9999px; padding: 0.55rem 1.1rem;
-      font-size: 0.72rem; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase;
+      border-radius: 9999px; padding: 0.6rem 1.2rem;
+      font-size: 0.78rem; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase;
       border: 1px solid rgba(255, 255, 255, 0.1); color: #94a3b8; cursor: pointer;
       background: rgba(255, 255, 255, 0.02); transition: color .2s, border-color .2s, background .2s;
     }
@@ -46,11 +46,11 @@
     .pg-btn.danger { border-color: rgba(248, 113, 113, 0.35); color: #f87171; }
     .pg-progress { height: 9px; border-radius: 6px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.07); overflow: hidden; }
     .pg-progress > div { height: 100%; width: 0%; background: linear-gradient(90deg, #059669, #34d399); transition: width .25s ease; }
-    .pg-status { color: #64748b; font-size: 0.78rem; font-family: "JetBrains Mono", monospace; }
-    .pg-note { color: #64748b; font-size: 0.82rem; line-height: 1.6; }
+    .pg-status { color: #94a3b8; font-size: 0.85rem; font-family: "JetBrains Mono", monospace; }
+    .pg-note { color: #94a3b8; font-size: 0.95rem; line-height: 1.65; }
     .pg-note strong { color: #cbd5e1; }
-    .pg-error { color: #f87171; font-size: 0.85rem; white-space: pre-wrap; }
-    .pg-label { font-size: 0.62rem; font-weight: 900; letter-spacing: 0.25em; text-transform: uppercase; color: #10b981; }
+    .pg-error { color: #f87171; font-size: 0.95rem; white-space: pre-wrap; }
+    .pg-label { font-size: 0.7rem; font-weight: 900; letter-spacing: 0.25em; text-transform: uppercase; color: #10b981; }
     .hidden { display: none !important; }
     audio { width: 100%; filter: invert(0.9) hue-rotate(150deg); }
     html { scroll-behavior: smooth; }
@@ -61,8 +61,8 @@
       display: inline-flex; align-items: center;
       border: 1px solid rgba(52, 211, 153, 0.2); border-radius: 9999px;
       background: rgba(16, 185, 129, 0.05); color: #94a3b8;
-      font-family: "JetBrains Mono", monospace; font-size: 0.68rem; font-weight: 700;
-      padding: 0.3rem 0.75rem; letter-spacing: 0.02em;
+      font-family: "JetBrains Mono", monospace; font-size: 0.75rem; font-weight: 700;
+      padding: 0.35rem 0.85rem; letter-spacing: 0.02em;
     }
     .pg-card { transition: transform .25s ease, border-color .25s ease, box-shadow .25s ease; }
     .pg-card:hover {
@@ -71,23 +71,23 @@
       box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35), 0 0 24px rgba(16, 185, 129, 0.06);
     }
     @media (prefers-reduced-motion: reduce) { .pg-card, .pg-card:hover { transform: none; transition: none; } }
-    .pg-voice-name { font-weight: 900; font-size: 1.05rem; color: #e2e8f0; margin-bottom: 0.25rem; }
+    .pg-voice-name { font-weight: 900; font-size: 1.2rem; color: #e2e8f0; margin-bottom: 0.25rem; }
     .pg-voice-char { min-height: 3.2em; }
     #wave-canvas {
       width: 100%; display: block; border-radius: 0.75rem;
       background: rgba(2, 10, 6, 0.7); border: 1px solid rgba(52, 211, 153, 0.15);
     }
-    #anatomy-viz { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-    #anatomy-viz svg { min-width: 720px; display: block; }
+    #anatomy-viz, #seams-viz { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    #anatomy-viz svg, #seams-viz svg { min-width: 720px; display: block; }
     .pg-rvq-controls { display: flex; align-items: center; gap: 1.2rem; flex-wrap: wrap; margin-top: 0.8rem; }
     .pg-slider { flex: 1; min-width: 200px; accent-color: #34d399; height: 1.4rem; cursor: pointer; }
     .pg-rvq-readout { display: flex; align-items: baseline; gap: 0.5rem; white-space: nowrap; }
     .pg-rvq-big { font-family: "JetBrains Mono", monospace; font-size: 1.8rem; font-weight: 900; color: #34d399; }
-    .pg-rvq-res { color: #64748b; font-size: 0.78rem; font-family: "JetBrains Mono", monospace; margin-left: 0.6rem; }
+    .pg-rvq-res { color: #94a3b8; font-size: 0.85rem; font-family: "JetBrains Mono", monospace; margin-left: 0.6rem; }
     .pg-lad-track { position: relative; height: 20px; border-radius: 10px; }
     .pg-lad-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: #fbbf24; opacity: 0.85; }
     .pg-lad-ref { background: linear-gradient(90deg, #334155, #64748b); }
-    .pg-lad-val { flex: 0 0 15rem; white-space: normal; }
+    .pg-lad-val { flex: 0 0 7rem; white-space: normal; }
     /* Anatomy / receipts cards */
     .pg-card { position: relative; overflow: hidden; }
     .pg-card-num {
@@ -103,8 +103,8 @@
     .pg-stat-dim { color: #64748b; font-size: 1.6rem; font-weight: 700; }
     .pg-bar-row { display: flex; align-items: center; gap: 0.9rem; margin-bottom: 0.7rem; }
     .pg-bar-name {
-      flex: 0 0 6.5rem; text-align: right; color: #94a3b8;
-      font-size: 0.75rem; font-weight: 700; font-family: "JetBrains Mono", monospace;
+      flex: 0 0 7.5rem; text-align: right; color: #94a3b8;
+      font-size: 0.85rem; font-weight: 700; font-family: "JetBrains Mono", monospace;
     }
     .pg-bar-track {
       flex: 1; height: 14px; border-radius: 7px;
@@ -113,7 +113,7 @@
     .pg-bar-fill { height: 100%; background: linear-gradient(90deg, #059669, #34d399); }
     .pg-bar-fill-ref { background: linear-gradient(90deg, #334155, #64748b); }
     .pg-bar-val {
-      flex: 0 0 5rem; color: #cbd5e1; font-size: 0.78rem;
+      flex: 0 0 5.5rem; color: #cbd5e1; font-size: 0.85rem;
       font-family: "JetBrains Mono", monospace; font-weight: 700;
     }
   </style>
@@ -287,6 +287,7 @@
           <div class="pg-label">03 · The Utterance</div>
           <textarea id="text" class="pg-input" maxlength="600">The rainbow is a division of white light into many beautiful colors. Now, spoken entirely inside your browser.</textarea>
           <div class="pg-status" id="char-count" style="text-align: right; margin-top: -0.5rem"></div>
+          <div id="samples" class="flex flex-wrap gap-2" aria-label="Sample texts"></div>
           <div class="flex flex-wrap items-center gap-3">
             <label class="pg-status" for="seed">seed</label>
             <input id="seed" type="text" value="0" size="6" class="pg-input" style="max-width: 90px" />
@@ -387,6 +388,47 @@
       </p>
     </div>
 
+    <div class="rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
+      <div class="pg-label mb-2">Fewer seams, better sound</div>
+      <p class="pg-note mb-4">
+        A classic TTS stack is several separately trained models handing fragile intermediate
+        formats to each other, and every seam loses information. A codec language model has one
+        seam, and the tokens that cross it are exactly what the codec was trained to decode.
+      </p>
+      <div id="seams-viz"></div>
+    </div>
+
+    <div class="grid md:grid-cols-2 lg:grid-cols-4 gap-5 mb-10 reveal">
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-card-num">1</div>
+        <div class="pg-label mb-3">Tokenize</div>
+        <p class="pg-note">Your text runs through Qwen's BPE tokenizer and is assembled into a
+        prompt with the 1,024-float voice vector and per-token rotary positions. The voice is
+        conditioning, not a filter applied afterwards.</p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-card-num">2</div>
+        <div class="pg-label mb-3">Predict</div>
+        <p class="pg-note">For each 80 ms frame the 28-layer talker predicts one code out of
+        2,048: the semantic backbone of that slice of speech. What word, what pitch region, what
+        energy.</p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-card-num">3</div>
+        <div class="pg-label mb-3">Refine</div>
+        <p class="pg-note">The microdecoder fills in codes 1 through 15, each depth conditioned
+        on all the previous ones. This is where breathiness, sibilance, and the fine grain of a
+        specific voice live.</p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-card-num">4</div>
+        <div class="pg-label mb-3">Decode</div>
+        <p class="pg-note">A causal convolutional codec upsamples the 16 codes by 8·5·4·3 into
+        1,920 PCM samples. Causal means it can stream: audio starts before the sentence
+        finishes generating.</p>
+      </div>
+    </div>
+
     <div class="grid lg:grid-cols-2 gap-5 mb-10 reveal">
       <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
         <div class="pg-label mb-3">Writing sound like text</div>
@@ -476,7 +518,7 @@
     </div>
 
     <div class="rounded-2xl border border-emerald-500/20 bg-black/40 p-6 md:p-8 mt-10 reveal">
-      <div class="pg-label mb-3">Then the browser took the GPU away twice</div>
+      <div class="pg-label mb-3">Then it had to fit in a browser</div>
       <p class="pg-note mb-5">
         The wasm build gets one thread, no memory mapping, no BLAS, and a hard 4 GB ceiling.
         Three measured changes made the same engine run there at all: a compact text-embedding
@@ -534,6 +576,27 @@
         <div class="pg-label mb-2">Real time, natively</div>
         <p class="pg-note">The int8 route measures 1.4–1.6× real time on a Mac Mini M4 Pro with
         first audio about 450 ms after synthesis starts, and warm model load at ~3.7 s.</p>
+      </div>
+    </div>
+
+    <div class="grid lg:grid-cols-3 gap-5 mt-8 reveal">
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">The oracle</div>
+        <p class="pg-note">Per-stage activations captured from the pinned PyTorch reference are
+        the ground truth. Tolerances are derived from the oracle's own run-to-run noise floor,
+        never invented.</p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">The ladder</div>
+        <p class="pg-note">Verification climbs in order: tokenizer ids exact, then per-layer
+        activations, then argmax decisions, then whole utterances. A kernel lands only after its
+        rung is green.</p>
+      </div>
+      <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
+        <div class="pg-label mb-3">The escape hatches</div>
+        <p class="pg-note">Every optimization sits behind a kill switch, and the full-precision
+        f32 route stays in the tree. A faster kernel that drifts the output gets reverted, not
+        shipped.</p>
       </div>
     </div>
 
