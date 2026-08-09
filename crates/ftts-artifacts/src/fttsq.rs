@@ -872,7 +872,9 @@ impl FttsqReader {
         }
 
         let format_version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        if format_version > FORMAT_VERSION {
+        // Version 0 was never issued: accepting it would silently read an unversioned or
+        // zero-filled header as v1. Valid artifacts carry 1..=FORMAT_VERSION.
+        if format_version == 0 || format_version > FORMAT_VERSION {
             return Err(FttsqError::UnsupportedVersion {
                 found: format_version,
                 supported: FORMAT_VERSION,

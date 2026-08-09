@@ -1813,7 +1813,9 @@ impl ModelManifest {
     }
 
     fn total_bytes(&self) -> u64 {
-        self.files.iter().map(|file| file.bytes).sum()
+        self.files
+            .iter()
+            .fold(0, |sum, file| sum.saturating_add(file.bytes))
     }
 }
 
@@ -1929,9 +1931,32 @@ fn pull_decision(dest: &Path, file: &ModelManifestFile, force: bool) -> PullDeci
 /// Shelling out is deliberate: inference never touches the network, so the binary links no HTTP
 /// stack. Only `pull` needs one, and `curl` is the same system-tool seam the audio encoders and
 /// decoders already use.
-fn download_with_curl(url: &str, staging: &Path) -> Result<(), FttsError> {
+fn download_with_curl(url: &str, staging: &Path, pinned_bytes: u64) -> Result<(), FttsError> {
+    // Hardening beyond the happy path: HTTPS only through every redirect (a release URL should
+    // never bounce through http), a connect timeout and a stall detector instead of hanging a
+    // silent `-sS` transfer forever, and the pinned size as a hard transfer cap so a
+    // misbehaving endpoint cannot fill the disk before the post-download size check runs.
     let outcome = std::process::Command::new("curl")
-        .args(["-L", "--fail", "--retry", "3", "-sS", "-o"])
+        .args([
+            "-L",
+            "--fail",
+            "--retry",
+            "3",
+            "-sS",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--connect-timeout",
+            "30",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "60",
+            "--max-filesize",
+        ])
+        .arg(pinned_bytes.to_string())
+        .arg("-o")
         .arg(staging)
         .arg(url)
         .status();
@@ -2007,13 +2032,44 @@ fn pull_one_file(
         })?;
     }
     let staging = pull_staging_path(dest);
+    // The staging name is predictable, and `curl -o` opens it with a plain create-or-truncate
+    // that follows symlinks. A pre-planted entry (stale crash debris, or a symlink in a shared
+    // model directory) must be cleared first, checked via symlink_metadata so a link is seen as
+    // itself rather than its target.
+    match fs::symlink_metadata(&staging) {
+        Ok(_) => fs::remove_file(&staging).map_err(|error| {
+            FttsError::Generic(format!(
+                "cannot clear stale staging file {}: {error}",
+                staging.display()
+            ))
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(FttsError::Generic(format!(
+                "cannot stat staging path {}: {error}",
+                staging.display()
+            )));
+        }
+    }
     let url = manifest.download_url(file);
-    let outcome =
-        download_with_curl(&url, &staging).and_then(|()| verify_pulled_file(&staging, file));
+    let outcome = download_with_curl(&url, &staging, file.bytes)
+        .and_then(|()| verify_pulled_file(&staging, file));
     if let Err(error) = outcome {
         let _ = fs::remove_file(&staging);
         return Err(error);
     }
+    // Durability before publish: rename orders the directory entry, not the data. Without the
+    // fsync a crash can leave a truncated file at the verified name — and the tokenizer/codec
+    // sidecars, unlike the .fttsq, carry no load-time digest to catch that. Same contract as
+    // FttsqWriter::write_to_path.
+    fs::File::open(&staging)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            FttsError::Generic(format!(
+                "cannot fsync downloaded {}: {error}",
+                staging.display()
+            ))
+        })?;
     fs::rename(&staging, dest).map_err(|error| {
         FttsError::Generic(format!(
             "downloaded {} verified but could not be published to {}: {error}",
