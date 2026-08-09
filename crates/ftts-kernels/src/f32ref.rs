@@ -251,7 +251,23 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
                 F32LinearAccumulation::Accelerate
                 | F32LinearAccumulation::AccelerateRowInvariant
                 | F32LinearAccumulation::AccelerateBiasSeeded
-                | F32LinearAccumulation::AccelerateBiasSeededRowInvariant => 1,
+                | F32LinearAccumulation::AccelerateBiasSeededRowInvariant => {
+                    // A denied BLAS request degrades to lanes = 1 (the scalar order) on native
+                    // targets — pinned behavior for Linux parity. On wasm32 that scalar f32
+                    // reduction chain cannot be autovectorized (f32 addition is not
+                    // reassociable) and profiled as 71% of ALL synthesis time; eight partial
+                    // chains give the compiler independent accumulators. Both orders live in
+                    // the same "correct, not exact" contract the denied-BLAS path already
+                    // declares.
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        8
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        1
+                    }
+                }
                 F32LinearAccumulation::Scalar | F32LinearAccumulation::WidenedF64 => {
                     unreachable!("scalar and widened orders are handled above")
                 }

@@ -704,6 +704,13 @@ fn codec_int8_route() -> Option<&'static CodecInt8Route> {
                 Ok("1" | "all") => (true, true),
                 Ok("transformer") => (true, false),
                 Ok("convnext") => (false, true),
+                // wasm32 has no BLAS: its f32 dense fall-through is the slow path, so the
+                // spectral-gate-passed convnext int8 arm (0.65 dB LSD, transparent) arms by
+                // default there — integer accumulation is reassociable and autovectorizes.
+                // Native keeps the no-int8 default the codec_time A/B chose.
+                #[cfg(target_arch = "wasm32")]
+                _ => (false, true),
+                #[cfg(not(target_arch = "wasm32"))]
                 _ => return None,
             };
             Some(CodecInt8Route {

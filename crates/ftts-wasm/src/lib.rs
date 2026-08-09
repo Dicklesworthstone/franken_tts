@@ -278,9 +278,14 @@ impl WasmEngine {
             Some(&self.artifact),
         );
 
+        let clock = js_sys::Date::now;
+        let prefill_started = clock();
         generator
             .begin_utterance(&prepared)
             .map_err(|error| js_error("prefill failed", error))?;
+        let prefill_ms = clock() - prefill_started;
+        let mut frames_ms = 0.0f64;
+        let mut codec_ms = 0.0f64;
 
         // The CLI's text-proportional EOS backstop, so a runaway prompt cannot spin forever.
         let cap = if max_frames == 0 {
@@ -303,9 +308,11 @@ impl WasmEngine {
             if *frames == 0 {
                 return Ok(());
             }
+            let codec_started = js_sys::Date::now();
             self.codec
                 .stream_push(state, packet, *frames, &mut packet_pcm)
                 .map_err(|error| js_error("codec decode failed", error))?;
+            codec_ms += js_sys::Date::now() - codec_started;
             pcm.extend_from_slice(&packet_pcm);
             packet.clear();
             *frames = 0;
@@ -313,10 +320,12 @@ impl WasmEngine {
         };
 
         for _ in 0..cap {
-            match generator
+            let frame_started = clock();
+            let step = generator
                 .next_frame()
-                .map_err(|error| js_error("generation failed", error))?
-            {
+                .map_err(|error| js_error("generation failed", error))?;
+            frames_ms += clock() - frame_started;
+            match step {
                 Some(frame) => {
                     for code in &frame.codes {
                         packet.push(i32::try_from(*code).map_err(|error| {
@@ -332,6 +341,11 @@ impl WasmEngine {
             }
         }
         flush(&mut state, &mut packet, &mut packet_frames, &mut pcm)?;
+        // Stage split to the console: the number that says WHERE wasm time goes.
+        console_error(&format!(
+            "ftts-wasm timing: prefill {prefill_ms:.0}ms, talker+micro {frames_ms:.0}ms, codec {codec_ms:.0}ms, {} samples",
+            pcm.len()
+        ));
         Ok(pcm)
     }
 

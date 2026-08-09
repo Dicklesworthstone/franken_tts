@@ -5,4 +5,4 @@
   Cross-Origin-Embedder-Policy: require-corp
 
 /pkg/*
-  Cache-Control: public, max-age=3600
+  Cache-Control: no-cache

@@ -101,7 +101,7 @@
       IT SPEAKS · ENTIRELY IN YOUR BROWSER
       <span class="h-px w-8 bg-emerald-500/40"></span>
     </div>
-    <h1 class="text-5xl md:text-7xl font-black tracking-tight mb-6">
+    <h1 class="font-black tracking-tight mb-6" style="font-size: clamp(3.6rem, 9vw, 7.5rem); line-height: 1.02">
       The Monster <span class="text-emerald-400">Voice</span> Engine.
     </h1>
     <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg mb-8">
@@ -191,8 +191,13 @@
               <span id="voice-character" class="pg-status"></span>
             </div>
             <div class="flex flex-wrap items-center gap-3 mb-2">
-              <button id="record" class="pg-btn">🎙 Record 10 s &amp; clone my voice</button>
+              <input id="clone-name" type="text" class="pg-input" style="max-width: 160px" placeholder="name your voice" maxlength="40" />
+              <button id="record" class="pg-btn">🎙 Record &amp; clone my voice</button>
               <span id="record-status" class="pg-status"></span>
+            </div>
+            <div id="script-wrap" class="hidden mb-2 rounded-xl border border-emerald-500/20 bg-black/50 p-4">
+              <div class="pg-label mb-2">Read this aloud (the standard enrollment script)</div>
+              <p id="script" class="pg-note" style="white-space: pre-wrap; color: #cbd5e1"></p>
             </div>
             <p class="pg-note">
               Cloning runs the speaker encoder locally on your recording; the audio is discarded
@@ -215,14 +220,15 @@
           <audio id="player" controls class="hidden"></audio>
           <div class="flex flex-wrap gap-2">
             <button id="download" class="pg-btn hidden">Download WAV</button>
-            <button id="share" class="pg-btn hidden">Share</button>
+            <button id="share" class="pg-btn hidden">Copy share link</button>
           </div>
           <p id="error" class="pg-error hidden"></p>
           <p class="pg-note">
-            Speed honesty: this build is single-threaded WASM at roughly
-            <strong>0.2–0.3× real time</strong> — a five-second line takes twenty-odd seconds.
-            The native CLI runs faster than real time; browser threads are the roadmap.
-            Desktop browsers only: the engine needs several GB of memory.
+            Speed honesty, measured: this single-threaded WASM build synthesizes at roughly
+            <strong>0.03–0.05× real time</strong> — a full sentence takes a couple of minutes,
+            with live progress. The native CLI runs the same engine faster than real time;
+            browser threads and int8 conv kernels are the tracked path. Desktop browsers only:
+            the engine needs several GB of memory.
           </p>
         </div>
       </div>

@@ -327,6 +327,17 @@ pub struct KernelPlanV0 {
 pub fn autotuned_plan() -> KernelPlanV0 {
     static PLAN: OnceLock<KernelPlanV0> = OnceLock::new();
     *PLAN.get_or_init(|| {
+        // wasm32 has no monotonic clock in std (`Instant::now` panics as `unreachable`, which
+        // is exactly how the browser playground's first synthesize died) and only the scalar
+        // tier exists there anyway — the measured-fastest plan IS scalar, no measurement needed.
+        #[cfg(target_arch = "wasm32")]
+        {
+            return KernelPlanV0 {
+                decode_gemv: Int8Tier::Scalar,
+                batch_gemm: Int8Tier::Scalar,
+            };
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         if std::env::var("FTTS_INT8_TIER").is_ok() {
             let forced = Int8Tier::dispatch();
             return KernelPlanV0 {

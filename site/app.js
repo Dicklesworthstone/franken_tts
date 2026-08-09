@@ -15,6 +15,9 @@ const ui = Object.fromEntries(
     "voice-character",
     "record",
     "record-status",
+    "script",
+    "script-wrap",
+    "clone-name",
     "text",
     "seed",
     "speak",
@@ -69,6 +72,7 @@ const gigabytes = (bytes) => (bytes / 1024 ** 3).toFixed(2);
 
 let presetList = [];
 let clonedVector = null;
+let clonedName = "my voice";
 let lastWavBlob = null;
 
 async function boot() {
@@ -85,6 +89,7 @@ async function boot() {
   cloned.textContent = "my cloned voice";
   cloned.disabled = true;
   ui.voice.appendChild(cloned);
+  applySharedFragment();
   updateVoiceCharacter();
 
   // Persistence contract: the model downloads ONCE and stays in this browser's storage until
@@ -132,7 +137,7 @@ async function loadFromStore() {
 function updateVoiceCharacter() {
   const preset = presetList.find((p) => p.name === ui.voice.value);
   ui.voiceCharacter.textContent =
-    ui.voice.value === "__cloned__" ? "your locally cloned voice" : (preset?.character ?? "");
+    ui.voice.value === "__cloned__" ? `“${clonedName}” — locally cloned` : (preset?.character ?? "");
 }
 ui.voice.addEventListener("change", updateVoiceCharacter);
 
@@ -203,7 +208,7 @@ ui.speak.addEventListener("click", async () => {
   const startedAt = performance.now();
   const ticker = setInterval(() => {
     const seconds = ((performance.now() - startedAt) / 1000).toFixed(0);
-    ui.synthStatus.textContent = `synthesizing… ${seconds}s (single-thread wasm is ~0.2–0.3× real time)`;
+    ui.synthStatus.textContent = `synthesizing… ${seconds}s (single-thread wasm runs ~0.03–0.05× real time — a sentence takes a couple of minutes)`;
     ui.synthBar.style.width = `${Math.min(90, 10 + seconds * 2)}%`;
   }, 500);
   try {
@@ -235,9 +240,28 @@ ui.speak.addEventListener("click", async () => {
   }
 });
 
+// The enrollment script, verbatim from the README: the Rainbow Passage + "Please call
+// Stella" — phonetically rich, and a known transcript is future-proof for ICL cloning.
+const ENROLLMENT_SCRIPT =
+  "Please call Stella. Ask her to bring these things with her from the store: six spoons " +
+  "of fresh snow peas, five thick slabs of blue cheese, and maybe a snack for her brother " +
+  "Bob. We also need a small plastic snake and a big toy frog for the kids. She can scoop " +
+  "these things into three red bags, and we will go meet her Wednesday at the train " +
+  "station.\n\nWhen the sunlight strikes raindrops in the air, they act as a prism and " +
+  "form a rainbow. The rainbow is a division of white light into many beautiful colors. " +
+  "These take the shape of a long round arch, with its path high above, and its two ends " +
+  "apparently beyond the horizon. There is, according to legend, a boiling pot of gold at " +
+  "one end. People look, but no one ever finds it. When a man looks for something beyond " +
+  "his reach, his friends say he is looking for the pot of gold at the end of the rainbow.";
+
+let recorder = null; // {stop: () => void} while a recording is live
+
 ui.record.addEventListener("click", async () => {
   clearError();
-  ui.record.disabled = true;
+  if (recorder) {
+    recorder.stop();
+    return;
+  }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const context = new AudioContext({ sampleRate: 24000 });
@@ -250,36 +274,54 @@ ui.record.addEventListener("click", async () => {
     source.connect(recorderNode);
     recorderNode.connect(context.destination);
 
-    const seconds = 10;
-    for (let remaining = seconds; remaining > 0; remaining -= 1) {
-      ui.recordStatus.textContent = `recording… ${remaining}s (read a couple of sentences)`;
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-    recorderNode.disconnect();
-    source.disconnect();
-    for (const track of stream.getTracks()) track.stop();
-    await context.close();
+    ui.script.textContent = ENROLLMENT_SCRIPT;
+    ui.scriptWrap.classList.remove("hidden");
+    ui.record.textContent = "⏹ Stop recording";
+    const startedAt = performance.now();
+    const ticker = setInterval(() => {
+      ui.recordStatus.textContent = `recording… ${((performance.now() - startedAt) / 1000).toFixed(0)}s — read the script aloud, then press Stop`;
+    }, 500);
 
-    const total = chunks.reduce((n, c) => n + c.length, 0);
-    const pcm = new Float32Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      pcm.set(chunk, offset);
-      offset += chunk.length;
-    }
-    ui.recordStatus.textContent = "computing your voice vector…";
-    const { vector } = await call("enroll", { pcm: pcm.buffer }, [pcm.buffer]);
-    clonedVector = new Float32Array(vector);
-    const clonedOption = [...ui.voice.options].find((o) => o.value === "__cloned__");
-    clonedOption.disabled = false;
-    ui.voice.value = "__cloned__";
-    updateVoiceCharacter();
-    ui.recordStatus.textContent = "cloned — your voice is selected.";
+    const finish = async () => {
+      clearInterval(ticker);
+      recorder = null;
+      ui.record.textContent = "🎙 Record & clone my voice";
+      ui.scriptWrap.classList.add("hidden");
+      recorderNode.disconnect();
+      source.disconnect();
+      for (const track of stream.getTracks()) track.stop();
+      await context.close();
+
+      const total = chunks.reduce((n, c) => n + c.length, 0);
+      if (total < 24000 * 3) {
+        ui.recordStatus.textContent = "";
+        throw new Error("recording too short — read at least a few seconds of the script");
+      }
+      const pcm = new Float32Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        pcm.set(chunk, offset);
+        offset += chunk.length;
+      }
+      ui.recordStatus.textContent = "computing your voice vector…";
+      const { vector } = await call("enroll", { pcm: pcm.buffer }, [pcm.buffer]);
+      clonedVector = new Float32Array(vector);
+      clonedName = (ui.cloneName.value || "my voice").trim().slice(0, 40);
+      const clonedOption = [...ui.voice.options].find((o) => o.value === "__cloned__");
+      clonedOption.disabled = false;
+      clonedOption.textContent = clonedName;
+      ui.voice.value = "__cloned__";
+      updateVoiceCharacter();
+      ui.recordStatus.textContent = `cloned — “${clonedName}” is selected.`;
+    };
+    recorder = { stop: () => finish().catch(showError) };
+    // Backstop: the full script takes under a minute; stop automatically at 60 s.
+    setTimeout(() => recorder?.stop(), 60_000);
   } catch (error) {
     showError(error);
     ui.recordStatus.textContent = "";
-  } finally {
-    ui.record.disabled = false;
+    recorder = null;
+    ui.record.textContent = "🎙 Record & clone my voice";
   }
 });
 
@@ -291,15 +333,71 @@ ui.download.addEventListener("click", () => {
   link.click();
 });
 
+// Share = a stateless URL. Everything needed to reproduce the utterance rides in the
+// FRAGMENT (never sent to any server): the text, the seed, and the voice — a preset by
+// name, or a custom clone as its full 1,024-float vector plus the name its owner gave it.
+function base64UrlEncode(bytes) {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function base64UrlDecode(text) {
+  const binary = atob(text.replaceAll("-", "+").replaceAll("_", "/"));
+  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+}
+
+function buildShareUrl() {
+  const params = new URLSearchParams();
+  params.set("v", "1");
+  params.set("t", base64UrlEncode(new TextEncoder().encode(ui.text.value)));
+  params.set("s", String(Number.parseInt(ui.seed.value, 10) || 0));
+  if (ui.voice.value === "__cloned__" && clonedVector) {
+    params.set("vec", base64UrlEncode(new Uint8Array(clonedVector.buffer)));
+    params.set("name", encodeURIComponent(clonedName));
+  } else {
+    params.set("voice", ui.voice.value);
+  }
+  return `${location.origin}${location.pathname}#${params.toString()}`;
+}
+
 ui.share.addEventListener("click", async () => {
-  if (!lastWavBlob) return;
-  const file = new File([lastWavBlob], "franken_tts.wav", { type: "audio/wav" });
+  const url = buildShareUrl();
   try {
-    await navigator.share({ files: [file], title: "franken_tts" });
-  } catch {
-    /* user cancelled */
+    await navigator.clipboard.writeText(url);
+    ui.synthStatus.textContent = "share link copied — it carries the text, seed, and voice.";
+  } catch (error) {
+    showError(error);
   }
 });
+
+function applySharedFragment() {
+  if (!location.hash.startsWith("#v=")) return;
+  try {
+    const params = new URLSearchParams(location.hash.slice(1));
+    const text = params.get("t");
+    if (text) ui.text.value = new TextDecoder().decode(base64UrlDecode(text));
+    if (params.get("s")) ui.seed.value = params.get("s");
+    const vec = params.get("vec");
+    if (vec) {
+      const bytes = base64UrlDecode(vec);
+      if (bytes.length === 1024 * 4) {
+        clonedVector = new Float32Array(bytes.buffer);
+        clonedName = decodeURIComponent(params.get("name") ?? "shared voice").slice(0, 40);
+        const clonedOption = [...ui.voice.options].find((o) => o.value === "__cloned__");
+        clonedOption.disabled = false;
+        clonedOption.textContent = clonedName;
+        ui.voice.value = "__cloned__";
+      }
+    } else if (params.get("voice")) {
+      ui.voice.value = params.get("voice");
+    }
+    updateVoiceCharacter();
+    ui.synthStatus.textContent = "loaded a shared utterance — load the model, then Synthesize.";
+  } catch {
+    /* a malformed fragment is ignored, never fatal */
+  }
+}
 
 ui.clearCache.addEventListener("click", async () => {
   await clearCache();
