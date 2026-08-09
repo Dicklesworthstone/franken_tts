@@ -180,11 +180,10 @@ macro_rules! test_name {
 /// ```
 #[macro_export]
 macro_rules! require_model {
-    ($contract:expr $(,)?) => {
-        match $crate::gate::ModelGate::resolve() {
+    ($contract:expr $(,)?) => {{
         // Oracle-parity tests measure the f32 reference route, never the optimized default.
         $crate::pin_reference_route();
-
+        match $crate::gate::ModelGate::resolve() {
             $crate::gate::ModelGate::Present { artifact } => artifact,
             $crate::gate::ModelGate::Absent { reason } => {
                 $crate::report::Receipt::new(
@@ -197,7 +196,7 @@ macro_rules! require_model {
                 return;
             }
         }
-    };
+    }};
 }
 
 /// Asserts two `f32` slices agree within tolerance, emitting a receipt and localizing any failure.

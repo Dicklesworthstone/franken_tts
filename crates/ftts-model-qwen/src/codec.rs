@@ -667,7 +667,7 @@ struct CodecInt8Route {
     plan: KernelPlanV0,
     transformer: bool,
     convnext: bool,
-    memo: Mutex<HashMap<(usize, usize), QuantMemoEntry>>,
+    memo: Mutex<HashMap<(usize, usize, usize, usize), QuantMemoEntry>>,
 }
 
 /// Which family of dense projections a [`dense_linear`] call belongs to.
@@ -742,7 +742,10 @@ fn dense_linear(
         return;
     };
 
-    let key = (weight.as_ptr() as usize, weight.len());
+    // The shape belongs in the key: an address can be reused by a different tensor (observed
+    // with constant-filled tiny test weights whose fingerprints also matched), and a memo hit
+    // with the wrong (n, k) would reinterpret the matrix.
+    let key = (weight.as_ptr() as usize, weight.len(), n, k);
     let fingerprint = (
         weight.first().map_or(0, |value| value.to_bits()),
         weight.last().map_or(0, |value| value.to_bits()),
