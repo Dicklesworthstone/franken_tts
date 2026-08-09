@@ -1649,7 +1649,7 @@ fn resolve_model_from(
         .join(", ");
     Err(FttsError::ModelNotFound(format!(
         "no model artifact was found; searched: [{searched}]; run `ftts pull` to fetch the model \
-         (~2.4 GB), or pass --model PATH or set FTTS_MODEL_DIR"
+         (~2.0 GB), or pass --model PATH or set FTTS_MODEL_DIR"
     )))
 }
 
@@ -3062,17 +3062,25 @@ mod tests {
             );
         }
 
-        // The converter and the downloader must pin the same main checkpoint, or `pull` would
-        // fetch bytes `convert` then refuses.
+        // Since frankentts-zm5 the pull ships the canonical quantized artifact, not the raw main
+        // checkpoint: enrollment and synthesis both hydrate from the .fttsq, so pulling the raw
+        // 1.7 GB main would be pure waste. The artifact lands at the exact basename every model
+        // search path probes for.
         let main = manifest
             .files
             .iter()
-            .find(|file| file.dest == PINNED_MAIN_WEIGHTS_FILENAME)
-            .expect("manifest carries the main checkpoint");
-        assert_eq!(main.sha256, PINNED_MAIN_WEIGHTS_SHA256);
+            .find(|file| file.dest == MODEL_BASENAME)
+            .expect("manifest carries the canonical artifact");
         assert_eq!(
             manifest.download_url(main),
-            "https://github.com/Dicklesworthstone/franken_tts/releases/download/model-qwen3-tts-v1/model.safetensors"
+            "https://github.com/Dicklesworthstone/franken_tts/releases/download/model-qwen3-tts-v1/qwen3-tts-12hz-0.6b-base.fttsq"
+        );
+        assert!(
+            !manifest
+                .files
+                .iter()
+                .any(|file| file.dest == PINNED_MAIN_WEIGHTS_FILENAME),
+            "pull must not fetch the raw main checkpoint alongside the canonical artifact"
         );
 
         // Together the files are exactly what ModelBundle::resolve requires plus the two config
@@ -3083,7 +3091,7 @@ mod tests {
             .map(|file| file.dest.as_str())
             .collect();
         for required in [
-            "model.safetensors",
+            MODEL_BASENAME,
             "speech_tokenizer/model.safetensors",
             "vocab.json",
             "merges.txt",
@@ -3266,7 +3274,7 @@ mod tests {
             .expect_err("an empty pull directory must not resolve");
         assert_eq!(error.exit_code(), FttsExitCode::ModelNotFound);
         assert!(error.to_string().contains("ftts pull"), "{error}");
-        assert!(error.to_string().contains("2.4 GB"), "{error}");
+        assert!(error.to_string().contains("2.0 GB"), "{error}");
         assert!(error.to_string().contains("FTTS_MODEL_DIR"), "{error}");
     }
 

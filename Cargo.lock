@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "ftts-artifacts"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ftts-core",
  "ftts-kernels",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "ftts-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "ftts-artifacts",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "ftts-conformance"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ftts-artifacts",
  "ftts-cli",
@@ -699,21 +699,21 @@ dependencies = [
 
 [[package]]
 name = "ftts-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "asupersync",
 ]
 
 [[package]]
 name = "ftts-kernels"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "ftts-model-qwen"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fancy-regex",
  "ftts-artifacts",

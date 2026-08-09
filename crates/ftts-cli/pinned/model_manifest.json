@@ -5,10 +5,10 @@
   "repo": "Dicklesworthstone/franken_tts",
   "files": [
     {
-      "asset": "model.safetensors",
-      "dest": "model.safetensors",
-      "sha256": "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6",
-      "bytes": 1829344272
+      "asset": "qwen3-tts-12hz-0.6b-base.fttsq",
+      "dest": "qwen3-tts-12hz-0.6b-base.fttsq",
+      "sha256": "597f7eb3314a2fe5be74fa10a6a3a28ace9e10e582c641deccd37348a0ccd824",
+      "bytes": 1312015713
     },
     {
       "asset": "speech_tokenizer_model.safetensors",

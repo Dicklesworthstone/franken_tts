@@ -15,9 +15,54 @@ individual commits are intentionally not cited.
 
 | Version | Date | Status | Summary |
 |---------|------|--------|---------|
+| 0.1.2 | 2026-08-08 | current | `ftts convert` works on the real checkpoint; `ftts pull` ships the quantized `.fttsq` |
+| 0.1.1 | 2026-08-08 | superseded | zero-config UX: `ftts pull`, default model cache, m4a/mp3 enrollment |
 | 0.1.0 | 2026-08-08 | first release | f32 reference engine, CLI, conformance ladder, artifact groundwork |
 
 ## [Unreleased]
+
+## [0.1.2] - 2026-08-08
+
+### Fixed
+
+- `ftts convert` completes on the real pinned checkpoint. The converter
+  emitted one container section per tensor (478) against the format's
+  64-section cap; sections are now one per access class — the page-in policy
+  unit the format was designed around — with tensors located by offset inside
+  them (`frankentts-zm5`).
+
+### Changed
+
+- `ftts pull` now fetches the pre-quantized `.fttsq` artifact (1.3 GB) instead
+  of the raw 1.7 GB main checkpoint, shrinking the download to ~2.0 GB total.
+  The artifact is byte-for-byte what `ftts convert` produces from the pinned
+  snapshot: talker/microdecoder hot projections stored int8
+  per-output-channel, everything else verbatim.
+- Enrollment hydrates the speaker encoder from the canonical `.fttsq` when the
+  model directory carries one. Speaker-encoder tensors are stored verbatim, so
+  artifact enrollment is bit-identical to raw-checkpoint enrollment (verified:
+  identical `.spk` SHA-256 from a real recording through both paths).
+
+## [0.1.1] - 2026-08-08
+
+### Added
+
+- `ftts pull`: one-command model download from the project's GitHub model
+  release, SHA-256-verified against a manifest embedded in the binary, into
+  `~/.cache/franken_tts/model` — no environment variable needed afterwards.
+- Enrollment accepts m4a/mp3/aac/mp4/ogg/opus references, transcoded through
+  the system decoder (afconvert or ffmpeg); `ftts enroll REF --default` stores
+  the voice the model directory picks up automatically.
+- Positional output path for `ftts say`, with m4a/flac encoding via the system
+  encoder; text-proportional EOS frame backstop.
+- Experimental `FTTS_INT8` W8A8 route with process-local autotune
+  (`KernelPlanV0`), off by default pending quality gates.
+
+### Fixed
+
+- Production sampling drives the microdecoder's residual selection through the
+  sampler instead of a hard-wired greedy argmax, eliminating the
+  silence-attractor failure on sampled runs.
 
 ## [0.1.0] - 2026-08-08
 
@@ -113,5 +158,7 @@ refer to the checked-in beads tracker at `.beads/issues.jsonl`.
   the enrollment parity gate is not yet closed.
 - CUDA and long-form/chunked synthesis are out of scope for this release.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Dicklesworthstone/franken_tts/releases/tag/v0.1.0

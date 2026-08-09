@@ -35,7 +35,7 @@ Sibling of [franken_ocr](https://github.com/Dicklesworthstone/franken_ocr) and f
 Three commands, no configuration:
 
 ```bash
-ftts pull                              # one-time: fetch the pinned model (~2.4 GB, SHA-256 verified)
+ftts pull                              # one-time: fetch the quantized model (~2.0 GB, SHA-256 verified)
 ftts enroll voice_memo.m4a --default   # clone a voice from any recording you have the right to use
 ftts say "Now is the time for all good men to come to the aid of the agents" out.m4a
 ```
@@ -100,7 +100,7 @@ Prebuilt binaries cover macOS (arm64, x86_64), Linux (x86_64, arm64), and Window
 
 ### Getting the model
 
-Weights are not bundled with the binary; `ftts pull` fetches the pinned Qwen3-TTS-12Hz-0.6B-Base snapshot (~2.4 GB, Apache-2.0 by Qwen) from this project's [model release](https://github.com/Dicklesworthstone/franken_tts/releases/tag/model-qwen3-tts-v1) into `~/.cache/franken_tts/model`, verifying every file's SHA-256 against the manifest embedded in the binary. Re-running `ftts pull` verifies and skips files already present. You can instead download the same snapshot from [Hugging Face](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) manually and point the CLI at it with `--model <dir>` or `FTTS_MODEL_DIR`.
+Weights are not bundled with the binary; `ftts pull` fetches this project's pre-quantized `.fttsq` artifact plus the codec checkpoint and tokenizer files (~2.0 GB total, derived from Qwen3-TTS-12Hz-0.6B-Base, Apache-2.0 by Qwen) from the [model release](https://github.com/Dicklesworthstone/franken_tts/releases/tag/model-qwen3-tts-v1) into `~/.cache/franken_tts/model`, verifying every file's SHA-256 against the manifest embedded in the binary. The artifact packs the talker's hot projections as int8 per-output-channel and everything else verbatim, so it is 30% smaller than the raw checkpoint and is the same file `ftts convert` produces. Re-running `ftts pull` verifies and skips files already present. You can instead download the same snapshot from [Hugging Face](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) manually and point the CLI at it with `--model <dir>` or `FTTS_MODEL_DIR`.
 
 ## Cloning your voice, step by step
 
