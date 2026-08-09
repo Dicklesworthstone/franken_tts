@@ -124,6 +124,7 @@ pub fn is_interactive() -> bool {
 /// different view of them; the stream is unchanged for every non-terminal consumer.
 #[derive(Default)]
 pub struct SayPresenter {
+    destination: Option<String>,
     load_started_ms: u64,
     synthesis_started_ms: u64,
     load_ms: u64,
@@ -132,6 +133,19 @@ pub struct SayPresenter {
 }
 
 impl SayPresenter {
+    /// Names the file the audio lands in, so the summary can say where it went.
+    ///
+    /// The event stream never carries this — a machine consumer passed the path in and knows it —
+    /// but a person reading four lines of output should not have to look back at their own command
+    /// to find out what was written.
+    #[must_use]
+    pub fn writing_to(destination: Option<String>) -> Self {
+        Self {
+            destination,
+            ..Self::default()
+        }
+    }
+
     /// Feed one lifecycle event. Unknown events are ignored, so a schema addition cannot break
     /// human output — it simply will not be narrated until someone teaches this about it.
     ///
@@ -189,14 +203,22 @@ impl SayPresenter {
                     .get("frames")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
-                ok(
-                    out,
-                    &format!(
-                        "synthesized {} frames {}",
-                        self.frames,
-                        detail(&secs(self.synthesis_ms))
-                    ),
-                )?;
+                // `--check` completes without synthesizing anything; announcing "0 frames" there
+                // would describe work that was never attempted.
+                if self.frames > 0 {
+                    let where_to = self
+                        .destination
+                        .as_deref()
+                        .map_or_else(String::new, |path| format!(" → {}", emphasis(path)));
+                    ok(
+                        out,
+                        &format!(
+                            "synthesized {} frames {}{where_to}",
+                            self.frames,
+                            detail(&secs(self.synthesis_ms))
+                        ),
+                    )?;
+                }
                 let mut tail = format!("{} of audio in {} total", secs(audio_ms), secs(elapsed));
                 if let Some(ttfa) = event.get("ttfa_ms").and_then(serde_json::Value::as_u64) {
                     tail.push_str(&format!(" · first audio {ttfa} ms"));

@@ -9,10 +9,15 @@
 [![Version](https://img.shields.io/badge/version-0.1.4-green.svg)](https://github.com/Dicklesworthstone/franken_tts/releases)
 
 ```bash
+# macOS / Linux
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_tts/main/install.sh | bash
+
+# macOS / Linux, via Homebrew
+brew install dicklesworthstone/tap/franken-tts
 ```
 
 ```powershell
+# Windows
 & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/franken_tts/main/install.ps1"))) -EasyMode
 ```
 
@@ -108,11 +113,22 @@ Every seam of the pipeline is checked against captured ground truth, not judged 
 brew install dicklesworthstone/tap/franken-tts
 ```
 
-**Install script:**
+**Install script (macOS/Linux):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_tts/main/install.sh | bash
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/franken_tts/main/install.ps1"))) -EasyMode
+```
+
+Downloads the release zip, verifies it against the release's own `SHA256SUMS`, installs both
+binaries under `%LOCALAPPDATA%\Programs\franken_tts\bin`, and with `-EasyMode` adds that to your
+user PATH (no administrator rights needed). `-Version`, `-InstallDir`, `-Force` and `-Quiet` are
+also accepted.
 
 **Cargo:**
 

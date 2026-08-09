@@ -68,13 +68,30 @@ try {
 function Write-Info { param([string] $Message) if (-not $Quiet) { Write-Host "-> $Message" -ForegroundColor Cyan } }
 function Write-Ok   { param([string] $Message) if (-not $Quiet) { Write-Host "OK $Message" -ForegroundColor Green } }
 function Write-Warn { param([string] $Message) Write-Host "!  $Message" -ForegroundColor Yellow }
-function Write-Err  { param([string] $Message) Write-Host "X  $Message" -ForegroundColor Red }
 
 function Get-ProxyArgs {
     # Honour the same environment corporate networks already set for curl.
     $proxy = if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } elseif ($env:HTTP_PROXY) { $env:HTTP_PROXY } else { $null }
     if ($proxy) { return @{ Proxy = $proxy; ProxyUseDefaultCredentials = $true } }
     return @{}
+}
+
+function Get-RemoteText {
+    <#
+        Fetches a URL as text.
+
+        `Invoke-WebRequest -UseBasicParsing` hands back `.Content` as a **byte[]** whenever the
+        response is not a recognized text type — and GitHub serves release assets, SHA256SUMS
+        included, as application/octet-stream. Splitting that byte array on newlines silently
+        yields one "line" per byte (516 lines of integers for a 516-byte manifest), so every
+        checksum lookup misses and the installer reports "no checksum published" for a release
+        that published one. Decoding explicitly is the fix; the string branch keeps PowerShell 7,
+        where the same call already returns text, on the same path.
+    #>
+    param([string] $Uri, [hashtable] $ProxyArgs)
+    $raw = (Invoke-WebRequest -Uri $Uri -UseBasicParsing @ProxyArgs).Content
+    if ($raw -is [byte[]]) { return [Text.Encoding]::UTF8.GetString($raw) }
+    return [string] $raw
 }
 
 function Resolve-Architecture {
@@ -155,7 +172,10 @@ try {
 
     Write-Info "Downloading $archive"
     try {
-        Invoke-WebRequest -Uri "$base/$archive" -OutFile $archivePath @proxyArgs
+        # -UseBasicParsing everywhere: on Windows PowerShell 5.1 the default engine is Internet
+        # Explorer's, which throws outright when IE's first-launch configuration has never run —
+        # a stock, freshly-imaged machine, i.e. the common case for a one-liner install.
+        Invoke-WebRequest -Uri "$base/$archive" -OutFile $archivePath -UseBasicParsing @proxyArgs
     } catch {
         throw "Download failed for $base/$archive : $($_.Exception.Message). Check the release page for the assets that exist."
     }
@@ -165,24 +185,43 @@ try {
     } else {
         # The combined manifest is authoritative; the per-asset sidecar is the fallback, matching
         # what install.sh accepts so both installers verify against the same published bytes.
+        #
+        # Why the failures are recorded rather than ignored: swallowing them makes a network hiccup
+        # or a parsing quirk indistinguishable from a release that genuinely published no
+        # checksums, and sends the user to -NoVerify — the one place they should never be sent by
+        # a bug. Verified on Windows PowerShell 5.1, where the first version of this did exactly
+        # that.
         $expected = $null
+        $why = @()
         try {
-            $sums = (Invoke-WebRequest -Uri "$base/SHA256SUMS" @proxyArgs).Content
+            $sums = Get-RemoteText -Uri "$base/SHA256SUMS" -ProxyArgs $proxyArgs
             foreach ($line in ($sums -split "`n")) {
-                if ($line -match '^\s*([0-9a-fA-F]{64})\s+\*?(.+?)\s*$' -and $Matches[2] -eq $archive) {
-                    $expected = $Matches[1]
-                    break
+                if ($line -match '^\s*([0-9a-fA-F]{64})\s+[\* ]?(.+?)\s*$') {
+                    # sha256sum writes "hash  name", "hash *name" for binary mode, and manifests
+                    # generated from a directory walk often carry a "./" prefix. Compare on the
+                    # base name so a cosmetic difference in how the manifest was produced cannot
+                    # send us down the "no checksum published" path and refuse a good download.
+                    $listed = ($Matches[2] -replace '^\.[\\/]', '')
+                    if ((Split-Path -Leaf $listed) -eq $archive) {
+                        $expected = $Matches[1]
+                        break
+                    }
                 }
             }
-        } catch { }
-        if (-not $expected) {
-            try {
-                $sidecar = (Invoke-WebRequest -Uri "$base/$archive.sha256" @proxyArgs).Content
-                if ($sidecar -match '([0-9a-fA-F]{64})') { $expected = $Matches[1] }
-            } catch { }
+        } catch {
+            $why += "SHA256SUMS: $($_.Exception.Message)"
         }
         if (-not $expected) {
-            throw "No checksum published for $archive (neither SHA256SUMS nor $archive.sha256). Refusing to install unverified binaries; pass -NoVerify to override."
+            try {
+                $sidecar = Get-RemoteText -Uri "$base/$archive.sha256" -ProxyArgs $proxyArgs
+                if ($sidecar -match '([0-9a-fA-F]{64})') { $expected = $Matches[1] }
+            } catch {
+                $why += "$archive.sha256: $($_.Exception.Message)"
+            }
+        }
+        if (-not $expected) {
+            $detail = if ($why) { " Reason: " + ($why -join '; ') } else { ' Both were fetched but neither listed this file.' }
+            throw "No checksum published for $archive (neither SHA256SUMS nor $archive.sha256).$detail Refusing to install unverified binaries; pass -NoVerify to override."
         }
         Assert-Checksum -File $archivePath -Expected $expected
     }

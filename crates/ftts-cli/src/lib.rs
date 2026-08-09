@@ -1084,7 +1084,12 @@ fn run_say(
         // it is what every pipe, file, CI job and agent still receives, because none of them is a
         // terminal. `--robot` forces it back on for a human debugging the stream itself.
         let mut discard = io::sink();
-        let mut presenter = style::SayPresenter::default();
+        let destination = args
+            .output
+            .as_deref()
+            .or(args.output_positional.as_deref())
+            .map(|path| path.display().to_string());
+        let mut presenter = style::SayPresenter::writing_to(destination);
         run_say_events(
             cli,
             args,
