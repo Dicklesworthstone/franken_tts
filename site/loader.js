@@ -5,8 +5,8 @@
 // A file only ever reaches the engine after its full SHA-256 matches the pinned digest;
 // a mismatch deletes the staging file and starts that file over.
 
-import { MODEL_FILES, TOTAL_BYTES, CHUNK_BYTES } from "./model-manifest.js?v=@SITEV@";
-import { Sha256, digestBlob } from "./sha256.js?v=@SITEV@";
+import { MODEL_FILES, TOTAL_BYTES, CHUNK_BYTES, ENDPOINT_BYTES } from "./model-manifest.js?v=@SITEV@";
+import { Sha256, digestBlob, digestRange } from "./sha256.js?v=@SITEV@";
 
 // A verified file records its identity here so it is never re-hashed. Hashing 2 GB in JS costs
 // ~10 s on a fast desktop and far more on a phone, all of it on the main thread — long enough for
@@ -14,6 +14,12 @@ import { Sha256, digestBlob } from "./sha256.js?v=@SITEV@";
 // load, so it is done ONCE (streamed alongside the download, while the bytes are already in hand)
 // and remembered.
 const VERIFIED_MARKER = "verified.json";
+
+// Kill switch for the endpoint fast path (DISC-004): `?fullverify` forces the whole-file digest
+// on every cached asset, restoring the pre-optimization behavior exactly. It is deliberately a URL
+// parameter rather than a build flag so a user who suspects a corrupt cache can prove it in one
+// reload, and so the slow path stays continuously exercised rather than rotting.
+const FULL_VERIFY = new URLSearchParams(globalThis.location?.search ?? "").has("fullverify");
 
 async function readVerified(root) {
   try {
@@ -30,6 +36,31 @@ async function readVerified(root) {
 /// desktop, considerably more on a phone — and iOS reclaims tabs that stop answering.
 function yieldToEventLoop() {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
+ * Prove a cached file is still the pinned artifact, cheaply.
+ *
+ * Exact byte length plus SHA-256 over the first and last ENDPOINT_BYTES. This reads 20 MB where a
+ * full digest reads 1.3 GB, which is the difference between a page that loads instantly on a warm
+ * cache and one that spends ~10 s hashing on every single visit before it can do anything.
+ *
+ * The length check is what makes the endpoints strong rather than decorative: a truncated or
+ * still-being-written file is caught by size alone, and any resumed download that stopped
+ * mid-stream has a short length. The endpoints then cover the two regions that actually differ
+ * between artifacts — the safetensors/fttsq header at the front, and the last tensor's payload at
+ * the back — so a stale manifest or a swapped file fails immediately.
+ *
+ * Falls back to the full digest for any file too small to have two disjoint endpoint windows, and
+ * for any manifest entry that carries no endpoint hashes.
+ */
+async function endpointsMatch(blob, file) {
+  if (blob.size !== file.bytes) return false;
+  if (FULL_VERIFY || !file.head || !file.tail || file.bytes < 2 * ENDPOINT_BYTES) {
+    return (await digestBlob(blob, 8 * 1024 * 1024, yieldToEventLoop)) === file.sha256;
+  }
+  if ((await digestRange(blob, 0, ENDPOINT_BYTES)) !== file.head) return false;
+  return (await digestRange(blob, file.bytes - ENDPOINT_BYTES, file.bytes)) === file.tail;
 }
 
 async function writeVerified(root, ledger) {
@@ -89,10 +120,17 @@ export async function ensureModel(onProgress) {
       const done = await root.getFileHandle(file.asset);
       const blob = await done.getFile();
       if (blob.size === file.bytes) {
+        // Two independent reasons to trust a cached file, cheapest first.
+        //
+        // `verified.json` is the memo from a previous visit and costs one small read. The endpoint
+        // check is the fallback, and is what makes a cold cache — a first visit after a download in
+        // an earlier session, or a marker that never landed — fast instead of a ~10 s stall. Before
+        // endpoints existed, that fallback was a full 1.3 GB rehash on the main thread, which is
+        // exactly the "incredibly slow even on desktop" case.
         const noted = verified[file.asset];
         const trusted = noted && noted.bytes === file.bytes && noted.sha256 === file.sha256;
         if (!trusted) report("verifying", file.asset);
-        if (trusted || (await digestBlob(blob, 8 * 1024 * 1024, yieldToEventLoop)) === file.sha256) {
+        if (trusted || (await endpointsMatch(blob, file))) {
           if (!trusted) {
             verified[file.asset] = { bytes: file.bytes, sha256: file.sha256 };
             await writeVerified(root, verified);

@@ -131,3 +131,30 @@ export async function digestBlob(blob, sliceBytes = 8 * 1024 * 1024, onProgress)
   }
   return hash.hex();
 }
+
+/**
+ * SHA-256 of a bounded byte range, preferring the native WebCrypto implementation.
+ *
+ * `crypto.subtle.digest` needs one contiguous buffer, which is exactly why the whole-file path
+ * above cannot use it — a 1.3 GB ArrayBuffer is what reclaimed the tab on iOS. For a 10 MB
+ * endpoint window that objection disappears entirely, and native SHA-256 runs roughly an order of
+ * magnitude faster than the JS core (which measured ~193 MB/s on an iPhone). `crypto.subtle` is
+ * absent on insecure origins, so the JS core stays as the fallback and the two agree by
+ * construction — `sha256.test.js` pins that against 17 lengths and 7 slice boundaries.
+ *
+ * @param {Blob} blob
+ * @param {number} start inclusive
+ * @param {number} end exclusive
+ * @returns {Promise<string>} lowercase hex
+ */
+export async function digestRange(blob, start, end) {
+  const slice = blob.slice(start, end);
+  const bytes = new Uint8Array(await slice.arrayBuffer());
+  if (globalThis.crypto?.subtle?.digest) {
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  const hash = new Sha256();
+  hash.update(bytes);
+  return hash.hex();
+}
