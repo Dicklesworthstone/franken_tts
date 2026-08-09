@@ -24,11 +24,85 @@ use crate::talker::{
     self, CODE_GROUP_COUNT, PRIMARY_CODE_VOCAB_SIZE, RotaryRows, TalkerConfig, TalkerKvCache,
     TalkerLayerQuant, TalkerWeights,
 };
-use ftts_kernels::int8::QuantLinearMode;
+use ftts_artifacts::fttsq::{MappedFttsq, StoredDtype};
+use ftts_kernels::int8::{QuantLinearMode, QuantizedMatrix};
 
 /// The talker's pinned mRoPE base. The microdecoder and codec each use a different theta; crossing
 /// them is a silent correctness failure, so the constant lives next to its only call sites.
 const MROPE_THETA: f32 = 1.0e6;
+
+/// Reads one Q8 tensor out of a canonical artifact as an executable [`QuantizedMatrix`].
+///
+/// The artifact's payload IS the canonical quantization — the converter and the runtime share one
+/// quantizer, pinned byte-identical by a cross-crate test — so consuming it directly skips both
+/// the bf16→f32 widen and the f32→int8 requantize the runtime route would otherwise pay at
+/// startup. `None` (wrong dtype, missing scales, geometry mismatch) sends the caller to the
+/// runtime-quantization fallback rather than failing hydration.
+fn q8_from_artifact(
+    artifact: &MappedFttsq,
+    name: &str,
+    n: usize,
+    k: usize,
+) -> Option<QuantizedMatrix> {
+    let entry = artifact.reader().tensor(name)?;
+    if entry.dtype != StoredDtype::Q8 {
+        return None;
+    }
+    let scales_name = entry.scales.clone()?;
+    let data_bytes = artifact.tensor_bytes(name).ok()?;
+    if data_bytes.len() != n.checked_mul(k)? {
+        return None;
+    }
+    let scales_bytes = artifact.tensor_bytes(&scales_name).ok()?;
+    if scales_bytes.len() != n.checked_mul(4)? {
+        return None;
+    }
+    // Q8 payload bytes are the two's-complement values themselves; this cast-copy is the whole
+    // hydration cost (a memcpy), replacing a widen + max-scan + rounding pass per row.
+    let data = data_bytes.iter().map(|&byte| byte as i8).collect();
+    let scales = scales_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect();
+    Some(QuantizedMatrix { data, scales, n, k })
+}
+
+/// The seven projections of one attention layer, artifact-native, in the same fused shape
+/// [`TalkerLayerQuant::quantize`] produces. `None` if any tensor is absent, letting mixed or
+/// older artifacts fall back to runtime quantization for the whole layer.
+fn fused_layer_from_artifact(
+    artifact: &MappedFttsq,
+    base: &str,
+    hidden: usize,
+    q_width: usize,
+    kv_width: usize,
+    intermediate: usize,
+) -> Option<(QuantizedMatrix, QuantizedMatrix, QuantizedMatrix, QuantizedMatrix)> {
+    let q = q8_from_artifact(artifact, &format!("{base}.self_attn.q_proj.weight"), q_width, hidden)?;
+    let k = q8_from_artifact(artifact, &format!("{base}.self_attn.k_proj.weight"), kv_width, hidden)?;
+    let v = q8_from_artifact(artifact, &format!("{base}.self_attn.v_proj.weight"), kv_width, hidden)?;
+    let o = q8_from_artifact(artifact, &format!("{base}.self_attn.o_proj.weight"), hidden, q_width)?;
+    let gate = q8_from_artifact(artifact, &format!("{base}.mlp.gate_proj.weight"), intermediate, hidden)?;
+    let up = q8_from_artifact(artifact, &format!("{base}.mlp.up_proj.weight"), intermediate, hidden)?;
+    let down = q8_from_artifact(artifact, &format!("{base}.mlp.down_proj.weight"), hidden, intermediate)?;
+    Some((
+        QuantizedMatrix::concat_rows(&[&q, &k, &v]),
+        o,
+        QuantizedMatrix::concat_rows(&[&gate, &up]),
+        down,
+    ))
+}
+
+/// `FTTS_ARTIFACT_Q8=0` forces the widen-then-requantize hydration even when a canonical
+/// artifact is available — the A/B and forensics switch for artifact-native hydration.
+fn artifact_q8_enabled() -> bool {
+    !matches!(
+        std::env::var("FTTS_ARTIFACT_Q8").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
 
 /// The cold text embedding table and the learned biased SiLU text projection.
 ///
@@ -154,6 +228,23 @@ impl<'a> QwenGenerator<'a> {
     /// these are checkpoint-hydration bugs, not runtime conditions.
     #[must_use]
     pub fn new(config: QwenGeneratorConfig<'a>) -> Self {
+        Self::new_with_artifact(config, None)
+    }
+
+    /// [`QwenGenerator::new`], additionally offered the mapped canonical artifact the checkpoint
+    /// was hydrated from.
+    ///
+    /// When the int8 route is armed and the artifact carries a layer's Q8 tensors, that layer's
+    /// projections hydrate directly from the artifact payload — the canonical quantization
+    /// itself — instead of re-quantizing widened f32 copies. Payload bytes are identical to the
+    /// runtime quantizer's output by the shared-quantizer contract; scales are the converter's
+    /// own (the requantize round trip can drift a scale by an ulp, so the artifact is the more
+    /// canonical of the two). `FTTS_ARTIFACT_Q8=0` forces the old path for A/B.
+    #[must_use]
+    pub fn new_with_artifact(
+        config: QwenGeneratorConfig<'a>,
+        artifact: Option<&MappedFttsq>,
+    ) -> Self {
         let hidden = config.talker_config.hidden_size;
         assert_eq!(
             config.feedback.talker_codec.len(),
