@@ -869,6 +869,19 @@ mod tests {
         }
     }
 
+    /// A clip too short to survive its own downsample must round to nothing here rather than
+    /// reaching the mel front end as an empty slice — which is why `decode_reference_audio`
+    /// re-checks emptiness against the resampled PCM instead of only the decoded PCM.
+    #[test]
+    fn a_clip_shorter_than_its_downsample_ratio_resamples_to_nothing() {
+        let out = resample_to_speaker_rate(vec![0.25], 192_000);
+        assert!(
+            out.is_empty(),
+            "one sample at 192 kHz is less than half an output sample at \
+             {SPEAKER_SAMPLE_RATE_HZ} Hz, so it cannot produce one"
+        );
+    }
+
     /// A tone that survives the resample proves the kernel is a real lowpass and not a decimator:
     /// 48 kHz is the rate every phone and Mac voice memo records at, and a 1 kHz tone sits well
     /// inside the 12 kHz band that survives the trip to 24 kHz.
