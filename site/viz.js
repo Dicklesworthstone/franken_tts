@@ -15,6 +15,25 @@ const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matc
 // Build lazily on approach, but never rely on intersection alone: an instant scroll
 // jump can skip right past an element without a single intersection callback, so a
 // timeout fallback guarantees every visualization exists within a few seconds.
+// Same guarantee for one-shot entrance animations (count-ups, bar fills): run when
+// the element becomes visible, or after a timeout if an instant jump skipped it.
+function onceVisible(el, run, threshold = 0.4, timeout = 3500) {
+  let done = false;
+  const fire = () => {
+    if (done) return;
+    done = true;
+    run();
+  };
+  const obs = new IntersectionObserver((entries) => {
+    if (entries.some((e) => e.isIntersecting)) {
+      obs.disconnect();
+      fire();
+    }
+  }, { threshold });
+  obs.observe(el);
+  setTimeout(fire, timeout);
+}
+
 function lazyBuild(el, build) {
   let built = false;
   const once = () => {
@@ -211,9 +230,7 @@ for (const el of document.querySelectorAll("[data-countup]")) {
     continue;
   }
   el.textContent = (0).toFixed(decimals) + suffix;
-  new IntersectionObserver((entries, observer) => {
-    if (!entries.some((e) => e.isIntersecting)) return;
-    observer.disconnect();
+  onceVisible(el, () => {
     const started = performance.now();
     const duration = 1100;
     const step = (now) => {
@@ -223,7 +240,7 @@ for (const el of document.querySelectorAll("[data-countup]")) {
       if (t < 1) requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
-  }, { threshold: 0.4 }).observe(el);
+  });
 }
 
 /* ------------------------------------------- pipeline seams comparison */
@@ -471,14 +488,12 @@ function buildLadder() {
     'The f32 route is 6–7× slower than real time by design; the wasm figure is single-threaded.';
   ladder.appendChild(key);
 
-  new IntersectionObserver((entries, observer) => {
-    if (!entries.some((e) => e.isIntersecting)) return;
-    observer.disconnect();
+  onceVisible(ladder, () => {
     for (const bar of ladder.querySelectorAll("[data-width]")) {
       bar.style.transition = reducedMotion ? "none" : "width 1.2s cubic-bezier(.2,.8,.2,1)";
       requestAnimationFrame(() => { bar.style.width = bar.dataset.width; });
     }
-  }, { threshold: 0.4 }).observe(ladder);
+  });
 }
 
 if (ladder) buildLadder();
@@ -607,12 +622,10 @@ if (stepper) buildStepper();
 
 const rms = document.getElementById("rms-bars");
 if (rms) {
-  new IntersectionObserver((entries, observer) => {
-    if (!entries.some((e) => e.isIntersecting)) return;
-    observer.disconnect();
+  onceVisible(rms, () => {
     for (const bar of rms.querySelectorAll("[data-width]")) {
       bar.style.transition = reducedMotion ? "none" : "width 1.2s cubic-bezier(.2,.8,.2,1)";
       requestAnimationFrame(() => { bar.style.width = bar.dataset.width; });
     }
-  }, { threshold: 0.4 }).observe(rms);
+  });
 }
