@@ -637,9 +637,184 @@ pub fn layer_step_q8(
 
     state.push(&k, &v);
 
+    let mut context = vec![0.0_f32; config.q_width()];
+    attend_one_position(config, &q, state, &mut context);
+
+    let mut attn_out = vec![0.0_f32; config.hidden_size];
+    quant_linear(mode, &context, &quant.o_proj, None, 1, &mut attn_out);
+    let residual: Vec<f32> = hidden
+        .iter()
+        .zip(attn_out.iter())
+        .map(|(h, a)| h + a)
+        .collect();
+
+    let normed = rms_norm(&residual, weights.post_attention_norm, config.rms_eps);
+    let mut gate_up = vec![0.0_f32; 2 * config.intermediate_size];
+    quant_linear(mode, &normed, &quant.gate_up, None, 1, &mut gate_up);
+    let up = gate_up.split_off(config.intermediate_size);
+    let mut gate = gate_up;
+    for (g, u) in gate.iter_mut().zip(up.iter()) {
+        *g = silu(*g) * u;
+    }
+    let mut mlp_out = vec![0.0_f32; config.hidden_size];
+    quant_linear(mode, &gate, &quant.down_proj, None, 1, &mut mlp_out);
+
+    residual
+        .iter()
+        .zip(mlp_out.iter())
+        .map(|(r, m)| r + m)
+        .collect()
+}
+
+/// [`layer_step_q8`] over all [`FRAME_POSITIONS`] positions with the four projections hoisted
+/// into single `m = FRAME_POSITIONS` dispatches.
+///
+/// This is the packed seq-16 kernel the FrankenMTP verifier was written against: the sequential
+/// decoder reads each layer's 15.7 MB of int8 body weights once per residual depth, fifteen times
+/// per frame; this reads them once. Only the *schedule* changes — every projection is the same
+/// `quant_linear` over the same `QuantizedMatrix`, and the norms, QK-Norm, rotary, and causal
+/// attention still run per position in position order against the same [`FrameKvState`].
+///
+/// **Bit-identity is by construction, not by measurement.** `linear_q8_dynamic` quantizes each
+/// row of `x` independently (its own `quantize_row_q8` scale) and accumulates each output element
+/// in i32, so one `m = 16` dispatch is byte-for-byte sixteen `m = 1` dispatches. Batching cannot
+/// perturb the arithmetic, which is why this is a pure schedule change rather than a numerics
+/// lever. `microdecoder_block_matches_sequential_q8` is the standing proof.
+///
+/// `hidden` is `[FRAME_POSITIONS, hidden_size]` row-major; the return has the same shape.
+///
+/// # Panics
+///
+/// Panics when `hidden` is not exactly `FRAME_POSITIONS * config.hidden_size` long.
+#[must_use]
+pub fn layer_block_q8(
+    config: &MicrodecoderConfig,
+    weights: &LayerWeights<'_>,
+    quant: &MicroLayerQuant,
+    rope: &RopeTable,
+    hidden: &[f32],
+    mode: QuantLinearMode,
+) -> Vec<f32> {
+    let width = config.hidden_size;
+    assert_eq!(
+        hidden.len(),
+        FRAME_POSITIONS * width,
+        "block input must be [{FRAME_POSITIONS}, {width}]"
+    );
+    let (q_width, kv_width) = (config.q_width(), config.kv_width());
+    let qkv_width = q_width + 2 * kv_width;
+
+    // Hoisted dispatch 1 of 4: Q‖K‖V for every position in one pass over the fused matrix.
+    let mut normed = Vec::with_capacity(FRAME_POSITIONS * width);
+    for position in 0..FRAME_POSITIONS {
+        let row = &hidden[position * width..(position + 1) * width];
+        normed.extend_from_slice(&rms_norm(row, weights.input_norm, config.rms_eps));
+    }
+    let mut qkv = vec![0.0_f32; FRAME_POSITIONS * qkv_width];
+    quant_linear(mode, &normed, &quant.qkv, None, FRAME_POSITIONS, &mut qkv);
+
+    // Per-position work: QK-Norm, rotary, and causal attention stay in position order against a
+    // single frame cache, so the reduction order the reference defines is preserved exactly.
+    let mut state = FrameKvState::new(config);
+    let mut context = vec![0.0_f32; FRAME_POSITIONS * q_width];
+    for position in 0..FRAME_POSITIONS {
+        let row = &qkv[position * qkv_width..(position + 1) * qkv_width];
+        let mut q = row[..q_width].to_vec();
+        let mut k = row[q_width..q_width + kv_width].to_vec();
+        let v = row[q_width + kv_width..].to_vec();
+        let (cos, sin) = rope.row(position);
+
+        for head in 0..config.num_q_heads {
+            let span = head * config.head_dim..(head + 1) * config.head_dim;
+            let normed_head = rms_norm(&q[span.clone()], weights.q_norm, config.rms_eps);
+            q[span.clone()].copy_from_slice(&normed_head);
+            apply_rope_row(&mut q[span], cos, sin);
+        }
+        for head in 0..config.num_kv_heads {
+            let span = head * config.head_dim..(head + 1) * config.head_dim;
+            let normed_head = rms_norm(&k[span.clone()], weights.k_norm, config.rms_eps);
+            k[span.clone()].copy_from_slice(&normed_head);
+            apply_rope_row(&mut k[span], cos, sin);
+        }
+        state.push(&k, &v);
+
+        let out = &mut context[position * q_width..(position + 1) * q_width];
+        attend_one_position(config, &q, &state, out);
+    }
+
+    // Hoisted dispatches 2, 3 and 4: output projection, fused SwiGLU gate‖up, and down.
+    let mut attn_out = vec![0.0_f32; FRAME_POSITIONS * width];
+    quant_linear(
+        mode,
+        &context,
+        &quant.o_proj,
+        None,
+        FRAME_POSITIONS,
+        &mut attn_out,
+    );
+    let residual: Vec<f32> = hidden
+        .iter()
+        .zip(attn_out.iter())
+        .map(|(h, a)| h + a)
+        .collect();
+
+    let mut normed = Vec::with_capacity(FRAME_POSITIONS * width);
+    for position in 0..FRAME_POSITIONS {
+        let row = &residual[position * width..(position + 1) * width];
+        normed.extend_from_slice(&rms_norm(row, weights.post_attention_norm, config.rms_eps));
+    }
+    let mut gate_up = vec![0.0_f32; FRAME_POSITIONS * 2 * config.intermediate_size];
+    quant_linear(
+        mode,
+        &normed,
+        &quant.gate_up,
+        None,
+        FRAME_POSITIONS,
+        &mut gate_up,
+    );
+
+    let mut activated = vec![0.0_f32; FRAME_POSITIONS * config.intermediate_size];
+    for position in 0..FRAME_POSITIONS {
+        let row = &gate_up[position * 2 * config.intermediate_size
+            ..(position + 1) * 2 * config.intermediate_size];
+        let (gate, up) = row.split_at(config.intermediate_size);
+        let out = &mut activated
+            [position * config.intermediate_size..(position + 1) * config.intermediate_size];
+        for ((slot, g), u) in out.iter_mut().zip(gate.iter()).zip(up.iter()) {
+            *slot = silu(*g) * u;
+        }
+    }
+
+    let mut mlp_out = vec![0.0_f32; FRAME_POSITIONS * width];
+    quant_linear(
+        mode,
+        &activated,
+        &quant.down_proj,
+        None,
+        FRAME_POSITIONS,
+        &mut mlp_out,
+    );
+
+    residual
+        .iter()
+        .zip(mlp_out.iter())
+        .map(|(r, m)| r + m)
+        .collect()
+}
+
+/// Grouped-query softmax attention for one query row against the frame cache.
+///
+/// Lifted verbatim out of [`layer_step_q8`] so the sequential and blocked schedules share one
+/// definition — the reduction order here is load-bearing for their bit-identity.
+fn attend_one_position(
+    config: &MicrodecoderConfig,
+    q: &[f32],
+    state: &FrameKvState,
+    context: &mut [f32],
+) {
     let scale = 1.0 / (config.head_dim as f32).sqrt();
     let positions = state.len();
-    let mut context = vec![0.0_f32; config.q_width()];
+    context.fill(0.0);
     for head in 0..config.num_q_heads {
         let kv_head = head / config.q_per_kv();
         let query = &q[head * config.head_dim..(head + 1) * config.head_dim];
@@ -671,31 +846,6 @@ pub fn layer_step_q8(
             }
         }
     }
-
-    let mut attn_out = vec![0.0_f32; config.hidden_size];
-    quant_linear(mode, &context, &quant.o_proj, None, 1, &mut attn_out);
-    let residual: Vec<f32> = hidden
-        .iter()
-        .zip(attn_out.iter())
-        .map(|(h, a)| h + a)
-        .collect();
-
-    let normed = rms_norm(&residual, weights.post_attention_norm, config.rms_eps);
-    let mut gate_up = vec![0.0_f32; 2 * config.intermediate_size];
-    quant_linear(mode, &normed, &quant.gate_up, None, 1, &mut gate_up);
-    let up = gate_up.split_off(config.intermediate_size);
-    let mut gate = gate_up;
-    for (g, u) in gate.iter_mut().zip(up.iter()) {
-        *g = silu(*g) * u;
-    }
-    let mut mlp_out = vec![0.0_f32; config.hidden_size];
-    quant_linear(mode, &gate, &quant.down_proj, None, 1, &mut mlp_out);
-
-    residual
-        .iter()
-        .zip(mlp_out.iter())
-        .map(|(r, m)| r + m)
-        .collect()
 }
 
 /// The armed microdecoder quantization route: body layers, optional heads, and the op mode.
@@ -1906,6 +2056,55 @@ mod tests {
                 gate_proj: &self.gate_proj,
                 up_proj: &self.up_proj,
                 down_proj: &self.down_proj,
+            }
+        }
+    }
+
+    /// The blocked seq-16 schedule must be **byte-identical** to the sequential one, not merely
+    /// close. Both run `layer_step_q8`'s arithmetic; the only difference is that
+    /// [`layer_block_q8`] hoists the four projections into `m = FRAME_POSITIONS` dispatches,
+    /// which reads each layer's int8 body once per frame instead of once per residual depth.
+    ///
+    /// This holds by construction — `linear_q8_dynamic` derives a separate activation scale per
+    /// row and accumulates every output element in i32 — so any failure here is a wiring bug in
+    /// the block's row indexing or cache ordering, never a tolerance question.
+    #[test]
+    fn microdecoder_block_matches_sequential_q8_bit_for_bit() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let layer = TestLayer::new(&config);
+        let borrowed = layer.borrow();
+        let quant = MicroLayerQuant::quantize(&config, &borrowed);
+        let mode = QuantLinearMode::W8A8(ftts_kernels::int8::Int8Tier::Scalar);
+
+        for seed in 0..6_u32 {
+            let hidden = weights_of(FRAME_POSITIONS * config.hidden_size, 4_000 + seed);
+
+            // Sequential: one position at a time through a single retained frame cache.
+            let mut state = FrameKvState::new(&config);
+            let mut sequential = Vec::with_capacity(FRAME_POSITIONS * config.hidden_size);
+            for position in 0..FRAME_POSITIONS {
+                let (cos, sin) = rope.row(position);
+                let row = &hidden
+                    [position * config.hidden_size..(position + 1) * config.hidden_size];
+                sequential.extend_from_slice(&layer_step_q8(
+                    &config, &borrowed, &quant, cos, sin, row, &mut state, mode,
+                ));
+            }
+
+            let blocked = layer_block_q8(&config, &borrowed, &quant, &rope, &hidden, mode);
+
+            assert_eq!(
+                blocked.len(),
+                sequential.len(),
+                "seed {seed}: block output shape must match the sequential schedule"
+            );
+            for (index, (block, step)) in blocked.iter().zip(sequential.iter()).enumerate() {
+                assert!(
+                    block.to_bits() == step.to_bits(),
+                    "seed {seed}: element {index} diverged — block {block:?} vs sequential \
+                     {step:?}; batching must never perturb the arithmetic"
+                );
             }
         }
     }
