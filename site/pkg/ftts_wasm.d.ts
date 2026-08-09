@@ -234,10 +234,10 @@ export interface InitOutput {
     readonly wasmengine_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
     readonly wasmengine_synthesize: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => [number, number, number, number];
     readonly worker_loop_entry: (a: number) => [number, number];
-    readonly worker_team_width: () => number;
     readonly arm_worker_team: (a: number) => void;
     readonly install_panic_hook: () => void;
     readonly publish_team_block: () => void;
+    readonly worker_team_width: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
