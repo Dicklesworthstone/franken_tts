@@ -96,7 +96,9 @@ fn run_say(resident_dir: &std::path::Path, out: &std::path::Path, extra: &[&str]
 #[test]
 fn resident_daemon_reuse_parity_and_idle_exit() {
     let Some(_model) = model_dir() else {
-        eprintln!("SKIP-AS-SUCCESS: no complete model directory; resident e2e needs the real model");
+        eprintln!(
+            "SKIP-AS-SUCCESS: no complete model directory; resident e2e needs the real model"
+        );
         return;
     };
     let scratch = std::env::temp_dir().join(format!("ftts-resident-e2e-{}", std::process::id()));
