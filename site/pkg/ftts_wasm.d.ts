@@ -2,6 +2,58 @@
 /* eslint-disable */
 
 /**
+ * Model bytes accumulated directly inside wasm linear memory, a slice at a time.
+ *
+ * # Why this exists
+ *
+ * Passing the artifact as a `Vec<u8>` makes wasm-bindgen copy it out of the JS `ArrayBuffer`
+ * into linear memory, so a 1.3 GB model is **live twice** at the moment of construction. Desktop
+ * Chrome absorbs 2.6 GB; an iPhone does not — the tab is reclaimed and the page "crashes while
+ * loading". Streaming OPFS slices straight into a buffer that already lives in wasm keeps the JS
+ * heap at one slice and the artifact at exactly one copy.
+ *
+ * Capacity is reserved once, exactly, up front. That is the load-bearing detail: a `Vec` that
+ * grows by doubling would transiently hold 1.3 GB *plus* its 2.6 GB successor while copying —
+ * worse than the problem being solved. `try_reserve_exact` also turns an allocation failure into
+ * a thrown error naming the number of bytes, rather than the opaque `unreachable` a wasm abort
+ * shows the user.
+ */
+export class ModelStaging {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Bytes accepted so far, so the caller can drive a progress bar without tracking it twice.
+     */
+    filled(): number;
+    /**
+     * Reserve exact room for both files before any bytes arrive.
+     *
+     * # Errors
+     *
+     * Throws when linear memory cannot be reserved, naming the byte count that failed — the
+     * honest signal on a device that simply does not have the memory.
+     */
+    constructor(fttsq_bytes: number, codec_bytes: number);
+    /**
+     * Append one slice of the codec checkpoint, in order.
+     *
+     * # Errors
+     *
+     * As [`ModelStaging::push_fttsq`].
+     */
+    push_codec(chunk: Uint8Array): void;
+    /**
+     * Append one slice of the artifact, in order.
+     *
+     * # Errors
+     *
+     * Throws if the slice would exceed the reserved capacity, which means the caller's manifest
+     * and its download disagree — better caught here than as a corrupt tensor later.
+     */
+    push_fttsq(chunk: Uint8Array): void;
+}
+
+/**
  * The loaded model: talker+microdecoder from the canonical artifact, codec from the raw
  * speech-tokenizer checkpoint, tokenizer from its three text files.
  */
@@ -18,6 +70,17 @@ export class WasmEngine {
      * Throws when the PCM is too short for the mel front end or hydration fails.
      */
     enroll(pcm: Float32Array): Float32Array;
+    /**
+     * Hydrate from bytes already resident in wasm memory, consuming the staging buffer.
+     *
+     * The streaming counterpart of [`WasmEngine::new`]: identical hydration, but the artifact is
+     * moved rather than copied, so the peak is one copy instead of two.
+     *
+     * # Errors
+     *
+     * Throws when staging is incomplete, or with the failing hydration stage named.
+     */
+    static from_staging(staging: ModelStaging, vocab_json: string, merges_txt: string, tokenizer_config_json: string): WasmEngine;
     /**
      * Hydrate the engine from in-memory buffers.
      *
@@ -57,10 +120,37 @@ export class WasmEngine {
 export function bench_frame_kernels(rounds: number): string;
 
 /**
+ * Times one int8 GEMV at a real model reduction length and returns nanoseconds per dot.
+ *
+ * A kernel benchmark rather than an end-to-end one on purpose: it isolates the thing the SIMD
+ * island changes, needs no 2 GB model, and runs in a second. `tier` takes the route names from
+ * [`ftts_kernels::int8::Int8Tier::as_str`] so a caller can A/B `scalar` against `wasm-simd128`
+ * in the same process — same allocator, same warm caches, same engine — which is the only way
+ * the ratio means anything.
+ *
+ * Timing is the caller's job: wasm has no clock, so this returns after `rounds` passes and the
+ * JS side divides by its own `performance.now()` delta.
+ *
+ * # Errors
+ *
+ * Throws when `tier` is not a route this build can execute.
+ */
+export function bench_int8_gemv(tier: string, k: number, n: number, rounds: number): number;
+
+/**
  * Routes Rust panics to `console.error` with the real message and location — without this a
  * release-wasm panic surfaces as an opaque `RuntimeError: unreachable`.
  */
 export function install_panic_hook(): void;
+
+/**
+ * Which int8 route this build actually dispatches in the browser.
+ *
+ * Exposed because the browser has no environment variables and no `robot backends`: without a
+ * way to ask, a wasm build that silently fell back to the scalar loop would look exactly like
+ * one running the SIMD128 island, and that difference is most of the frame time.
+ */
+export function int8_route(): string;
 
 /**
  * The 1,024-float x-vector of a built-in voice.
@@ -80,11 +170,19 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly __wbg_modelstaging_free: (a: number, b: number) => void;
     readonly __wbg_wasmengine_free: (a: number, b: number) => void;
     readonly bench_frame_kernels: (a: number) => [number, number];
+    readonly bench_int8_gemv: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
+    readonly int8_route: () => [number, number];
+    readonly modelstaging_filled: (a: number) => number;
+    readonly modelstaging_new: (a: number, b: number) => [number, number, number];
+    readonly modelstaging_push_codec: (a: number, b: number, c: number) => [number, number];
+    readonly modelstaging_push_fttsq: (a: number, b: number, c: number) => [number, number];
     readonly preset_vector: (a: number, b: number) => [number, number, number, number];
     readonly presets: () => [number, number];
     readonly wasmengine_enroll: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly wasmengine_from_staging: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly wasmengine_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
     readonly wasmengine_synthesize: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => [number, number, number, number];
     readonly install_panic_hook: () => void;

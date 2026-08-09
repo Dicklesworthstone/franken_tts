@@ -2,7 +2,7 @@
   "name": "ftts-wasm",
   "type": "module",
   "description": "franken_tts browser bindings: the Qwen3-TTS pipeline compiled to WASM for the playground",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "license": "SEE LICENSE IN ../../LICENSE",
   "repository": {
     "type": "git",

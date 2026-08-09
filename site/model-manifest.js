@@ -17,18 +17,21 @@ export const MODEL_FILES = [
   {
     asset: "vocab.json",
     key: "vocab",
+    text: true,
     bytes: 2776833,
     sha256: "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
   },
   {
     asset: "merges.txt",
     key: "merges",
+    text: true,
     bytes: 1671839,
     sha256: "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
   },
   {
     asset: "tokenizer_config.json",
     key: "tokenizerConfig",
+    text: true,
     bytes: 7344,
     sha256: "dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670",
   },

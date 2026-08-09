@@ -2,7 +2,16 @@
 // at wasm speed, and none of that may block the UI thread. Protocol: postMessage
 // {type, ...}; replies mirror the request type with `ok` or `error`.
 
-import init, { WasmEngine, presets, preset_vector } from "./pkg/ftts_wasm.js?v=@SITEV@";
+import init, {
+  WasmEngine,
+  ModelStaging,
+  presets,
+  preset_vector,
+} from "./pkg/ftts_wasm.js?v=@SITEV@";
+
+// Slice size for streaming OPFS into wasm. Big enough that per-call overhead is noise, small
+// enough that the JS heap never holds a meaningful fraction of the model.
+const INGEST_SLICE = 16 * 1024 * 1024;
 
 let engine = null;
 
@@ -19,11 +28,26 @@ self.onmessage = async ({ data }) => {
         break;
       }
       case "load": {
-        // Buffers arrive transferred (zero-copy); the engine verifies the artifact's
-        // digests again in wasm before reading a single tensor.
-        engine = new WasmEngine(
-          new Uint8Array(data.fttsq),
-          new Uint8Array(data.codec),
+        // The large files are streamed OUT of OPFS and straight INTO wasm linear memory. They are
+        // never materialized as JS ArrayBuffers: doing that put a 1.3 GB artifact in memory twice
+        // (once for JS, once for wasm-bindgen's copy) and is what reclaimed the tab on iOS.
+        // The engine still re-verifies the artifact's own digests in wasm before reading a tensor.
+        const root = await navigator.storage.getDirectory();
+        const staging = new ModelStaging(data.fttsq.bytes, data.codec.bytes);
+        for (const [meta, push] of [
+          [data.fttsq, (chunk) => staging.push_fttsq(chunk)],
+          [data.codec, (chunk) => staging.push_codec(chunk)],
+        ]) {
+          const blob = await (await root.getFileHandle(meta.asset)).getFile();
+          for (let offset = 0; offset < blob.size; offset += INGEST_SLICE) {
+            const end = Math.min(offset + INGEST_SLICE, blob.size);
+            // One slice live at a time; the previous is collectable before the next is read.
+            push(new Uint8Array(await blob.slice(offset, end).arrayBuffer()));
+            reply("loadProgress", { bytesDone: staging.filled() });
+          }
+        }
+        engine = WasmEngine.from_staging(
+          staging,
           data.vocab,
           data.merges,
           data.tokenizerConfig,

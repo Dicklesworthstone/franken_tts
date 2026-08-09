@@ -1,10 +1,107 @@
 /* @ts-self-types="./ftts_wasm.d.ts" */
 
 /**
+ * Model bytes accumulated directly inside wasm linear memory, a slice at a time.
+ *
+ * # Why this exists
+ *
+ * Passing the artifact as a `Vec<u8>` makes wasm-bindgen copy it out of the JS `ArrayBuffer`
+ * into linear memory, so a 1.3 GB model is **live twice** at the moment of construction. Desktop
+ * Chrome absorbs 2.6 GB; an iPhone does not — the tab is reclaimed and the page "crashes while
+ * loading". Streaming OPFS slices straight into a buffer that already lives in wasm keeps the JS
+ * heap at one slice and the artifact at exactly one copy.
+ *
+ * Capacity is reserved once, exactly, up front. That is the load-bearing detail: a `Vec` that
+ * grows by doubling would transiently hold 1.3 GB *plus* its 2.6 GB successor while copying —
+ * worse than the problem being solved. `try_reserve_exact` also turns an allocation failure into
+ * a thrown error naming the number of bytes, rather than the opaque `unreachable` a wasm abort
+ * shows the user.
+ */
+export class ModelStaging {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ModelStagingFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_modelstaging_free(ptr, 0);
+    }
+    /**
+     * Bytes accepted so far, so the caller can drive a progress bar without tracking it twice.
+     * @returns {number}
+     */
+    filled() {
+        const ret = wasm.modelstaging_filled(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Reserve exact room for both files before any bytes arrive.
+     *
+     * # Errors
+     *
+     * Throws when linear memory cannot be reserved, naming the byte count that failed — the
+     * honest signal on a device that simply does not have the memory.
+     * @param {number} fttsq_bytes
+     * @param {number} codec_bytes
+     */
+    constructor(fttsq_bytes, codec_bytes) {
+        const ret = wasm.modelstaging_new(fttsq_bytes, codec_bytes);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0];
+        ModelStagingFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Append one slice of the codec checkpoint, in order.
+     *
+     * # Errors
+     *
+     * As [`ModelStaging::push_fttsq`].
+     * @param {Uint8Array} chunk
+     */
+    push_codec(chunk) {
+        const ptr0 = passArray8ToWasm0(chunk, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.modelstaging_push_codec(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Append one slice of the artifact, in order.
+     *
+     * # Errors
+     *
+     * Throws if the slice would exceed the reserved capacity, which means the caller's manifest
+     * and its download disagree — better caught here than as a corrupt tensor later.
+     * @param {Uint8Array} chunk
+     */
+    push_fttsq(chunk) {
+        const ptr0 = passArray8ToWasm0(chunk, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.modelstaging_push_fttsq(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+}
+if (Symbol.dispose) ModelStaging.prototype[Symbol.dispose] = ModelStaging.prototype.free;
+
+/**
  * The loaded model: talker+microdecoder from the canonical artifact, codec from the raw
  * speech-tokenizer checkpoint, tokenizer from its three text files.
  */
 export class WasmEngine {
+    static __wrap(ptr) {
+        const obj = Object.create(WasmEngine.prototype);
+        obj.__wbg_ptr = ptr;
+        WasmEngineFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;
         this.__wbg_ptr = 0;
@@ -36,6 +133,36 @@ export class WasmEngine {
         var v2 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
         wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
         return v2;
+    }
+    /**
+     * Hydrate from bytes already resident in wasm memory, consuming the staging buffer.
+     *
+     * The streaming counterpart of [`WasmEngine::new`]: identical hydration, but the artifact is
+     * moved rather than copied, so the peak is one copy instead of two.
+     *
+     * # Errors
+     *
+     * Throws when staging is incomplete, or with the failing hydration stage named.
+     * @param {ModelStaging} staging
+     * @param {string} vocab_json
+     * @param {string} merges_txt
+     * @param {string} tokenizer_config_json
+     * @returns {WasmEngine}
+     */
+    static from_staging(staging, vocab_json, merges_txt, tokenizer_config_json) {
+        _assertClass(staging, ModelStaging);
+        var ptr0 = staging.__destroy_into_raw();
+        const ptr1 = passStringToWasm0(vocab_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(merges_txt, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(tokenizer_config_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmengine_from_staging(ptr0, ptr1, len1, ptr2, len2, ptr3, len3);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmEngine.__wrap(ret[0]);
     }
     /**
      * Hydrate the engine from in-memory buffers.
@@ -130,11 +257,63 @@ export function bench_frame_kernels(rounds) {
 }
 
 /**
+ * Times one int8 GEMV at a real model reduction length and returns nanoseconds per dot.
+ *
+ * A kernel benchmark rather than an end-to-end one on purpose: it isolates the thing the SIMD
+ * island changes, needs no 2 GB model, and runs in a second. `tier` takes the route names from
+ * [`ftts_kernels::int8::Int8Tier::as_str`] so a caller can A/B `scalar` against `wasm-simd128`
+ * in the same process — same allocator, same warm caches, same engine — which is the only way
+ * the ratio means anything.
+ *
+ * Timing is the caller's job: wasm has no clock, so this returns after `rounds` passes and the
+ * JS side divides by its own `performance.now()` delta.
+ *
+ * # Errors
+ *
+ * Throws when `tier` is not a route this build can execute.
+ * @param {string} tier
+ * @param {number} k
+ * @param {number} n
+ * @param {number} rounds
+ * @returns {number}
+ */
+export function bench_int8_gemv(tier, k, n, rounds) {
+    const ptr0 = passStringToWasm0(tier, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.bench_int8_gemv(ptr0, len0, k, n, rounds);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0];
+}
+
+/**
  * Routes Rust panics to `console.error` with the real message and location — without this a
  * release-wasm panic surfaces as an opaque `RuntimeError: unreachable`.
  */
 export function install_panic_hook() {
     wasm.install_panic_hook();
+}
+
+/**
+ * Which int8 route this build actually dispatches in the browser.
+ *
+ * Exposed because the browser has no environment variables and no `robot backends`: without a
+ * way to ask, a wasm build that silently fell back to the scalar loop would look exactly like
+ * one running the SIMD128 island, and that difference is most of the frame time.
+ * @returns {string}
+ */
+export function int8_route() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const ret = wasm.int8_route();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
 }
 
 /**
@@ -180,7 +359,7 @@ function __wbg_get_imports() {
         __wbg___wbindgen_throw_344f42d3211c4765: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
-        __wbg_error_125507972813364c: function(arg0, arg1) {
+        __wbg_error_6d29952fd74a0b78: function(arg0, arg1) {
             console.error(getStringFromWasm0(arg0, arg1));
         },
         __wbg_now_86c0d4ba3fa605b8: function() {
@@ -208,9 +387,18 @@ function __wbg_get_imports() {
     };
 }
 
+const ModelStagingFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_modelstaging_free(ptr, 1));
 const WasmEngineFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_wasmengine_free(ptr, 1));
+
+function _assertClass(instance, klass) {
+    if (!(instance instanceof klass)) {
+        throw new Error(`expected instance of ${klass.name}`);
+    }
+}
 
 function getArrayF32FromWasm0(ptr, len) {
     ptr = ptr >>> 0;

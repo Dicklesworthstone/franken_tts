@@ -37,7 +37,12 @@ async function fetchRange(asset, start, endInclusive) {
 /**
  * Ensure every model file is present and digest-verified in OPFS.
  * `onProgress({assetsDone, assetsTotal, bytesDone, bytesTotal, phase, asset})`.
- * Returns { fttsq: ArrayBuffer, codec: ArrayBuffer, vocab: string, ... } keyed per manifest.
+ * Returns { fttsq: {asset, bytes}, codec: {asset, bytes}, vocab: string, ... }.
+ *
+ * The two large files are deliberately NOT returned as buffers. Reading a 1.3 GB artifact into an
+ * ArrayBuffer here, then handing it to wasm-bindgen, puts it in memory twice — which is what
+ * reclaims the tab on iOS. They stay in OPFS and the worker streams them into wasm linear memory
+ * a slice at a time; only the small tokenizer files decode to strings.
  */
 export async function ensureModel(onProgress) {
   const root = await opfsRoot();
@@ -62,10 +67,9 @@ export async function ensureModel(onProgress) {
       if (blob.size === file.bytes) {
         report("verifying", file.asset);
         if ((await digestBlob(blob)) === file.sha256) {
-          // The engine takes transferable ArrayBuffers, so one contiguous allocation is still
-          // required at hand-off. What streaming removed is the *second* one: verification used
-          // to materialize the whole file too, so a 1.3 GB asset needed 2.6 GB before this.
-          out[file.key] = await blob.arrayBuffer();
+          out[file.key] = file.text
+            ? new TextDecoder().decode(await blob.arrayBuffer())
+            : { asset: file.asset, bytes: file.bytes };
           bytesDone += file.bytes;
           assetsDone += 1;
           report("cached", file.asset);
@@ -116,17 +120,14 @@ export async function ensureModel(onProgress) {
     await writable.close();
     await root.removeEntry(`${file.asset}.part`);
 
-    out[file.key] = await (await (await root.getFileHandle(file.asset)).getFile()).arrayBuffer();
+    out[file.key] = file.text
+      ? new TextDecoder().decode(await (await (await root.getFileHandle(file.asset)).getFile()).arrayBuffer())
+      : { asset: file.asset, bytes: file.bytes };
     bytesDone += file.bytes;
     assetsDone += 1;
     report("done", file.asset);
   }
 
-  // Text files decode to strings for the tokenizer API.
-  const decoder = new TextDecoder();
-  for (const key of ["vocab", "merges", "tokenizerConfig"]) {
-    out[key] = decoder.decode(out[key]);
-  }
   return out;
 }
 
