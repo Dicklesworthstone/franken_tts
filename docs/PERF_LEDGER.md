@@ -30,6 +30,25 @@ tally_w_l_n: <wins/losses/neutrals for this lever>
 ## Local entries
 
 ```text
+PERF-004
+claim_id: codec-dense-blas-form
+evidence_id: interleaved 3-round codec_time A/B 2026-08-09 + codec_decode_l2 ratchet re-pin; commit 9528cac
+status: KEEP
+model_source_commit: 5d83992436eae1d760afd27aff78a71d676296fc
+fixture_sha256: 5ec2bc3f3217f9e026198c0694b3993d9911f7e954ea726c69ebd95e7d5ba4dd (fixture_manifest.json, via codec_decode_l2)
+artifact_sha256: not-applicable (codec loads raw speech_tokenizer safetensors)
+cpu_features: Apple M4 Pro aarch64, Accelerate BLAS
+command_env: codec_time example, 32 frames, three interleaved arms (FTTS_INT8_CODEC=0 / convnext / all), fleet-loaded host
+kill_switch: FTTS_INT8_CODEC=convnext|all|transformer re-arms the int8 arms; off macOS the named BLAS request degrades to the scalar reference
+incumbent: the tree's own previous default (convnext int8 + scalar-then-BLAS transformer dense); historical scalar f32 dense was 57-72 ms/frame on this family
+before_after: all-BLAS f32 20.5/21.1/21.2 ms/frame vs convnext-int8 default 21.1/22.1/22.1 (3/3 rounds); all-int8 19.4-19.9 remains excluded by its failed 1.24 dB spectral gate
+cv_percent: not-gated (loaded host; 3/3 interleaved direction + the fidelity improvement carry the KEEP — quiet-window rerun shared with PERF-003's bead frankentts-866)
+equivalence: same-seed code stream identical (talker untouched, sample counts equal); codec waveform moves at the pinned f32-reorder level — the codec_decode_l2 ratchet TIGHTENED at all eight transformer seams and is re-pinned to the measured values; streaming==offline green; snake/convnext/gemm bisects green
+disposition: KEEP; the reference's nn.Linear IS addmm (bias-seeded beta=1 BLAS GEMM), so the named BLAS form is the more oracle-faithful arithmetic, not a tolerance concession — quantizing the codec now costs speed AND fidelity, hence int8 arms demoted to opt-in
+tally_w_l_n: 1/0/0
+```
+
+```text
 PERF-003
 claim_id: startup-hydration-campaign
 evidence_id: interleaved 3-round load-stage A/B vs installed v0.1.3 binary, 2026-08-09; commits 9478b3c/c311ab1/c883b6c/6c1b80d/4df93f0
