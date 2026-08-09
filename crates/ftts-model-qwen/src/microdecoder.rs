@@ -2499,6 +2499,25 @@ mod tests {
                             "{tier:?}/{label}/{draft_label}/seed {seed}: repair flag must track \
                              whether the whole draft was accepted"
                         );
+                        // Beyond the invariant above, each drafter state must reach the branch it
+                        // was built to exercise — otherwise this test could pass while never
+                        // running the accept path or never running the repair path at all.
+                        match draft_label {
+                            "exact" => assert!(
+                                !result.repaired && result.accepted_prefix_len == RESIDUAL_DEPTHS,
+                                "{tier:?}/{label}: a draft equal to the sequential output must be \
+                                 accepted whole, got prefix {} repaired={}",
+                                result.accepted_prefix_len,
+                                result.repaired
+                            ),
+                            "stale" => assert!(
+                                result.repaired,
+                                "{tier:?}/{label}: a draft that differs at depth {} must fall back \
+                                 to the authoritative sequential path",
+                                RESIDUAL_DEPTHS / 2
+                            ),
+                            _ => {}
+                        }
                     }
                 }
             }
