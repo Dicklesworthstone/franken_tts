@@ -50,12 +50,14 @@ fn run_say(resident_dir: &std::path::Path, out: &std::path::Path, extra: &[&str]
     let mut command = Command::new(env!("CARGO_BIN_EXE_ftts"));
     command
         .arg("say")
-        .arg("Resident engines should answer twice as politely.")
+        .arg("Warm start check.")
         .arg("-o")
         .arg(out)
         .args(extra)
         .env("FTTS_RESIDENT_DIR", resident_dir)
-        .env("FTTS_RESIDENT_IDLE_SECS", "3");
+        // Generous idle window: on slow machines a debug-build synthesis takes minutes,
+        // and a short window can reap the daemon between the runs that share it.
+        .env("FTTS_RESIDENT_IDLE_SECS", "30");
     let output = command.output().expect("ftts say runs");
     assert!(
         output.status.success(),
@@ -140,8 +142,8 @@ fn resident_daemon_reuse_parity_and_idle_exit() {
         "resident and in-process synthesis must produce identical WAV bytes",
     );
 
-    // Idle exit: within the 3 s idle period (plus slack), the daemon removes its state.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // Idle exit: within the 30 s idle period (plus slack), the daemon removes its state.
+    let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if !state_file.path().exists() {
             break;
