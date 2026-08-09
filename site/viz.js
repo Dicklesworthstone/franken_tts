@@ -333,7 +333,9 @@ const rvq = document.getElementById("rvq-viz");
 
 function buildRvq() {
   const NS = "http://www.w3.org/2000/svg";
-  const W = 900, H = 240, MID = 110, AMP = 78;
+  // MID sits below center: the component sum's worst-case upward excursion is larger
+  // than its downward one (measured across all 16 depths), and the legend needs y<30.
+  const W = 900, H = 240, MID = 124, AMP = 78;
   const COMPONENTS = 16;
   const comp = [];
   for (let k = 0; k < COMPONENTS; k++) {
