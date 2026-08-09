@@ -124,6 +124,7 @@ impl WasmEngine {
     /// tokenizer construction.
     #[wasm_bindgen(constructor)]
     #[allow(clippy::needless_pass_by_value)]
+    #[cfg(not(unix))]
     pub fn new(
         fttsq: Vec<u8>,
         codec: Vec<u8>,
@@ -131,19 +132,10 @@ impl WasmEngine {
         merges_txt: String,
         tokenizer_config_json: String,
     ) -> Result<WasmEngine, JsValue> {
-        #[cfg(not(unix))]
         let artifact = Arc::new(
             ftts_artifacts::fttsq::MappedFttsq::from_bytes(fttsq)
                 .map_err(|error| js_error("artifact rejected", error))?,
         );
-        #[cfg(unix)]
-        let artifact: Arc<ftts_artifacts::fttsq::MappedFttsq> = {
-            let _ = fttsq;
-            return Err(js_error(
-                "unsupported host",
-                "byte-based engine construction is the wasm path; native hosts use the CLI",
-            ));
-        };
 
         let label = Path::new("browser://model.fttsq");
         let talker = TalkerCheckpoint::load_fttsq_mapped(
@@ -153,14 +145,8 @@ impl WasmEngine {
         )
         .map_err(|error| js_error("talker hydration failed", error))?;
 
-        #[cfg(not(unix))]
         let codec_file = ftts_artifacts::safetensors::SafetensorsFile::from_bytes(codec)
             .map_err(|error| js_error("codec checkpoint rejected", error))?;
-        #[cfg(unix)]
-        let codec_file: ftts_artifacts::safetensors::SafetensorsFile = {
-            let _ = codec;
-            unreachable!("unix constructor already returned above");
-        };
         let codec =
             CodecCheckpoint::load_from_file(&codec_file, Path::new("browser://codec.safetensors"))
                 .map_err(|error| js_error("codec hydration failed", error))?;
@@ -179,6 +165,28 @@ impl WasmEngine {
             artifact,
             speaker_encoder: None,
         })
+    }
+
+    /// The unix stub: byte-based construction is the wasm path; native hosts use the CLI.
+    ///
+    /// # Errors
+    ///
+    /// Always throws — it exists so the crate compiles in native workspace gates.
+    #[wasm_bindgen(constructor)]
+    #[allow(clippy::needless_pass_by_value)]
+    #[cfg(unix)]
+    pub fn new(
+        fttsq: Vec<u8>,
+        codec: Vec<u8>,
+        vocab_json: String,
+        merges_txt: String,
+        tokenizer_config_json: String,
+    ) -> Result<WasmEngine, JsValue> {
+        let _ = (fttsq, codec, vocab_json, merges_txt, tokenizer_config_json);
+        Err(js_error(
+            "unsupported host",
+            "byte-based engine construction is the wasm path; native hosts use the CLI",
+        ))
     }
 
     /// Synthesize `text` with a 1,024-float speaker vector; returns mono 24 kHz PCM in
