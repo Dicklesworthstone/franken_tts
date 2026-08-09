@@ -355,6 +355,45 @@ pub fn write_speaker_vector_new(path: &Path, vector: &[f32]) -> Result<(), FttsE
     })
 }
 
+/// Replaces an existing enrolled voice, keeping the displaced one alongside it.
+///
+/// Enrollment is cheap to redo but a voice is not always cheap to re-record, and the reference a
+/// `.spk` came from may be long gone. The previous vector is copied to `<path>.bak` before the new
+/// one lands, so a mistaken overwrite is one `mv` away from undone rather than unrecoverable.
+///
+/// # Errors
+///
+/// When the vector is malformed, the backup cannot be written, or the file cannot be replaced.
+pub fn replace_speaker_vector(path: &Path, vector: &[f32]) -> Result<PathBuf, FttsError> {
+    let backup = path.with_extension("spk.bak");
+    fs::copy(path, &backup).map_err(|error| {
+        FttsError::Input(format!(
+            "cannot back up the existing voice {} to {}: {error}",
+            path.display(),
+            backup.display()
+        ))
+    })?;
+    // Write the replacement to a sibling first, then rename over the target: a crash mid-write
+    // must not leave a half-written vector where a valid voice used to be.
+    let staging = path.with_extension("spk.incoming");
+    if staging.exists() {
+        fs::remove_file(&staging).map_err(|error| {
+            FttsError::Input(format!(
+                "cannot clear the stale staging file {}: {error}",
+                staging.display()
+            ))
+        })?;
+    }
+    write_speaker_vector_new(&staging, vector)?;
+    fs::rename(&staging, path).map_err(|error| {
+        FttsError::Input(format!(
+            "cannot replace {} with the new voice: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(backup)
+}
+
 fn decode_speaker_vector(path: &Path, bytes: &[u8]) -> Result<Vec<f32>, FttsError> {
     let vector: Vec<f32> = bytes
         .as_chunks::<4>()

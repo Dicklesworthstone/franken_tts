@@ -4,6 +4,7 @@
 
 mod error;
 pub mod robot;
+pub mod style;
 pub mod synth;
 
 pub use error::{FttsError, FttsExitCode};
@@ -216,6 +217,13 @@ struct EnrollArgs {
     /// Explicitly proceed after an enrollment-quality warning where safe.
     #[arg(long)]
     force: bool,
+
+    /// Replace an existing voice at the destination without asking.
+    ///
+    /// Interactive runs are asked to confirm instead; this is how a script or an agent gives that
+    /// consent up front. The displaced voice is copied to `<name>.spk.bak` either way.
+    #[arg(long)]
+    overwrite: bool,
 
     /// Spectral-subtract the stationary noise floor from the reference before enrolling.
     ///
@@ -1716,31 +1724,96 @@ fn run_enroll(
         &args.reference_audio,
         args.denoise.then_some(&mut denoise_report),
     )?;
-    synth::write_speaker_vector_new(&output, &speaker)?;
     // Report what the denoise measured rather than asserting it helped: a reference whose floor
     // barely moves was not noisy, and the user should reach for a better recording instead.
     if let Some(report) = denoise_report {
-        writeln!(
+        let moved = report.before_dbfs - report.after_dbfs;
+        style::ok(
             stdout,
-            "denoised reference: pause floor {:.1} dBFS -> {:.1} dBFS ({:.1} dB quieter)",
-            report.before_dbfs,
-            report.after_dbfs,
-            report.before_dbfs - report.after_dbfs,
+            &format!(
+                "denoised reference {}",
+                style::detail(&format!(
+                    "pause floor {:.1} → {:.1} dBFS ({moved:.1} dB quieter)",
+                    report.before_dbfs, report.after_dbfs
+                )),
+            ),
         )
         .map_err(|error| FttsError::Generic(format!("cannot write denoise report: {error}")))?;
     }
-    writeln!(
-        stdout,
-        "enrolled x-vector from {} to {}{}",
-        args.reference_audio.display(),
-        output.display(),
-        if args.default {
-            "; `ftts say` will use it when --voice is absent"
+
+    // Enrollment is cheap to redo; the recording behind an existing voice may not still exist. So
+    // an occupied destination asks rather than refuses — but only when somebody is there to ask.
+    // A pipe, a CI job, or an agent gets the explicit error it can act on instead of a prompt that
+    // would hang forever, and says `--overwrite` when it means it.
+    let backup = if output.exists() {
+        let consented = if args.overwrite {
+            true
         } else {
-            ""
-        },
+            style::warn(
+                stdout,
+                &format!(
+                    "{} already holds an enrolled voice",
+                    style::emphasis(&output.display().to_string())
+                ),
+            )
+            .map_err(|error| {
+                FttsError::Generic(format!("cannot write overwrite notice: {error}"))
+            })?;
+            match style::confirm(stdout, "Replace it?")
+                .map_err(|error| FttsError::Generic(format!("cannot read a reply: {error}")))?
+            {
+                Some(reply) => reply,
+                None => {
+                    return Err(FttsError::Input(format!(
+                        "{} already exists; pass --overwrite to replace it (the displaced voice is \
+                         kept as {}.bak)",
+                        output.display(),
+                        output.display()
+                    )));
+                }
+            }
+        };
+        if !consented {
+            style::info(stdout, "left the existing voice in place")
+                .map_err(|error| FttsError::Generic(format!("cannot write result: {error}")))?;
+            return Ok(());
+        }
+        Some(synth::replace_speaker_vector(&output, &speaker)?)
+    } else {
+        synth::write_speaker_vector_new(&output, &speaker)?;
+        None
+    };
+
+    style::ok(
+        stdout,
+        &format!(
+            "enrolled {} → {}",
+            style::emphasis(&args.reference_audio.display().to_string()),
+            style::emphasis(&output.display().to_string()),
+        ),
     )
-    .map_err(|error| FttsError::Generic(format!("cannot write enrollment result: {error}")))
+    .map_err(|error| FttsError::Generic(format!("cannot write enrollment result: {error}")))?;
+    if let Some(backup) = backup {
+        style::info(
+            stdout,
+            &format!(
+                "previous voice kept at {}",
+                style::emphasis(&backup.display().to_string())
+            ),
+        )
+        .map_err(|error| FttsError::Generic(format!("cannot write backup notice: {error}")))?;
+    }
+    if args.default {
+        style::info(
+            stdout,
+            &format!(
+                "{} will use it when --voice is absent",
+                style::emphasis("ftts say")
+            ),
+        )
+        .map_err(|error| FttsError::Generic(format!("cannot write result: {error}")))?;
+    }
+    Ok(())
 }
 
 /// One downloadable model file from the embedded manifest.
