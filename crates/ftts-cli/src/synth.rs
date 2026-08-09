@@ -147,10 +147,10 @@ pub struct LoadedModel {
     talker: TalkerCheckpoint,
     codec: CodecCheckpoint,
     tokenizer: QwenTokenizer,
-    /// A second mapping of the canonical artifact, when the bundle carries one. The int8 route
-    /// hydrates its Q8 tables straight from this (proven byte-identical to requantizing the
-    /// widened f32 copies, scales included); mapping the file twice costs nothing beyond page
-    /// cache the first mapping already warmed.
+    /// The checkpoint's own digest-verified mapping of the canonical artifact, shared so the
+    /// int8 route hydrates its Q8 tables from it (proven byte-identical to requantizing the
+    /// widened f32 copies, scales included). Never re-opened: every `MappedFttsq::open`
+    /// re-verifies the whole artifact's digests, ~1.3 GB of hashing.
     artifact: Option<std::sync::Arc<ftts_artifacts::fttsq::MappedFttsq>>,
 }
 
@@ -715,6 +715,30 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
         .collect();
 
     let mut tracker = ImcraTracker::new(bins);
+
+    // Pass 1 learns the noise floor over the whole recording and emits nothing.
+    //
+    // IMCRA seeds from its first frame and needs roughly a minimum-tracking window to converge.
+    // Streaming has to wear that, but enrollment does not: the file is already on disk, so the
+    // second pass can enhance frame 0 against a mature floor. Skipping this cost the opening half
+    // second of a reference that starts on speech ~78% of its energy — and voice memos usually do
+    // start on speech.
+    //
+    // Only the power spectra are retained. Keeping the complex frames instead would save the
+    // second FFT at the cost of 8× the memory, which a several-minute reference would feel.
+    let mut powers: Vec<Vec<f32>> = Vec::with_capacity(starts.len());
+    let mut scratch: Vec<rustfft::num_complex::Complex<f32>> =
+        vec![rustfft::num_complex::Complex::new(0.0, 0.0); DENOISE_FRAME];
+    for &start in &starts {
+        for (slot, n) in scratch.iter_mut().zip(0..DENOISE_FRAME) {
+            *slot = rustfft::num_complex::Complex::new(pcm[start + n] * window[n], 0.0);
+        }
+        forward.process(&mut scratch);
+        let power: Vec<f32> = (0..bins).map(|bin| scratch[bin].norm_sqr()).collect();
+        tracker.update(&power);
+        powers.push(power);
+    }
+
     // Decision-directed state: last frame's gain and a posteriori SNR, per bin.
     let mut prev_gain = vec![1.0_f32; bins];
     let mut prev_gamma = vec![1.0_f32; bins];
@@ -722,14 +746,15 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0_f32; pcm.len()];
     let mut weight = vec![0.0_f32; pcm.len()];
 
-    for &start in &starts {
+    // Pass 2 enhances, continuing the same tracker so its minima stay warm.
+    for (index, &start) in starts.iter().enumerate() {
         let mut frame: Vec<rustfft::num_complex::Complex<f32>> = (0..DENOISE_FRAME)
             .map(|n| rustfft::num_complex::Complex::new(pcm[start + n] * window[n], 0.0))
             .collect();
         forward.process(&mut frame);
 
-        let power: Vec<f32> = (0..bins).map(|bin| frame[bin].norm_sqr()).collect();
-        let presence = tracker.update(&power);
+        let power = &powers[index];
+        let presence = tracker.update(power);
 
         for bin in 0..bins {
             let noise = tracker.noise[bin].max(1e-12);
@@ -1434,6 +1459,43 @@ mod tests {
         assert!(
             kept > 0.7,
             "denoise removed too much of the signal: peak RMS kept {kept:.3} of the original"
+        );
+    }
+
+    /// IMCRA seeds its noise floor from the first frame, so a reference that opens on loud speech
+    /// — someone who starts talking immediately, which is most voice memos — seeds the floor high
+    /// and can have its own opening attenuated before minimum tracking catches up.
+    ///
+    /// Guards the worst case: the very first burst, not the loudest one, since a peak-over-the-
+    /// whole-file check would be carried by later bursts and hide exactly this.
+    #[test]
+    fn denoise_does_not_gut_a_reference_that_opens_on_speech() {
+        const TONE_HZ: f64 = 440.0;
+        let rate = SPEAKER_SAMPLE_RATE_HZ as usize;
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut noise = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / 2048.0) - 0.5
+        };
+        // Speech from sample zero, for two seconds, with no leading room tone to learn from.
+        let noisy: Vec<f32> = (0..rate * 2)
+            .map(|n| {
+                let t = n as f64 / rate as f64;
+                (std::f64::consts::TAU * TONE_HZ * t).sin() as f32 * 0.3 + noise() * 0.02
+            })
+            .collect();
+
+        let cleaned = denoise_reference(&noisy);
+        let rms = |pcm: &[f32]| (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt();
+
+        let opening = rate / 2; // the first half second, before minimum tracking has settled
+        let kept = rms(&cleaned[..opening]) / rms(&noisy[..opening]);
+        assert!(
+            kept > 0.7,
+            "the opening half second kept only {kept:.3} of its energy; IMCRA's seeding is \
+             attenuating speech it has not yet learned to distinguish from the floor"
         );
     }
 
