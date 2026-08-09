@@ -1040,23 +1040,23 @@ pub struct DereverbReport {
 /// Only late reverberation is removed. Early reflections arrive inside the protected delay by
 /// design, so a very close, very live room is improved less than a distant one.
 fn dereverb_reference(pcm: &[f32]) -> Vec<f32> {
-    if pcm.len() < DENOISE_FRAME * 4 {
+    if pcm.len() < DEREVERB_FRAME * 4 {
         return pcm.to_vec();
     }
     let mut planner = rustfft::FftPlanner::<f32>::new();
-    let forward = planner.plan_fft_forward(DENOISE_FRAME);
-    let inverse = planner.plan_fft_inverse(DENOISE_FRAME);
+    let forward = planner.plan_fft_forward(DEREVERB_FRAME);
+    let inverse = planner.plan_fft_inverse(DEREVERB_FRAME);
 
-    let window: Vec<f32> = (0..DENOISE_FRAME)
+    let window: Vec<f32> = (0..DEREVERB_FRAME)
         .map(|n| {
-            let phase = std::f32::consts::TAU * n as f32 / DENOISE_FRAME as f32;
+            let phase = std::f32::consts::TAU * n as f32 / DEREVERB_FRAME as f32;
             0.5 - 0.5 * phase.cos()
         })
         .collect();
 
-    let bins = DENOISE_FRAME / 2 + 1;
-    let starts: Vec<usize> = (0..=pcm.len() - DENOISE_FRAME)
-        .step_by(DENOISE_HOP)
+    let bins = DEREVERB_FRAME / 2 + 1;
+    let starts: Vec<usize> = (0..=pcm.len() - DEREVERB_FRAME)
+        .step_by(DEREVERB_HOP)
         .collect();
     let frames = starts.len();
     if frames <= DEREVERB_DELAY + DEREVERB_TAPS + 2 {
@@ -1066,9 +1066,9 @@ fn dereverb_reference(pcm: &[f32]) -> Vec<f32> {
     // Observed spectra, kept complex: prediction needs phase, unlike the magnitude-only denoiser.
     let mut observed: Vec<Vec<Complex64>> = Vec::with_capacity(frames);
     let mut scratch: Vec<rustfft::num_complex::Complex<f32>> =
-        vec![rustfft::num_complex::Complex::new(0.0, 0.0); DENOISE_FRAME];
+        vec![rustfft::num_complex::Complex::new(0.0, 0.0); DEREVERB_FRAME];
     for &start in &starts {
-        for (slot, n) in scratch.iter_mut().zip(0..DENOISE_FRAME) {
+        for (slot, n) in scratch.iter_mut().zip(0..DEREVERB_FRAME) {
             *slot = rustfft::num_complex::Complex::new(pcm[start + n] * window[n], 0.0);
         }
         forward.process(&mut scratch);
@@ -1146,20 +1146,20 @@ fn dereverb_reference(pcm: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0_f32; pcm.len()];
     let mut weight = vec![0.0_f32; pcm.len()];
     for (index, &start) in starts.iter().enumerate() {
-        let mut frame = vec![rustfft::num_complex::Complex::new(0.0_f32, 0.0); DENOISE_FRAME];
+        let mut frame = vec![rustfft::num_complex::Complex::new(0.0_f32, 0.0); DEREVERB_FRAME];
         for bin in 0..bins {
             let value = desired[index][bin];
             #[allow(clippy::cast_possible_truncation)]
             let value = rustfft::num_complex::Complex::new(value.re as f32, value.im as f32);
             frame[bin] = value;
-            let mirror = DENOISE_FRAME - bin;
-            if mirror != bin && mirror < DENOISE_FRAME {
+            let mirror = DEREVERB_FRAME - bin;
+            if mirror != bin && mirror < DEREVERB_FRAME {
                 frame[mirror] = value.conj();
             }
         }
         inverse.process(&mut frame);
-        let scale = 1.0 / DENOISE_FRAME as f32;
-        for n in 0..DENOISE_FRAME {
+        let scale = 1.0 / DEREVERB_FRAME as f32;
+        for n in 0..DEREVERB_FRAME {
             out[start + n] += frame[n].re * scale * window[n];
             weight[start + n] += window[n] * window[n];
         }
@@ -1170,7 +1170,7 @@ fn dereverb_reference(pcm: &[f32]) -> Vec<f32> {
         }
     }
     let covered =
-        starts.first().copied().unwrap_or(0)..starts.last().map_or(0, |last| last + DENOISE_FRAME);
+        starts.first().copied().unwrap_or(0)..starts.last().map_or(0, |last| last + DEREVERB_FRAME);
     for (index, sample) in out.iter_mut().enumerate() {
         if !covered.contains(&index) || weight[index] <= 1e-6 {
             *sample = pcm[index];
