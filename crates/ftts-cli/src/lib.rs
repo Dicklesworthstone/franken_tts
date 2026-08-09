@@ -67,6 +67,28 @@ const ENVIRONMENT_VARIABLES: [&str; 11] = [
 
 /// Runs the shared `ftts` / `franken_tts` command-line interface.
 pub fn cli_main() -> ExitCode {
+    // The PRODUCT defaults to the optimized route (owner decision, DISC-003): int8 W8A8 on the
+    // talker and microdecoder, int8 on the codec's ConvNeXt projections (the arm the spectral
+    // gate measured transparent, 0.65 dB LSD), the SLEEF SnakeBeta (129.6 dB SNR), and the
+    // measured six-way worker team. Every switch is a plain environment default, so setting a
+    // variable yourself always wins, and `FTTS_INT8=0` is the master reference switch: it turns
+    // the whole optimized stack off unless you re-arm pieces explicitly. The library crates
+    // keep f32 defaults, so every oracle-parity suite still tests the reference path.
+    // `set_default_if_unset`'s contract is "before any thread exists" — which is here, the
+    // first statements of the binary entrypoint.
+    if matches!(
+        std::env::var("FTTS_INT8").as_deref(),
+        Ok("0" | "off" | "false")
+    ) {
+        ftts_kernels::startup_env::set_default_if_unset("FTTS_INT8_CODEC", "0");
+        ftts_kernels::startup_env::set_default_if_unset("FTTS_FAST_SNAKE", "0");
+    } else {
+        ftts_kernels::startup_env::set_default_if_unset("FTTS_INT8", "1");
+        ftts_kernels::startup_env::set_default_if_unset("FTTS_INT8_CODEC", "convnext");
+        ftts_kernels::startup_env::set_default_if_unset("FTTS_FAST_SNAKE", "1");
+        ftts_kernels::startup_env::set_default_if_unset("FTTS_INT8_THREADS", "6");
+    }
+
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {

@@ -54,17 +54,18 @@ This is the first release. What works now:
   - Codec: whole-utterance codes exact vs oracle at the engine level.
   - Audio: peak frame RMS 0.08578 vs 0.0859745 for the pinned PyTorch reference.
   - Streaming: codec streaming == offline, bit-identical, under all packet schedules.
-- **Honest performance.** A 55-frame utterance takes ~60 s wall in a release build (~0.5 s/frame, plus a one-time ~30 s model load). That is 6–7× slower than real time, and deliberately so: the default path is the unoptimized f32 reference. The int8 route below is where the speed lives.
+- **Performance, measured honestly.** The `ftts` binary now defaults to the optimized int8 route (below). On one M4 Pro that was busy running a dozen other build jobs, a 59-frame utterance (4.7 s of audio) synthesized in 4.5–7.2 s: 0.66–1.05× real time depending on machine load, with model load and one-time weight quantization adding ~3 s up front. The f32 reference path remains available (`FTTS_INT8=0`) and runs 6–7× slower than real time by design — it exists for correctness, not speed.
 
-### Experimental int8 route (off by default)
+### The optimized route (the default in the `ftts` binary)
 
-The first quantized kernels have landed behind kill-switches. Everything below was measured on one M4 Pro under varying load, against this tree's own f32 reference rather than a pinned external incumbent, so treat the ratios as local evidence:
+The `ftts` binary arms the quantized stack by default; the library crates keep f32 defaults so every oracle-parity suite still tests the reference path. `FTTS_INT8=0` is the master switch back to the bit-exact f32 reference. What the default route runs, with its measured evidence (one M4 Pro, this tree's own f32 reference as the comparison — local evidence, not a cross-project benchmark):
 
-- `FTTS_INT8=1` runs the talker and microdecoder projection matmuls as W8A8 int8 (symmetric per-channel weights, dynamic per-row activations, exact i32 accumulation). Local synthesis speedup: roughly 5–7×.
-- `FTTS_INT8_CODEC=convnext` (or `all`) extends int8 to the codec's dense projections. The codec alone drops from ~64 ms to ~26–33 ms per 80 ms frame; PCM SNR against the f32 codec on a real sampled utterance measured 41.4 dB for `convnext` and 32.6 dB for `all`.
-- Three kernel tiers ship (plain scalar, an 8-lane variant kept only as a measurement control, and a NEON SDOT island), all proven exactly equal in i32 on every census shape by `ftts robot selftest` on your machine, with a small startup autotuner picking the winner per regime.
+- **W8A8 int8 talker + microdecoder** (symmetric per-channel weights, dynamic per-row activations, exact i32 accumulation), fanned across a six-thread persistent worker team whose partitioning is bit-identical to serial execution at every thread count.
+- **int8 codec ConvNeXt projections** — the arm the spectral gate measured transparent: 0.65 dB mean log-spectral distance against the f32 codec on identical codes, spectrograms visually indistinguishable. The coarser `all` arm exists but failed the 1 dB threshold and is not the default.
+- **SLEEF SnakeBeta** (129.6 dB SNR against libm — inaudible by a wide margin) and a startup autotuner that picks the fastest proven kernel tier per regime, cached in `~/.cache/franken_tts/`.
+- Every int8 kernel tier is proven exactly equal to the scalar reference in i32 by `ftts robot selftest`, on your machine, at this model's real reduction lengths.
 
-Why it stays off: int8 changes the numbers, and the shipping gate for that is listening-based quality evaluation, not kernel math. Under greedy decode the int8 token stream matched f32 exactly on one test utterance and diverged on most others (near-tie argmaxes flip, and the divergence compounds autoregressively), which is expected for a lossy route and is precisely what the pending quality gates exist to judge. Until they pass, f32 remains the default and the flags above are opt-in.
+What the default route does not promise yet: sampled outputs are *different valid renditions*, not the f32 waveform — with sixteen sampled draws per frame, any lossy weight change alters the token stream within a frame or two (measured). Objective spectral checks pass for the codec and SnakeBeta pieces; a listening-based evaluation of the full sampled path against the reference is still open (`docs/DISCREPANCIES.md`, DISC-003), which is why the reference route stays one environment variable away.
 
 ## Verification
 
@@ -152,8 +153,9 @@ Workspace crates: `ftts-core` (engine), `ftts-model-qwen` (model graph), `ftts-k
 
 ## Known limitations
 
-- **Slower than real time by default.** The f32 reference path runs 6–7× slower than real time on M-series. The experimental int8 route closes most of that gap but stays opt-in until its quality gates pass.
-- **int8 quality is unproven.** The int8 kernels are exact integer math, but quantization changes the model's numbers; listening-based evaluation of the sampled production path has not run yet.
+- **Real time is load-dependent.** The default optimized route measured 0.66–1.05× real time on a heavily loaded M4 Pro; a quiet machine sits at the top of that range. The f32 reference route (`FTTS_INT8=0`) runs 6–7× slower than real time by design.
+- **The optimized default trades exactness for speed.** Kernel integer math is exactly proven, and the codec and SnakeBeta pieces pass objective spectral gates, but listening-based evaluation of the full sampled path is still open (DISC-003); `FTTS_INT8=0` restores the reference route.
+- **Weights quantize at load time (~2–3 s).** Pre-quantized artifact downloads are planned; today `ftts pull` fetches the f32 snapshot and the optimized route quantizes in memory.
 - **No quantized artifacts ship yet.** int8 currently quantizes at load time; the `.fttsq` artifact pipeline for pre-quantized weights is still in progress.
 - **Voice quality depends on the reference voice** you enroll.
 - **EOS stop timing is sampling-dependent.** A text-proportional frame cap backstops it by default; set `FTTS_MAX_FRAMES` for an exact cap.
