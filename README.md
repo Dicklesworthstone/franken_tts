@@ -70,7 +70,7 @@ The output format follows the extension. `.wav` comes straight from the built-in
 
 ## Try it in your browser
 
-**[frankentts.com](https://frankentts.com)** (also [frankentts.pages.dev](https://frankentts.pages.dev)) runs the whole pipeline as WebAssembly — type, pick a voice, clone your own from a 10-second mic recording, listen, download. Nothing you type or record leaves the tab: the model downloads once (~2.0 GB, resumable, SHA-256-verified into browser storage) and inference is local. Honest speed note: the single-threaded wasm build runs ~0.2–0.3× real time (measured 258 ms per 80 ms frame for the talker+microdecoder schedule) — a five-second line takes twenty-odd seconds with a progress bar; browser threads + relaxed SIMD are the tracked path to real time. Desktop browsers only (~3.5 GB peak memory). The site lives in `site/`; the bindings in `crates/ftts-wasm`.
+**[frankentts.com](https://frankentts.com)** (also [frankentts.pages.dev](https://frankentts.pages.dev)) runs the whole pipeline as WebAssembly — type, pick a voice, clone your own by reading a half-minute script into the mic, listen, download. Nothing you type or record leaves the tab: the model downloads once (~2.0 GB, resumable, SHA-256-verified into browser storage) and inference is local. Honest speed note: the single-threaded wasm build runs ~0.2–0.3× real time (measured 258 ms per 80 ms frame for the talker+microdecoder schedule) — a five-second line takes twenty-odd seconds with a progress bar; browser threads + relaxed SIMD are the tracked path to real time. Desktop browsers only (~3.5 GB peak memory). The site lives in `site/`; the bindings in `crates/ftts-wasm`.
 
 ## Status: v0.1.4, faster than real time
 

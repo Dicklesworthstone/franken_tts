@@ -515,9 +515,9 @@
       <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
         <div class="pg-label mb-3">Zero-shot cloning</div>
         <p class="pg-note mb-3">
-          A speaker encoder distills roughly ten seconds of reference audio into a single
-          1,024-float x-vector. That vector conditions every frame of generation. There is no
-          fine-tuning and no per-voice training; a new voice is one forward pass of the encoder.
+          A speaker encoder distills a short reference recording into a single 1,024-float
+          x-vector. That vector conditions every frame of generation. There is no fine-tuning
+          and no per-voice training; a new voice is one forward pass of the encoder.
         </p>
         <p class="pg-note">
           This is the same mechanism the playground uses when you record the enrollment script,
