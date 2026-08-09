@@ -30,6 +30,25 @@ tally_w_l_n: <wins/losses/neutrals for this lever>
 ## Local entries
 
 ```text
+PERF-003
+claim_id: startup-hydration-campaign
+evidence_id: interleaved 3-round load-stage A/B vs installed v0.1.3 binary, 2026-08-09; commits 9478b3c/c311ab1/c883b6c/6c1b80d/4df93f0
+status: KEEP (magnitude PROVISIONAL_LOCAL_WIN — host load average 26-54 throughout; direction consistent 3/3 interleaved rounds; quiet-window rerun owed)
+model_source_commit: 5d83992436eae1d760afd27aff78a71d676296fc
+fixture_sha256: not-applicable (load-stage wall time, no fixture)
+artifact_sha256: 597f7eb3314a2fe5be74fa10a6a3a28ace9e10e582c641deccd37348a0ccd824
+cpu_features: Apple M4 Pro aarch64
+command_env: ftts say --seed 11 "Hi." (load-stage NDJSON elapsed), new binary interleaved with brew-installed v0.1.3
+kill_switch: FTTS_LOAD_THREADS=1 (serial widen), FTTS_ARTIFACT_Q8=0 (requantize + no elision), FTTS_INT8=0 (f32 reference, elision auto-off)
+incumbent: installed v0.1.3 (pre-campaign hydration; its own ~1.1 s generator-build requantize additionally falls OUTSIDE its load stage, so the shown gap understates the total)
+before_after: load stage 6.3/6.9/8.0 s (v0.1.3) vs 4.8/5.7/5.3 s (campaign) in interleaved pairs under load
+cv_percent: not-gated (host load 26-54 — magnitudes are provisional by rule; the 3/3 direction and the eliminated double-digest-verify (~1.3 GB re-hash, structural) support KEEP)
+equivalence: BYTE-IDENTICAL same-seed say across armed+elided, FTTS_ARTIFACT_Q8=0, and FTTS_INT8=0 routes at every step of the campaign
+disposition: KEEP; levers: (1) concurrent tensor widening (capped avail/2 max 6 after uncapped workers measured LOSING ~2x to serial under external load — that interleaved loss is recorded here as the reason for the cap), (2) hot-projection f32 elision when the armed route hydrates artifact-natively, (3) codec/tokenizer load overlapped with talker, (4) parallel codec piece hydration, (5) shared digest-verified mapping (the double MappedFttsq::open was hashing 1.3 GB twice)
+tally_w_l_n: 1/0/0 (campaign; the uncapped-workers sub-lever is the internal L that produced the cap)
+```
+
+```text
 PERF-002
 claim_id: artifact-native-q8-hydration
 evidence_id: examples/artifact_q8_hydration.rs run 2026-08-09 + same-seed say byte-compare; commits 90c75d3/9183802/54eb4b8
