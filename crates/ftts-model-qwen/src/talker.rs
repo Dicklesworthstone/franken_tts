@@ -607,9 +607,12 @@ fn talker_norm_and_head(
 
 /// Runs the complete 28-layer talker and its final primary-code head.
 ///
-/// `hidden` is the already assembled `[seq, 1024]` input. It is updated in place to the final
-/// normalized hidden state; `logits` receives `[seq, 3072]`. `mask` is the additive causal and
-/// left-padding mask for this call, with shape `[seq, cache_len + seq]`.
+/// `hidden` is the already assembled `[seq, 1024]` input. `mask` is the additive causal and
+/// left-padding mask for this call, with shape `[seq, cache_len + seq]`. The `logits` shape
+/// selects the head form (see [`talker_norm_and_head`]): `[seq, 3072]` normalizes every hidden
+/// position in place and projects them all — the teacher-forced contract; `[3072]` normalizes
+/// and projects only the newest position (earlier `hidden` rows stay pre-norm), which is what
+/// prefill consumes.
 ///
 /// This is intentionally the f32 correctness baseline. It has no quantization, packing, or
 /// scheduler assumptions, so a future kernel route can be compared against this complete graph.
