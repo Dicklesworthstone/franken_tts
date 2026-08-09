@@ -614,6 +614,7 @@ pub fn linear_q8(
     // result is bit-identical per element, so this is purely a speed dispatch. Small matrices
     // stay serial — the dispatch handshake would cost more than the work.
     if n * k >= TEAM_WORK_THRESHOLD_BYTES
+        && !crate::team::thread_bypassed()
         && let Some(team) = crate::team::armed()
     {
         team.linear_q8(x_q, x_scales, weight, bias, m, out, tier);

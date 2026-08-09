@@ -72,6 +72,25 @@ pub struct Team {
     dispatch_gate: Mutex<()>,
 }
 
+thread_local! {
+    static TEAM_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes THIS thread run its int8 linears serially, never dispatching to the team.
+///
+/// The codec pipeline worker sets this: its work is meant to overlap with the generator's
+/// team dispatches on spare cores, and routing it through the shared team would merely
+/// interleave the two through the dispatch gate instead of running them concurrently.
+pub fn bypass_team_on_this_thread() {
+    TEAM_BYPASS.with(|cell| cell.set(true));
+}
+
+/// Whether the current thread opted out of team dispatch.
+#[must_use]
+pub fn thread_bypassed() -> bool {
+    TEAM_BYPASS.with(std::cell::Cell::get)
+}
+
 /// The team for this process, if parallel execution is enabled.
 ///
 /// `FTTS_INT8_THREADS` sets the total partition count (caller included); `1` or unset means

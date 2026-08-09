@@ -633,6 +633,9 @@ pub fn synthesize(
     let (result, pcm) = std::thread::scope(
         |scope| -> Result<(ftts_core::SynthesisResult, Vec<f32>), FttsError> {
             let worker = scope.spawn(move || -> Result<Vec<f32>, FttsError> {
+                // Overlap for real: this thread's int8 ops run serially on a spare core
+                // instead of contending for the generator's worker team.
+                ftts_kernels::team::bypass_team_on_this_thread();
                 const PACKET_FRAMES: usize = 4;
                 let mut state = codec.stream_state();
                 let mut pcm = Vec::new();
