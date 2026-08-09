@@ -260,8 +260,8 @@ struct SayArgs {
     model: Option<PathBuf>,
 
     /// Voice source: a .spk vector, reference audio, or a built-in voice name
-    /// (aria, ember — synthetic-lineage voices enrolled from the model's own speech).
-    /// Default: MODEL_DIR/default.spk when enrolled, else the built-in "aria".
+    /// (matt, james, leo, robert, aria, ember).
+    /// Default: MODEL_DIR/default.spk when enrolled, else the built-in "matt".
     #[arg(long, value_name = "PATH|NAME")]
     voice: Option<PathBuf>,
 
@@ -307,6 +307,15 @@ struct EnrollArgs {
     /// consent up front. The displaced voice is copied to `<name>.spk.bak` either way.
     #[arg(long)]
     overwrite: bool,
+
+    /// Remove late reverberation from the reference before enrolling.
+    ///
+    /// A room is convolutive, so `--denoise` cannot touch it; this is the lever for a reference
+    /// that sounds "wet". It matters because the speaker encoder cannot separate voice from room,
+    /// so a reverberant reference enrolls the room as part of the speaker and every utterance the
+    /// clone speaks is rendered in it. Off by default: it changes the enrolled identity.
+    #[arg(long)]
+    dereverb: bool,
 
     /// Spectral-subtract the stationary noise floor from the reference before enrolling.
     ///
@@ -1240,7 +1249,8 @@ fn run_say_events(
         None => materialize_preset_voice(DEFAULT_PRESET_VOICE)
             .expect("the default preset name is a member of PRESET_VOICES")?,
     };
-    let speaker = synth::speaker_from_voice(&bundle, &voice_path, None)?;
+    let speaker =
+        synth::speaker_from_voice(&bundle, &voice_path, synth::ReferenceCleanup::default())?;
     let loaded = synth::LoadedModel::load(&bundle)?;
     emit_stage(run, emit, "load", "end", &mut seq)?;
 
@@ -1819,11 +1829,30 @@ fn run_enroll(
         (Some(_), true) => unreachable!("clap enforces the conflict"),
     };
     let mut denoise_report = None;
+    let mut dereverb_report = None;
     let speaker = synth::speaker_from_voice(
         &bundle,
         &args.reference_audio,
-        args.denoise.then_some(&mut denoise_report),
+        synth::ReferenceCleanup {
+            denoise: args.denoise.then_some(&mut denoise_report),
+            dereverb: args.dereverb.then_some(&mut dereverb_report),
+        },
     )?;
+    // Same reporting discipline as the denoise below: state what was measured. A reference whose
+    // reverb time barely moves was not the problem, and a better recording beats more filtering.
+    if let Some(report) = dereverb_report {
+        style::ok(
+            stdout,
+            &format!(
+                "dereverberated reference {}",
+                style::detail(&format!(
+                    "RT60-equivalent {:.2} → {:.2} s",
+                    report.before_rt60_s, report.after_rt60_s
+                )),
+            ),
+        )
+        .map_err(|error| FttsError::Generic(format!("cannot write dereverb report: {error}")))?;
+    }
     // Report what the denoise measured rather than asserting it helped: a reference whose floor
     // barely moves was not noisy, and the user should reach for a better recording instead.
     if let Some(report) = denoise_report {

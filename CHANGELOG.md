@@ -33,14 +33,14 @@ proof; the f32 reference route remains one variable away (`FTTS_INT8=0`).
 
 ### Added
 
-- **Built-in voices: `aria` (default) and `ember`.** A fresh install speaks out
-  of the box: `ftts pull` then `ftts say "hello" out.wav` uses `aria`, and
-  `--voice ember` selects the same character a few semitones deeper. Both are
-  real enrolled x-vectors with a fully synthetic lineage — enrolled from the
-  model's own synthesized reference passage, no recording of any person —
-  and verified stable across a multi-text listening battery (a first cut of
-  tone-enrolled voices rendered inconsistently and was replaced). An enrolled
-  `default.spk`, `FTTS_DEFAULT_VOICE`, or explicit `--voice` always wins.
+- **Built-in voices, selectable by name.** A fresh install speaks out of the
+  box: `ftts pull` then `ftts say "hello" out.wav` uses `matt`, the default.
+  Six voices ship in the binary — `matt`, `james`, `leo`, `robert` (masculine)
+  and `aria`, `ember` (feminine) — each an ordinary enrolled x-vector approved
+  by listening before it shipped, chosen with `--voice NAME`. An enrolled
+  `default.spk`, `FTTS_DEFAULT_VOICE`, or explicit `--voice` always wins; an
+  unknown bare name lists the built-ins. (A first cut of tone-enrolled voices
+  rendered inconsistently across texts and was replaced before release.)
 
 ### Performance
 
