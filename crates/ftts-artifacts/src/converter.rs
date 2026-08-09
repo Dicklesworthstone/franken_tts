@@ -85,8 +85,14 @@ impl TensorConversion {
         }
     }
 
-    fn section_name(&self) -> String {
-        format!("tensor:{}", self.artifact_name)
+    /// The access-class section this tensor's bytes land in.
+    ///
+    /// One section per [`AccessClass`], never per tensor: the format caps sections at
+    /// [`crate::fttsq::MAX_SECTIONS`] because a section IS an access class (the page-in policy
+    /// unit), while tensors locate themselves inside it by offset. Emitting per-tensor sections
+    /// overflowed that cap at 478 on the real checkpoint (frankentts-zm5).
+    fn section_name(&self) -> &'static str {
+        self.access_class.as_str()
     }
 
     fn scales_name(&self) -> String {
@@ -725,7 +731,7 @@ pub fn convert_safetensors_streaming<W: std::io::Write + std::io::Seek>(
         .begin(destination)
         .map_err(StreamingConversionError::Artifact)?;
 
-    for tensor in &plan.tensors {
+    for tensor in tensors_in_write_order(plan) {
         let matrix_or_values = index.view(&tensor.source_name, source).ok_or_else(|| {
             StreamingConversionError::Plan(ConversionPlanError::SourceTensorMissing {
                 name: tensor.source_name.clone(),
@@ -842,7 +848,12 @@ fn build_artifact_plan(
         .model_config(plan.model_config.clone())
         .quantization_manifest(plan.quantization_manifest.clone());
 
-    for tensor in &plan.tensors {
+    //  One section per access class, tensors located by running offset inside it. The write loop
+    //  must emit payloads in exactly this order, so both sides iterate [`tensors_in_write_order`].
+    let mut section_offsets: std::collections::BTreeMap<&'static str, u64> =
+        std::collections::BTreeMap::new();
+    let mut declared_sections: Vec<&'static str> = Vec::new();
+    for tensor in tensors_in_write_order(plan) {
         let entry = index.entry(&tensor.source_name).ok_or_else(|| {
             ConversionPlanError::SourceTensorMissing {
                 name: tensor.source_name.clone(),
@@ -850,6 +861,10 @@ fn build_artifact_plan(
         })?;
         let shape = artifact_shape(entry, &tensor.source_name)?;
         let section = tensor.section_name();
+        if !declared_sections.contains(&section) {
+            declared_sections.push(section);
+        }
+        let running = section_offsets.entry(section).or_insert(0);
         match tensor.storage {
             TensorStoragePolicy::Verbatim => {
                 let length = u64::try_from(entry.byte_len()).map_err(|_| {
@@ -857,17 +872,20 @@ fn build_artifact_plan(
                         name: tensor.source_name.clone(),
                     }
                 })?;
-                artifact_plan = artifact_plan
-                    .section(section.clone(), tensor.access_class, length)
-                    .tensor(ArtifactTensorEntry {
-                        name: tensor.artifact_name.clone(),
-                        section,
-                        dtype: stored_dtype(entry.dtype),
-                        shape,
-                        offset: 0,
-                        length,
-                        scales: None,
-                    });
+                artifact_plan = artifact_plan.tensor(ArtifactTensorEntry {
+                    name: tensor.artifact_name.clone(),
+                    section: section.to_owned(),
+                    dtype: stored_dtype(entry.dtype),
+                    shape,
+                    offset: *running,
+                    length,
+                    scales: None,
+                });
+                *running = running.checked_add(length).ok_or_else(|| {
+                    ConversionPlanError::SectionLengthOverflow {
+                        name: tensor.source_name.clone(),
+                    }
+                })?;
             }
             TensorStoragePolicy::Q8PerOutputChannel => {
                 let rows = entry.shape.first().copied().ok_or_else(|| {
@@ -896,34 +914,92 @@ fn build_artifact_plan(
                 })?;
                 let scales_name = tensor.scales_name();
                 artifact_plan = artifact_plan
-                    .section(section.clone(), tensor.access_class, section_len)
                     .tensor(ArtifactTensorEntry {
                         name: tensor.artifact_name.clone(),
-                        section: section.clone(),
+                        section: section.to_owned(),
                         dtype: StoredDtype::Q8,
                         shape,
-                        offset: 0,
+                        offset: *running,
                         length: values_len,
                         scales: Some(scales_name.clone()),
                     })
                     .tensor(ArtifactTensorEntry {
                         name: scales_name,
-                        section,
+                        section: section.to_owned(),
                         dtype: StoredDtype::F32,
                         shape: vec![u64::try_from(rows).map_err(|_| {
                             ConversionPlanError::ShapeOutOfRange {
                                 name: tensor.source_name.clone(),
                             }
                         })?],
-                        offset: values_len,
+                        offset: running.checked_add(values_len).ok_or_else(|| {
+                            ConversionPlanError::SectionLengthOverflow {
+                                name: tensor.source_name.clone(),
+                            }
+                        })?,
                         length: scales_len,
                         scales: None,
                     });
+                *running = running.checked_add(section_len).ok_or_else(|| {
+                    ConversionPlanError::SectionLengthOverflow {
+                        name: tensor.source_name.clone(),
+                    }
+                })?;
             }
         }
     }
 
+    //  Declare the access-class sections in first-touch order with their accumulated lengths;
+    //  the write loop replays the same order, so every section fills exactly to its declaration.
+    for section in declared_sections {
+        let class = section_access_class(section);
+        let length = section_offsets
+            .get(section)
+            .copied()
+            .expect("declared sections accumulate a length");
+        artifact_plan = artifact_plan.section(section, class, length);
+    }
+
     Ok(artifact_plan)
+}
+
+/// The stable payload order shared by planning and writing: grouped by access-class section in
+/// first-appearance order, original recipe order preserved within each class.
+fn tensors_in_write_order(plan: &StreamingConversionPlan) -> Vec<&TensorConversion> {
+    let mut order: Vec<&'static str> = Vec::new();
+    for tensor in &plan.tensors {
+        let section = tensor.section_name();
+        if !order.contains(&section) {
+            order.push(section);
+        }
+    }
+    let mut grouped = Vec::with_capacity(plan.tensors.len());
+    for section in order {
+        grouped.extend(
+            plan.tensors
+                .iter()
+                .filter(|tensor| tensor.section_name() == section),
+        );
+    }
+    grouped
+}
+
+/// Maps a section wire name back to its access class; sections and classes are one-to-one.
+fn section_access_class(name: &str) -> AccessClass {
+    for class in [
+        AccessClass::HotRecurrentMicrodecoder,
+        AccessClass::HotRecurrentTalker,
+        AccessClass::HotCodecDecoder,
+        AccessClass::ColdTextEmbedding,
+        AccessClass::EnrollmentSpeakerEncoder,
+        AccessClass::EnrollmentCodecEncoder,
+        AccessClass::Metadata,
+    ] {
+        if class.as_str() == name {
+            return class;
+        }
+    }
+    unreachable!("section names are minted from AccessClass::as_str")
 }
 
 fn artifact_shape(
