@@ -173,6 +173,7 @@ struct Hydrated {
     micro_final_norm: Vec<f32>,
     micro_heads: Vec<Vec<f32>>,
     text_stub_table: Vec<f32>,
+    text_stub_gathered: Vec<u32>,
     text_stub_fc1: Vec<f32>,
     text_stub_fc1_bias: Vec<f32>,
     text_stub_fc2: Vec<f32>,
@@ -262,6 +263,7 @@ impl Hydrated {
                 .collect(),
             // The text path is unused behind `begin_with_prefill`; minimal well-shaped stubs.
             text_stub_table: vec![0.0; 2],
+            text_stub_gathered: vec![0],
             text_stub_fc1: vec![0.0; 2],
             text_stub_fc1_bias: vec![0.0; 1],
             text_stub_fc2: vec![0.0; HIDDEN],
@@ -303,6 +305,7 @@ impl Hydrated {
             },
             text: TextEmbeddingWeights {
                 table: &self.text_stub_table,
+                gathered: &self.text_stub_gathered,
                 embed_width: 2,
                 fc1_weight: &self.text_stub_fc1,
                 fc1_bias: &self.text_stub_fc1_bias,

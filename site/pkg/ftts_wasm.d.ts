@@ -57,6 +57,12 @@ export class WasmEngine {
 export function bench_frame_kernels(rounds: number): string;
 
 /**
+ * Routes Rust panics to `console.error` with the real message and location — without this a
+ * release-wasm panic surfaces as an opaque `RuntimeError: unreachable`.
+ */
+export function install_panic_hook(): void;
+
+/**
  * The 1,024-float x-vector of a built-in voice.
  *
  * # Errors
@@ -81,6 +87,7 @@ export interface InitOutput {
     readonly wasmengine_enroll: (a: number, b: number, c: number) => [number, number, number, number];
     readonly wasmengine_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
     readonly wasmengine_synthesize: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => [number, number, number, number];
+    readonly install_panic_hook: () => void;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;

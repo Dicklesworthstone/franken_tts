@@ -67,6 +67,21 @@ const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
     ),
 ];
 
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error(message: &str);
+}
+
+/// Routes Rust panics to `console.error` with the real message and location — without this a
+/// release-wasm panic surfaces as an opaque `RuntimeError: unreachable`.
+#[wasm_bindgen(start)]
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        console_error(&format!("ftts-wasm panic: {info}"));
+    }));
+}
+
 fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("{context}: {error}"))
 }

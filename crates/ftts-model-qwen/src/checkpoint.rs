@@ -16,11 +16,13 @@
 //!
 //! `talker.model.text_embedding.weight` is `[151936, 2048]`: 622 MB of bf16, and 1.24 GB once
 //! widened to `f32`. An utterance touches a few dozen rows of it. [`TextEmbeddingTable::gather`]
-//! therefore allocates the full-width table — the generator indexes it by real token id, and
-//! remapping ids would break the wrapper-id checks in [`crate::prompt`] — but *fills* only the
-//! requested rows. The untouched pages are never faulted in, so the resident cost is the rows we
-//! asked for rather than the whole table. This is the `ColdTextEmbedding` access class of the plan
-//! showing up as a concrete allocation policy, not an optimization to schedule later.
+//! therefore materializes ONLY the requested rows, compactly, located by binary search on the
+//! sorted gathered-id list. (An earlier revision allocated the full-vocab stride and relied on
+//! lazy zero pages; wasm linear memory has no lazy pages, and the 1.24 GB commit was the
+//! difference between the browser engine synthesizing and dying at the 4 GB ceiling.) Token ids
+//! themselves are never remapped — the wrapper-id checks in [`crate::prompt`] see real ids; only
+//! the storage is compact. This is the `ColdTextEmbedding` access class of the plan showing up as
+//! a concrete allocation policy, not an optimization to schedule later.
 //!
 //! # The prompt header is derived, not invented
 //!
@@ -627,11 +629,15 @@ impl TextEmbeddingTable {
             });
         }
 
-        let mut rows = vec![0.0f32; TEXT_VOCAB * TEXT_EMBED_WIDTH];
         let mut gathered: Vec<u32> = ids.to_vec();
         gathered.sort_unstable();
         gathered.dedup();
-        for id in &gathered {
+        // Compact storage: one materialized row per gathered id, located by binary search on
+        // `gathered`. A full-vocab-stride table would be 1.24 GB of address space per gather —
+        // free-ish under lazy native pages, but a hard allocation on wasm linear memory, where
+        // it measured as the difference between synthesizing and dying at the 4 GB ceiling.
+        let mut rows = vec![0.0f32; gathered.len() * TEXT_EMBED_WIDTH];
+        for (slot, id) in gathered.iter().enumerate() {
             let row = *id as usize;
             if row >= TEXT_VOCAB {
                 return Err(CheckpointError::TensorShape {
@@ -640,7 +646,7 @@ impl TextEmbeddingTable {
                     actual: row + 1,
                 });
             }
-            let start = row * TEXT_EMBED_WIDTH;
+            let start = slot * TEXT_EMBED_WIDTH;
             if !view.copy_row_f32(row, &mut rows[start..start + TEXT_EMBED_WIDTH]) {
                 // A refused copy would leave the row zero, which reads downstream as a legitimate
                 // embedding and produces confident wrong audio rather than an error.
@@ -727,11 +733,12 @@ impl TextEmbeddingTable {
             None
         };
 
-        let mut rows = vec![0.0f32; TEXT_VOCAB * TEXT_EMBED_WIDTH];
         let mut gathered: Vec<u32> = ids.to_vec();
         gathered.sort_unstable();
         gathered.dedup();
-        for id in &gathered {
+        // Compact storage, exactly as the safetensors gather: one row per gathered id.
+        let mut rows = vec![0.0f32; gathered.len() * TEXT_EMBED_WIDTH];
+        for (slot, id) in gathered.iter().enumerate() {
             let row = *id as usize;
             if row >= TEXT_VOCAB {
                 return Err(CheckpointError::TensorShape {
@@ -741,7 +748,7 @@ impl TextEmbeddingTable {
                 });
             }
             let source = &bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
-            let destination = &mut rows[row * TEXT_EMBED_WIDTH..(row + 1) * TEXT_EMBED_WIDTH];
+            let destination = &mut rows[slot * TEXT_EMBED_WIDTH..(slot + 1) * TEXT_EMBED_WIDTH];
             match dtype {
                 StoredDtype::Bf16 => {
                     for (slot, bytes) in destination.iter_mut().zip(source.as_chunks::<2>().0) {
@@ -788,10 +795,21 @@ impl TextEmbeddingTable {
         &self.gathered
     }
 
-    /// The table, indexable by token id.
+    /// The compact rows, one per gathered id in ascending-id order. Index through
+    /// [`TextEmbeddingTable::row`] or the sorted [`TextEmbeddingTable::gathered_ids`], never by
+    /// raw token id.
     #[must_use]
-    pub fn rows(&self) -> &[f32] {
+    pub fn compact_rows(&self) -> &[f32] {
         &self.rows
+    }
+
+    /// One gathered id's embedding row, or `None` when the id was never materialized —
+    /// distinguishable, unlike the old full-stride table where an ungathered id read as a
+    /// silent zero row.
+    #[must_use]
+    pub fn row(&self, id: u32) -> Option<&[f32]> {
+        let slot = self.gathered.binary_search(&id).ok()?;
+        Some(&self.rows[slot * TEXT_EMBED_WIDTH..(slot + 1) * TEXT_EMBED_WIDTH])
     }
 }
 
@@ -1175,7 +1193,8 @@ impl TalkerCheckpoint {
     #[must_use]
     pub fn text_weights<'a>(&'a self, table: &'a TextEmbeddingTable) -> TextEmbeddingWeights<'a> {
         TextEmbeddingWeights {
-            table: table.rows(),
+            table: table.compact_rows(),
+            gathered: table.gathered_ids(),
             embed_width: TEXT_EMBED_WIDTH,
             fc1_weight: &self.fc1_weight,
             fc1_bias: &self.fc1_bias,
@@ -1198,8 +1217,9 @@ impl TalkerCheckpoint {
 
     /// One text id through the cold embedding and the biased SiLU projection.
     fn project_text_id(&self, table: &TextEmbeddingTable, id: u32) -> HiddenState {
-        let start = id as usize * TEXT_EMBED_WIDTH;
-        let embed = &table.rows()[start..start + TEXT_EMBED_WIDTH];
+        let embed = table
+            .row(id)
+            .expect("projected ids must be in the gathered set (utterance_text_ids covers them)");
 
         let mut inner = vec![0.0f32; TEXT_EMBED_WIDTH];
         for (row, slot) in inner.iter_mut().enumerate() {

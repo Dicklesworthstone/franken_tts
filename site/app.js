@@ -1,6 +1,7 @@
 // Playground orchestration: loader → worker-hosted engine → WebAudio playback.
 
 import { ensureModel, clearCache, cachedBytes } from "./loader.js";
+import { TOTAL_BYTES } from "./model-manifest.js";
 
 const ui = Object.fromEntries(
   [
@@ -86,9 +87,45 @@ async function boot() {
   ui.voice.appendChild(cloned);
   updateVoiceCharacter();
 
+  // Persistence contract: the model downloads ONCE and stays in this browser's storage until
+  // "Clear model cache". When a complete cache exists, hydrate immediately on page open —
+  // consent is for the download, not for using what was already approved and downloaded.
   const cached = await cachedBytes();
-  if (cached > 0) {
-    ui.dlStatus.textContent = `${gigabytes(cached)} GB cached — click to verify & load.`;
+  if (cached >= TOTAL_BYTES) {
+    ui.dlStatus.textContent = "Model cached — verifying and loading…";
+    await loadFromStore();
+  } else if (cached > 0) {
+    ui.dlStatus.textContent = `${gigabytes(cached)} GB of a partial download cached — click to resume.`;
+  }
+}
+
+async function loadFromStore() {
+  ui.loadModel.disabled = true;
+  ui.loadModel.classList.add("hidden");
+  try {
+    const files = await ensureModel(({ bytesDone, bytesTotal, phase, asset }) => {
+      ui.dlBar.style.width = `${((bytesDone / bytesTotal) * 100).toFixed(1)}%`;
+      ui.dlStatus.textContent = `${phase} ${asset ?? ""} — ${gigabytes(bytesDone)} / ${gigabytes(bytesTotal)} GB`;
+    });
+    ui.dlStatus.textContent = "Hydrating the engine (this takes a minute at wasm speed)…";
+    await call(
+      "load",
+      {
+        fttsq: files.fttsq,
+        codec: files.codec,
+        vocab: files.vocab,
+        merges: files.merges,
+        tokenizerConfig: files.tokenizerConfig,
+      },
+      [files.fttsq, files.codec],
+    );
+    ui.dlBar.style.width = "100%";
+    ui.dlStatus.textContent = "Model loaded. Ready to speak.";
+    ui.speak.disabled = false;
+  } catch (error) {
+    showError(error);
+    ui.loadModel.disabled = false;
+    ui.loadModel.classList.remove("hidden");
   }
 }
 

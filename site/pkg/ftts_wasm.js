@@ -130,6 +130,14 @@ export function bench_frame_kernels(rounds) {
 }
 
 /**
+ * Routes Rust panics to `console.error` with the real message and location — without this a
+ * release-wasm panic surfaces as an opaque `RuntimeError: unreachable`.
+ */
+export function install_panic_hook() {
+    wasm.install_panic_hook();
+}
+
+/**
  * The 1,024-float x-vector of a built-in voice.
  *
  * # Errors
@@ -171,6 +179,9 @@ function __wbg_get_imports() {
         __proto__: null,
         __wbg___wbindgen_throw_344f42d3211c4765: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
+        },
+        __wbg_error_125507972813364c: function(arg0, arg1) {
+            console.error(getStringFromWasm0(arg0, arg1));
         },
         __wbg_now_86c0d4ba3fa605b8: function() {
             const ret = Date.now();

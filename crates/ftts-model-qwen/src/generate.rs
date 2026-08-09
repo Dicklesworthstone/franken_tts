@@ -227,8 +227,12 @@ fn artifact_q8_enabled() -> bool {
 /// stay explicit so tiny-geometry tests exercise the same code path.
 #[derive(Clone, Copy, Debug)]
 pub struct TextEmbeddingWeights<'a> {
-    /// Row-major `[vocab, embed_width]` cold text embedding. Only requested rows are read.
+    /// Compact row-major `[gathered.len(), embed_width]` cold-embedding rows, one per entry of
+    /// `gathered`, in the same order. Compact rather than vocab-strided: a full-stride table is
+    /// 1.24 GB of address space per utterance, which wasm linear memory must actually commit.
     pub table: &'a [f32],
+    /// The token ids materialized in `table`, ascending. Lookups binary-search this.
+    pub gathered: &'a [u32],
     /// Width of one embedding row.
     pub embed_width: usize,
     /// Projection fc1 weight, `[intermediate, embed_width]`.
@@ -537,17 +541,16 @@ impl<'a> QwenGenerator<'a> {
     /// Embeds token ids through the cold table and projects them to talker width.
     fn project_text_ids(&self, ids: &[u32]) -> Result<Vec<HiddenState>, GenerationError> {
         let embed_width = self.text.embed_width;
-        let vocab = self.text.table.len() / embed_width;
         let mut embedded = Vec::with_capacity(ids.len() * embed_width);
         for &id in ids {
-            let row = id as usize;
-            if row >= vocab {
+            let Ok(slot) = self.text.gathered.binary_search(&id) else {
                 return Err(GenerationError::new(format!(
-                    "text token {id} is outside the [{vocab}, {embed_width}] embedding table"
+                    "text token {id} was not gathered into the compact embedding table; the \
+                     utterance id set must cover every id the prompt can reach"
                 )));
-            }
+            };
             embedded
-                .extend_from_slice(&self.text.table[row * embed_width..(row + 1) * embed_width]);
+                .extend_from_slice(&self.text.table[slot * embed_width..(slot + 1) * embed_width]);
         }
 
         let hidden = self.talker_config.hidden_size;
@@ -995,6 +998,7 @@ mod tests {
             },
             text: TextEmbeddingWeights {
                 table: &weights.text_table,
+                gathered: &[0, 1, 2, 3],
                 embed_width: 4,
                 fc1_weight: &weights.text_fc1,
                 fc1_bias: &weights.text_fc1_bias,
