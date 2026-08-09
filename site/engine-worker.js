@@ -117,11 +117,17 @@ self.onmessage = async ({ data }) => {
         // (once for JS, once for wasm-bindgen's copy) and is what reclaimed the tab on iOS.
         // The engine still re-verifies the artifact's own digests in wasm before reading a tensor.
         const root = await navigator.storage.getDirectory();
-        const staging = new ModelStaging(data.fttsq.bytes, data.codec.bytes);
-        for (const [meta, push] of [
-          [data.fttsq, (chunk) => staging.push_fttsq(chunk)],
-          [data.codec, (chunk) => staging.push_codec(chunk)],
-        ]) {
+
+        // CODEC FIRST, and hydrated before the artifact is even reserved.
+        //
+        // The order is load-bearing, not stylistic. `CodecCheckpoint` widens every BF16 tensor
+        // into owned f32, so hydrating it while the 1.31 GB artifact is also resident puts three
+        // large allocations in flight at once (~3.35 GB) — past what iOS Safari grants a tab, and
+        // the reason the page died the moment it reported "hydrating". Draining the codec's source
+        // bytes first drops the high-water mark to ~2.67 GB with nothing read twice. See the
+        // ModelStaging docs in crates/ftts-wasm/src/lib.rs for the arithmetic.
+        const staging = new ModelStaging(data.codec.bytes);
+        const drain = async (meta, push) => {
           const blob = await (await root.getFileHandle(meta.asset)).getFile();
           for (let offset = 0; offset < blob.size; offset += INGEST_SLICE) {
             const end = Math.min(offset + INGEST_SLICE, blob.size);
@@ -129,7 +135,14 @@ self.onmessage = async ({ data }) => {
             push(new Uint8Array(await blob.slice(offset, end).arrayBuffer()));
             reply("loadProgress", { bytesDone: staging.filled() });
           }
-        }
+        };
+
+        await drain(data.codec, (chunk) => staging.push_codec(chunk));
+        staging.finish_codec();
+
+        staging.reserve_fttsq(data.fttsq.bytes);
+        await drain(data.fttsq, (chunk) => staging.push_fttsq(chunk));
+
         engine = WasmEngine.from_staging(
           staging,
           data.vocab,

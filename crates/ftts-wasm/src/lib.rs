@@ -256,56 +256,161 @@ const DENOISER_SAFETENSORS: &[u8] =
 /// worse than the problem being solved. `try_reserve_exact` also turns an allocation failure into
 /// a thrown error naming the number of bytes, rather than the opaque `unreachable` a wasm abort
 /// shows the user.
+/// # Why the two files are staged in sequence rather than together
+///
+/// The order is the whole optimization. Staging both raw files first and hydrating afterwards
+/// means that at the moment the codec finishes widening, THREE allocations are live at once:
+///
+/// ```text
+/// artifact raw   1.31 GB   (staged, still untouched)
+/// codec raw      0.68 GB   (source, not yet droppable)
+/// codec f32     ~1.36 GB   (CodecCheckpoint owns Vec<f32> for every tensor)
+///                =======
+/// peak          ~3.35 GB
+/// ```
+///
+/// Dropping the codec source after the fact does not help: the peak has already happened. iOS
+/// Safari reclaims the tab somewhere below that, which is why the page died the instant it said
+/// "hydrating" even though the download had just succeeded.
+///
+/// Hydrating the codec BEFORE the artifact is staged removes the largest term from the peak
+/// instead of from the aftermath:
+///
+/// ```text
+/// phase 1   codec raw 0.68 + codec f32 1.36  = 2.04 GB, then the source drops -> 1.36 GB
+/// phase 2   codec f32 1.36 + artifact 1.31   = 2.67 GB
+/// ```
+///
+/// 2.67 GB against 3.35 GB, and nothing is ever read twice. The caller therefore drives:
+/// `new(codec_bytes)` -> `push_codec` xN -> `finish_codec()` -> `reserve_fttsq(bytes)` ->
+/// `push_fttsq` xN -> `WasmEngine::from_staging`. Each step refuses to run out of order.
 #[wasm_bindgen]
 pub struct ModelStaging {
+    /// The codec's raw bytes; emptied and freed by `finish_codec`.
+    codec_source: Vec<u8>,
+    /// Present only after `finish_codec`. Its presence IS the phase marker.
+    codec: Option<CodecCheckpoint>,
+    /// Reserved by `reserve_fttsq`, which refuses to run before the codec is hydrated.
     fttsq: Vec<u8>,
-    codec: Vec<u8>,
+    /// Bytes freed by `finish_codec`, so `filled` can keep reporting monotonic download progress
+    /// after the source it was counting has gone away.
+    codec_retired: usize,
 }
 
 #[wasm_bindgen]
 impl ModelStaging {
-    /// Reserve exact room for both files before any bytes arrive.
+    /// Reserve exact room for the codec checkpoint, the first file staged.
+    ///
+    /// The artifact is deliberately NOT reserved here — see the type-level note. Reserving it now
+    /// would put its 1.31 GB back into the codec-hydration peak and undo the whole point.
     ///
     /// # Errors
     ///
     /// Throws when linear memory cannot be reserved, naming the byte count that failed — the
     /// honest signal on a device that simply does not have the memory.
     #[wasm_bindgen(constructor)]
-    pub fn new(fttsq_bytes: usize, codec_bytes: usize) -> Result<ModelStaging, JsValue> {
-        let mut fttsq = Vec::new();
-        fttsq
-            .try_reserve_exact(fttsq_bytes)
-            .map_err(|_| js_error("cannot reserve model memory (bytes)", fttsq_bytes))?;
-        let mut codec = Vec::new();
-        codec
+    pub fn new(codec_bytes: usize) -> Result<ModelStaging, JsValue> {
+        let mut codec_source = Vec::new();
+        codec_source
             .try_reserve_exact(codec_bytes)
             .map_err(|_| js_error("cannot reserve codec memory (bytes)", codec_bytes))?;
-        Ok(ModelStaging { fttsq, codec })
-    }
-
-    /// Append one slice of the artifact, in order.
-    ///
-    /// # Errors
-    ///
-    /// Throws if the slice would exceed the reserved capacity, which means the caller's manifest
-    /// and its download disagree — better caught here than as a corrupt tensor later.
-    pub fn push_fttsq(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
-        append_exact(&mut self.fttsq, chunk, "artifact")
+        Ok(ModelStaging {
+            codec_source,
+            codec: None,
+            fttsq: Vec::new(),
+            codec_retired: 0,
+        })
     }
 
     /// Append one slice of the codec checkpoint, in order.
     ///
     /// # Errors
     ///
-    /// As [`ModelStaging::push_fttsq`].
+    /// Throws if the slice would exceed the reserved capacity, which means the caller's manifest
+    /// and its download disagree — better caught here than as a corrupt tensor later. Also throws
+    /// once the codec has been hydrated, when there is nothing left to append to.
     pub fn push_codec(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
-        append_exact(&mut self.codec, chunk, "codec")
+        if self.codec.is_some() {
+            return Err(js_error(
+                "codec already hydrated",
+                "push_codec after finish",
+            ));
+        }
+        append_exact(&mut self.codec_source, chunk, "codec")
+    }
+
+    /// Parse and widen the codec, then free its source bytes.
+    ///
+    /// This is the phase boundary. After it returns, the 0.68 GB of BF16 is gone and only the
+    /// widened checkpoint remains, so the artifact can be staged against a much lower floor.
+    ///
+    /// # Errors
+    ///
+    /// Throws when the staged bytes are short of what was reserved, or when the checkpoint does
+    /// not parse.
+    pub fn finish_codec(&mut self) -> Result<(), JsValue> {
+        if self.codec.is_some() {
+            return Err(js_error("codec already hydrated", "finish_codec twice"));
+        }
+        if self.codec_source.len() != self.codec_source.capacity() {
+            return Err(js_error(
+                "codec staging is incomplete",
+                format!(
+                    "{}/{}",
+                    self.codec_source.len(),
+                    self.codec_source.capacity()
+                ),
+            ));
+        }
+        // `take` moves the bytes into the parser and leaves an empty Vec behind, so the source is
+        // owned by exactly one place and is released the moment `codec_file` goes out of scope —
+        // which happens inside this function, before the artifact has been reserved at all.
+        let bytes = std::mem::take(&mut self.codec_source);
+        self.codec_retired = bytes.len();
+        let codec_file = ftts_artifacts::safetensors::SafetensorsFile::from_bytes(bytes)
+            .map_err(|error| js_error("codec checkpoint rejected", error))?;
+        let codec =
+            CodecCheckpoint::load_from_file(&codec_file, Path::new("browser://codec.safetensors"))
+                .map_err(|error| js_error("codec hydration failed", error))?;
+        drop(codec_file);
+        self.codec = Some(codec);
+        Ok(())
+    }
+
+    /// Reserve exact room for the artifact, once the codec no longer needs its source bytes.
+    ///
+    /// # Errors
+    ///
+    /// Throws if called before [`ModelStaging::finish_codec`] — which would silently restore the
+    /// 3.35 GB peak this type exists to avoid — or when the reservation fails.
+    pub fn reserve_fttsq(&mut self, fttsq_bytes: usize) -> Result<(), JsValue> {
+        if self.codec.is_none() {
+            return Err(js_error(
+                "codec must be hydrated first",
+                "reserve_fttsq before finish_codec",
+            ));
+        }
+        self.fttsq
+            .try_reserve_exact(fttsq_bytes)
+            .map_err(|_| js_error("cannot reserve model memory (bytes)", fttsq_bytes))
+    }
+
+    /// Append one slice of the artifact, in order.
+    ///
+    /// # Errors
+    ///
+    /// Throws if the slice would exceed the reserved capacity, or if no reservation was made.
+    pub fn push_fttsq(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
+        append_exact(&mut self.fttsq, chunk, "artifact")
     }
 
     /// Bytes accepted so far, so the caller can drive a progress bar without tracking it twice.
+    ///
+    /// Counts the retired codec source rather than the live buffer, so the number keeps rising
+    /// across the phase boundary instead of collapsing when the source is freed.
     #[must_use]
     pub fn filled(&self) -> usize {
-        self.fttsq.len() + self.codec.len()
+        self.codec_retired + self.codec_source.len() + self.fttsq.len()
     }
 }
 
@@ -344,22 +449,24 @@ impl WasmEngine {
         merges_txt: String,
         tokenizer_config_json: String,
     ) -> Result<WasmEngine, JsValue> {
-        if staging.fttsq.len() != staging.fttsq.capacity()
-            || staging.codec.len() != staging.codec.capacity()
-        {
+        if staging.fttsq.len() != staging.fttsq.capacity() {
             return Err(js_error(
                 "staging is incomplete",
                 format!(
-                    "artifact {}/{}, codec {}/{}",
+                    "artifact {}/{}",
                     staging.fttsq.len(),
-                    staging.fttsq.capacity(),
-                    staging.codec.len(),
-                    staging.codec.capacity()
+                    staging.fttsq.capacity()
                 ),
             ));
         }
-        let ModelStaging { fttsq, codec } = staging;
-        Self::hydrate(
+        let ModelStaging { fttsq, codec, .. } = staging;
+        let codec = codec.ok_or_else(|| {
+            js_error(
+                "codec was never hydrated",
+                "call finish_codec() before from_staging",
+            )
+        })?;
+        Self::hydrate_with_codec(
             fttsq,
             codec,
             &vocab_json,
@@ -397,11 +504,37 @@ impl WasmEngine {
         )
     }
 
-    /// The hydration both constructors share, taking ownership of bytes already in wasm memory.
+    /// The whole-buffer constructor's hydration: parse the codec, then delegate.
+    ///
+    /// This path necessarily holds both raw files at once — that is inherent to being handed two
+    /// complete buffers — so it carries the ~3.35 GB peak described on [`ModelStaging`]. It is
+    /// kept for callers with memory to spare (desktop Chrome, tests); the streaming path is what
+    /// the site uses and what a phone can survive.
     #[cfg(not(unix))]
     fn hydrate(
         fttsq: Vec<u8>,
         codec: Vec<u8>,
+        vocab_json: &str,
+        merges_txt: &str,
+        tokenizer_config_json: &str,
+    ) -> Result<WasmEngine, JsValue> {
+        let codec_file = ftts_artifacts::safetensors::SafetensorsFile::from_bytes(codec)
+            .map_err(|error| js_error("codec checkpoint rejected", error))?;
+        let codec =
+            CodecCheckpoint::load_from_file(&codec_file, Path::new("browser://codec.safetensors"))
+                .map_err(|error| js_error("codec hydration failed", error))?;
+        drop(codec_file);
+        Self::hydrate_with_codec(fttsq, codec, vocab_json, merges_txt, tokenizer_config_json)
+    }
+
+    /// Hydration from an artifact buffer plus an ALREADY-widened codec.
+    ///
+    /// Taking the codec pre-built is what lets the streaming path keep the codec's source bytes
+    /// out of the artifact's memory window entirely (see [`ModelStaging`]).
+    #[cfg(not(unix))]
+    fn hydrate_with_codec(
+        fttsq: Vec<u8>,
+        codec: CodecCheckpoint,
         vocab_json: &str,
         merges_txt: &str,
         tokenizer_config_json: &str,
@@ -418,21 +551,6 @@ impl WasmEngine {
             ftts_model_qwen::generate::hot_elision_from_environment(),
         )
         .map_err(|error| js_error("talker hydration failed", error))?;
-
-        let codec_file = ftts_artifacts::safetensors::SafetensorsFile::from_bytes(codec)
-            .map_err(|error| js_error("codec checkpoint rejected", error))?;
-        let codec =
-            CodecCheckpoint::load_from_file(&codec_file, Path::new("browser://codec.safetensors"))
-                .map_err(|error| js_error("codec hydration failed", error))?;
-        // Free the codec's source bytes the instant they stop being needed.
-        //
-        // `CodecCheckpoint` materializes every tensor into owned `Vec<f32>`, so the moment it is
-        // built the ~0.68 GB of BF16 behind `codec_file` is dead weight — yet Rust would hold it
-        // until this function returns, which is exactly when the high-water mark occurs: artifact
-        // (1.31 GB) + codec source (0.68) + widened codec f32 (~1.36) ≈ 3.35 GB. That is more than
-        // iOS Safari gives a tab, and it is why hydration dies there while the download now
-        // survives. Dropping here removes 0.68 GB from the peak at no cost to anything.
-        drop(codec_file);
 
         let tokenizer = QwenTokenizer::from_files_using_environment(TokenizerFiles {
             vocab_json,
