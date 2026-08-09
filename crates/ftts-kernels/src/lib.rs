@@ -27,6 +27,8 @@ pub mod int8;
 pub mod mmap;
 pub mod selftest;
 pub mod sleef;
+pub mod startup_env;
+pub mod team;
 
 /// Identifies this crate's scaffold revision.
 pub const SCAFFOLD_REVISION: u8 = 1;

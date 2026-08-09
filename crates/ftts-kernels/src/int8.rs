@@ -26,6 +26,12 @@ use std::sync::OnceLock;
 /// Largest absolute Q8 byte the canonical symmetric recipe emits.
 pub const Q8_MAX_ABS: i8 = 127;
 
+/// Weight bytes below which a linear stays on the calling thread even when a team exists.
+///
+/// Every talker/microdecoder projection (2-12 MB) and the codec's ConvNeXt projections clear
+/// this; genuinely small ops don't repay the dispatch handshake.
+const TEAM_WORK_THRESHOLD_BYTES: usize = 512 * 1024;
+
 /// Quantizes one row (weight output channel or activation row) with the canonical symmetric
 /// Q8 recipe.
 ///
@@ -299,15 +305,74 @@ pub fn autotuned_plan() -> KernelPlanV0 {
                 batch_gemm: forced,
             };
         }
-        KernelPlanV0 {
+        if let Some(cached) = load_persisted_plan() {
+            return cached;
+        }
+        let plan = KernelPlanV0 {
             // Talker/microdecoder decode: one activation row against tall matrices; K = 1024
             // and 3072 are the real reduction lengths, 256 output rows keep the probe cheap
             // while streaming enough weight bytes to reach the bandwidth regime.
             decode_gemv: fastest_tier(&[(1, 1024, 256), (1, 3072, 256)]),
             // Verify/prefill/codec batches: sixteen rows, same reduction lengths.
             batch_gemm: fastest_tier(&[(16, 1024, 128), (16, 3072, 64)]),
-        }
+        };
+        persist_plan(plan);
+        plan
     })
+}
+
+/// Where the measured plan is cached between runs: the pre-`.fttspack` v0 of the per-machine
+/// execution cache. Losing or corrupting this file only costs a re-measurement.
+fn plan_cache_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(|home| std::path::PathBuf::from(home).join(".cache/franken_tts/kernel_plan_v0.txt"))
+}
+
+/// The cache key: anything here changing invalidates the measurement.
+fn plan_cache_key() -> String {
+    let tiers: Vec<&str> = Int8Tier::available().iter().map(|t| t.as_str()).collect();
+    format!(
+        "v0|crate={}|tiers={}",
+        env!("CARGO_PKG_VERSION"),
+        tiers.join(",")
+    )
+}
+
+fn load_persisted_plan() -> Option<KernelPlanV0> {
+    let text = std::fs::read_to_string(plan_cache_path()?).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != plan_cache_key() {
+        return None;
+    }
+    let parse = |line: &str| match line {
+        "scalar" => Some(Int8Tier::Scalar),
+        "autovec" => Some(Int8Tier::Autovec),
+        "neon-sdot" if neon_sdot_available() => Some(Int8Tier::NeonSdot),
+        _ => None,
+    };
+    Some(KernelPlanV0 {
+        decode_gemv: parse(lines.next()?)?,
+        batch_gemm: parse(lines.next()?)?,
+    })
+}
+
+fn persist_plan(plan: KernelPlanV0) {
+    let Some(path) = plan_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Best-effort: an unwritable cache directory must never fail synthesis.
+    let _ = std::fs::write(
+        path,
+        format!(
+            "{}\n{}\n{}\n",
+            plan_cache_key(),
+            plan.decode_gemv.as_str(),
+            plan.batch_gemm.as_str()
+        ),
+    );
 }
 
 /// Times every available tier over the given `(m, k, n)` probes; median of three rounds each,
@@ -522,6 +587,16 @@ pub fn linear_q8(
     if let Some(bias) = bias {
         assert_eq!(bias.len(), n, "bias must be [n]");
     }
+    // Large operations fan out across the persistent team when one exists; the partitioned
+    // result is bit-identical per element, so this is purely a speed dispatch. Small matrices
+    // stay serial — the dispatch handshake would cost more than the work.
+    if n * k >= TEAM_WORK_THRESHOLD_BYTES
+        && let Some(team) = crate::team::armed()
+    {
+        team.linear_q8(x_q, x_scales, weight, bias, m, out, tier);
+        return;
+    }
+
     // Weight-stationary loop order: each Q8 weight row is streamed exactly once and reused
     // across all m activation rows, so an m>1 call (prefill, the seq-16 verify pass) does not
     // re-read the whole matrix m times. Each output element's dot product is unchanged, so this
