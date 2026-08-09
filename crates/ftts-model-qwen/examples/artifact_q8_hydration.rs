@@ -102,19 +102,63 @@ fn main() {
 
     let mut worst_ulp = 0_u32;
     for (index, (native, requant)) in native_talker.iter().zip(&requant_talker).enumerate() {
-        compare(&format!("talker.{index}.qkv"), &native.qkv, &requant.qkv, &mut worst_ulp);
-        compare(&format!("talker.{index}.o"), &native.o_proj, &requant.o_proj, &mut worst_ulp);
-        compare(&format!("talker.{index}.gate_up"), &native.gate_up, &requant.gate_up, &mut worst_ulp);
-        compare(&format!("talker.{index}.down"), &native.down_proj, &requant.down_proj, &mut worst_ulp);
+        compare(
+            &format!("talker.{index}.qkv"),
+            &native.qkv,
+            &requant.qkv,
+            &mut worst_ulp,
+        );
+        compare(
+            &format!("talker.{index}.o"),
+            &native.o_proj,
+            &requant.o_proj,
+            &mut worst_ulp,
+        );
+        compare(
+            &format!("talker.{index}.gate_up"),
+            &native.gate_up,
+            &requant.gate_up,
+            &mut worst_ulp,
+        );
+        compare(
+            &format!("talker.{index}.down"),
+            &native.down_proj,
+            &requant.down_proj,
+            &mut worst_ulp,
+        );
     }
     for (index, (native, requant)) in native_micro.iter().zip(&requant_micro).enumerate() {
-        compare(&format!("micro.{index}.qkv"), &native.qkv, &requant.qkv, &mut worst_ulp);
-        compare(&format!("micro.{index}.o"), &native.o_proj, &requant.o_proj, &mut worst_ulp);
-        compare(&format!("micro.{index}.gate_up"), &native.gate_up, &requant.gate_up, &mut worst_ulp);
-        compare(&format!("micro.{index}.down"), &native.down_proj, &requant.down_proj, &mut worst_ulp);
+        compare(
+            &format!("micro.{index}.qkv"),
+            &native.qkv,
+            &requant.qkv,
+            &mut worst_ulp,
+        );
+        compare(
+            &format!("micro.{index}.o"),
+            &native.o_proj,
+            &requant.o_proj,
+            &mut worst_ulp,
+        );
+        compare(
+            &format!("micro.{index}.gate_up"),
+            &native.gate_up,
+            &requant.gate_up,
+            &mut worst_ulp,
+        );
+        compare(
+            &format!("micro.{index}.down"),
+            &native.down_proj,
+            &requant.down_proj,
+            &mut worst_ulp,
+        );
     }
 
-    println!("layers: talker {} micro {}", native_talker.len(), native_micro.len());
+    println!(
+        "layers: talker {} micro {}",
+        native_talker.len(),
+        native_micro.len()
+    );
     println!("payload bytes: IDENTICAL (asserted)");
     println!("worst scale ulp distance: {worst_ulp}");
     println!("checkpoint f32 hydration (widen): {widen_elapsed:?}");

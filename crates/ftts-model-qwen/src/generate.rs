@@ -79,14 +79,54 @@ fn fused_layer_from_artifact(
     q_width: usize,
     kv_width: usize,
     intermediate: usize,
-) -> Option<(QuantizedMatrix, QuantizedMatrix, QuantizedMatrix, QuantizedMatrix)> {
-    let q = q8_from_artifact(artifact, &format!("{base}.self_attn.q_proj.weight"), q_width, hidden)?;
-    let k = q8_from_artifact(artifact, &format!("{base}.self_attn.k_proj.weight"), kv_width, hidden)?;
-    let v = q8_from_artifact(artifact, &format!("{base}.self_attn.v_proj.weight"), kv_width, hidden)?;
-    let o = q8_from_artifact(artifact, &format!("{base}.self_attn.o_proj.weight"), hidden, q_width)?;
-    let gate = q8_from_artifact(artifact, &format!("{base}.mlp.gate_proj.weight"), intermediate, hidden)?;
-    let up = q8_from_artifact(artifact, &format!("{base}.mlp.up_proj.weight"), intermediate, hidden)?;
-    let down = q8_from_artifact(artifact, &format!("{base}.mlp.down_proj.weight"), hidden, intermediate)?;
+) -> Option<(
+    QuantizedMatrix,
+    QuantizedMatrix,
+    QuantizedMatrix,
+    QuantizedMatrix,
+)> {
+    let q = q8_from_artifact(
+        artifact,
+        &format!("{base}.self_attn.q_proj.weight"),
+        q_width,
+        hidden,
+    )?;
+    let k = q8_from_artifact(
+        artifact,
+        &format!("{base}.self_attn.k_proj.weight"),
+        kv_width,
+        hidden,
+    )?;
+    let v = q8_from_artifact(
+        artifact,
+        &format!("{base}.self_attn.v_proj.weight"),
+        kv_width,
+        hidden,
+    )?;
+    let o = q8_from_artifact(
+        artifact,
+        &format!("{base}.self_attn.o_proj.weight"),
+        hidden,
+        q_width,
+    )?;
+    let gate = q8_from_artifact(
+        artifact,
+        &format!("{base}.mlp.gate_proj.weight"),
+        intermediate,
+        hidden,
+    )?;
+    let up = q8_from_artifact(
+        artifact,
+        &format!("{base}.mlp.up_proj.weight"),
+        intermediate,
+        hidden,
+    )?;
+    let down = q8_from_artifact(
+        artifact,
+        &format!("{base}.mlp.down_proj.weight"),
+        hidden,
+        intermediate,
+    )?;
     Some((
         QuantizedMatrix::concat_rows(&[&q, &k, &v]),
         o,
