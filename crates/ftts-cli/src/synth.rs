@@ -179,7 +179,14 @@ impl LoadedModel {
 
         Ok(Self {
             talker: match bundle.canonical_main.as_deref() {
-                Some(path) => TalkerCheckpoint::load_fttsq(path).map_err(checkpoint_error)?,
+                // The elision mirrors the generator's own hydration decision for this process:
+                // stacks that will run artifact-native int8 skip their dead f32 projections
+                // (~2.5 GB of widening nobody reads).
+                Some(path) => TalkerCheckpoint::load_fttsq_elided(
+                    path,
+                    ftts_model_qwen::generate::hot_elision_from_environment(),
+                )
+                .map_err(checkpoint_error)?,
                 None => TalkerCheckpoint::load(&bundle.main).map_err(checkpoint_error)?,
             },
             codec: CodecCheckpoint::load(&bundle.codec).map_err(checkpoint_error)?,
@@ -242,7 +249,28 @@ pub fn read_speaker_vector(path: &Path) -> Result<Vec<f32>, FttsError> {
 }
 
 /// Derive an x-vector from an enrolled raw vector or a real reference recording.
-pub fn speaker_from_voice(bundle: &ModelBundle, path: &Path) -> Result<Vec<f32>, FttsError> {
+/// What a `--denoise` enrollment measured, so the CLI can report the effect rather than assert it.
+#[derive(Clone, Copy, Debug)]
+pub struct DenoiseReport {
+    /// Pause floor of the decoded reference, before denoising.
+    pub before_dbfs: f32,
+    /// Pause floor after denoising.
+    pub after_dbfs: f32,
+}
+
+/// Derive a speaker vector from a voice source: a raw x-vector file, or reference audio.
+///
+/// Passing `Some` for `denoise` opts the reference into [`denoise_reference`] and fills the slot
+/// with the measured before/after pause floor.
+///
+/// # Errors
+///
+/// When the source cannot be read, decoded, resampled, or encoded into a finite x-vector.
+pub fn speaker_from_voice(
+    bundle: &ModelBundle,
+    path: &Path,
+    denoise: Option<&mut Option<DenoiseReport>>,
+) -> Result<Vec<f32>, FttsError> {
     let bytes = fs::read(path).map_err(|error| {
         FttsError::Input(format!(
             "cannot read voice source {}: {error}",
@@ -253,6 +281,18 @@ pub fn speaker_from_voice(bundle: &ModelBundle, path: &Path) -> Result<Vec<f32>,
         return decode_speaker_vector(path, &bytes);
     }
     let pcm = decode_reference_audio_any(path)?;
+    let pcm = match denoise {
+        Some(report) => {
+            let before = pause_floor_dbfs(&pcm);
+            let cleaned = denoise_reference(&pcm);
+            *report = Some(DenoiseReport {
+                before_dbfs: before,
+                after_dbfs: pause_floor_dbfs(&cleaned),
+            });
+            cleaned
+        }
+        None => pcm,
+    };
     let mel = log_mel_from_24khz_pcm(&pcm)
         .map_err(|error| FttsError::Input(format!("cannot extract speaker features: {error}")))?;
     let encoder = match bundle.canonical_main.as_deref() {
@@ -579,6 +619,158 @@ fn resample_to_speaker_rate(mono: Vec<f32>, from_rate: u32) -> Vec<f32> {
     out
 }
 
+/// STFT window for reference denoising: 512 samples is ~21 ms at the pinned 24 kHz, long enough
+/// to resolve a noise floor between words and short enough not to smear plosives.
+const DENOISE_FRAME: usize = 512;
+
+/// Three-quarter overlap. Hann at hop `N/4` overlap-adds smoothly, which is what keeps gain
+/// changes from becoming audible frame edges.
+const DENOISE_HOP: usize = DENOISE_FRAME / 4;
+
+/// Per-bin noise magnitude is the low quantile of that bin across the whole recording: speech is
+/// sparse in time, so the quiet tail of each bin is the room, not the voice.
+const DENOISE_NOISE_QUANTILE: f32 = 0.15;
+
+/// How much of the estimated noise power to remove. Mild on purpose — aggressive subtraction is
+/// what produces "musical noise" and, worse here, erodes the breath and sibilance the speaker
+/// encoder reads as identity.
+const DENOISE_OVERSUBTRACT: f32 = 1.5;
+
+/// Never attenuate a bin below this. A floor keeps residual noise as a smooth quiet bed instead
+/// of a flickering one, which listeners find far less objectionable than isolated spectral holes.
+const DENOISE_GAIN_FLOOR: f32 = 0.1;
+
+/// Spectral-subtraction denoise of a reference recording, at the pinned speaker rate.
+///
+/// Enrollment noise is not cosmetic: it is encoded into the x-vector and then reproduced in every
+/// utterance the cloned voice speaks (measured — cleaning a real 53 s reference dropped the
+/// synthesized output's pause floor by 3.7 dB). This removes the stationary part of it.
+///
+/// Deliberately conservative. The speaker encoder reads breath, sibilance, and room as part of
+/// identity, so an aggressive denoise trades one audible defect for a subtler and worse one. This
+/// is why the CLI leaves it opt-in (`--denoise`) rather than applying it to every enrollment:
+/// per the project's quantization doctrine, a lever that can damage speaker identity ships behind
+/// a named switch and stays off until blind listening clears it.
+///
+/// Phase is preserved untouched; only per-bin magnitude is scaled.
+fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
+    if pcm.len() < DENOISE_FRAME {
+        return pcm.to_vec();
+    }
+    let mut planner = rustfft::FftPlanner::<f32>::new();
+    let forward = planner.plan_fft_forward(DENOISE_FRAME);
+    let inverse = planner.plan_fft_inverse(DENOISE_FRAME);
+
+    let window: Vec<f32> = (0..DENOISE_FRAME)
+        .map(|n| {
+            let phase = std::f32::consts::TAU * n as f32 / DENOISE_FRAME as f32;
+            0.5 - 0.5 * phase.cos()
+        })
+        .collect();
+
+    // Analysis pass: keep every frame's spectrum so the noise estimate can see the whole
+    // recording before any frame is modified.
+    let starts: Vec<usize> = (0..=pcm.len() - DENOISE_FRAME)
+        .step_by(DENOISE_HOP)
+        .collect();
+    let bins = DENOISE_FRAME / 2 + 1;
+    let mut spectra: Vec<Vec<rustfft::num_complex::Complex<f32>>> =
+        Vec::with_capacity(starts.len());
+    for &start in &starts {
+        let mut frame: Vec<rustfft::num_complex::Complex<f32>> = (0..DENOISE_FRAME)
+            .map(|n| rustfft::num_complex::Complex::new(pcm[start + n] * window[n], 0.0))
+            .collect();
+        forward.process(&mut frame);
+        spectra.push(frame);
+    }
+
+    // Per-bin noise floor from the low quantile across frames.
+    let mut noise = vec![0.0_f32; bins];
+    let mut column = Vec::with_capacity(spectra.len());
+    for (bin, slot) in noise.iter_mut().enumerate() {
+        column.clear();
+        column.extend(spectra.iter().map(|frame| frame[bin].norm()));
+        column.sort_by(f32::total_cmp);
+        let rank = ((column.len() as f32 - 1.0) * DENOISE_NOISE_QUANTILE).round() as usize;
+        *slot = column[rank];
+    }
+
+    // Synthesis pass: scale magnitudes, keep phase, overlap-add, and divide out the accumulated
+    // window energy so the reconstruction is exact wherever the gain is 1.
+    let mut out = vec![0.0_f32; pcm.len()];
+    let mut weight = vec![0.0_f32; pcm.len()];
+    for (frame_index, &start) in starts.iter().enumerate() {
+        let mut frame = spectra[frame_index].clone();
+        for bin in 0..bins {
+            let magnitude = frame[bin].norm();
+            let noise_power = (DENOISE_OVERSUBTRACT * noise[bin]).powi(2);
+            let gain = if magnitude > 0.0 {
+                (1.0 - noise_power / magnitude.mul_add(magnitude, f32::EPSILON))
+                    .max(DENOISE_GAIN_FLOOR)
+            } else {
+                DENOISE_GAIN_FLOOR
+            };
+            frame[bin] *= gain;
+            // The spectrum of a real signal is conjugate-symmetric; scaling only the first half
+            // and letting the mirror drift would synthesize a complex signal.
+            if bin > 0 && bin < DENOISE_FRAME - bin {
+                frame[DENOISE_FRAME - bin] *= gain;
+            }
+        }
+        inverse.process(&mut frame);
+        let scale = 1.0 / DENOISE_FRAME as f32;
+        for n in 0..DENOISE_FRAME {
+            out[start + n] += frame[n].re * scale * window[n];
+            weight[start + n] += window[n] * window[n];
+        }
+    }
+    for (sample, energy) in out.iter_mut().zip(weight.iter()) {
+        if *energy > 1e-6 {
+            *sample /= *energy;
+        }
+    }
+    // The head and tail lie outside any full window and keep their original samples rather than
+    // a partially-normalized reconstruction.
+    let covered =
+        starts.first().copied().unwrap_or(0)..starts.last().map_or(0, |last| last + DENOISE_FRAME);
+    for (index, sample) in out.iter_mut().enumerate() {
+        if !covered.contains(&index) || weight[index] <= 1e-6 {
+            *sample = pcm[index];
+        }
+    }
+    out
+}
+
+/// Root-mean-square of the quietest decile of 50 ms windows, in dBFS.
+///
+/// Whole-signal RMS hides pause noise behind the speech that dominates it, so enrollment
+/// diagnostics report the floor between words — the part a denoise actually moves.
+fn pause_floor_dbfs(pcm: &[f32]) -> f32 {
+    let span = (SPEAKER_SAMPLE_RATE_HZ as usize) / 20;
+    if pcm.len() < span {
+        return f32::NEG_INFINITY;
+    }
+    let mut windows: Vec<f32> = pcm
+        .chunks_exact(span)
+        .map(|chunk| {
+            (chunk
+                .iter()
+                .map(|s| f64::from(*s) * f64::from(*s))
+                .sum::<f64>()
+                / chunk.len() as f64)
+                .sqrt() as f32
+        })
+        .filter(|rms| *rms > 0.0)
+        .collect();
+    if windows.is_empty() {
+        return f32::NEG_INFINITY;
+    }
+    windows.sort_by(f32::total_cmp);
+    let keep = (windows.len() / 10).max(1);
+    let mean = windows[..keep].iter().sum::<f32>() / keep as f32;
+    20.0 * mean.log10()
+}
+
 /// One Lanczos tap: a sinc lowpass at `cutoff`, windowed by a wider sinc over `lobes`.
 fn lanczos_tap(offset: f64, cutoff: f64, lobes: f64) -> f64 {
     let scaled = cutoff * offset;
@@ -867,6 +1059,64 @@ mod tests {
                 "sample {index} was altered at the pinned rate"
             );
         }
+    }
+
+    /// The denoiser has to do both halves of its job: drop the noise floor between bursts, and
+    /// leave the signal itself standing. A filter that achieves the first by attenuating
+    /// everything would pass a floor-only check while destroying the voice it was meant to clean.
+    #[test]
+    fn denoise_lowers_the_floor_between_bursts_without_eating_the_signal() {
+        const TONE_HZ: f64 = 700.0;
+        let samples = SPEAKER_SAMPLE_RATE_HZ as usize * 2;
+        // Deterministic hiss, so the assertion cannot flake on a lucky seed.
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut noise = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / 2048.0) - 0.5
+        };
+
+        // Half-second bursts of tone alternating with silence, all of it under hiss.
+        let clean: Vec<f32> = (0..samples)
+            .map(|n| {
+                let t = n as f64 / f64::from(SPEAKER_SAMPLE_RATE_HZ);
+                let speaking = (n / (SPEAKER_SAMPLE_RATE_HZ as usize / 2)) % 2 == 0;
+                if speaking {
+                    (std::f64::consts::TAU * TONE_HZ * t).sin() as f32 * 0.35
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let noisy: Vec<f32> = clean.iter().map(|s| s + noise() * 0.02).collect();
+
+        let cleaned = denoise_reference(&noisy);
+        assert_eq!(cleaned.len(), noisy.len(), "denoise must preserve length");
+        assert!(
+            cleaned.iter().all(|s| s.is_finite()),
+            "denoise produced a non-finite sample"
+        );
+
+        let before = pause_floor_dbfs(&noisy);
+        let after = pause_floor_dbfs(&cleaned);
+        assert!(
+            after < before - 3.0,
+            "expected the pause floor to drop by >3 dB, got {before:.1} -> {after:.1} dBFS"
+        );
+
+        // Energy inside a burst must survive. Compare the loudest quarter-second of each.
+        let span = SPEAKER_SAMPLE_RATE_HZ as usize / 4;
+        let peak_rms = |pcm: &[f32]| {
+            pcm.chunks_exact(span)
+                .map(|c| (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt())
+                .fold(0.0_f32, f32::max)
+        };
+        let kept = peak_rms(&cleaned) / peak_rms(&noisy);
+        assert!(
+            kept > 0.7,
+            "denoise removed too much of the signal: peak RMS kept {kept:.3} of the original"
+        );
     }
 
     /// A clip too short to survive its own downsample must round to nothing here rather than

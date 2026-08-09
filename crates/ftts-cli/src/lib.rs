@@ -216,6 +216,14 @@ struct EnrollArgs {
     /// Explicitly proceed after an enrollment-quality warning where safe.
     #[arg(long)]
     force: bool,
+
+    /// Spectral-subtract the stationary noise floor from the reference before enrolling.
+    ///
+    /// Off by default: room tone and breath are part of what the speaker encoder reads as
+    /// identity, so this changes the enrolled voice and stays opt-in until blind listening
+    /// clears it. Worth trying when a recording has audible hiss or hum.
+    #[arg(long)]
+    denoise: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1145,7 +1153,7 @@ fn run_say_events(
                     .to_owned(),
             )
         })?;
-    let speaker = synth::speaker_from_voice(&bundle, &voice_path)?;
+    let speaker = synth::speaker_from_voice(&bundle, &voice_path, None)?;
     let loaded = synth::LoadedModel::load(&bundle)?;
     emit_stage(run, emit, "load", "end", &mut seq)?;
 
@@ -1696,8 +1704,25 @@ fn run_enroll(
         }
         (Some(_), true) => unreachable!("clap enforces the conflict"),
     };
-    let speaker = synth::speaker_from_voice(&bundle, &args.reference_audio)?;
+    let mut denoise_report = None;
+    let speaker = synth::speaker_from_voice(
+        &bundle,
+        &args.reference_audio,
+        args.denoise.then_some(&mut denoise_report),
+    )?;
     synth::write_speaker_vector_new(&output, &speaker)?;
+    // Report what the denoise measured rather than asserting it helped: a reference whose floor
+    // barely moves was not noisy, and the user should reach for a better recording instead.
+    if let Some(report) = denoise_report {
+        writeln!(
+            stdout,
+            "denoised reference: pause floor {:.1} dBFS -> {:.1} dBFS ({:.1} dB quieter)",
+            report.before_dbfs,
+            report.after_dbfs,
+            report.before_dbfs - report.after_dbfs,
+        )
+        .map_err(|error| FttsError::Generic(format!("cannot write denoise report: {error}")))?;
+    }
     writeln!(
         stdout,
         "enrolled x-vector from {} to {}{}",

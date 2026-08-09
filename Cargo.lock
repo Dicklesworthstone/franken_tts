@@ -680,6 +680,7 @@ dependencies = [
  "ftts-core",
  "ftts-kernels",
  "ftts-model-qwen",
+ "rustfft",
  "serde_json",
  "symphonia",
 ]
