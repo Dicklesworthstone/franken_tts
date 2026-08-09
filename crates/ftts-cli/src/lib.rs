@@ -37,18 +37,23 @@ const MODEL_BASENAME: &str = "qwen3-tts-12hz-0.6b-base.fttsq";
 
 /// Built-in voices: name, one-line character, and the enrolled 1,024-float x-vector.
 ///
-/// Both were enrolled from the model's OWN synthesized speech (a rich reference passage), which
-/// is what makes them stable: tone-enrolled vectors sit off the speaker encoder's speech
-/// manifold and rendered inconsistently across texts (every one of eighteen tone candidates
-/// eventually failed listening or the clarity-plus-harmonicity stability screen), while
-/// speech-enrolled vectors passed the three-text battery cleanly. "ember" is "aria"'s passage
-/// pitch-shifted ~3.4 semitones down before re-enrollment. "aria" is the out-of-box default when
-/// no enrollment exists. These are conveniences, not clones of any person: the lineage is
-/// synthetic end to end, and enrolling a real reference always takes precedence.
+/// Two lineages ship here, and the difference is worth stating rather than blurring.
+///
+/// "aria" and "ember" were enrolled from the model's OWN synthesized speech (a rich reference
+/// passage), which is what makes them stable: tone-enrolled vectors sit off the speaker encoder's
+/// speech manifold and rendered inconsistently across texts (every one of eighteen tone
+/// candidates eventually failed listening or the clarity-plus-harmonicity stability screen),
+/// while speech-enrolled vectors passed the three-text battery cleanly. "ember" is "aria"'s
+/// passage pitch-shifted ~3.4 semitones down before re-enrollment. Their lineage is synthetic end
+/// to end and they clone no person.
+///
+/// "matt" is the out-of-box default when no enrollment exists.
+///
+/// Enrolling a real reference always takes precedence over any of them.
 const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
     (
         "aria",
-        "clear, warm, feminine — the out-of-box default",
+        "clear, warm, feminine",
         include_bytes!("../presets/aria.spk"),
     ),
     (
@@ -56,11 +61,21 @@ const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
         "the same character a few semitones deeper",
         include_bytes!("../presets/ember.spk"),
     ),
+    (
+        "james",
+        "natural, conversational, masculine",
+        include_bytes!("../presets/james.spk"),
+    ),
+    (
+        "matt",
+        "warm, easy, masculine — the out-of-box default",
+        include_bytes!("../presets/matt.spk"),
+    ),
 ];
 
 /// The preset used when `--voice`, `FTTS_DEFAULT_VOICE`, and MODEL_DIR/default.spk are all
 /// absent, so a fresh install speaks out of the box.
-const DEFAULT_PRESET_VOICE: &str = "aria";
+const DEFAULT_PRESET_VOICE: &str = "matt";
 
 /// Names a preset resolves to a temp-materialized `.spk` path the existing voice loaders read.
 ///
