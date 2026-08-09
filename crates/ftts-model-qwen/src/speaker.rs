@@ -516,9 +516,23 @@ impl Encoder {
     /// As [`Encoder::load`], plus artifact-integrity failures from the mapped container.
     pub fn load_fttsq(path: &Path) -> Result<Self, CheckpointError> {
         let artifact = crate::checkpoint::open_fttsq(path)?;
+        Self::load_fttsq_mapped(&artifact, path)
+    }
+
+    /// [`Encoder::load_fttsq`] over an already-verified mapping (the no-filesystem entry
+    /// point); `label` stands in for the path in error messages.
+    ///
+    /// # Errors
+    ///
+    /// As [`Encoder::load_fttsq`].
+    pub fn load_fttsq_mapped(
+        artifact: &ftts_artifacts::fttsq::MappedFttsq,
+        label: &Path,
+    ) -> Result<Self, CheckpointError> {
+        let path = label;
         let path_buf = path.to_path_buf();
         let mut fetch = move |name: &str, expected: usize| -> Result<Vec<f32>, CheckpointError> {
-            let values = crate::checkpoint::widen_fttsq(&artifact, &path_buf, name)?;
+            let values = crate::checkpoint::widen_fttsq(artifact, &path_buf, name)?;
             if values.len() != expected {
                 return Err(CheckpointError::TensorShape {
                     tensor: name.to_owned(),
