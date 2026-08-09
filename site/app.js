@@ -32,6 +32,8 @@ const ui = Object.fromEntries(
     "dice",
     "wave-canvas",
     "voice-cards",
+    "play-again",
+    "download-mp3",
   ].map((id) => [id.replace(/-([a-z])/g, (_, c) => c.toUpperCase()), document.getElementById(id)]),
 );
 
@@ -91,6 +93,9 @@ let clonedVector = null;
 let clonedName = "my voice";
 let lastWavBlob = null;
 let lastWavUrl = null;
+let lastSamples = null; // Float32Array of the latest synthesis, for MP3 encoding
+let lastSampleRate = 24000;
+let lastMp3Blob = null; // encoded lazily, once per synthesis
 
 // One object URL per synthesis, shared by the player and the download link; the
 // previous one is revoked so repeated syntheses don't leak blobs.
@@ -374,10 +379,15 @@ ui.speak.addEventListener("click", async () => {
     const { pcm, sampleRate, elapsedMs } = await call("synthesize", payload);
     const samples = new Float32Array(pcm);
     setWavBlob(pcmToWavBlob(samples, sampleRate));
+    lastSamples = samples;
+    lastSampleRate = sampleRate;
+    lastMp3Blob = null;
     drawWaveform(samples);
     ui.player.src = wavObjectUrl();
     ui.player.classList.remove("hidden");
+    ui.playAgain.classList.remove("hidden");
     ui.download.classList.remove("hidden");
+    ui.downloadMp3.classList.remove("hidden");
     const audioSeconds = samples.length / sampleRate;
     ui.synthStatus.textContent = `${audioSeconds.toFixed(1)}s of audio in ${(elapsedMs / 1000).toFixed(1)}s (${(audioSeconds / (elapsedMs / 1000)).toFixed(2)}× real time)`;
     ui.synthBar.style.width = "100%";
@@ -485,6 +495,68 @@ ui.download.addEventListener("click", () => {
   link.href = wavObjectUrl();
   link.download = "franken_tts.wav";
   link.click();
+});
+
+ui.playAgain.addEventListener("click", () => {
+  ui.player.currentTime = 0;
+  ui.player.play().catch(showError);
+});
+
+// MP3 export: the vendored lamejs encoder (LGPL, loaded as its own classic script) is
+// fetched lazily on the first click, and each synthesis is encoded at most once.
+let lameLoading = null;
+function loadLame() {
+  if (globalThis.lamejs) return Promise.resolve();
+  lameLoading ??= new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "vendor/lame.min.js";
+    script.onload = () => resolve();
+    script.onerror = () => {
+      lameLoading = null;
+      reject(new Error("failed to load the MP3 encoder"));
+    };
+    document.head.appendChild(script);
+  });
+  return lameLoading;
+}
+
+function encodeMp3(samples, sampleRate) {
+  const encoder = new globalThis.lamejs.Mp3Encoder(1, sampleRate, 128);
+  const pcm = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i += 1) {
+    pcm[i] = Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32767)));
+  }
+  const parts = [];
+  const BLOCK = 1152; // one MPEG frame of samples
+  for (let i = 0; i < pcm.length; i += BLOCK) {
+    const chunk = encoder.encodeBuffer(pcm.subarray(i, Math.min(i + BLOCK, pcm.length)));
+    if (chunk.length) parts.push(chunk);
+  }
+  const tail = encoder.flush();
+  if (tail.length) parts.push(tail);
+  return new Blob(parts, { type: "audio/mpeg" });
+}
+
+ui.downloadMp3.addEventListener("click", async () => {
+  if (!lastSamples) return;
+  ui.downloadMp3.disabled = true;
+  const originalLabel = ui.downloadMp3.textContent;
+  ui.downloadMp3.textContent = "Encoding…";
+  try {
+    await loadLame();
+    lastMp3Blob ??= encodeMp3(lastSamples, lastSampleRate);
+    const url = URL.createObjectURL(lastMp3Blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "franken_tts.mp3";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  } catch (error) {
+    showError(error);
+  } finally {
+    ui.downloadMp3.disabled = false;
+    ui.downloadMp3.textContent = originalLabel;
+  }
 });
 
 // Share = a stateless URL. Everything needed to reproduce the utterance rides in the
