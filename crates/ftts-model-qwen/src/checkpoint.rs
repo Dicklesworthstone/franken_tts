@@ -925,7 +925,7 @@ impl TalkerCheckpoint {
         ] {
             push(single.to_owned());
         }
-        drop(push);
+        // NLL releases `push`'s borrow of `names` here; the closure needs no explicit drop.
 
         let mut widened = widen_many(&names, &widen_tensor)?.into_iter();
 

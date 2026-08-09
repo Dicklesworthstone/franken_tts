@@ -170,26 +170,41 @@ impl LoadedModel {
         let vocab = read("vocab.json")?;
         let merges = read("merges.txt")?;
         let config = read("tokenizer_config.json")?;
-        let tokenizer = QwenTokenizer::from_files_using_environment(TokenizerFiles {
-            vocab_json: &vocab,
-            merges_txt: &merges,
-            tokenizer_config_json: &config,
-        })
-        .map_err(|error| FttsError::ArtifactFormat(format!("tokenizer unusable: {error}")))?;
 
-        Ok(Self {
-            talker: match bundle.canonical_main.as_deref() {
+        // The three heavyweight hydrations are independent, so the codec checkpoint and the
+        // tokenizer build overlap the talker load instead of queueing behind it. Each result is
+        // computed exactly as it was serially; only wall time changes.
+        let (talker, codec, tokenizer) = std::thread::scope(|scope| {
+            let codec = scope.spawn(|| CodecCheckpoint::load(&bundle.codec));
+            let tokenizer = scope.spawn(|| {
+                QwenTokenizer::from_files_using_environment(TokenizerFiles {
+                    vocab_json: &vocab,
+                    merges_txt: &merges,
+                    tokenizer_config_json: &config,
+                })
+            });
+            let talker = match bundle.canonical_main.as_deref() {
                 // The elision mirrors the generator's own hydration decision for this process:
                 // stacks that will run artifact-native int8 skip their dead f32 projections
                 // (~2.5 GB of widening nobody reads).
                 Some(path) => TalkerCheckpoint::load_fttsq_elided(
                     path,
                     ftts_model_qwen::generate::hot_elision_from_environment(),
-                )
-                .map_err(checkpoint_error)?,
-                None => TalkerCheckpoint::load(&bundle.main).map_err(checkpoint_error)?,
-            },
-            codec: CodecCheckpoint::load(&bundle.codec).map_err(checkpoint_error)?,
+                ),
+                None => TalkerCheckpoint::load(&bundle.main),
+            };
+            (
+                talker,
+                codec.join().expect("codec loader panicked"),
+                tokenizer.join().expect("tokenizer builder panicked"),
+            )
+        });
+        let tokenizer = tokenizer
+            .map_err(|error| FttsError::ArtifactFormat(format!("tokenizer unusable: {error}")))?;
+
+        Ok(Self {
+            talker: talker.map_err(checkpoint_error)?,
+            codec: codec.map_err(checkpoint_error)?,
             tokenizer,
             artifact: bundle
                 .canonical_main
@@ -627,30 +642,63 @@ const DENOISE_FRAME: usize = 512;
 /// changes from becoming audible frame edges.
 const DENOISE_HOP: usize = DENOISE_FRAME / 4;
 
-/// Per-bin noise magnitude is the low quantile of that bin across the whole recording: speech is
-/// sparse in time, so the quiet tail of each bin is the room, not the voice.
-const DENOISE_NOISE_QUANTILE: f32 = 0.15;
+/// Decision-directed smoothing for the a priori SNR. Ephraim and Malah's 0.98 is calmer but lags
+/// onsets; 0.92 tracks a voice that starts and stops mid-recording.
+const DD_ALPHA: f32 = 0.92;
 
-/// How much of the estimated noise power to remove. Mild on purpose — aggressive subtraction is
-/// what produces "musical noise" and, worse here, erodes the breath and sibilance the speaker
-/// encoder reads as identity.
-const DENOISE_OVERSUBTRACT: f32 = 1.5;
+/// Floor gain, −25 dB. OM-LSA never gates a bin fully closed: leaving a quiet, *stationary* bed
+/// is what stops residual noise from flickering into musical tones.
+const OMLSA_GAIN_FLOOR: f32 = 0.056_234_13;
 
-/// Never attenuate a bin below this. A floor keeps residual noise as a smooth quiet bed instead
-/// of a flickering one, which listeners find far less objectionable than isolated spectral holes.
-const DENOISE_GAIN_FLOOR: f32 = 0.1;
+/// Smoothing for IMCRA's power spectrum, and for its recursive noise average.
+const IMCRA_ALPHA_S: f32 = 0.9;
+const IMCRA_ALPHA_D: f32 = 0.85;
 
-/// Spectral-subtraction denoise of a reference recording, at the pinned speaker rate.
+/// Minimum-tracking window: `U` subwindows of `V` frames. 8 × 15 frames ≈ 0.64 s at this hop,
+/// long enough to span a syllable so speech cannot masquerade as the floor.
+const IMCRA_SUBWINDOWS: usize = 8;
+const IMCRA_SUBWINDOW_LEN: usize = 15;
+
+/// Bias compensation for the minimum of a smoothed periodogram, and the decision thresholds that
+/// separate "this bin is noise" from "this bin has speech" (Cohen 2003, §III).
+const IMCRA_B_MIN: f32 = 1.66;
+const IMCRA_GAMMA0: f32 = 4.6;
+const IMCRA_GAMMA1: f32 = 3.0;
+const IMCRA_ZETA0: f32 = 1.67;
+
+/// Single-channel speech enhancement by OM-LSA with IMCRA noise tracking.
 ///
 /// Enrollment noise is not cosmetic: it is encoded into the x-vector and then reproduced in every
 /// utterance the cloned voice speaks (measured — cleaning a real 53 s reference dropped the
 /// synthesized output's pause floor by 3.7 dB). This removes the stationary part of it.
 ///
-/// Deliberately conservative. The speaker encoder reads breath, sibilance, and room as part of
-/// identity, so an aggressive denoise trades one audible defect for a subtler and worse one. This
-/// is why the CLI leaves it opt-in (`--denoise`) rather than applying it to every enrollment:
-/// per the project's quantization doctrine, a lever that can damage speaker identity ships behind
-/// a named switch and stays off until blind listening clears it.
+/// **Why this and not spectral subtraction.** Subtracting an estimated noise magnitude minimises
+/// squared error in the *spectrum*, which is the wrong objective for something a listener judges
+/// and a speaker encoder reads: it punches holes in low-SNR bins, producing musical noise, and it
+/// removes real signal along with the noise (measured here at 33% of peak burst energy before
+/// this replaced it). Three pieces fix that, and they compose:
+///
+/// 1. **MMSE-LSA** (Ephraim & Malah 1985) estimates the *log* amplitude, matching how loudness is
+///    perceived, and yields the gain `ξ/(1+ξ) · exp(½·E₁(ν))`. The exponential-integral term is
+///    what makes it gentle where the a posteriori SNR is uncertain instead of gating hard.
+/// 2. **Decision-directed a priori SNR** (same paper) smooths ξ across frames using the previous
+///    frame's own estimate. This is the specific mechanism that suppresses musical noise: isolated
+///    noise peaks never get a confident ξ, so they are never sharply attenuated *or* passed.
+/// 3. **IMCRA** (Cohen 2003) tracks the noise floor by minimum statistics with a two-pass
+///    speech-presence exclusion, so the floor keeps adapting through speech and follows
+///    nonstationary room tone — where a fixed quantile estimate silently drifts wrong.
+///
+/// OM-LSA (Cohen & Berdugo 2001) then blends the LSA gain toward the floor by the speech-presence
+/// probability, `G = G_LSA^p · G_min^(1−p)`, so bins that are probably noise are attenuated to a
+/// constant bed rather than tracked.
+///
+/// This is the state of the art among methods that need no trained weights. Neural enhancers
+/// (DeepFilterNet and friends) do beat it, at the cost of shipping and running another model —
+/// which is not a trade this CLI should make silently for an enrollment preprocessing step.
+///
+/// Deliberately conservative even so: the speaker encoder reads breath, sibilance, and room as
+/// part of identity, so this stays opt-in (`--denoise`) per the project's doctrine that a lever
+/// which can damage speaker identity ships behind a named switch until blind listening clears it.
 ///
 /// Phase is preserved untouched; only per-bin magnitude is scaled.
 fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
@@ -668,55 +716,57 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
         })
         .collect();
 
-    // Analysis pass: keep every frame's spectrum so the noise estimate can see the whole
-    // recording before any frame is modified.
+    let bins = DENOISE_FRAME / 2 + 1;
     let starts: Vec<usize> = (0..=pcm.len() - DENOISE_FRAME)
         .step_by(DENOISE_HOP)
         .collect();
-    let bins = DENOISE_FRAME / 2 + 1;
-    let mut spectra: Vec<Vec<rustfft::num_complex::Complex<f32>>> =
-        Vec::with_capacity(starts.len());
+
+    let mut tracker = ImcraTracker::new(bins);
+    // Decision-directed state: last frame's gain and a posteriori SNR, per bin.
+    let mut prev_gain = vec![1.0_f32; bins];
+    let mut prev_gamma = vec![1.0_f32; bins];
+
+    let mut out = vec![0.0_f32; pcm.len()];
+    let mut weight = vec![0.0_f32; pcm.len()];
+
     for &start in &starts {
         let mut frame: Vec<rustfft::num_complex::Complex<f32>> = (0..DENOISE_FRAME)
             .map(|n| rustfft::num_complex::Complex::new(pcm[start + n] * window[n], 0.0))
             .collect();
         forward.process(&mut frame);
-        spectra.push(frame);
-    }
 
-    // Per-bin noise floor from the low quantile across frames.
-    let mut noise = vec![0.0_f32; bins];
-    let mut column = Vec::with_capacity(spectra.len());
-    for (bin, slot) in noise.iter_mut().enumerate() {
-        column.clear();
-        column.extend(spectra.iter().map(|frame| frame[bin].norm()));
-        column.sort_by(f32::total_cmp);
-        let rank = ((column.len() as f32 - 1.0) * DENOISE_NOISE_QUANTILE).round() as usize;
-        *slot = column[rank];
-    }
+        let power: Vec<f32> = (0..bins).map(|bin| frame[bin].norm_sqr()).collect();
+        let presence = tracker.update(&power);
 
-    // Synthesis pass: scale magnitudes, keep phase, overlap-add, and divide out the accumulated
-    // window energy so the reconstruction is exact wherever the gain is 1.
-    let mut out = vec![0.0_f32; pcm.len()];
-    let mut weight = vec![0.0_f32; pcm.len()];
-    for (frame_index, &start) in starts.iter().enumerate() {
-        let mut frame = spectra[frame_index].clone();
         for bin in 0..bins {
-            let magnitude = frame[bin].norm();
-            let noise_power = (DENOISE_OVERSUBTRACT * noise[bin]).powi(2);
-            let gain = if magnitude > 0.0 {
-                (1.0 - noise_power / magnitude.mul_add(magnitude, f32::EPSILON))
-                    .max(DENOISE_GAIN_FLOOR)
-            } else {
-                DENOISE_GAIN_FLOOR
-            };
+            let noise = tracker.noise[bin].max(1e-12);
+            let gamma = (power[bin] / noise).min(1e6);
+            // Decision-directed a priori SNR: last frame's estimate, blended with this frame's
+            // maximum-likelihood one.
+            let xi = (DD_ALPHA * prev_gain[bin].powi(2) * prev_gamma[bin]
+                + (1.0 - DD_ALPHA) * (gamma - 1.0).max(0.0))
+            .max(1e-6);
+
+            let nu = (xi / (1.0 + xi)) * gamma;
+            let lsa = (xi / (1.0 + xi)) * (0.5 * exponential_integral_e1(nu)).exp();
+            let lsa = lsa.clamp(OMLSA_GAIN_FLOOR, 1.0);
+
+            // OM-LSA: interpolate in the log domain between the LSA gain and the floor.
+            let p = presence[bin].clamp(0.0, 1.0);
+            let gain = lsa.powf(p) * OMLSA_GAIN_FLOOR.powf(1.0 - p);
+
+            prev_gain[bin] = gain;
+            prev_gamma[bin] = gamma;
+
             frame[bin] *= gain;
             // The spectrum of a real signal is conjugate-symmetric; scaling only the first half
             // and letting the mirror drift would synthesize a complex signal.
-            if bin > 0 && bin < DENOISE_FRAME - bin {
-                frame[DENOISE_FRAME - bin] *= gain;
+            let mirror = DENOISE_FRAME - bin;
+            if bin > 0 && mirror < DENOISE_FRAME {
+                frame[mirror] *= gain;
             }
         }
+
         inverse.process(&mut frame);
         let scale = 1.0 / DENOISE_FRAME as f32;
         for n in 0..DENOISE_FRAME {
@@ -724,6 +774,7 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
             weight[start + n] += window[n] * window[n];
         }
     }
+
     for (sample, energy) in out.iter_mut().zip(weight.iter()) {
         if *energy > 1e-6 {
             *sample /= *energy;
@@ -739,6 +790,239 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
         }
     }
     out
+}
+
+/// IMCRA noise tracker: minimum statistics with two-pass speech exclusion.
+///
+/// The whole point is that the noise floor must keep updating *while someone is speaking*. A
+/// tracker that only learns during silence drifts as the room changes; one that learns from every
+/// frame absorbs the voice into its own noise estimate and then subtracts it.
+struct ImcraTracker {
+    bins: usize,
+    /// Recursively averaged noise power — the estimate everything downstream divides by.
+    noise: Vec<f32>,
+    /// First-pass smoothed power and its running/subwindow minima.
+    smoothed: Vec<f32>,
+    running_min: Vec<f32>,
+    subwindow_min: Vec<f32>,
+    history: Vec<Vec<f32>>,
+    /// Second pass, computed over bins the first pass called noise-only.
+    smoothed_refined: Vec<f32>,
+    running_min_refined: Vec<f32>,
+    subwindow_min_refined: Vec<f32>,
+    history_refined: Vec<Vec<f32>>,
+    frame: usize,
+    subwindow_slot: usize,
+}
+
+impl ImcraTracker {
+    fn new(bins: usize) -> Self {
+        Self {
+            bins,
+            noise: vec![0.0; bins],
+            smoothed: vec![0.0; bins],
+            running_min: vec![f32::MAX; bins],
+            subwindow_min: vec![f32::MAX; bins],
+            history: vec![vec![f32::MAX; bins]; IMCRA_SUBWINDOWS],
+            smoothed_refined: vec![0.0; bins],
+            running_min_refined: vec![f32::MAX; bins],
+            subwindow_min_refined: vec![f32::MAX; bins],
+            history_refined: vec![vec![f32::MAX; bins]; IMCRA_SUBWINDOWS],
+            frame: 0,
+            subwindow_slot: 0,
+        }
+    }
+
+    /// Feed one frame's power spectrum; return per-bin speech-presence probability.
+    fn update(&mut self, power: &[f32]) -> Vec<f32> {
+        if self.frame == 0 {
+            // Seed every state from the first frame rather than from zero, so the first second of
+            // audio is not enhanced against a meaningless floor.
+            self.noise.copy_from_slice(power);
+            self.smoothed.copy_from_slice(power);
+            self.smoothed_refined.copy_from_slice(power);
+            self.running_min.copy_from_slice(power);
+            self.subwindow_min.copy_from_slice(power);
+            self.running_min_refined.copy_from_slice(power);
+            self.subwindow_min_refined.copy_from_slice(power);
+        }
+
+        // Pass 1: smooth in frequency, then in time, then track the minimum.
+        let smoothed_freq = smooth_across_bins(power);
+        for bin in 0..self.bins {
+            self.smoothed[bin] =
+                IMCRA_ALPHA_S * self.smoothed[bin] + (1.0 - IMCRA_ALPHA_S) * smoothed_freq[bin];
+        }
+        track_minimum(
+            &self.smoothed,
+            &mut self.running_min,
+            &mut self.subwindow_min,
+        );
+
+        // Which bins look like noise only? Both the instantaneous and the smoothed power have to
+        // sit close to the tracked minimum.
+        let mut noise_only = vec![false; self.bins];
+        for bin in 0..self.bins {
+            let floor = (IMCRA_B_MIN * self.running_min[bin]).max(1e-12);
+            let gamma_min = power[bin] / floor;
+            let zeta = self.smoothed[bin] / floor;
+            noise_only[bin] = gamma_min < IMCRA_GAMMA0 && zeta < IMCRA_ZETA0;
+        }
+
+        // Pass 2: repeat the smoothing using only those bins, which keeps a strong harmonic from
+        // dragging its neighbours' floor upward.
+        let refined_freq = smooth_across_bins_masked(power, &noise_only, &self.smoothed_refined);
+        for bin in 0..self.bins {
+            self.smoothed_refined[bin] = IMCRA_ALPHA_S * self.smoothed_refined[bin]
+                + (1.0 - IMCRA_ALPHA_S) * refined_freq[bin];
+        }
+        track_minimum(
+            &self.smoothed_refined,
+            &mut self.running_min_refined,
+            &mut self.subwindow_min_refined,
+        );
+
+        // Speech-absence probability from the refined statistics, then presence.
+        let mut presence = vec![0.0_f32; self.bins];
+        for bin in 0..self.bins {
+            let floor = (IMCRA_B_MIN * self.running_min_refined[bin]).max(1e-12);
+            let gamma_min = power[bin] / floor;
+            let zeta = self.smoothed_refined[bin] / floor;
+            let q = if gamma_min <= 1.0 || zeta < IMCRA_ZETA0 {
+                1.0
+            } else if gamma_min >= IMCRA_GAMMA1 {
+                0.0
+            } else {
+                (IMCRA_GAMMA1 - gamma_min) / (IMCRA_GAMMA1 - 1.0)
+            };
+            presence[bin] = (1.0 - q).clamp(0.0, 1.0);
+        }
+
+        // Recursive noise update, slowed wherever speech is likely present.
+        for bin in 0..self.bins {
+            let alpha = IMCRA_ALPHA_D + (1.0 - IMCRA_ALPHA_D) * presence[bin];
+            self.noise[bin] = alpha * self.noise[bin] + (1.0 - alpha) * power[bin];
+        }
+
+        self.frame += 1;
+        if self.frame % IMCRA_SUBWINDOW_LEN == 0 {
+            self.roll_subwindow();
+        }
+        presence
+    }
+
+    /// Close the current subwindow and recompute each running minimum over the retained ones.
+    fn roll_subwindow(&mut self) {
+        self.history[self.subwindow_slot].copy_from_slice(&self.subwindow_min);
+        self.history_refined[self.subwindow_slot].copy_from_slice(&self.subwindow_min_refined);
+        self.subwindow_slot = (self.subwindow_slot + 1) % IMCRA_SUBWINDOWS;
+
+        for bin in 0..self.bins {
+            let mut best = f32::MAX;
+            let mut best_refined = f32::MAX;
+            for slot in 0..IMCRA_SUBWINDOWS {
+                best = best.min(self.history[slot][bin]);
+                best_refined = best_refined.min(self.history_refined[slot][bin]);
+            }
+            self.running_min[bin] = best.min(self.smoothed[bin]);
+            self.running_min_refined[bin] = best_refined.min(self.smoothed_refined[bin]);
+            self.subwindow_min[bin] = self.smoothed[bin];
+            self.subwindow_min_refined[bin] = self.smoothed_refined[bin];
+        }
+    }
+}
+
+/// Running and subwindow minima, updated in place for one frame.
+fn track_minimum(smoothed: &[f32], running: &mut [f32], subwindow: &mut [f32]) {
+    for bin in 0..smoothed.len() {
+        running[bin] = running[bin].min(smoothed[bin]);
+        subwindow[bin] = subwindow[bin].min(smoothed[bin]);
+    }
+}
+
+/// Three-bin Hann smoothing across frequency, which is what makes the minimum statistic stable
+/// enough to track without a long window.
+fn smooth_across_bins(power: &[f32]) -> Vec<f32> {
+    const WEIGHTS: [f32; 3] = [0.25, 0.5, 0.25];
+    (0..power.len())
+        .map(|bin| {
+            let mut acc = 0.0;
+            let mut norm = 0.0;
+            for (offset, weight) in (-1_isize..=1).zip(WEIGHTS) {
+                let index = bin as isize + offset;
+                if index >= 0 && (index as usize) < power.len() {
+                    acc += weight * power[index as usize];
+                    norm += weight;
+                }
+            }
+            acc / norm
+        })
+        .collect()
+}
+
+/// As [`smooth_across_bins`], but averaging only over bins currently believed to be noise.
+///
+/// Where a whole neighbourhood is speech there is nothing to average, so the previous refined
+/// estimate carries forward rather than being replaced by the speech power.
+fn smooth_across_bins_masked(power: &[f32], noise_only: &[bool], previous: &[f32]) -> Vec<f32> {
+    const WEIGHTS: [f32; 3] = [0.25, 0.5, 0.25];
+    (0..power.len())
+        .map(|bin| {
+            let mut acc = 0.0;
+            let mut norm = 0.0;
+            for (offset, weight) in (-1_isize..=1).zip(WEIGHTS) {
+                let index = bin as isize + offset;
+                if index >= 0 && (index as usize) < power.len() && noise_only[index as usize] {
+                    acc += weight * power[index as usize];
+                    norm += weight;
+                }
+            }
+            if norm > 0.0 {
+                acc / norm
+            } else {
+                previous[bin]
+            }
+        })
+        .collect()
+}
+
+/// The exponential integral `E₁(x) = ∫ₓ^∞ e^{−t}/t dt`, for `x > 0`.
+///
+/// This is the term that makes MMSE-LSA gentle rather than gating: it grows without bound as the
+/// a priori SNR falls, so the log-amplitude estimate backs off smoothly instead of snapping shut.
+/// Abramowitz & Stegun 5.1.53 below 1 and 5.1.56 above it; both are accurate to ~2e-7, far inside
+/// what a spectral gain needs.
+fn exponential_integral_e1(x: f32) -> f32 {
+    if x <= 0.0 {
+        // ν ≤ 0 cannot arise from a non-negative SNR, but a denormal would otherwise return NaN
+        // and poison the frame.
+        return 0.0;
+    }
+    let x = f64::from(x);
+    let value = if x < 1.0 {
+        // A&S 5.1.53: E₁(x) + ln x = polynomial in x.
+        const A: [f64; 6] = [
+            -0.577_215_664_9,
+            0.999_991_93,
+            -0.249_910_55,
+            0.055_199_68,
+            -0.009_760_04,
+            0.001_079_857,
+        ];
+        let mut acc = 0.0;
+        for (power, coefficient) in A.iter().enumerate() {
+            acc += coefficient * x.powi(power as i32);
+        }
+        acc - x.ln()
+    } else {
+        // A&S 5.1.56: x·e^x·E₁(x) = rational in x.
+        const A: [f64; 4] = [8.573_328_74, 18.059_016_97, 8.634_760_89, 0.267_773_734];
+        const B: [f64; 4] = [9.573_322_34, 25.632_956_15, 21.099_653_08, 3.958_496_93];
+        let numerator = x.powi(4) + A[0] * x.powi(3) + A[1] * x * x + A[2] * x + A[3];
+        let denominator = x.powi(4) + B[0] * x.powi(3) + B[1] * x * x + B[2] * x + B[3];
+        (numerator / denominator) / (x * x.exp())
+    };
+    value as f32
 }
 
 /// Root-mean-square of the quietest decile of 50 ms windows, in dBFS.
