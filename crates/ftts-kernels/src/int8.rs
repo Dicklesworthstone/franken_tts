@@ -161,6 +161,116 @@ impl Int8Tier {
     }
 }
 
+/// Which quantized linear op class the armed route runs.
+///
+/// `W8A8` quantizes activations per row and uses the exact-i32 int8 dot — fastest, but the
+/// activation rounding perturbs logits enough that seeded sampling can draw different tokens
+/// than f32. `W8A16` keeps activations f32 and dequantizes weights in-register — the same
+/// one-byte-per-weight memory traffic, no activation error, so the output tracks the f32
+/// reference much more closely. Its f32 accumulation is lane-ordered (not the reference's
+/// left-to-right order): this is a lossy route already, so reduction-order freedom is part of
+/// the deal, and the fidelity gate is measured downstream, not asserted bitwise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuantLinearMode {
+    /// Int8 activations times int8 weights, exact i32 accumulation.
+    W8A8(Int8Tier),
+    /// f32 activations times dequantized int8 weights, lane-ordered f32 accumulation.
+    W8A16,
+}
+
+impl QuantLinearMode {
+    /// Stable machine-readable mode name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::W8A8(_) => "w8a8",
+            Self::W8A16 => "w8a16",
+        }
+    }
+}
+
+/// W8A16 linear: f32 activations `[m, k]` times a [`QuantizedMatrix`] `[n, k]` producing
+/// f32 `[m, n]`.
+///
+/// Eight independent f32 FMA lanes per dot product, weights widened from i8 in-register; the
+/// per-output-channel scale multiplies once after accumulation, mirroring the W8A8 dequant
+/// order. Weight-stationary loop, like [`linear_q8`].
+///
+/// # Panics
+///
+/// Panics on any shape mismatch.
+pub fn linear_w8a16(
+    x: &[f32],
+    weight: &QuantizedMatrix,
+    bias: Option<&[f32]>,
+    m: usize,
+    out: &mut [f32],
+) {
+    let (n, k) = (weight.n, weight.k);
+    assert_eq!(x.len(), m * k, "x must be [m, k]");
+    assert_eq!(out.len(), m * n, "out must be [m, n]");
+    if let Some(bias) = bias {
+        assert_eq!(bias.len(), n, "bias must be [n]");
+    }
+    for col in 0..n {
+        let w_row = &weight.data[col * k..(col + 1) * k];
+        let w_scale = weight.scales[col];
+        let bias_term = bias.map(|b| b[col]);
+        for row in 0..m {
+            let x_row = &x[row * k..(row + 1) * k];
+            let acc = dot_w8a16(x_row, w_row);
+            let value = acc * w_scale;
+            out[row * n + col] = bias_term.map_or(value, |b| value + b);
+        }
+    }
+}
+
+/// Eight-lane f32 dot of an f32 row against an i8 weight row, widened in-register.
+fn dot_w8a16(x: &[f32], w: &[i8]) -> f32 {
+    const LANES: usize = 8;
+    let mut lanes = [0.0_f32; LANES];
+    let chunks = x.len() / LANES;
+    for chunk in 0..chunks {
+        let base = chunk * LANES;
+        for lane in 0..LANES {
+            lanes[lane] = f32::from(w[base + lane]).mul_add(x[base + lane], lanes[lane]);
+        }
+    }
+    let mut sum: f32 = lanes.iter().sum();
+    for index in chunks * LANES..x.len() {
+        sum = f32::from(w[index]).mul_add(x[index], sum);
+    }
+    sum
+}
+
+/// The armed quantized-linear mode for the talker/microdecoder route.
+///
+/// `FTTS_INT8=1` or `w8a8` selects the int8-dot route; `FTTS_INT8=w8a16` selects the
+/// weight-only route. Anything else means the caller should not be arming quantization at all
+/// (the kill-switch check happens before this is consulted).
+#[must_use]
+pub fn quant_mode_from_environment() -> QuantLinearMode {
+    match std::env::var("FTTS_INT8").as_deref() {
+        Ok("w8a16") => QuantLinearMode::W8A16,
+        _ => QuantLinearMode::W8A8(autotuned_plan().decode_gemv),
+    }
+}
+
+/// Runs one quantized linear in the selected mode; the drop-in used by the armed model paths.
+pub fn quant_linear(
+    mode: QuantLinearMode,
+    x: &[f32],
+    weight: &QuantizedMatrix,
+    bias: Option<&[f32]>,
+    m: usize,
+    out: &mut [f32],
+) {
+    match mode {
+        QuantLinearMode::W8A8(tier) => linear_q8_dynamic(x, weight, bias, m, out, tier),
+        QuantLinearMode::W8A16 => linear_w8a16(x, weight, bias, m, out),
+    }
+}
+
 /// The measured per-regime route assignment, decided once per process.
 ///
 /// v0 of the KernelPlan: two regimes, no persistence (`.fttspack` owns that when it lands).

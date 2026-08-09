@@ -18,7 +18,7 @@
 use ftts_kernels::f32ref::{
     self, F32LinearAccumulation, F32RmsNormArithmetic, F32SiluArithmetic, F32SoftmaxArithmetic,
 };
-use ftts_kernels::int8::{Int8Tier, QuantizedMatrix, linear_q8_dynamic};
+use ftts_kernels::int8::{QuantLinearMode, QuantizedMatrix, quant_linear};
 
 /// Talker geometry. Field values come from `talker_config` in the pinned `config.json`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -673,7 +673,7 @@ pub fn forward_layer_q8(
     hidden: &mut [f32],
     seq: usize,
     cache: &mut KvCache,
-    tier: Int8Tier,
+    mode: QuantLinearMode,
 ) {
     let hidden_size = config.hidden_size;
     let head_dim = config.head_dim;
@@ -712,9 +712,9 @@ pub fn forward_layer_q8(
     let mut queries = vec![0.0f32; seq * query_width];
     let mut keys = vec![0.0f32; seq * kv_width];
     let mut values = vec![0.0f32; seq * kv_width];
-    linear_q8_dynamic(&normed, &quant.q_proj, None, seq, &mut queries, tier);
-    linear_q8_dynamic(&normed, &quant.k_proj, None, seq, &mut keys, tier);
-    linear_q8_dynamic(&normed, &quant.v_proj, None, seq, &mut values, tier);
+    quant_linear(mode, &normed, &quant.q_proj, None, seq, &mut queries);
+    quant_linear(mode, &normed, &quant.k_proj, None, seq, &mut keys);
+    quant_linear(mode, &normed, &quant.v_proj, None, seq, &mut values);
 
     // QK-Norm over head_dim, then rotary — identical to the f32 reference.
     let mut scratch = vec![0.0f32; head_dim];
@@ -773,7 +773,7 @@ pub fn forward_layer_q8(
     );
 
     let mut attention = vec![0.0f32; seq * hidden_size];
-    linear_q8_dynamic(&context, &quant.o_proj, None, seq, &mut attention, tier);
+    quant_linear(mode, &context, &quant.o_proj, None, seq, &mut attention);
     for (state, delta) in hidden.iter_mut().zip(&attention) {
         *state += *delta;
     }
@@ -791,12 +791,12 @@ pub fn forward_layer_q8(
     let intermediate = config.intermediate_size;
     let mut gate = vec![0.0f32; seq * intermediate];
     let mut up = vec![0.0f32; seq * intermediate];
-    linear_q8_dynamic(&normed, &quant.gate_proj, None, seq, &mut gate, tier);
-    linear_q8_dynamic(&normed, &quant.up_proj, None, seq, &mut up, tier);
+    quant_linear(mode, &normed, &quant.gate_proj, None, seq, &mut gate);
+    quant_linear(mode, &normed, &quant.up_proj, None, seq, &mut up);
     f32ref::silu_mul_in_place(&mut gate, &up);
 
     let mut down = vec![0.0f32; seq * hidden_size];
-    linear_q8_dynamic(&gate, &quant.down_proj, None, seq, &mut down, tier);
+    quant_linear(mode, &gate, &quant.down_proj, None, seq, &mut down);
     for (state, delta) in hidden.iter_mut().zip(&down) {
         *state += *delta;
     }
@@ -822,7 +822,7 @@ pub fn forward_talker_q8(
     seq: usize,
     cache: &mut TalkerKvCache,
     logits: &mut [f32],
-    tier: Int8Tier,
+    mode: QuantLinearMode,
 ) {
     assert_eq!(
         weights.layers.len(),
@@ -864,7 +864,7 @@ pub fn forward_talker_q8(
             hidden,
             seq,
             layer_cache,
-            tier,
+            mode,
         );
     }
 
@@ -1191,7 +1191,7 @@ mod tests {
                 &mut hidden,
                 seq,
                 &mut cache,
-                tier,
+                ftts_kernels::int8::QuantLinearMode::W8A8(tier),
             );
             match &reference {
                 None => reference = Some(hidden),
@@ -1255,7 +1255,7 @@ mod tests {
             &mut actual,
             seq,
             &mut q8_cache,
-            ftts_kernels::int8::Int8Tier::Scalar,
+            ftts_kernels::int8::QuantLinearMode::W8A8(ftts_kernels::int8::Int8Tier::Scalar),
         );
 
         assert_eq!(q8_cache.len(), f32_cache.len());

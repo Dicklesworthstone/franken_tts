@@ -38,7 +38,7 @@
 //! Strict-mode acceptance therefore compares **argmax / token ids**, never logit bits, unless a
 //! verify kernel reproduces this loop's reduction order exactly.
 
-use ftts_kernels::int8::{Int8Tier, QuantizedMatrix, linear_q8_dynamic};
+use ftts_kernels::int8::{QuantLinearMode, QuantizedMatrix, quant_linear};
 
 /// Number of code groups per frame: one primary code plus 15 residuals.
 pub const CODES_PER_FRAME: usize = 16;
@@ -616,16 +616,16 @@ pub fn layer_step_q8(
     sin: &[f32],
     hidden: &[f32],
     state: &mut FrameKvState,
-    tier: Int8Tier,
+    mode: QuantLinearMode,
 ) -> Vec<f32> {
     let normed = rms_norm(hidden, weights.input_norm, config.rms_eps);
 
     let mut q = vec![0.0_f32; config.q_width()];
     let mut k = vec![0.0_f32; config.kv_width()];
     let mut v = vec![0.0_f32; config.kv_width()];
-    linear_q8_dynamic(&normed, &quant.q_proj, None, 1, &mut q, tier);
-    linear_q8_dynamic(&normed, &quant.k_proj, None, 1, &mut k, tier);
-    linear_q8_dynamic(&normed, &quant.v_proj, None, 1, &mut v, tier);
+    quant_linear(mode, &normed, &quant.q_proj, None, 1, &mut q);
+    quant_linear(mode, &normed, &quant.k_proj, None, 1, &mut k);
+    quant_linear(mode, &normed, &quant.v_proj, None, 1, &mut v);
 
     for head in 0..config.num_q_heads {
         let span = head * config.head_dim..(head + 1) * config.head_dim;
@@ -678,7 +678,7 @@ pub fn layer_step_q8(
     }
 
     let mut attn_out = vec![0.0_f32; config.hidden_size];
-    linear_q8_dynamic(&context, &quant.o_proj, None, 1, &mut attn_out, tier);
+    quant_linear(mode, &context, &quant.o_proj, None, 1, &mut attn_out);
     let residual: Vec<f32> = hidden
         .iter()
         .zip(attn_out.iter())
@@ -688,13 +688,13 @@ pub fn layer_step_q8(
     let normed = rms_norm(&residual, weights.post_attention_norm, config.rms_eps);
     let mut gate = vec![0.0_f32; config.intermediate_size];
     let mut up = vec![0.0_f32; config.intermediate_size];
-    linear_q8_dynamic(&normed, &quant.gate_proj, None, 1, &mut gate, tier);
-    linear_q8_dynamic(&normed, &quant.up_proj, None, 1, &mut up, tier);
+    quant_linear(mode, &normed, &quant.gate_proj, None, 1, &mut gate);
+    quant_linear(mode, &normed, &quant.up_proj, None, 1, &mut up);
     for (g, u) in gate.iter_mut().zip(up.iter()) {
         *g = silu(*g) * u;
     }
     let mut mlp_out = vec![0.0_f32; config.hidden_size];
-    linear_q8_dynamic(&gate, &quant.down_proj, None, 1, &mut mlp_out, tier);
+    quant_linear(mode, &gate, &quant.down_proj, None, 1, &mut mlp_out);
 
     residual
         .iter()
@@ -1174,7 +1174,7 @@ pub fn decode_frame_with_selector_q8(
     rope: &RopeTable,
     weights: &MicrodecoderWeights<'_>,
     quant: &[MicroLayerQuant],
-    tier: Int8Tier,
+    mode: QuantLinearMode,
     state: &mut FrameState,
     talker_hidden: &[f32],
     primary_code: usize,
@@ -1189,7 +1189,7 @@ pub fn decode_frame_with_selector_q8(
         config,
         rope,
         weights,
-        Some((quant, tier)),
+        Some((quant, mode)),
         state,
         talker_hidden,
         primary_code,
@@ -1202,7 +1202,7 @@ fn decode_frame_with_selector_inner(
     config: &MicrodecoderConfig,
     rope: &RopeTable,
     weights: &MicrodecoderWeights<'_>,
-    quant: Option<(&[MicroLayerQuant], Int8Tier)>,
+    quant: Option<(&[MicroLayerQuant], QuantLinearMode)>,
     state: &mut FrameState,
     talker_hidden: &[f32],
     primary_code: usize,
@@ -1237,7 +1237,7 @@ fn decode_frame_with_selector_inner(
 
         for (index, layer) in weights.layers.iter().enumerate() {
             hidden = match quant {
-                Some((quant_layers, tier)) => {
+                Some((quant_layers, mode)) => {
                     let (cos, sin) = rope.row(position);
                     layer_step_q8(
                         config,
@@ -1247,7 +1247,7 @@ fn decode_frame_with_selector_inner(
                         sin,
                         &hidden,
                         &mut state.layers[index],
-                        tier,
+                        mode,
                     )
                 }
                 None => layer_step(
@@ -1847,7 +1847,14 @@ mod tests {
             let mut state = FrameKvState::new(&config);
             let (cos, sin) = rope.row(0);
             let out = layer_step_q8(
-                &config, &weights, &quant, cos, sin, &hidden, &mut state, tier,
+                &config,
+                &weights,
+                &quant,
+                cos,
+                sin,
+                &hidden,
+                &mut state,
+                ftts_kernels::int8::QuantLinearMode::W8A8(tier),
             );
             match &reference {
                 None => reference = Some(out),
@@ -1890,7 +1897,7 @@ mod tests {
             sin,
             &hidden,
             &mut q8_state,
-            ftts_kernels::int8::Int8Tier::Autovec,
+            ftts_kernels::int8::QuantLinearMode::W8A8(ftts_kernels::int8::Int8Tier::Autovec),
         );
 
         let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();

@@ -24,7 +24,7 @@ use crate::talker::{
     self, CODE_GROUP_COUNT, PRIMARY_CODE_VOCAB_SIZE, RotaryRows, TalkerConfig, TalkerKvCache,
     TalkerLayerQuant, TalkerWeights,
 };
-use ftts_kernels::int8::Int8Tier;
+use ftts_kernels::int8::QuantLinearMode;
 
 /// The talker's pinned mRoPE base. The microdecoder and codec each use a different theta; crossing
 /// them is a silent correctness failure, so the constant lives next to its only call sites.
@@ -117,7 +117,7 @@ struct UtteranceState {
 struct Int8Route {
     talker: Vec<TalkerLayerQuant>,
     micro: Vec<MicroLayerQuant>,
-    tier: Int8Tier,
+    mode: QuantLinearMode,
 }
 
 /// The Qwen3-TTS Base implementation of [`FrameGenerator`].
@@ -196,7 +196,11 @@ impl<'a> QwenGenerator<'a> {
 
         // Staged levers 2a+2b: runtime W8A8, armed only by the explicit kill-switch. The default
         // path quantizes nothing and calls the untouched f32 reference functions.
-        let int8 = (std::env::var("FTTS_INT8").as_deref() == Ok("1")).then(|| Int8Route {
+        let int8 = matches!(
+            std::env::var("FTTS_INT8").as_deref(),
+            Ok("1" | "w8a8" | "w8a16")
+        )
+        .then(|| Int8Route {
             talker: config
                 .talker_weights
                 .layers
@@ -209,7 +213,7 @@ impl<'a> QwenGenerator<'a> {
                 .iter()
                 .map(|layer| MicroLayerQuant::quantize(&config.microdecoder_config, layer))
                 .collect(),
-            tier: ftts_kernels::int8::autotuned_plan().decode_gemv,
+            mode: ftts_kernels::int8::quant_mode_from_environment(),
         });
 
         Self {
@@ -323,7 +327,7 @@ impl<'a> QwenGenerator<'a> {
                 seq,
                 &mut self.kv,
                 &mut logits,
-                route.tier,
+                route.mode,
             ),
             None => talker::forward_talker(
                 &self.talker_config,
@@ -450,7 +454,7 @@ impl FrameGenerator for QwenGenerator<'_> {
                 &self.microdecoder_rope,
                 &self.microdecoder_weights,
                 &route.micro,
-                route.tier,
+                route.mode,
                 &mut self.frame_state,
                 &utterance.pending_hidden,
                 primary as usize,
@@ -510,7 +514,7 @@ impl FrameGenerator for QwenGenerator<'_> {
                 1,
                 &mut self.kv,
                 &mut logits,
-                route.tier,
+                route.mode,
             ),
             None => talker::forward_talker(
                 &self.talker_config,
