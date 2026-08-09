@@ -862,6 +862,12 @@ impl TalkerCheckpoint {
         let source = TextEmbeddingSource::Fttsq(Arc::clone(&artifact));
         let elide = {
             let artifact = Arc::clone(&artifact);
+            let q8_present = move |name: &str| {
+                artifact
+                    .reader()
+                    .tensor(name)
+                    .is_some_and(|entry| entry.dtype == StoredDtype::Q8 && entry.scales.is_some())
+            };
             move |name: &str| {
                 let stack_elided = if name.starts_with("talker.code_predictor.model.layers.") {
                     elision.micro
@@ -870,13 +876,23 @@ impl TalkerCheckpoint {
                 } else {
                     false
                 };
-                stack_elided
-                    && HOT_PROJECTION_SUFFIXES
-                        .iter()
-                        .any(|suffix| name.ends_with(suffix))
-                    && artifact.reader().tensor(name).is_some_and(|entry| {
-                        entry.dtype == StoredDtype::Q8 && entry.scales.is_some()
-                    })
+                if !stack_elided {
+                    return false;
+                }
+                // The generator's artifact-native hydration is per LAYER: one missing projection
+                // sends the whole layer to the requantize fallback, which reads the f32 copies.
+                // Elision must therefore be per layer too — a tensor is skipped only when every
+                // hot projection of its layer is verifiably Q8 in the artifact, never just itself.
+                let Some(suffix) = HOT_PROJECTION_SUFFIXES
+                    .iter()
+                    .find(|suffix| name.ends_with(*suffix))
+                else {
+                    return false;
+                };
+                let layer_prefix = &name[..name.len() - suffix.len()];
+                HOT_PROJECTION_SUFFIXES
+                    .iter()
+                    .all(|suffix| q8_present(&format!("{layer_prefix}{suffix}")))
             }
         };
         Self::load_with(
