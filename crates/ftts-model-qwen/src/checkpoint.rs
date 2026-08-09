@@ -466,8 +466,19 @@ fn widen_many(
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let workers = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
+    // Interleaved A/B under a heavily loaded host measured uncapped hydration workers LOSING ~2x
+    // to the serial walk (context-switch thrash against external load); a small fixed team keeps
+    // the win on a quiet machine without fighting a busy one. FTTS_LOAD_THREADS overrides; 1 is
+    // the serial walk.
+    let workers = std::env::var("FTTS_LOAD_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get)
+                .div_euclid(2)
+                .min(6)
+        })
         .min(names.len())
         .max(1);
     if workers == 1 {
