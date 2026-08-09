@@ -755,7 +755,9 @@ fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
             // The spectrum of a real signal is conjugate-symmetric; scaling only the first half
             // and letting the mirror drift would synthesize a complex signal.
             let mirror = DENOISE_FRAME - bin;
-            if bin > 0 && mirror < DENOISE_FRAME {
+            // DC (bin 0) has no mirror, and Nyquist (bin N/2) *is* its own mirror — scaling it
+            // through this branch as well would apply `gain` twice there.
+            if mirror != bin && mirror < DENOISE_FRAME {
                 frame[mirror] *= gain;
             }
         }
@@ -1002,7 +1004,7 @@ fn exponential_integral_e1(x: f32) -> f32 {
             -0.249_910_55,
             0.055_199_68,
             -0.009_760_04,
-            0.001_079_857,
+            0.001_078_57,
         ];
         let mut acc = 0.0;
         for (power, coefficient) in A.iter().enumerate() {
@@ -1338,6 +1340,43 @@ mod tests {
                 "sample {index} was altered at the pinned rate"
             );
         }
+    }
+
+    /// `E₁` sets the MMSE-LSA gain at every bin of every frame, so a mistyped coefficient would
+    /// quietly bias the whole denoiser instead of failing. References computed from the
+    /// convergent series `−γ − ln x + Σ (−1)^{k+1} x^k /(k·k!)`, a different algorithm from the
+    /// rational fits under test.
+    ///
+    /// The tolerance is tight on purpose: a single-digit slip in the fifth-order coefficient
+    /// perturbs `E₁(0.9)` by ~7.6e-7, which a looser bound would wave through.
+    #[test]
+    fn the_exponential_integral_matches_its_series_expansion() {
+        // (x, E₁(x)) — the series branch, x < 1.
+        for (x, expected) in [
+            (0.1_f32, 1.822_923_958_419_f32),
+            (0.5, 0.559_773_594_776),
+            (0.9, 0.260_183_939_326),
+        ] {
+            let actual = exponential_integral_e1(x);
+            let relative = ((actual - expected) / expected).abs();
+            assert!(
+                relative < 1e-6,
+                "E1({x}) = {actual} but the series gives {expected} (relative {relative:e})"
+            );
+        }
+
+        // E₁ is positive and strictly decreasing; the two branches must agree where they meet.
+        let below = exponential_integral_e1(0.999_9);
+        let above = exponential_integral_e1(1.000_1);
+        assert!(
+            below > above && (below - above).abs() < 1e-4,
+            "the series and rational branches disagree across x = 1: {below} vs {above}"
+        );
+        assert_eq!(
+            exponential_integral_e1(0.0),
+            0.0,
+            "a non-positive argument must not produce NaN"
+        );
     }
 
     /// The denoiser has to do both halves of its job: drop the noise floor between bursts, and
