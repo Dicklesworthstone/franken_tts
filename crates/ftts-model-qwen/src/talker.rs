@@ -544,6 +544,67 @@ impl Default for TalkerKvCache {
     }
 }
 
+/// The final RMS-norm and codec head, full-sequence or last-row-only by logits shape.
+///
+/// A `[seq, 3072]` logits buffer requests the teacher-forced behavior: every position is
+/// normalized in place and projected — the conformance ladder's full-head contract. A `[3072]`
+/// buffer requests only the newest position: prefill's caller consumes exactly the last row of
+/// `hidden` and `logits`, so normalizing and projecting the other `seq - 1` rows is pure waste
+/// (the head is `[3072, 1024]` per row — the classic last-row-only lm_head lever). The consumed
+/// row's bytes are identical in both shapes; earlier `hidden` rows simply stay pre-norm in the
+/// last-row-only form, and nothing reads them.
+fn talker_norm_and_head(
+    config: &TalkerConfig,
+    weights: &TalkerWeights<'_>,
+    hidden: &mut [f32],
+    seq: usize,
+    logits: &mut [f32],
+) {
+    let hidden_size = config.hidden_size;
+    if logits.len() == PRIMARY_CODE_VOCAB_SIZE {
+        let last = &mut hidden[(seq - 1) * hidden_size..];
+        let mut normalized = vec![0.0f32; hidden_size];
+        f32ref::rms_norm(
+            last,
+            weights.final_norm,
+            config.rms_norm_eps,
+            1,
+            hidden_size,
+            &mut normalized,
+        );
+        last.copy_from_slice(&normalized);
+        f32ref::linear(
+            last,
+            weights.codec_head,
+            None,
+            1,
+            hidden_size,
+            PRIMARY_CODE_VOCAB_SIZE,
+            logits,
+        );
+        return;
+    }
+    let mut normalized = vec![0.0f32; hidden.len()];
+    f32ref::rms_norm(
+        hidden,
+        weights.final_norm,
+        config.rms_norm_eps,
+        seq,
+        hidden_size,
+        &mut normalized,
+    );
+    hidden.copy_from_slice(&normalized);
+    f32ref::linear(
+        hidden,
+        weights.codec_head,
+        None,
+        seq,
+        hidden_size,
+        PRIMARY_CODE_VOCAB_SIZE,
+        logits,
+    );
+}
+
 /// Runs the complete 28-layer talker and its final primary-code head.
 ///
 /// `hidden` is the already assembled `[seq, 1024]` input. It is updated in place to the final
@@ -584,31 +645,16 @@ pub fn forward_talker(
         PRIMARY_CODE_VOCAB_SIZE * config.hidden_size,
         "codec head shape"
     );
-    assert_eq!(logits.len(), seq * PRIMARY_CODE_VOCAB_SIZE, "logit shape");
+    assert!(
+        logits.len() == seq * PRIMARY_CODE_VOCAB_SIZE || logits.len() == PRIMARY_CODE_VOCAB_SIZE,
+        "logits are [seq, 3072] for the teacher-forced full head or [3072] for last-row-only"
+    );
 
     for (layer, layer_cache) in weights.layers.iter().zip(&mut cache.layers) {
         forward_layer(config, layer, rotary, mask, hidden, seq, layer_cache);
     }
 
-    let mut normalized = vec![0.0f32; hidden.len()];
-    f32ref::rms_norm(
-        hidden,
-        weights.final_norm,
-        config.rms_norm_eps,
-        seq,
-        config.hidden_size,
-        &mut normalized,
-    );
-    hidden.copy_from_slice(&normalized);
-    f32ref::linear(
-        hidden,
-        weights.codec_head,
-        None,
-        seq,
-        config.hidden_size,
-        PRIMARY_CODE_VOCAB_SIZE,
-        logits,
-    );
+    talker_norm_and_head(config, weights, hidden, seq, logits);
 }
 
 /// One talker layer's seven projection matrices, quantized W8 per-output-channel symmetric.
@@ -864,7 +910,10 @@ pub fn forward_talker_q8(
         PRIMARY_CODE_VOCAB_SIZE * config.hidden_size,
         "codec head shape"
     );
-    assert_eq!(logits.len(), seq * PRIMARY_CODE_VOCAB_SIZE, "logit shape");
+    assert!(
+        logits.len() == seq * PRIMARY_CODE_VOCAB_SIZE || logits.len() == PRIMARY_CODE_VOCAB_SIZE,
+        "logits are [seq, 3072] for the teacher-forced full head or [3072] for last-row-only"
+    );
 
     for ((layer, layer_quant), layer_cache) in
         weights.layers.iter().zip(quant).zip(&mut cache.layers)
@@ -882,25 +931,7 @@ pub fn forward_talker_q8(
         );
     }
 
-    let mut normalized = vec![0.0f32; hidden.len()];
-    f32ref::rms_norm(
-        hidden,
-        weights.final_norm,
-        config.rms_norm_eps,
-        seq,
-        config.hidden_size,
-        &mut normalized,
-    );
-    hidden.copy_from_slice(&normalized);
-    f32ref::linear(
-        hidden,
-        weights.codec_head,
-        None,
-        seq,
-        config.hidden_size,
-        PRIMARY_CODE_VOCAB_SIZE,
-        logits,
-    );
+    talker_norm_and_head(config, weights, hidden, seq, logits);
 }
 
 /// The resolved OQ-4 left-padding position rule for one prompt.

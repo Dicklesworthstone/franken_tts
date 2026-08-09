@@ -602,7 +602,9 @@ impl<'a> QwenGenerator<'a> {
         let positions: Vec<i64> = (0..seq as i64).collect();
         let (cos, sin) = talker::mrope_rows(&positions, self.talker_config.head_dim, MROPE_THETA);
         let mask = causal_mask(seq);
-        let mut logits = vec![0.0_f32; seq * PRIMARY_CODE_VOCAB_SIZE];
+        // A [3072] buffer selects the last-row-only head: prefill consumes only the newest
+        // position's logits, and the projected row is byte-identical to the full-head form.
+        let mut logits = vec![0.0_f32; PRIMARY_CODE_VOCAB_SIZE];
         let rotary = RotaryRows {
             cos: &cos,
             sin: &sin,
@@ -633,7 +635,7 @@ impl<'a> QwenGenerator<'a> {
         }
         self.utterance = Some(UtteranceState {
             pending_hidden: hidden[(seq - 1) * hidden_size..].to_vec(),
-            pending_logits: logits[(seq - 1) * PRIMARY_CODE_VOCAB_SIZE..].to_vec(),
+            pending_logits: logits,
             trailing_text_hidden: trailing,
             next_position: seq,
             frames_emitted: 0,
