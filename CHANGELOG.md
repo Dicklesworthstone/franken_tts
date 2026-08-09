@@ -15,12 +15,78 @@ individual commits are intentionally not cited.
 
 | Version | Date | Status | Summary |
 |---------|------|--------|---------|
-| 0.1.3 | 2026-08-09 | current | optimized route becomes the library-wide default; 48 kHz enrollment fix |
+| 0.1.4 | 2026-08-09 | current | faster than real time: worker team, pipelined codec, 2.5× faster startup |
+| 0.1.3 | 2026-08-09 | superseded | optimized route becomes the library-wide default; 48 kHz enrollment fix |
 | 0.1.2 | 2026-08-08 | superseded | `ftts convert` works on the real checkpoint; `ftts pull` ships the quantized `.fttsq` |
 | 0.1.1 | 2026-08-08 | superseded | zero-config UX: `ftts pull`, default model cache, m4a/mp3 enrollment |
 | 0.1.0 | 2026-08-08 | first release | f32 reference engine, CLI, conformance ladder, artifact groundwork |
 
 ## [Unreleased]
+
+## [0.1.4] - 2026-08-09
+
+The speed release: synthesis now runs faster than real time on an M4 Pro
+(typically 1.4–1.6× on a machine that is also doing other work), model load is
+2.5× faster, and the first audio arrives about half a second after synthesis
+starts. Every optimization ships with a bit-identity or ledgered-equivalence
+proof; the f32 reference route remains one variable away (`FTTS_INT8=0`).
+
+### Performance
+
+- **Persistent int8 worker team.** The talker and microdecoder projection
+  matmuls fan out across a pool of persistent workers (six by default,
+  `FTTS_INT8_THREADS` to change) with output-column partitioning that is
+  bit-identical to serial execution at every thread count. GQA attention now
+  partitions across query heads on the same team, through a head-range loop
+  extracted from — not duplicated from — the f32 reference.
+- **Codec decode overlaps generation.** A tee on the frame generator feeds a
+  streaming codec worker on its own core, so codec time hides behind talker
+  time instead of adding to it. Streamed output is bit-identical to offline
+  decode; `run_complete` now reports `ttfa_ms` (time to first audio,
+  ~450 ms typical).
+- **Startup 2.5× faster** (PERF-003, quiet-window certified): checkpoint
+  tensors widen concurrently, the codec and tokenizer load in parallel with
+  the talker, the quantized artifact hydrates int8 weights natively instead
+  of widening and requantizing (PERF-002, byte-identical output proof), and a
+  duplicated 1.3 GB artifact hash was eliminated. Warm load is ~3.7 s where
+  v0.1.3 took ~9.2 s plus a hidden ~1.1 s requantize.
+- **The codec runs the reference's own BLAS form** (PERF-004): dense codec
+  projections now use the bias-seeded GEMM arithmetic the oracle itself uses,
+  which measured equal-or-faster than the int8 codec arm while tightening
+  parity at all eight transformer seams. The int8 codec arms are demoted to
+  opt-in A/B routes (`FTTS_INT8_CODEC=convnext|all`).
+- Smaller levers: int8 per-depth heads with exact top-96 f32 refinement
+  (byte-identical sampler inputs), a packed seq-16 microdecoder block
+  schedule for draft verification, allocation-free microdecoder steps,
+  prefill computes the final norm and primary head on the last row only,
+  the SLEEF SnakeBeta path (129.6 dB SNR vs libm), and a persisted per-machine
+  kernel plan (`~/.cache/franken_tts/kernel_plan_v0.txt`).
+
+### Added
+
+- `ftts enroll --denoise`: opt-in OM-LSA spectral subtraction for noisy
+  reference recordings, with an offline-quantile noise floor.
+- Enrollment accepts any input rate; audio is resampled to 24 kHz in-process
+  with a Lanczos-3 kernel (m4a/mp3/wav/flac).
+- `scripts/audio_ab_report.py`: the objective audio quality gate — SNR,
+  log-spectral distance, mel-band distance, and ffmpeg spectrograms, with an
+  aligned mode for same-codes comparisons and a stats mode for sampled runs.
+- `FTTS_SPEC_PROBE=1` measures speculative-draft acceptance rates in place;
+  its first use ruled OUT speculative sampling with the current drafter
+  (NE-002: ~1% per-depth acceptance — measured dead before implementation).
+- `FTTS_INT8_SCOPE=talker|micro` narrows the int8 lever for sensitivity
+  attribution; `FTTS_INT8=w8a16` selects the weight-only quantization arm.
+
+### Fixed
+
+- The worker team survives panics: a panicking partition previously hung the
+  caller forever, a panicking caller could free buffers workers still held
+  pointers into, and workers materialized aliasing `&mut` views of the shared
+  output buffer. All three are closed, with a panic-injection regression test.
+- Enrollment denoise correctness: IMCRA speech presence matches Cohen eq. 29,
+  the Nyquist bin is no longer double-scaled in the STFT mirror pass, and
+  references that resample to empty PCM are refused instead of enrolled.
+- Generation errors take precedence over codec-worker errors when both fail.
 
 ## [0.1.3] - 2026-08-09
 
