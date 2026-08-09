@@ -4,6 +4,9 @@ import { ensureModel, clearCache, cachedBytes } from "./loader.js";
 
 const ui = Object.fromEntries(
   [
+    "consent",
+    "consent-yes",
+    "consent-no",
     "load-model",
     "dl-bar",
     "dl-status",
@@ -96,13 +99,43 @@ function updateVoiceCharacter() {
 }
 ui.voice.addEventListener("change", updateVoiceCharacter);
 
-ui.loadModel.addEventListener("click", async () => {
+// The download is 2 GB: never start it on a bare click. The first button only reveals the
+// consent panel (size, storage location, resumability, removal); the download starts from
+// explicit consent, and progress then reports rate and estimated time remaining from a
+// rolling throughput window.
+ui.loadModel.addEventListener("click", () => {
   clearError();
+  ui.consent.classList.remove("hidden");
+  ui.loadModel.classList.add("hidden");
+});
+
+ui.consentNo.addEventListener("click", () => {
+  ui.consent.classList.add("hidden");
+  ui.loadModel.classList.remove("hidden");
+});
+
+ui.consentYes.addEventListener("click", async () => {
+  ui.consent.classList.add("hidden");
   ui.loadModel.disabled = true;
+  const samples = [];
+  const eta = (bytesDone, bytesTotal) => {
+    const now = performance.now();
+    samples.push([now, bytesDone]);
+    while (samples.length > 2 && now - samples[0][0] > 10_000) samples.shift();
+    const [t0, b0] = samples[0];
+    const rate = (bytesDone - b0) / Math.max(now - t0, 1) * 1000; // bytes/s
+    if (rate < 1024) return "";
+    const remaining = (bytesTotal - bytesDone) / rate;
+    const minutes = Math.floor(remaining / 60);
+    const seconds = Math.round(remaining % 60);
+    const speed = rate >= 1024 ** 2 ? `${(rate / 1024 ** 2).toFixed(1)} MB/s` : `${(rate / 1024).toFixed(0)} kB/s`;
+    return ` · ${speed} · ~${minutes ? `${minutes}m ` : ""}${seconds}s left`;
+  };
   try {
     const files = await ensureModel(({ bytesDone, bytesTotal, phase, asset }) => {
       ui.dlBar.style.width = `${((bytesDone / bytesTotal) * 100).toFixed(1)}%`;
-      ui.dlStatus.textContent = `${phase} ${asset ?? ""} — ${gigabytes(bytesDone)} / ${gigabytes(bytesTotal)} GB`;
+      const tail = phase === "downloading" ? eta(bytesDone, bytesTotal) : "";
+      ui.dlStatus.textContent = `${phase} ${asset ?? ""} — ${gigabytes(bytesDone)} / ${gigabytes(bytesTotal)} GB${tail}`;
     });
     ui.dlStatus.textContent = "Hydrating the engine (this takes a minute at wasm speed)…";
     await call(
@@ -122,6 +155,7 @@ ui.loadModel.addEventListener("click", async () => {
   } catch (error) {
     showError(error);
     ui.loadModel.disabled = false;
+    ui.loadModel.classList.remove("hidden");
   }
 });
 

@@ -239,12 +239,26 @@
             (<strong>≈2.0&nbsp;GB</strong>, resumable, cached in this browser) and verifies every
             byte against pinned SHA-256 digests.
           </p>
+          <div id="consent" class="hidden">
+            <p class="note">
+              <strong>Before downloading:</strong> the model is
+              <strong id="consent-size">2.0&nbsp;GB</strong>. It will be stored in this
+              browser's private storage for this site only (nothing is installed on your
+              computer's filesystem), it stays on your device, the download resumes if
+              interrupted, and you can remove it any time with “Clear model cache”. On a
+              typical 100&nbsp;Mbps connection this takes about three minutes.
+            </p>
+            <div class="row">
+              <button id="consent-yes" class="button primary">Start the 2.0&nbsp;GB download</button>
+              <button id="consent-no" class="button">Not now</button>
+            </div>
+          </div>
           <div class="progress"><div id="dl-bar"></div></div>
           <div class="row">
             <span id="dl-status" class="status">Model not loaded.</span>
           </div>
           <div class="row">
-            <button id="load-model" class="button primary">Download &amp; load model</button>
+            <button id="load-model" class="button primary">Download &amp; load model…</button>
           </div>
 
           <h2>2 · Voice</h2>
