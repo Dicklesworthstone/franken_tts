@@ -224,6 +224,21 @@ fn apply_talker_processors(
 }
 
 /// Applies the sampling-only transformers warpers in their pinned order.
+/// The production sampling probability of one token: exactly the mass [`QwenSampler::sample`]
+/// would assign it after the T/top-k warpers. Diagnostic support for the speculative-sampling
+/// probe (bead w4q); consumes no RNG.
+pub(crate) fn production_probability(logits: &[f32], token: usize) -> f64 {
+    let mut scores = logits.to_vec();
+    apply_sampling_warpers(&mut scores);
+    match softmax_finite(&scores) {
+        Ok(probabilities) => probabilities
+            .iter()
+            .find(|(candidate, _)| *candidate == token)
+            .map_or(0.0, |(_, probability)| *probability),
+        Err(_) => 0.0,
+    }
+}
+
 fn apply_sampling_warpers(scores: &mut [f32]) {
     for score in scores.iter_mut().filter(|score| score.is_finite()) {
         *score /= TEMPERATURE;

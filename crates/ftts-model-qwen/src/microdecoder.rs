@@ -1308,6 +1308,13 @@ pub fn verify_frame_draft_q8(
         config.num_layers,
         "the quantized route needs every microdecoder layer quantized"
     );
+    if let Some(heads) = route.heads {
+        assert_eq!(
+            heads.len(),
+            RESIDUAL_DEPTHS,
+            "the quantized head route needs every per-depth head quantized"
+        );
+    }
     assert_eq!(
         drafted_codes.len(),
         RESIDUAL_DEPTHS,
@@ -1513,6 +1520,22 @@ pub fn decode_frame_with_selector_q8(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `FTTS_SPEC_PROBE=1` measures the speculative-sampling precondition without changing any
+/// output: a shadow drafter proposes each frame, and the loop logs the production-sampling
+/// probability each draft would have been accepted with (NDJSON on stderr, one line per
+/// depth). Bead w4q's go/no-go is decided by this number, per §7.5's warning that a partial
+/// accept can cost more than the sequential loop it replaces.
+fn spec_probe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FTTS_SPEC_PROBE").as_deref() == Ok("1"))
+}
+
+thread_local! {
+    static PROBE_DRAFTER: std::cell::RefCell<FrankenMtpDrafter> =
+        const { std::cell::RefCell::new(FrankenMtpDrafter::new()) };
+}
+
 fn decode_frame_with_selector_inner(
     config: &MicrodecoderConfig,
     rope: &RopeTable,
@@ -1528,6 +1551,8 @@ fn decode_frame_with_selector_inner(
     // Frame boundary: frame N must not see frame N-1's keys.
     state.reset();
 
+    let probe_draft =
+        spec_probe_enabled().then(|| PROBE_DRAFTER.with(|drafter| drafter.borrow().draft()));
     let mut codes = Vec::with_capacity(RESIDUAL_DEPTHS);
     let mut previous_code = primary_code;
 
@@ -1596,6 +1621,11 @@ fn decode_frame_with_selector_inner(
             ),
             None => matvec(weights.heads[head], &normed, &mut logits),
         }
+        if let Some(draft) = &probe_draft {
+            let depth = position - 1;
+            let acceptance = crate::sampler::production_probability(&logits, draft[depth]);
+            eprintln!("{{\"probe\":\"spec\",\"depth\":{depth},\"p_draft\":{acceptance:.6}}}");
+        }
         let code = select(&logits);
         assert!(
             code < RESIDUAL_VOCAB,
@@ -1605,6 +1635,11 @@ fn decode_frame_with_selector_inner(
         previous_code = code;
     }
 
+    if probe_draft.is_some()
+        && let Ok(frame_codes) = <[usize; RESIDUAL_DEPTHS]>::try_from(codes.as_slice())
+    {
+        PROBE_DRAFTER.with(|drafter| drafter.borrow_mut().observe(&frame_codes));
+    }
     codes
 }
 
@@ -2170,36 +2205,42 @@ mod tests {
         let layer = TestLayer::new(&config);
         let borrowed = layer.borrow();
         let quant = MicroLayerQuant::quantize(&config, &borrowed);
-        let mode = QuantLinearMode::W8A8(ftts_kernels::int8::Int8Tier::Scalar);
 
-        for seed in 0..6_u32 {
-            let hidden = weights_of(FRAME_POSITIONS * config.hidden_size, 4_000 + seed);
+        // Every dispatchable tier, not just scalar. NeonSdot is what actually runs on Apple
+        // Silicon, so proving only `Int8Tier::Scalar` would leave the shipped route unproven —
+        // the same reason `q8_layer_is_bit_identical_across_every_available_tier` sweeps the
+        // talker seam.
+        for tier in ftts_kernels::int8::Int8Tier::available() {
+            let mode = QuantLinearMode::W8A8(tier);
+            for seed in 0..6_u32 {
+                let hidden = weights_of(FRAME_POSITIONS * config.hidden_size, 4_000 + seed);
 
-            // Sequential: one position at a time through a single retained frame cache.
-            let mut state = FrameKvState::new(&config);
-            let mut sequential = Vec::with_capacity(FRAME_POSITIONS * config.hidden_size);
-            for position in 0..FRAME_POSITIONS {
-                let (cos, sin) = rope.row(position);
-                let row =
-                    &hidden[position * config.hidden_size..(position + 1) * config.hidden_size];
-                sequential.extend_from_slice(&layer_step_q8(
-                    &config, &borrowed, &quant, cos, sin, row, &mut state, mode,
-                ));
-            }
+                // Sequential: one position at a time through a single retained frame cache.
+                let mut state = FrameKvState::new(&config);
+                let mut sequential = Vec::with_capacity(FRAME_POSITIONS * config.hidden_size);
+                for position in 0..FRAME_POSITIONS {
+                    let (cos, sin) = rope.row(position);
+                    let row =
+                        &hidden[position * config.hidden_size..(position + 1) * config.hidden_size];
+                    sequential.extend_from_slice(&layer_step_q8(
+                        &config, &borrowed, &quant, cos, sin, row, &mut state, mode,
+                    ));
+                }
 
-            let blocked = layer_block_q8(&config, &borrowed, &quant, &rope, &hidden, mode);
+                let blocked = layer_block_q8(&config, &borrowed, &quant, &rope, &hidden, mode);
 
-            assert_eq!(
-                blocked.len(),
-                sequential.len(),
-                "seed {seed}: block output shape must match the sequential schedule"
-            );
-            for (index, (block, step)) in blocked.iter().zip(sequential.iter()).enumerate() {
-                assert!(
-                    block.to_bits() == step.to_bits(),
-                    "seed {seed}: element {index} diverged — block {block:?} vs sequential \
-                     {step:?}; batching must never perturb the arithmetic"
+                assert_eq!(
+                    blocked.len(),
+                    sequential.len(),
+                    "{tier:?}/seed {seed}: block output shape must match the sequential schedule"
                 );
+                for (index, (block, step)) in blocked.iter().zip(sequential.iter()).enumerate() {
+                    assert!(
+                        block.to_bits() == step.to_bits(),
+                        "{tier:?}/seed {seed}: element {index} diverged — block {block:?} vs \
+                         sequential {step:?}; batching must never perturb the arithmetic"
+                    );
+                }
             }
         }
     }
@@ -2215,15 +2256,17 @@ mod tests {
     fn packed_verifier_matches_the_scalar_verifier_on_the_same_quantized_body() {
         let config = tiny();
         let rope = RopeTable::new(&config);
+        // Distinct weights per layer. Identical layers would let a route that reused layer 0's
+        // quantized body for every layer — or paired the two lists in the wrong order — pass a
+        // test whose entire job is catching exactly that wiring bug.
         let layers: Vec<TestLayer> = (0..config.num_layers)
-            .map(|_| TestLayer::new(&config))
+            .map(|layer| TestLayer::new_seeded(&config, 500 + layer as u32 * 8))
             .collect();
         let borrowed: Vec<LayerWeights<'_>> = layers.iter().map(TestLayer::borrow).collect();
         let quant: Vec<MicroLayerQuant> = borrowed
             .iter()
             .map(|layer| MicroLayerQuant::quantize(&config, layer))
             .collect();
-        let mode = QuantLinearMode::W8A8(ftts_kernels::int8::Int8Tier::Scalar);
 
         let talker_codec = weights_of(TALKER_CODEC_VOCAB * config.hidden_size, 11);
         let residual_tables: Vec<Vec<f32>> = (0..RESIDUAL_DEPTHS - 1)
@@ -2243,13 +2286,19 @@ mod tests {
             heads: &head_refs,
             final_norm: &final_norm,
         };
-        let route = MicroQuantRoute {
-            layers: &quant,
-            heads: None,
-            mode,
-        };
+        // Sweep tier × seed. Pinning this to scalar would prove the schedule only on a route the
+        // product never dispatches.
+        let cases = ftts_kernels::int8::Int8Tier::available()
+            .into_iter()
+            .flat_map(|tier| (0..4_u32).map(move |seed| (tier, seed)));
 
-        for seed in 0..4_u32 {
+        for (tier, seed) in cases {
+            let mode = QuantLinearMode::W8A8(tier);
+            let route = MicroQuantRoute {
+                layers: &quant,
+                heads: None,
+                mode,
+            };
             let talker_hidden = weights_of(config.hidden_size, 700 + seed);
             let drafted: Vec<usize> = (0..RESIDUAL_DEPTHS)
                 .map(|depth| (depth * 137 + seed as usize * 31) % RESIDUAL_VOCAB)
@@ -2294,14 +2343,14 @@ mod tests {
             assert_eq!(
                 packed.logits().len(),
                 expected.len(),
-                "seed {seed}: row count"
+                "{tier:?}/seed {seed}: row count"
             );
             for (depth, (fast, slow)) in packed.logits().iter().zip(expected.iter()).enumerate() {
                 for (token, (a, b)) in fast.iter().zip(slow.iter()).enumerate() {
                     assert!(
                         a.to_bits() == b.to_bits(),
-                        "seed {seed}: depth {depth} token {token} diverged — packed {a:?} vs \
-                         scalar {b:?}"
+                        "{tier:?}/seed {seed}: depth {depth} token {token} diverged — packed \
+                         {a:?} vs sequential {b:?}"
                     );
                 }
             }
