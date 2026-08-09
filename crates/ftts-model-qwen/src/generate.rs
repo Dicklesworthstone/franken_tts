@@ -95,6 +95,62 @@ fn fused_layer_from_artifact(
     ))
 }
 
+/// Every talker layer's fused int8 tables read artifact-natively, or `None` if any tensor is
+/// missing. Public for the hydration parity gate (`examples/artifact_q8_hydration.rs`).
+#[must_use]
+pub fn talker_layers_from_artifact(
+    artifact: &MappedFttsq,
+    config: &TalkerConfig,
+    layer_count: usize,
+) -> Option<Vec<TalkerLayerQuant>> {
+    (0..layer_count)
+        .map(|index| {
+            fused_layer_from_artifact(
+                artifact,
+                &format!("talker.model.layers.{index}"),
+                config.hidden_size,
+                config.query_width(),
+                config.kv_width(),
+                config.intermediate_size,
+            )
+            .map(|(qkv, o_proj, gate_up, down_proj)| TalkerLayerQuant {
+                qkv,
+                o_proj,
+                gate_up,
+                down_proj,
+            })
+        })
+        .collect()
+}
+
+/// Every microdecoder layer's fused int8 tables read artifact-natively, or `None` if any tensor
+/// is missing. Public for the hydration parity gate.
+#[must_use]
+pub fn micro_layers_from_artifact(
+    artifact: &MappedFttsq,
+    config: &MicrodecoderConfig,
+    layer_count: usize,
+) -> Option<Vec<MicroLayerQuant>> {
+    (0..layer_count)
+        .map(|index| {
+            fused_layer_from_artifact(
+                artifact,
+                &format!("talker.code_predictor.model.layers.{index}"),
+                config.hidden_size,
+                config.q_width(),
+                config.kv_width(),
+                config.intermediate_size,
+            )
+            .map(|(qkv, o_proj, gate_up, down_proj)| MicroLayerQuant {
+                qkv,
+                o_proj,
+                gate_up,
+                down_proj,
+            })
+        })
+        .collect()
+}
+
 /// `FTTS_ARTIFACT_Q8=0` forces the widen-then-requantize hydration even when a canonical
 /// artifact is available — the A/B and forensics switch for artifact-native hydration.
 fn artifact_q8_enabled() -> bool {
