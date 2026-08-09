@@ -37,23 +37,24 @@ const MODEL_BASENAME: &str = "qwen3-tts-12hz-0.6b-base.fttsq";
 
 /// Built-in voices: name, one-line character, and the enrolled 1,024-float x-vector.
 ///
-/// Each was enrolled from a pure sine tone — the speaker encoder maps even a bare tone to a
-/// stable point in voice space, and single sines land on clean voices where richer harmonic
-/// stacks came out muddy. Sixteen candidates were auditioned 2026-08-09; these two were the only
-/// listener-verified keepers, and a clarity-plus-harmonicity screen calibrated on those verdicts
-/// rejected every other sweep point — 560 and 720 Hz are genuine local optima. "aria" is the
-/// out-of-box default when no enrollment exists. These are conveniences, not clones: enrolling a
-/// real reference always takes precedence.
+/// Both were enrolled from the model's OWN synthesized speech (a rich reference passage), which
+/// is what makes them stable: tone-enrolled vectors sit off the speaker encoder's speech
+/// manifold and rendered inconsistently across texts (every one of eighteen tone candidates
+/// eventually failed listening or the clarity-plus-harmonicity stability screen), while
+/// speech-enrolled vectors passed the three-text battery cleanly. "ember" is "aria"'s passage
+/// pitch-shifted ~3.4 semitones down before re-enrollment. "aria" is the out-of-box default when
+/// no enrollment exists. These are conveniences, not clones of any person: the lineage is
+/// synthetic end to end, and enrolling a real reference always takes precedence.
 const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
     (
         "aria",
-        "bright, clear, feminine — the out-of-box default (560 Hz tone)",
+        "clear, warm, feminine — the out-of-box default",
         include_bytes!("../presets/aria.spk"),
     ),
     (
-        "piper",
-        "light and airy, higher register (720 Hz tone)",
-        include_bytes!("../presets/piper.spk"),
+        "ember",
+        "the same character a few semitones deeper",
+        include_bytes!("../presets/ember.spk"),
     ),
 ];
 
@@ -234,7 +235,8 @@ struct SayArgs {
     model: Option<PathBuf>,
 
     /// Voice source: a .spk vector, reference audio, or a built-in voice name
-    /// (aria, piper). Default: MODEL_DIR/default.spk, else the built-in "aria".
+    /// (aria, ember — synthetic-lineage voices enrolled from the model's own speech).
+    /// Default: MODEL_DIR/default.spk when enrolled, else the built-in "aria".
     #[arg(long, value_name = "PATH|NAME")]
     voice: Option<PathBuf>,
 
@@ -1207,9 +1209,9 @@ fn run_say_events(
     }) {
         Some(path) => path,
         // Out-of-box: no --voice, no FTTS_DEFAULT_VOICE, no enrollment — speak with the built-in
-        // default preset rather than refusing. The preset is itself a real enrolled x-vector
-        // (from a tone reference), not a fabricated speaker, and any user enrollment or explicit
-        // voice always outranks it.
+        // default preset rather than refusing. The presets are real enrolled x-vectors taken from
+        // speech, so they sit on the speaker encoder's manifold; any user enrollment or explicit
+        // voice always outranks them.
         None => materialize_preset_voice(DEFAULT_PRESET_VOICE)
             .expect("the default preset name is a member of PRESET_VOICES")?,
     };
