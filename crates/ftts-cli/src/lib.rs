@@ -71,6 +71,16 @@ const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
         "warm, easy, masculine — the out-of-box default",
         include_bytes!("../presets/matt.spk"),
     ),
+    (
+        "leo",
+        "relaxed, resonant, masculine",
+        include_bytes!("../presets/leo.spk"),
+    ),
+    (
+        "robert",
+        "steady, measured, masculine",
+        include_bytes!("../presets/robert.spk"),
+    ),
 ];
 
 /// The preset used when `--voice`, `FTTS_DEFAULT_VOICE`, and MODEL_DIR/default.spk are all
