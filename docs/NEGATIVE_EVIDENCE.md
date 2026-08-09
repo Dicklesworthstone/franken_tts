@@ -32,6 +32,10 @@ tally_local_w_l_n: <wins/losses/neutrals>
 
 This is also the first local re-confirmation signal for NE-INH-001/NE-INH-003: the winning int8 m=1 shape on Apple Silicon is the one LLVM autovectorizes, and hand SDOT merely ties it at memory bandwidth. Certification to ledger quality still requires a quiet-window rerun that passes the cv gate.
 
+### NE-002 speculative-sampling-with-transition-sketch-drafter
+
+`claim_id: local-frankenmtp-sampled-drafter-v1`; `evidence_id: FTTS_SPEC_PROBE=1 instrumentation in decode_frame_with_selector_inner + probe run 2026-08-09 (960 depth samples, 64 production frames, enrolled voice, seed 0)`; `status: NEGATIVE`; `model_source_commit: 5d83992436eae1d760afd27aff78a71d676296fc`; `fixture_sha256: not-applicable (production sampling on the pinned checkpoint)`; `cpu_features: Apple M4 Pro`; `command_env: FTTS_INT8=1 FTTS_SPEC_PROBE=1 int8_greedy_divergence <snapshot> voice "..." 64 production`; `kill_switch: not-applicable (lever never armed; probe is diagnostic-only, default off)`; `before_after: the FrankenMtpDrafter (previous-frame residuals + 64-bucket transition sketch) would be ACCEPTED by exact point-mass rejection sampling with mean probability ~0.01 per depth under the production T0.9/top-50 distribution; expected accepted-prefix length 0.04 of 15; zero near-full-accept frames in 64. Speculative cost ~16.6 body-read units vs 15.0 sequential — strictly worse`; `equivalence: not-applicable (lever rejected before implementation)`; `killing_metric: drafter acceptance probability under the production sampling distribution`; `disposition: REVERT (never implemented; probe instrumentation retained behind FTTS_SPEC_PROBE for future drafters)`; `do_not_retry: unless a drafter with measured mean per-depth acceptance above ~0.6 exists (e.g. a small learned draft head), or the strict-greedy tier is the target (argmax-match acceptance is a different, unmeasured number)`; `tally_local_w_l_n: 0/2/0`.
+
 ## Inherited priors (pre-truth-pack)
 
 ### NE-INH-001 hand-wide-simd-glue
