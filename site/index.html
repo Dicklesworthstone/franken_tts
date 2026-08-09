@@ -838,6 +838,12 @@
         <div>ftts pull</div>
         <div>ftts say "Now is the time for all good men to come to the aid of the agents" out.m4a</div>
       </div>
+      <p class="pg-note max-w-2xl mx-auto mt-6">
+        Only the first say of a session loads the model. A resident helper then keeps it warm in
+        memory, so following commands start instantly, and it retires itself after ten idle
+        minutes. Pass <span class="text-slate-200">--no-resident</span> to opt out; the output is
+        byte-identical either way.
+      </p>
     </div>
   </section>
 
