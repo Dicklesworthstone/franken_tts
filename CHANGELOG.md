@@ -25,18 +25,23 @@ individual commits are intentionally not cited.
 
 ### Added
 
-- Enrollment now denoises automatically: when the pulled weights are present, every
-  `ftts enroll` cleans the reference with the neural engine before computing the
-  embedding, and the browser playground does the same for mic enrollments (weights
-  embedded in the wasm module). `--no-denoise` enrolls the recording untouched;
-  `--denoise` additionally engages the classic engine when the weights are absent.
-- Neural enrollment denoise: `ftts enroll --denoise` now runs a pure-Rust port of
-  FastEnhancer-S 48 kHz (207 K parameters, MIT), proven to 114–125 dB SNR parity against
-  its pinned PyTorch reference on every fixture. `ftts pull` fetches the 0.8 MB weight
-  artifact (sha256-pinned) alongside the model; without it, `--denoise` falls back to the
-  existing spectral-subtraction engine, and `FTTS_DENOISE_ENGINE=omlsa` forces that engine
-  explicitly. On a 15 dB-SNR static-hiss reference the neural path lowers the pause floor
-  by 65.5 dB (spectral subtraction: 24.6 dB) and moves the enrolled x-vector closer to the
+- Enrollment denoises automatically. Every `ftts enroll` now cleans the reference with
+  a neural denoiser before computing the embedding — no flag to remember — and the
+  browser playground applies the identical cleanup to mic enrollments, with the weights
+  embedded in the wasm module. `ftts say --voice <audio-file>` (the ephemeral one-off
+  enrollment) gets the same treatment, so the one-off form no longer sounds worse than
+  the saved form; `.spk` vectors and presets never enter the cleanup path. The result
+  on an ordinary phone voice memo is a voice that enrolls sounding studio-recorded,
+  and the clone keeps that cleanliness in everything it speaks. Opt-outs and levers:
+  `--no-denoise` enrolls the recording untouched, an explicit `--denoise` additionally
+  engages the classic no-weights spectral subtraction when the neural weights are
+  absent (the automatic path skips cleanup rather than swapping engines unannounced),
+  and `FTTS_DENOISE_ENGINE=omlsa` forces the classic engine outright.
+- The denoiser is a pure-Rust port of FastEnhancer-S 48 kHz (207 K parameters, MIT),
+  proven to 114–125 dB SNR parity against its pinned PyTorch reference on every fixture.
+  `ftts pull` fetches the 0.8 MB weight artifact (sha256-pinned) alongside the model.
+  On a 15 dB-SNR static-hiss reference it lowers the pause floor by 65.5 dB (classic
+  spectral subtraction: 24.6 dB) and moves the enrolled x-vector closer to the
   clean-source enrollment (cosine 0.9613 vs 0.9548). The engine is thread-free and
   mmap-free and compiles unchanged for wasm32. See `docs/DENOISER.md` for the truth pack.
 

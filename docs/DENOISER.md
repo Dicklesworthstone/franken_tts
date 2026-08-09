@@ -1,9 +1,13 @@
 # The neural denoiser: FastEnhancer-S 48 kHz
 
-`ftts enroll --denoise` runs a pure-Rust port of FastEnhancer-S, a 207 K-parameter
-streaming speech-enhancement network (ICASSP 2026). The classic OM-LSA/IMCRA spectral
-subtraction remains in-tree as the no-weights fallback and as the `FTTS_DENOISE_ENGINE=omlsa`
-escape hatch.
+Enrollment denoises the reference automatically with a pure-Rust port of FastEnhancer-S,
+a 207 K-parameter streaming speech-enhancement network (ICASSP 2026). This is the default
+whenever the pulled weights are present: `ftts enroll`, the ephemeral enrollment inside
+`ftts say --voice <audio-file>`, and browser mic enrollment (weights embedded in the wasm
+module) all run it with no flag. `--no-denoise` opts out; an explicit `--denoise` also
+engages the classic OM-LSA/IMCRA spectral subtraction when the weights are absent, and
+`FTTS_DENOISE_ENGINE=omlsa` forces that engine. `.spk` vectors and presets never enter
+the cleanup path.
 
 ## Truth pack
 
@@ -40,9 +44,11 @@ includes 24 kHz content, so the engine's 24 kHz pipeline is in-distribution for 
 
 `ftts pull` fetches the artifact into `<model>/denoise/fastenhancer-s-48k.safetensors`
 (manifest-pinned size + sha256, same verify-or-redownload contract as the main model).
-When the artifact is present, `--denoise` uses it; when absent, the classic engine runs and
-nothing new is downloaded. A present-but-corrupt artifact is a hard error naming
-`ftts pull --force`, never a silent engine swap.
+When the artifact is present, enrollment cleans with it by default; when absent, the
+automatic path skips cleanup (only an explicit `--denoise` engages the classic engine
+there). A present-but-corrupt artifact is a hard error naming `ftts pull --force`,
+never a silent engine swap. The wasm build carries the same weights via `include_bytes!`,
+so the browser needs no fetch.
 
 ## Regeneration recipe
 

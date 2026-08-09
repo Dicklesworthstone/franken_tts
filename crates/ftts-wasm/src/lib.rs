@@ -229,6 +229,7 @@ pub struct WasmEngine {
     tokenizer: QwenTokenizer,
     artifact: Arc<ftts_artifacts::fttsq::MappedFttsq>,
     speaker_encoder: Option<SpeakerEncoder>,
+    #[cfg(not(unix))]
     denoiser: Option<ftts_kernels::enhance::Enhancer>,
 }
 
@@ -236,6 +237,7 @@ pub struct WasmEngine {
 /// inference-form safetensors (see `docs/DENOISER.md` for the pin). Embedding them keeps
 /// browser enrollment cleanup working with no extra fetch, no CORS surface, and no
 /// divergence between what the CLI and the tab run.
+#[cfg(not(unix))]
 const DENOISER_SAFETENSORS: &[u8] =
     include_bytes!("../assets/fastenhancer-s-48k-denoise.safetensors");
 
@@ -436,6 +438,7 @@ impl WasmEngine {
             tokenizer,
             artifact,
             speaker_encoder: None,
+            #[cfg(not(unix))]
             denoiser: None,
         })
     }
@@ -618,26 +621,34 @@ impl WasmEngine {
     ///
     /// Throws when the PCM is too short for the mel front end or hydration fails.
     pub fn enroll(&mut self, pcm: &[f32]) -> Result<Vec<f32>, JsValue> {
-        if self.denoiser.is_none() {
-            let file = ftts_artifacts::safetensors::SafetensorsFile::from_bytes(
-                DENOISER_SAFETENSORS.to_vec(),
-            )
-            .map_err(|error| {
-                js_error(
-                    "embedded denoiser weights are malformed",
-                    format!("{error:?}"),
+        // The in-memory safetensors backing only exists off-unix (`SafetensorsFile::from_bytes`),
+        // like every other browser-only path in this crate. The unix compilation exists to keep
+        // the workspace gate honest, not to serve users — there `enroll` is the raw path.
+        #[cfg(not(unix))]
+        {
+            if self.denoiser.is_none() {
+                let file = ftts_artifacts::safetensors::SafetensorsFile::from_bytes(
+                    DENOISER_SAFETENSORS.to_vec(),
                 )
-            })?;
-            let enhancer = ftts_artifacts::enhance_loader::enhancer_from_safetensors(&file)
-                .map_err(|error| js_error("embedded denoiser weights are malformed", error))?;
-            self.denoiser = Some(enhancer);
+                .map_err(|error| {
+                    js_error(
+                        "embedded denoiser weights are malformed",
+                        format!("{error:?}"),
+                    )
+                })?;
+                let enhancer = ftts_artifacts::enhance_loader::enhancer_from_safetensors(&file)
+                    .map_err(|error| js_error("embedded denoiser weights are malformed", error))?;
+                self.denoiser = Some(enhancer);
+            }
+            let cleaned = self
+                .denoiser
+                .as_ref()
+                .expect("cached just above")
+                .enhance_24k(pcm);
+            self.enroll_raw(&cleaned)
         }
-        let cleaned = self
-            .denoiser
-            .as_ref()
-            .expect("cached just above")
-            .enhance_24k(pcm);
-        self.enroll_raw(&cleaned)
+        #[cfg(unix)]
+        self.enroll_raw(pcm)
     }
 
     /// Enroll exactly the PCM given, with no noise cleanup.

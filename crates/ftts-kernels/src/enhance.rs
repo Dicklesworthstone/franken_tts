@@ -348,6 +348,12 @@ impl Enhancer {
     /// `frames = wav.len() / hop + 1` (the reference's centered-STFT round trip);
     /// pad the input to a hop multiple to keep the full length.
     pub fn enhance_48k(&self, wav: &[f32]) -> Vec<f32> {
+        // Below one hop the length contract is zero samples anyway ((frames-1)*hop == 0),
+        // and the reflect-padding walk below does not terminate for 0- or 1-sample input —
+        // reflection needs more signal than padding. Return the contracted empty answer.
+        if wav.len() < HOP {
+            return Vec::new();
+        }
         let frames = wav.len() / HOP + 1;
         let mut state = self.new_state();
         // Compressed spectrum per frame, then masked spectrum accumulated into OLA.
@@ -913,6 +919,74 @@ impl Fft {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zero_weight_enhancer() -> Enhancer {
+        let mut tensors = BTreeMap::new();
+        let mut put = |name: &str, shape: &[usize]| {
+            let count: usize = shape.iter().product();
+            tensors.insert(name.to_owned(), (shape.to_vec(), vec![0.0f32; count]));
+        };
+        put("enc_pre.0.weight", &[CH, 2 * STRIDE, K0 / STRIDE]);
+        put("enc_pre.0.bias", &[CH]);
+        for i in 0..ENC_CONVS {
+            put(&format!("encoder.{i}.0.weight"), &[CH, CH, ENC_K]);
+            put(&format!("encoder.{i}.0.bias"), &[CH]);
+            put(&format!("decoder.{i}.0.weight"), &[CH, 2 * CH, 1]);
+            put(&format!("decoder.{i}.0.bias"), &[CH]);
+            put(&format!("decoder.{i}.2.weight"), &[CH, CH, ENC_K]);
+            put(&format!("decoder.{i}.2.bias"), &[CH]);
+        }
+        put("rf_pre.0.weight", &[RF_FREQ, F_ENC]);
+        put("rf_pre.1.weight", &[RF_CH, CH, 1]);
+        put("rf_pre.1.bias", &[RF_CH]);
+        put("rf_block.0.pe", &[RF_FREQ, RF_CH]);
+        for i in 0..BLOCKS {
+            put(
+                &format!("rf_block.{i}.rnn.weight_ih_l0"),
+                &[3 * RF_CH, RF_CH],
+            );
+            put(
+                &format!("rf_block.{i}.rnn.weight_hh_l0"),
+                &[3 * RF_CH, RF_CH],
+            );
+            put(&format!("rf_block.{i}.rnn.bias_ih_l0"), &[3 * RF_CH]);
+            put(&format!("rf_block.{i}.rnn.bias_hh_l0"), &[3 * RF_CH]);
+            put(&format!("rf_block.{i}.rnn_fc.weight"), &[RF_CH, RF_CH]);
+            put(&format!("rf_block.{i}.rnn_fc.bias"), &[RF_CH]);
+            put(
+                &format!("rf_block.{i}.attn.qkv.weight"),
+                &[3 * RF_CH, RF_CH],
+            );
+            put(&format!("rf_block.{i}.attn_fc.weight"), &[RF_CH, RF_CH]);
+            put(&format!("rf_block.{i}.attn_fc.bias"), &[RF_CH]);
+        }
+        put("rf_post.0.weight", &[F_ENC, RF_FREQ]);
+        put("rf_post.1.weight", &[CH, RF_CH, 1]);
+        put("rf_post.1.bias", &[CH]);
+        put("dec_post.0.weight", &[CH, 2 * CH, 1]);
+        put("dec_post.0.bias", &[CH]);
+        put("dec_post.2.weight", &[CH, 2, K0]);
+        put("dec_post.2.bias", &[2]);
+        put("buffer.stft.window", &[N_FFT]);
+        Enhancer::load(tensors).expect("all shapes present")
+    }
+
+    /// The reflect-padding walk cannot terminate on 0- or 1-sample input; the guard must
+    /// return the contracted empty answer instead of spinning, and short-but-real input
+    /// must keep its exact length through the 24 kHz round trip.
+    #[test]
+    fn tiny_inputs_terminate_and_keep_their_length() {
+        let enhancer = zero_weight_enhancer();
+        assert!(enhancer.enhance_48k(&[]).is_empty());
+        assert!(enhancer.enhance_48k(&[0.25]).is_empty());
+        assert!(enhancer.enhance_48k(&[0.25; 100]).is_empty());
+        assert!(enhancer.enhance_24k(&[]).is_empty());
+        assert_eq!(enhancer.enhance_24k(&[0.25; 50]).len(), 50);
+        // 2,400 samples = 100 ms: enough to cross several hops without making the
+        // debug-profile suite crawl (the full-length case lives in the parity harness).
+        assert_eq!(enhancer.enhance_24k(&[0.25; 2_400]).len(), 2_400);
+        assert_eq!(enhancer.enhance_48k(&[0.25; 1024]).len(), 1024);
+    }
 
     #[test]
     fn fft_round_trip_recovers_the_signal() {
