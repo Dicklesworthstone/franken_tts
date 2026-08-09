@@ -1490,20 +1490,60 @@ impl CodecCheckpoint {
             )
             .map_err(CheckpointError::Codec)
         };
-        let mut rest_codebooks = Vec::with_capacity(CODE_GROUP_COUNT - 1);
-        for layer in 0..CODE_GROUP_COUNT - 1 {
-            rest_codebooks.push(materialize(&format!(
-                "decoder.quantizer.rvq_rest.vq.layers.{layer}._codebook"
-            ))?);
-        }
-        let mut layers = Vec::with_capacity(8);
-        for index in 0..8 {
-            layers.push(OwnedCodecLayer::load(&file, path, index)?);
-        }
+
+        // The pieces are independent, so the heavyweight groups hydrate on scoped threads while
+        // the main thread takes the small convs and singles. Each piece's bytes are computed
+        // exactly as the serial walk computed them; only wall time changes.
+        let (codebooks, layers, blocks, upsample) = std::thread::scope(|scope| {
+            let codebooks = scope.spawn(|| -> Result<_, CheckpointError> {
+                let first = materialize("decoder.quantizer.rvq_first.vq.layers.0._codebook")?;
+                let rest = (0..CODE_GROUP_COUNT - 1)
+                    .map(|layer| {
+                        materialize(&format!(
+                            "decoder.quantizer.rvq_rest.vq.layers.{layer}._codebook"
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((first, rest))
+            });
+            let layers = scope.spawn(|| {
+                (0..8)
+                    .map(|index| OwnedCodecLayer::load(&file, path, index))
+                    .collect::<Result<Vec<_>, _>>()
+            });
+            let block_handles = [
+                scope.spawn(|| OwnedBlock::load(&file, path, 1, 1_536, 768, 16, 8)),
+                scope.spawn(|| OwnedBlock::load(&file, path, 2, 768, 384, 10, 5)),
+                scope.spawn(|| OwnedBlock::load(&file, path, 3, 384, 192, 8, 4)),
+                scope.spawn(|| OwnedBlock::load(&file, path, 4, 192, 96, 6, 3)),
+            ];
+            let upsample = scope.spawn(|| -> Result<_, CheckpointError> {
+                Ok([
+                    OwnedUpsampleStage::load(&file, path, 0)?,
+                    OwnedUpsampleStage::load(&file, path, 1)?,
+                ])
+            });
+            let mut blocks = block_handles
+                .into_iter()
+                .map(|handle| handle.join().expect("codec block loader panicked"));
+            (
+                codebooks.join().expect("codebook loader panicked"),
+                layers.join().expect("codec layer loader panicked"),
+                [
+                    blocks.next().expect("four blocks"),
+                    blocks.next().expect("four blocks"),
+                    blocks.next().expect("four blocks"),
+                    blocks.next().expect("four blocks"),
+                ],
+                upsample.join().expect("upsample loader panicked"),
+            )
+        });
+        let (first_codebook, rest_codebooks) = codebooks?;
+        let [block1, block2, block3, block4] = blocks;
 
         Ok(Self {
             config,
-            first_codebook: materialize("decoder.quantizer.rvq_first.vq.layers.0._codebook")?,
+            first_codebook,
             rest_codebooks,
             first_output_proj: widen(
                 &file,
@@ -1513,20 +1553,12 @@ impl CodecCheckpoint {
             rest_output_proj: widen(&file, path, "decoder.quantizer.rvq_rest.output_proj.weight")?,
             pre_conv: OwnedConv::load(&file, path, "decoder.pre_conv.conv")?,
             input_proj: OwnedConv::load(&file, path, "decoder.pre_transformer.input_proj")?,
-            layers,
+            layers: layers?,
             final_norm: widen(&file, path, "decoder.pre_transformer.norm.weight")?,
             output_proj: OwnedConv::load(&file, path, "decoder.pre_transformer.output_proj")?,
-            upsample: [
-                OwnedUpsampleStage::load(&file, path, 0)?,
-                OwnedUpsampleStage::load(&file, path, 1)?,
-            ],
+            upsample: upsample?,
             decoder_input: OwnedConv::load(&file, path, "decoder.decoder.0.conv")?,
-            blocks: [
-                OwnedBlock::load(&file, path, 1, 1_536, 768, 16, 8)?,
-                OwnedBlock::load(&file, path, 2, 768, 384, 10, 5)?,
-                OwnedBlock::load(&file, path, 3, 384, 192, 8, 4)?,
-                OwnedBlock::load(&file, path, 4, 192, 96, 6, 3)?,
-            ],
+            blocks: [block1?, block2?, block3?, block4?],
             final_alpha: widen(&file, path, "decoder.decoder.5.alpha")?,
             final_beta: widen(&file, path, "decoder.decoder.5.beta")?,
             final_conv: OwnedConv::load(&file, path, "decoder.decoder.6.conv")?,
