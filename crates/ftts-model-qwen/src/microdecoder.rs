@@ -592,6 +592,51 @@ impl MicroLayerQuant {
     }
 }
 
+/// Reusable buffers for [`layer_step_q8`], one set per thread.
+///
+/// The q8 layer step runs 75 times per frame; without reuse each call makes ~8 short-lived
+/// allocations. Buffer reuse changes no arithmetic — every buffer is fully overwritten (or
+/// explicitly cleared) before it is read.
+struct MicroStepScratch {
+    normed: Vec<f32>,
+    qkv: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    context: Vec<f32>,
+    attn_out: Vec<f32>,
+    residual: Vec<f32>,
+    gate_up: Vec<f32>,
+    mlp_out: Vec<f32>,
+    scores: Vec<f32>,
+}
+
+impl MicroStepScratch {
+    const fn new() -> Self {
+        Self {
+            normed: Vec::new(),
+            qkv: Vec::new(),
+            q: Vec::new(),
+            k: Vec::new(),
+            context: Vec::new(),
+            attn_out: Vec::new(),
+            residual: Vec::new(),
+            gate_up: Vec::new(),
+            mlp_out: Vec::new(),
+            scores: Vec::new(),
+        }
+    }
+}
+
+thread_local! {
+    static MICRO_STEP_SCRATCH: std::cell::RefCell<MicroStepScratch> =
+        const { std::cell::RefCell::new(MicroStepScratch::new()) };
+}
+
+fn resize_filled(buffer: &mut Vec<f32>, len: usize) {
+    buffer.clear();
+    buffer.resize(len, 0.0);
+}
+
 /// [`layer_step_with_rotary`] with the seven projections running W8A8 int8.
 ///
 /// Norms, QK-Norm, rotary, attention, and residual adds are byte-for-byte the f32 reference's
@@ -611,59 +656,123 @@ pub fn layer_step_q8(
     state: &mut FrameKvState,
     mode: QuantLinearMode,
 ) -> Vec<f32> {
-    let normed = rms_norm(hidden, weights.input_norm, config.rms_eps);
+    MICRO_STEP_SCRATCH.with(|scratch| {
+        let scratch = &mut *scratch.borrow_mut();
+        let (q_width, kv_width) = (config.q_width(), config.kv_width());
 
-    // Single position: the fused Q‖K‖V output row splits into the role buffers without a
-    // second pass over memory beyond these copies.
-    let (q_width, kv_width) = (config.q_width(), config.kv_width());
-    let mut qkv = vec![0.0_f32; q_width + 2 * kv_width];
-    quant_linear(mode, &normed, &quant.qkv, None, 1, &mut qkv);
-    let mut q = qkv[..q_width].to_vec();
-    let mut k = qkv[q_width..q_width + kv_width].to_vec();
-    let v = qkv[q_width + kv_width..].to_vec();
+        resize_filled(&mut scratch.normed, hidden.len());
+        rms_norm_into(
+            hidden,
+            weights.input_norm,
+            config.rms_eps,
+            &mut scratch.normed,
+        );
 
-    for head in 0..config.num_q_heads {
-        let span = head * config.head_dim..(head + 1) * config.head_dim;
-        let normed_head = rms_norm(&q[span.clone()], weights.q_norm, config.rms_eps);
-        q[span.clone()].copy_from_slice(&normed_head);
-        apply_rope_row(&mut q[span], cos, sin);
+        // Single position: the fused Q‖K‖V output row splits into the role buffers without a
+        // second pass over memory beyond these copies.
+        resize_filled(&mut scratch.qkv, q_width + 2 * kv_width);
+        quant_linear(mode, &scratch.normed, &quant.qkv, None, 1, &mut scratch.qkv);
+        scratch.q.clear();
+        scratch.q.extend_from_slice(&scratch.qkv[..q_width]);
+        scratch.k.clear();
+        scratch
+            .k
+            .extend_from_slice(&scratch.qkv[q_width..q_width + kv_width]);
+        // `v` reuses the tail of `qkv` in place: nothing below mutates it before the push.
+        let v = &scratch.qkv[q_width + kv_width..];
+
+        for head in 0..config.num_q_heads {
+            let span = head * config.head_dim..(head + 1) * config.head_dim;
+            resize_filled(&mut scratch.scores, config.head_dim);
+            rms_norm_into(
+                &scratch.q[span.clone()],
+                weights.q_norm,
+                config.rms_eps,
+                &mut scratch.scores,
+            );
+            scratch.q[span.clone()].copy_from_slice(&scratch.scores);
+            apply_rope_row(&mut scratch.q[span], cos, sin);
+        }
+        for head in 0..config.num_kv_heads {
+            let span = head * config.head_dim..(head + 1) * config.head_dim;
+            resize_filled(&mut scratch.scores, config.head_dim);
+            rms_norm_into(
+                &scratch.k[span.clone()],
+                weights.k_norm,
+                config.rms_eps,
+                &mut scratch.scores,
+            );
+            scratch.k[span.clone()].copy_from_slice(&scratch.scores);
+            apply_rope_row(&mut scratch.k[span], cos, sin);
+        }
+
+        state.push(&scratch.k, v);
+
+        resize_filled(&mut scratch.context, q_width);
+        attend_one_position(config, &scratch.q, state, &mut scratch.context);
+
+        resize_filled(&mut scratch.attn_out, config.hidden_size);
+        quant_linear(
+            mode,
+            &scratch.context,
+            &quant.o_proj,
+            None,
+            1,
+            &mut scratch.attn_out,
+        );
+        scratch.residual.clear();
+        scratch.residual.extend(
+            hidden
+                .iter()
+                .zip(scratch.attn_out.iter())
+                .map(|(h, a)| h + a),
+        );
+
+        resize_filled(&mut scratch.normed, scratch.residual.len());
+        rms_norm_into(
+            &scratch.residual,
+            weights.post_attention_norm,
+            config.rms_eps,
+            &mut scratch.normed,
+        );
+        resize_filled(&mut scratch.gate_up, 2 * config.intermediate_size);
+        quant_linear(
+            mode,
+            &scratch.normed,
+            &quant.gate_up,
+            None,
+            1,
+            &mut scratch.gate_up,
+        );
+        let (gate, up) = scratch.gate_up.split_at_mut(config.intermediate_size);
+        for (g, u) in gate.iter_mut().zip(up.iter()) {
+            *g = silu(*g) * u;
+        }
+        resize_filled(&mut scratch.mlp_out, config.hidden_size);
+        let gate = &scratch.gate_up[..config.intermediate_size];
+        quant_linear(mode, gate, &quant.down_proj, None, 1, &mut scratch.mlp_out);
+
+        scratch
+            .residual
+            .iter()
+            .zip(scratch.mlp_out.iter())
+            .map(|(r, m)| r + m)
+            .collect()
+    })
+}
+
+/// [`rms_norm`] writing into a caller-provided buffer instead of allocating.
+///
+/// Same arithmetic, same order: sum of squares left to right, one reciprocal square root, then
+/// `v * scale * w` per element.
+fn rms_norm_into(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
+    assert_eq!(x.len(), weight.len(), "rms_norm weight width mismatch");
+    assert_eq!(x.len(), out.len(), "rms_norm output width mismatch");
+    let mean_square = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let scale = 1.0 / (mean_square + eps).sqrt();
+    for ((slot, v), w) in out.iter_mut().zip(x).zip(weight) {
+        *slot = v * scale * w;
     }
-    for head in 0..config.num_kv_heads {
-        let span = head * config.head_dim..(head + 1) * config.head_dim;
-        let normed_head = rms_norm(&k[span.clone()], weights.k_norm, config.rms_eps);
-        k[span.clone()].copy_from_slice(&normed_head);
-        apply_rope_row(&mut k[span], cos, sin);
-    }
-
-    state.push(&k, &v);
-
-    let mut context = vec![0.0_f32; config.q_width()];
-    attend_one_position(config, &q, state, &mut context);
-
-    let mut attn_out = vec![0.0_f32; config.hidden_size];
-    quant_linear(mode, &context, &quant.o_proj, None, 1, &mut attn_out);
-    let residual: Vec<f32> = hidden
-        .iter()
-        .zip(attn_out.iter())
-        .map(|(h, a)| h + a)
-        .collect();
-
-    let normed = rms_norm(&residual, weights.post_attention_norm, config.rms_eps);
-    let mut gate_up = vec![0.0_f32; 2 * config.intermediate_size];
-    quant_linear(mode, &normed, &quant.gate_up, None, 1, &mut gate_up);
-    let up = gate_up.split_off(config.intermediate_size);
-    let mut gate = gate_up;
-    for (g, u) in gate.iter_mut().zip(up.iter()) {
-        *g = silu(*g) * u;
-    }
-    let mut mlp_out = vec![0.0_f32; config.hidden_size];
-    quant_linear(mode, &gate, &quant.down_proj, None, 1, &mut mlp_out);
-
-    residual
-        .iter()
-        .zip(mlp_out.iter())
-        .map(|(r, m)| r + m)
-        .collect()
 }
 
 /// [`layer_step_q8`] over all [`FRAME_POSITIONS`] positions with the four projections hoisted
@@ -1119,31 +1228,73 @@ pub struct GreedySpeculativeFrame {
 /// authoritative sequential frame is regenerated; this conservative v1 repair never emits a
 /// stale verified suffix after the causal context changes. A later suffix-only repair may reuse
 /// the accepted prefix, but must preserve these exact output semantics.
+///
+/// `route` selects the numerics for **both** verification and repair. `Some` runs the packed
+/// seq-16 kernel ([`verify_frame_draft_q8`]), which is where the speculation actually pays: the
+/// verifier reads each layer's int8 body once for the whole frame instead of once per residual
+/// depth. `None` keeps the f32 reference schedule.
+///
+/// Speculation is a *scheduling* device, never a quality one: whatever the drafter proposes, the
+/// emitted codes equal what the same route's sequential greedy decode would have emitted, which
+/// `speculation_never_changes_the_emitted_codes` pins for both routes.
+///
+/// This is greedy-only by construction — acceptance compares against the verifier's argmax. The
+/// production sampler (T 0.9, top-k 50) needs the sampled-mode acceptance rule
+/// (`frankentts-k-oq19-sampled-rule-w4q`) before speculation can reach the shipping path.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn decode_frame_greedy_speculative(
     config: &MicrodecoderConfig,
     rope: &RopeTable,
     weights: &MicrodecoderWeights<'_>,
+    route: Option<&MicroQuantRoute<'_>>,
     state: &mut FrameState,
     drafter: &mut FrankenMtpDrafter,
     talker_hidden: &[f32],
     primary_code: usize,
 ) -> GreedySpeculativeFrame {
     let drafted_codes = drafter.draft();
-    let verification = verify_frame_draft(
-        config,
-        rope,
-        weights,
-        talker_hidden,
-        primary_code,
-        &drafted_codes,
-    );
+
+    // Verification and repair MUST run the same numerics. Verifying a draft under int8 and then
+    // repairing it under f32 would make an accepted frame and a repaired frame come from two
+    // different routes, so whether a frame was drafted well would leak into the audio — a
+    // speculation mechanism is only sound while it cannot change the output.
+    let verification = match route {
+        Some(route) => verify_frame_draft_q8(
+            config,
+            rope,
+            weights,
+            route,
+            talker_hidden,
+            primary_code,
+            &drafted_codes,
+        ),
+        None => verify_frame_draft(
+            config,
+            rope,
+            weights,
+            talker_hidden,
+            primary_code,
+            &drafted_codes,
+        ),
+    };
     let accepted_prefix_len = verification.accepted_greedy_prefix_len(&drafted_codes);
     let (codes, repaired) = if accepted_prefix_len == RESIDUAL_DEPTHS {
         (drafted_codes, false)
     } else {
-        let sequential =
-            decode_frame_greedy(config, rope, weights, state, talker_hidden, primary_code);
+        let sequential = match route {
+            Some(route) => decode_frame_with_selector_q8(
+                config,
+                rope,
+                weights,
+                route,
+                state,
+                talker_hidden,
+                primary_code,
+                argmax,
+            ),
+            None => decode_frame_greedy(config, rope, weights, state, talker_hidden, primary_code),
+        };
         (
             sequential
                 .try_into()
@@ -1536,6 +1687,10 @@ thread_local! {
         const { std::cell::RefCell::new(FrankenMtpDrafter::new()) };
 }
 
+// Matches `layer_step_q8`: the microdecoder's shared entry points carry the model's full context
+// (config, rope table, weights, route, cache, conditioning) and bundling them into a struct would
+// buy nothing but an extra indirection on the hot path.
+#[allow(clippy::too_many_arguments)]
 fn decode_frame_with_selector_inner(
     config: &MicrodecoderConfig,
     rope: &RopeTable,
@@ -2065,6 +2220,7 @@ mod tests {
             &config,
             &rope,
             &weights,
+            None,
             &mut speculative_state,
             &mut drafter,
             &talker_hidden,
@@ -2107,6 +2263,7 @@ mod tests {
             &config,
             &rope,
             &weights,
+            None,
             &mut speculative_state,
             &mut drafter,
             &talker_hidden,
@@ -2240,6 +2397,109 @@ mod tests {
                         "{tier:?}/seed {seed}: element {index} diverged — block {block:?} vs \
                          sequential {step:?}; batching must never perturb the arithmetic"
                     );
+                }
+            }
+        }
+    }
+
+    /// Speculation is a scheduling device, not a quality one. Whatever the drafter proposes —
+    /// a perfect guess, one stale code, or pure garbage — the codes that come out must equal
+    /// what the same route's sequential greedy decode emits.
+    ///
+    /// Run on **both** routes, because the failure this guards against is asymmetric: verifying
+    /// under one set of numerics and repairing under another would make the audio depend on how
+    /// lucky the drafter got, and only the quantized route can express that mistake.
+    #[test]
+    fn speculation_never_changes_the_emitted_codes() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
+        let quant: Vec<MicroLayerQuant> = layers
+            .iter()
+            .map(|layer| MicroLayerQuant::quantize(&config, layer))
+            .collect();
+
+        for tier in ftts_kernels::int8::Int8Tier::available() {
+            let q8 = MicroQuantRoute {
+                layers: &quant,
+                heads: None,
+                mode: QuantLinearMode::W8A8(tier),
+            };
+
+            for (label, route) in [("f32", None), ("q8", Some(&q8))] {
+                for seed in 0..3_u32 {
+                    let talker_hidden = weights_of(config.hidden_size, 880 + seed);
+                    let primary_code = (seed as usize * 29) % TALKER_CODEC_VOCAB;
+
+                    // The authoritative answer for this route.
+                    let mut reference_state = FrameState::new(&config);
+                    let expected: Vec<usize> = match route {
+                        Some(route) => decode_frame_with_selector_q8(
+                            &config,
+                            &rope,
+                            &weights,
+                            route,
+                            &mut reference_state,
+                            &talker_hidden,
+                            primary_code,
+                            argmax,
+                        ),
+                        None => decode_frame_greedy(
+                            &config,
+                            &rope,
+                            &weights,
+                            &mut reference_state,
+                            &talker_hidden,
+                            primary_code,
+                        ),
+                    };
+
+                    // Three drafter states: cold (no history), exactly right, and deliberately
+                    // wrong — the accept, the full-accept, and the repair paths respectively.
+                    let exact: [usize; RESIDUAL_DEPTHS] = expected
+                        .clone()
+                        .try_into()
+                        .expect("greedy decode emits fifteen residuals");
+                    let mut wrong = exact;
+                    wrong[RESIDUAL_DEPTHS / 2] = (wrong[RESIDUAL_DEPTHS / 2] + 7) % RESIDUAL_VOCAB;
+
+                    let mut cold = FrankenMtpDrafter::new();
+                    let mut right = FrankenMtpDrafter::new();
+                    right.observe(&exact);
+                    let mut stale = FrankenMtpDrafter::new();
+                    stale.previous_frame = Some(wrong);
+
+                    for (draft_label, drafter) in [
+                        ("cold", &mut cold),
+                        ("exact", &mut right),
+                        ("stale", &mut stale),
+                    ] {
+                        let mut state = FrameState::new(&config);
+                        let result = decode_frame_greedy_speculative(
+                            &config,
+                            &rope,
+                            &weights,
+                            route,
+                            &mut state,
+                            drafter,
+                            &talker_hidden,
+                            primary_code,
+                        );
+                        assert_eq!(
+                            result.codes.to_vec(),
+                            expected,
+                            "{tier:?}/{label}/{draft_label}/seed {seed}: speculation changed the \
+                             emitted codes"
+                        );
+                        assert_eq!(
+                            result.repaired,
+                            result.accepted_prefix_len != RESIDUAL_DEPTHS,
+                            "{tier:?}/{label}/{draft_label}/seed {seed}: repair flag must track \
+                             whether the whole draft was accepted"
+                        );
+                    }
                 }
             }
         }
