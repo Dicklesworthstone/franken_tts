@@ -15,11 +15,35 @@ individual commits are intentionally not cited.
 
 | Version | Date | Status | Summary |
 |---------|------|--------|---------|
-| 0.1.2 | 2026-08-08 | current | `ftts convert` works on the real checkpoint; `ftts pull` ships the quantized `.fttsq` |
+| 0.1.3 | 2026-08-09 | current | optimized route becomes the library-wide default; 48 kHz enrollment fix |
+| 0.1.2 | 2026-08-08 | superseded | `ftts convert` works on the real checkpoint; `ftts pull` ships the quantized `.fttsq` |
 | 0.1.1 | 2026-08-08 | superseded | zero-config UX: `ftts pull`, default model cache, m4a/mp3 enrollment |
 | 0.1.0 | 2026-08-08 | first release | f32 reference engine, CLI, conformance ladder, artifact groundwork |
 
 ## [Unreleased]
+
+## [0.1.3] - 2026-08-09
+
+### Changed
+
+- The optimized int8 route is now the **library-wide** default
+  (`ftts_kernels::route::optimized_default`), not just a CLI entry-point
+  environment default, so library consumers get the same speed path as the
+  binary. Conformance and oracle entry points pin the f32 reference route
+  explicitly, so parity suites never measure the optimized numerics.
+  `FTTS_INT8=0` remains the master switch back to the bit-exact reference
+  (DISC-003, amended).
+- Talker QKV and gate‖up projections fuse into single int8 dispatches.
+
+### Fixed
+
+- Enrollment from 44.1/48 kHz recordings (the default for phone and Mac voice
+  memos): the system-decoder transcode now resamples to the speaker encoder's
+  pinned 24 kHz mono instead of preserving the source rate and failing the
+  rate check (`frankentts-gra`).
+- The codec int8 quantization memo keys on shape as well as pointer/length, so
+  an allocator-reused address can never replay a memo entry under the wrong
+  matrix geometry.
 
 ## [0.1.2] - 2026-08-08
 
@@ -158,7 +182,8 @@ refer to the checked-in beads tracker at `.beads/issues.jsonl`.
   the enrollment parity gate is not yet closed.
 - CUDA and long-form/chunked synthesis are out of scope for this release.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Dicklesworthstone/franken_tts/releases/tag/v0.1.0
