@@ -419,6 +419,36 @@ const ATTENTION_LAYER_SUFFIXES: [&str; 11] = [
     "mlp.down_proj.weight",
 ];
 
+/// The seven projection suffixes whose f32 widening the armed int8 route never reads.
+///
+/// `forward_talker_q8` / the microdecoder q8 step consume [`ATTENTION_LAYER_SUFFIXES`] norms plus
+/// the artifact's own Q8 tables; the f32 projections exist only for the f32 reference forward and
+/// the requantize fallback. When neither can run (stack armed, artifact hydration enabled, and
+/// the artifact verifiably carries the tensor as Q8), widening them is pure startup and memory
+/// waste — ~2.5 GB of f32 nobody reads.
+const HOT_PROJECTION_SUFFIXES: [&str; 7] = [
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+];
+
+/// Which decode stacks may skip widening their hot projections at hydration.
+///
+/// Both flags must reflect the CURRENT armed route for this process: an elided stack's f32
+/// projection slices are empty, and the f32 forward's shape assertions fail loudly (never
+/// silently) if a route change routes an elided layer back through f32 arithmetic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HotElision {
+    /// Skip the talker stack's seven per-layer projections.
+    pub talker: bool,
+    /// Skip the microdecoder stack's seven per-layer projections.
+    pub micro: bool,
+}
+
 /// Widens `names` concurrently, returning the tensors in the order the names were given.
 ///
 /// Hydration writes gigabytes of freshly widened f32 and was measured wholly serial at ~0.4 GB/s
@@ -430,7 +460,7 @@ const ATTENTION_LAYER_SUFFIXES: [&str; 11] = [
 ///
 /// The first error wins and is returned after every worker has stopped.
 fn widen_many(
-    names: &[String],
+    names: &[(String, bool)],
     widen_tensor: &(dyn Fn(&str) -> Result<Vec<f32>, CheckpointError> + Sync),
 ) -> Result<Vec<Vec<f32>>, CheckpointError> {
     use std::sync::Mutex;
@@ -441,7 +471,16 @@ fn widen_many(
         .min(names.len())
         .max(1);
     if workers == 1 {
-        return names.iter().map(|name| widen_tensor(name)).collect();
+        return names
+            .iter()
+            .map(|(name, elided)| {
+                if *elided {
+                    Ok(Vec::new())
+                } else {
+                    widen_tensor(name)
+                }
+            })
+            .collect();
     }
 
     let cursor = AtomicUsize::new(0);
@@ -455,7 +494,13 @@ fn widen_many(
                     if index >= names.len() || first_error.lock().expect("error slot").is_some() {
                         return;
                     }
-                    match widen_tensor(&names[index]) {
+                    let (name, elided) = &names[index];
+                    let outcome = if *elided {
+                        Ok(Vec::new())
+                    } else {
+                        widen_tensor(name)
+                    };
+                    match outcome {
                         Ok(tensor) => {
                             slots.lock().expect("tensor slots")[index] = Some(tensor);
                         }
@@ -765,9 +810,12 @@ impl TalkerCheckpoint {
     /// If the file cannot be opened or a required tensor is missing or misshapen.
     pub fn load(path: &Path) -> Result<Self, CheckpointError> {
         let file = open(path)?;
-        Self::load_with(path, TextEmbeddingSource::Safetensors, |name| {
-            widen(&file, path, name)
-        })
+        Self::load_with(
+            path,
+            TextEmbeddingSource::Safetensors,
+            |name| widen(&file, path, name),
+            |_| false,
+        )
     }
 
     /// Hydrate the talker and residual-code microdecoder from a canonical `.fttsq` artifact.
@@ -777,6 +825,22 @@ impl TalkerCheckpoint {
     /// baseline; the native int8 kernels can replace that reconstruction once their parity gate is
     /// green without changing the artifact contract.
     pub fn load_fttsq(path: &Path) -> Result<Self, CheckpointError> {
+        Self::load_fttsq_elided(path, HotElision::default())
+    }
+
+    /// [`TalkerCheckpoint::load_fttsq`], skipping the f32 widening of hot projections the caller
+    /// certifies the armed int8 route will hydrate artifact-natively instead.
+    ///
+    /// A projection is elided only when its stack's flag is set AND the artifact verifiably
+    /// carries it as Q8 with scales — the exact precondition under which the generator's
+    /// artifact-native hydration succeeds and the requantize fallback never runs. Elided
+    /// projections hydrate as empty slices; any misrouted f32 use fails that path's shape
+    /// assertions immediately rather than computing on garbage.
+    ///
+    /// # Errors
+    ///
+    /// As [`TalkerCheckpoint::load_fttsq`].
+    pub fn load_fttsq_elided(path: &Path, elision: HotElision) -> Result<Self, CheckpointError> {
         let artifact =
             Arc::new(
                 MappedFttsq::open(path).map_err(|error| CheckpointError::Open {
@@ -785,13 +849,38 @@ impl TalkerCheckpoint {
                 })?,
             );
         let source = TextEmbeddingSource::Fttsq(Arc::clone(&artifact));
-        Self::load_with(path, source, |name| widen_fttsq(&artifact, path, name))
+        let elide = {
+            let artifact = Arc::clone(&artifact);
+            move |name: &str| {
+                let stack_elided = if name.starts_with("talker.code_predictor.model.layers.") {
+                    elision.micro
+                } else if name.starts_with("talker.model.layers.") {
+                    elision.talker
+                } else {
+                    false
+                };
+                stack_elided
+                    && HOT_PROJECTION_SUFFIXES
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix))
+                    && artifact.reader().tensor(name).is_some_and(|entry| {
+                        entry.dtype == StoredDtype::Q8 && entry.scales.is_some()
+                    })
+            }
+        };
+        Self::load_with(
+            path,
+            source,
+            |name| widen_fttsq(&artifact, path, name),
+            elide,
+        )
     }
 
     fn load_with(
         path: &Path,
         text_embedding_source: TextEmbeddingSource,
         widen_tensor: impl Fn(&str) -> Result<Vec<f32>, CheckpointError> + Sync,
+        elide_tensor: impl Fn(&str) -> bool,
     ) -> Result<Self, CheckpointError> {
         let hidden = TALKER_HIDDEN;
         let micro_layer_count = MicrodecoderConfig::default().num_layers;
@@ -799,26 +888,30 @@ impl TalkerCheckpoint {
         // One flat, canonically ordered name list, hydrated in one concurrent pass; the struct is
         // then assembled by walking the results in the same order. Field-order changes here must
         // keep the two walks in lockstep -- the assertions at each seam catch a drift.
-        let mut names: Vec<String> = Vec::new();
+        let mut names: Vec<(String, bool)> = Vec::new();
+        let mut push = |name: String| {
+            let elided = elide_tensor(&name);
+            names.push((name, elided));
+        };
         for layer in 0..TALKER_LAYER_COUNT {
             for suffix in ATTENTION_LAYER_SUFFIXES {
-                names.push(format!("talker.model.layers.{layer}.{suffix}"));
+                push(format!("talker.model.layers.{layer}.{suffix}"));
             }
         }
         for layer in 0..micro_layer_count {
             for suffix in ATTENTION_LAYER_SUFFIXES {
-                names.push(format!(
+                push(format!(
                     "talker.code_predictor.model.layers.{layer}.{suffix}"
                 ));
             }
         }
         for table in 0..CODE_GROUP_COUNT - 1 {
-            names.push(format!(
+            push(format!(
                 "talker.code_predictor.model.codec_embedding.{table}.weight"
             ));
         }
         for head in 0..RESIDUAL_DEPTHS {
-            names.push(format!("talker.code_predictor.lm_head.{head}.weight"));
+            push(format!("talker.code_predictor.lm_head.{head}.weight"));
         }
         for single in [
             "talker.model.norm.weight",
@@ -830,8 +923,9 @@ impl TalkerCheckpoint {
             "talker.text_projection.linear_fc2.weight",
             "talker.text_projection.linear_fc2.bias",
         ] {
-            names.push(single.to_owned());
+            push(single.to_owned());
         }
+        drop(push);
 
         let mut widened = widen_many(&names, &widen_tensor)?.into_iter();
 

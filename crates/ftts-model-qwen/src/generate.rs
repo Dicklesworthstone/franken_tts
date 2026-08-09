@@ -191,6 +191,27 @@ pub fn micro_layers_from_artifact(
         .collect()
 }
 
+/// The hot-projection elision the CURRENT process environment permits.
+///
+/// This is the load-time mirror of the generator's own hydration decision: a stack's f32
+/// projections may be skipped exactly when that stack will run int8 with artifact-native tables
+/// (route armed for it, artifact hydration not kill-switched). Callers pass the result to
+/// [`crate::checkpoint::TalkerCheckpoint::load_fttsq_elided`]; the checkpoint additionally
+/// verifies per tensor that the artifact really carries the Q8 payload before eliding it.
+#[must_use]
+pub fn hot_elision_from_environment() -> crate::checkpoint::HotElision {
+    if !ftts_kernels::route::optimized_default("FTTS_INT8") || !artifact_q8_enabled() {
+        return crate::checkpoint::HotElision::default();
+    }
+    let scope = std::env::var("FTTS_INT8_SCOPE").unwrap_or_default();
+    let (talker, micro) = match scope.as_str() {
+        "talker" => (true, false),
+        "micro" => (false, true),
+        _ => (true, true),
+    };
+    crate::checkpoint::HotElision { talker, micro }
+}
+
 /// `FTTS_ARTIFACT_Q8=0` forces the widen-then-requantize hydration even when a canonical
 /// artifact is available — the A/B and forensics switch for artifact-native hydration.
 fn artifact_q8_enabled() -> bool {
