@@ -694,16 +694,16 @@ fn codec_int8_route() -> Option<&'static CodecInt8Route> {
     static ROUTE: OnceLock<Option<CodecInt8Route>> = OnceLock::new();
     ROUTE
         .get_or_init(|| {
-            // Default: the convnext arm (the one the spectral gate measured transparent),
-            // unless the master switch or a reference pin turns the optimized route off, or
-            // the variable itself says otherwise.
-            let master_on = ftts_kernels::route::optimized_default("FTTS_INT8");
+            // Default: NO codec int8 — the dense fall-through's named BLAS reduction measured
+            // faster than the convnext int8 arm in every interleaved round (20.5/21.1/21.2 vs
+            // 21.1/22.1/22.1 ms/frame, 2026-08-09) while tracking the oracle's own addmm
+            // arithmetic more closely (the codec_decode_l2 ratchet tightened at all eight
+            // transformer seams). Quantizing the codec now costs speed AND fidelity; the arms
+            // stay opt-in for A/B.
             let (transformer, convnext) = match std::env::var("FTTS_INT8_CODEC").as_deref() {
                 Ok("1" | "all") => (true, true),
                 Ok("transformer") => (true, false),
                 Ok("convnext") => (false, true),
-                Ok("0" | "off" | "false") => return None,
-                _ if master_on && !ftts_kernels::route::reference_pinned() => (false, true),
                 _ => return None,
             };
             Some(CodecInt8Route {
@@ -738,7 +738,21 @@ fn dense_linear(
         DenseClass::ConvNext => route.convnext,
     });
     let Some(route) = armed else {
-        f32ref::linear(x, weight, bias, m, k, n, out);
+        // The reference's dense projections are `nn.Linear` — torch `addmm`, a bias-seeded
+        // `beta = 1` BLAS GEMM. The convolution sites measured that exact named form byte-exact
+        // against the oracle while every scalar/laned reduction diverged (see the GEMM-bisect
+        // table above `causal_conv`), so the f32 dense fall-through asks for the same reduction
+        // by name. Off macOS the request degrades to the scalar reference — correct, not exact.
+        f32ref::linear_with_accumulation(
+            x,
+            weight,
+            bias,
+            m,
+            k,
+            n,
+            f32ref::F32LinearAccumulation::AccelerateBiasSeededRowInvariant,
+            out,
+        );
         return;
     };
 

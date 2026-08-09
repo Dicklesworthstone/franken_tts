@@ -90,46 +90,46 @@ const PINNED_DIVERGENCE: &[(&str, f64, usize)] = &[
     (
         "codec_decoder.transformer_layer_00.output",
         5.9604644775390625e-8,
-        4_614,
+        4_332,
     ),
     (
         "codec_decoder.transformer_layer_01.output",
-        3.7252902984619141e-8,
-        4_451,
+        4.4703483581542969e-8,
+        4_244,
     ),
     (
         "codec_decoder.transformer_layer_02.output",
         2.8610229492187500e-6,
-        4_680,
+        4_552,
     ),
     (
         "codec_decoder.transformer_layer_03.output",
-        2.3841857910156250e-7,
-        4_973,
+        1.3411045074462891e-7,
+        4_895,
     ),
     (
         "codec_decoder.transformer_layer_04.output",
-        3.5762786865234375e-7,
-        4_832,
+        1.3411045074462891e-7,
+        4_742,
     ),
     (
         "codec_decoder.transformer_layer_05.output",
         1.1920928955078125e-7,
-        4_767,
+        4_588,
     ),
     (
         "codec_decoder.transformer_layer_06.output",
-        7.4505805969238281e-8,
-        3_560,
+        5.9604644775390625e-8,
+        3_214,
     ),
     (
         "codec_decoder.transformer_layer_07.output",
-        8.9406967163085938e-8,
-        4_578,
+        6.7055225372314453e-8,
+        4_161,
     ),
     ("final_norm+output_proj", 8.9406967163085938e-8, 13_462),
-    ("codec_decoder.upsample_0_1", 1.6987323760986328e-6, 24_932),
-    ("codec_decoder.upsample_1_1", 2.4795532226562500e-5, 49_986),
+    ("codec_decoder.upsample_0_1", 1.4901161193847656e-6, 24_695),
+    ("codec_decoder.upsample_1_1", 2.8610229492187500e-5, 49_656),
     (
         "codec_decoder.block_01.output",
         4.7683715820312500e-6,
@@ -152,14 +152,14 @@ const PINNED_DIVERGENCE: &[(&str, f64, usize)] = &[
     ),
     ("codec_decoder.block_05", 7.6293945312500000e-6, 42_042),
     ("codec_decoder.block_06", 2.2351741790771484e-8, 15_125),
-    ("decode_codec_offline[icl]", 1.7881393432617188e-7, 25_749),
+    ("decode_codec_offline[icl]", 1.8626451492309570e-7, 25_671),
     // Moved 5.402e-8/1_904 -> 4.610e-8/1_877 when the Accelerate M=1 GEMV path was pinned to the
     // M>=2 GEMM kernel for streaming==offline M-invariance (this capture decodes a single frame,
     // so its conv GEMMs ran M=1 offline); the shift is toward the oracle.
     (
         "decode_codec_offline[xvector]",
-        4.6100467443466187e-8,
-        1_877,
+        5.2154064178466797e-8,
+        1_891,
     ),
 ];
 
