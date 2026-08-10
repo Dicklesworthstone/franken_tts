@@ -85,7 +85,26 @@ async function fetchRange(asset, start, endInclusive) {
   if (!(response.status === 206 || (response.status === 200 && start === 0))) {
     throw new Error(`range fetch for ${asset} failed: HTTP ${response.status}`);
   }
-  return new Uint8Array(await response.arrayBuffer());
+  const window = endInclusive - start + 1;
+  if (response.status === 200) {
+    // The server ignored the Range header. Buffering the reply would materialize the
+    // ENTIRE asset in one JS ArrayBuffer — the exact iOS OOM this chunked loader exists
+    // to avoid — so a range-blind server is only acceptable when the window IS the file.
+    const total = Number(response.headers.get("Content-Length") ?? NaN);
+    if (Number.isFinite(total) && total > window) {
+      throw new Error(
+        `range fetch for ${asset}: server ignored Range and offered ${total} bytes ` +
+          `for a ${window}-byte window`,
+      );
+    }
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength > window) {
+    throw new Error(
+      `range fetch for ${asset}: got ${bytes.byteLength} bytes for a ${window}-byte window`,
+    );
+  }
+  return bytes;
 }
 
 /**
@@ -143,8 +162,15 @@ export async function ensureModel(onProgress) {
           report("cached", file.asset);
           continue;
         }
+        // Full-length but the bytes are wrong: corrupt — clear it for a clean redownload.
+        await root.removeEntry(file.asset);
+      } else if (blob.size > file.bytes) {
+        // Longer than the manifest says: a stale file from an older manifest — clear it.
+        await root.removeEntry(file.asset);
       }
-      await root.removeEntry(file.asset);
+      // A SHORTER file is an interrupted download and must survive to the resume path
+      // below (`offset = size`). Deleting it here was the bug that made "the download
+      // resumes if interrupted" false: every partial restarted from zero.
     } catch {
       /* not cached yet */
     }

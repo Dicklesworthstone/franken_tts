@@ -21,10 +21,17 @@
   Cache-Control: no-cache
 /engine-worker.js
   Cache-Control: no-cache
+/kernel-worker.js
+  Cache-Control: no-cache
+/sha256.js
+  Cache-Control: no-cache
 /model-manifest.js
   Cache-Control: no-cache
 
 /pkg/*
+  Cache-Control: no-cache
+
+/pkg-serial/*
   Cache-Control: no-cache
 
 # The vendored MP3 encoder is versioned by content and effectively immutable.

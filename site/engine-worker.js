@@ -23,7 +23,13 @@ function threadsAreSafeHere() {
   // Every iOS browser is WebKit underneath, so Chrome/Firefox on iOS inherit the same behavior.
   const isApple = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
   const isSafari = /Safari/.test(ua) && !/Chrome|Chromium|Edg\//.test(ua);
-  return !isApple && !isSafari;
+  // The engine token, not just the browser token: `navigator.maxTouchPoints` does not
+  // exist on WorkerNavigator, so the "Macintosh + touch" iPad test above is dead here, and
+  // an iPadOS browser in desktop mode without a `Safari` UA token (Firefox) would slip
+  // through both checks onto the exact WebKit shared-memory-growth crash this allow-list
+  // exists to prevent. Any WebKit engine that is not really Blink is treated as unsafe.
+  const isWebKitEngine = /AppleWebKit/.test(ua) && !/Chrome|Chromium|Edg\//.test(ua);
+  return !isApple && !isSafari && !isWebKitEngine;
 }
 
 const THREADED = threadsAreSafeHere();
@@ -74,6 +80,9 @@ const {
 const INGEST_SLICE = 16 * 1024 * 1024;
 
 let engine = null;
+// The in-flight load's staging handle, held here so the error path can free its wasm-side
+// buffers (~2 GB) immediately instead of waiting on the FinalizationRegistry.
+let loadStaging = null;
 
 /// A shared memory for the threaded build, or null when this engine runs the serial one.
 ///
@@ -266,10 +275,23 @@ async function handleMessage({ data }) {
           presets: JSON.parse(presets()),
           threads: 1,
           route: int8_route(),
+          requestId: data.requestId,
         });
         break;
       }
       case "load": {
+        // A superseded engine's wasm-side buffers (~2 GB) must not wait for the
+        // FinalizationRegistry: a second load alongside the orphan doubles peak memory,
+        // which is exactly the reclaim threshold on iOS.
+        if (engine) {
+          const superseded = engine;
+          engine = null;
+          try {
+            superseded.free();
+          } catch {
+            /* already freed */
+          }
+        }
         // The large files are streamed OUT of OPFS and straight INTO wasm linear memory. They are
         // never materialized as JS ArrayBuffers: doing that put a 1.3 GB artifact in memory twice
         // (once for JS, once for wasm-bindgen's copy) and is what reclaimed the tab on iOS.
@@ -285,7 +307,12 @@ async function handleMessage({ data }) {
         // bytes first drops the high-water mark to ~2.67 GB with nothing read twice. See the
         // ModelStaging docs in crates/ftts-wasm/src/lib.rs for the arithmetic.
         stage("staging-new", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
+        // Freed explicitly on ANY failure below: the handle owns up to ~2 GB of wasm-side
+        // staging buffers, and leaving it to the FinalizationRegistry means the retry the
+        // error message invites allocates a second 2 GB alongside the orphan → tab death.
+        // (`from_staging` consumes the handle on success, making the later free a no-op.)
         const staging = new ModelStaging(data.codec.bytes);
+        loadStaging = staging;
         const drain = async (meta, push) => {
           const blob = await (await root.getFileHandle(meta.asset)).getFile();
           for (let offset = 0; offset < blob.size; offset += INGEST_SLICE) {
@@ -313,6 +340,7 @@ async function handleMessage({ data }) {
           data.merges,
           data.tokenizerConfig,
         );
+        loadStaging = null; // consumed by from_staging
         // Now that linear memory has finished growing, it is safe to park worker threads on it.
         let threads = 1;
         if (teamPending) {
@@ -326,7 +354,7 @@ async function handleMessage({ data }) {
           teamPending = null;
         }
         stage("ready", `threads=${threads}`);
-        reply("load", { ok: true, threads });
+        reply("load", { ok: true, threads, requestId: data.requestId });
         break;
       }
       case "synthesize": {
@@ -355,6 +383,15 @@ async function handleMessage({ data }) {
         throw new Error(`unknown message type ${data.type}`);
     }
   } catch (error) {
+    // Free an abandoned load's staging buffers before inviting a retry (see `loadStaging`).
+    if (loadStaging) {
+      try {
+        loadStaging.free();
+      } catch {
+        /* already consumed */
+      }
+      loadStaging = null;
+    }
     reply(data.type, { ok: false, error: String(error), requestId: data.requestId });
   }
 }

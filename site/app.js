@@ -76,6 +76,10 @@ function recordStage(stage, detail) {
   // second, so the init stages — the ones that say which build actually loaded — were erased
   // before anyone could read them. The harness reads this array.
   (globalThis.__fttsStages ??= []).push(detail ? `${stage} [${detail}]` : stage);
+  // Message-arrival pings (`msg:synthesize`, …) are forensics, not status: painting them
+  // here replaced "Model loaded — 6 kernel threads" with the literal text "msg:synthesize"
+  // on every click. They still land in localStorage and the stage history above.
+  if (stage.startsWith("msg:")) return;
   const status = document.getElementById("dl-status");
   if (status) {
     status.textContent = detail ? `${stage} — ${detail}` : stage;
@@ -109,18 +113,36 @@ worker.onmessage = ({ data }) => {
     return;
   }
   const key = `${data.type}:${data.requestId ?? ""}`;
-  // init/load replies carry no requestId; match by type alone.
-  const entry =
-    pending.get(key) ?? pending.get([...pending.keys()].find((k) => k.startsWith(`${data.type}:`)));
+  // Every reply now echoes its requestId; the by-type fallback survives only for an older
+  // worker script paired with a newer page mid-deploy. It settles exactly ONE promise —
+  // the earlier version deleted every same-type key, so a second in-flight call of the
+  // same type was dropped without ever settling.
+  const fallbackKey =
+    data.requestId === undefined
+      ? [...pending.keys()].find((k) => k.startsWith(`${data.type}:`))
+      : undefined;
+  const matched = pending.has(key) ? key : fallbackKey;
+  const entry = matched === undefined ? undefined : pending.get(matched);
   if (!entry) return;
-  pending.delete(key);
-  for (const k of [...pending.keys()]) {
-    if (k.startsWith(`${data.type}:`) && (data.requestId === undefined || k === key)) {
-      pending.delete(k);
-    }
-  }
+  pending.delete(matched);
   if (data.ok) entry.resolve(data);
   else entry.reject(new Error(data.error));
+};
+
+// A worker that dies before (or instead of) replying must fail the calls, not strand them:
+// a top-level import error in the worker script previously left `call("init")` pending
+// forever and the page stuck on "Model not loaded." with zero error surface.
+function failAllPending(reason) {
+  const error = reason instanceof Error ? reason : new Error(String(reason));
+  for (const [, entry] of pending) entry.reject(error);
+  pending.clear();
+  showError(error);
+}
+worker.onerror = (event) => {
+  failAllPending(event.message ? `engine worker error: ${event.message}` : "engine worker crashed");
+};
+worker.onmessageerror = () => {
+  failAllPending("engine worker message could not be deserialized");
 };
 
 function showError(error) {
@@ -498,9 +520,15 @@ ui.record.addEventListener("click", async () => {
     recorder.stop();
     return;
   }
+  // Hoisted out of the `try` so the catch can release them: without this, a failure after
+  // `getUserMedia` (an AudioContext that rejects the 24 kHz rate, a retired API) left the
+  // microphone LIVE — OS recording indicator on — until reload, on a page whose whole
+  // pitch is that nothing leaves the tab.
+  let stream = null;
+  let context = null;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const context = new AudioContext({ sampleRate: 24000 });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    context = new AudioContext({ sampleRate: 24000 });
     const source = context.createMediaStreamSource(stream);
     const recorderNode = context.createScriptProcessor(4096, 1, 1);
     const chunks = [];
@@ -559,6 +587,8 @@ ui.record.addEventListener("click", async () => {
       if (recorder === session) session.stop();
     }, 60_000);
   } catch (error) {
+    for (const track of stream?.getTracks() ?? []) track.stop();
+    await context?.close().catch(() => {});
     showError(error);
     ui.recordStatus.textContent = "";
     recorder = null;
