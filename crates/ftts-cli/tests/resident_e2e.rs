@@ -57,7 +57,10 @@ fn run_say(resident_dir: &std::path::Path, out: &std::path::Path, extra: &[&str]
         .env("FTTS_RESIDENT_DIR", resident_dir)
         // Generous idle window: on slow machines a debug-build synthesis takes minutes,
         // and a short window can reap the daemon between the runs that share it.
-        .env("FTTS_RESIDENT_IDLE_SECS", "30");
+        .env("FTTS_RESIDENT_IDLE_SECS", "30")
+        // Debug-build synthesis on the slowest test machines outlives the production
+        // client timeout; the contract under test is reuse and parity, not speed.
+        .env("FTTS_RESIDENT_CLIENT_TIMEOUT_SECS", "1800");
     let output = command.output().expect("ftts say runs");
     assert!(
         output.status.success(),

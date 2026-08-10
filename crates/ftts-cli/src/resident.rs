@@ -40,7 +40,16 @@ const DEFAULT_IDLE: Duration = Duration::from_secs(600);
 
 /// How long the client is willing to wait for a reply. Synthesis of a long paragraph is
 /// minutes at f32-reference speed; ten minutes matches the engine's own budget spirit.
-const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(600);
+/// `FTTS_RESIDENT_CLIENT_TIMEOUT_SECS` overrides it, which the e2e suite uses to stay
+/// valid on machines whose debug-build synthesis is slower than the production budget.
+const DEFAULT_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn client_read_timeout() -> Duration {
+    std::env::var("FTTS_RESIDENT_CLIENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(DEFAULT_CLIENT_READ_TIMEOUT, Duration::from_secs)
+}
 
 /// How long the client waits for a freshly spawned daemon to write its state file and
 /// accept. The daemon binds before loading the model, so this covers process start only.
@@ -229,7 +238,7 @@ fn connect_once(bundle: &ModelBundle) -> Option<TcpStream> {
         Duration::from_millis(500),
     )
     .ok()?;
-    stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT)).ok()?;
+    stream.set_read_timeout(Some(client_read_timeout())).ok()?;
     stream.set_nodelay(true).ok();
     Some(stream)
 }
