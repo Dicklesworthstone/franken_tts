@@ -364,6 +364,14 @@ struct LabView: View {
         .sensoryFeedback(.success, trigger: importCount) { _, count in count > 0 }
         .onAppear(perform: debugCardHook)
         .onAppear(perform: debugVideoHook)
+        .onAppear {
+            #if DEBUG
+                // Screenshot harness: FTTS_DEBUG_GALAXY=1 opens the constellation.
+                if ProcessInfo.processInfo.environment["FTTS_DEBUG_GALAXY"] != nil {
+                    showGalaxy = true
+                }
+            #endif
+        }
         .scrollDismissesKeyboard(.interactively)
     }
 

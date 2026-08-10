@@ -190,6 +190,22 @@ pub fn trailing_noise_samples_relative_to(
     sample_rate: u32,
     speech_level: f32,
 ) -> usize {
+    trailing_noise_range_relative_to(pcm, sample_rate, speech_level).len()
+}
+
+/// As [`trailing_noise_samples_relative_to`], but returning WHERE the noise run sits.
+///
+/// The count alone is not enough to remove the artifact: the noise ends at the last
+/// audible sample, and any sub-epsilon silence after it is genuine model output to be
+/// kept. A caller that removes `count` samples from the buffer's literal end instead
+/// keeps the audible artifact and deletes the harmless silence — the exact inversion
+/// this range exists to prevent.
+#[must_use]
+pub fn trailing_noise_range_relative_to(
+    pcm: &[f32],
+    sample_rate: u32,
+    speech_level: f32,
+) -> std::ops::Range<usize> {
     /// Analysis window. 10 ms is short enough to localize the burst and long enough that a
     /// single glottal pulse does not dominate the statistic.
     const WINDOW_MILLIS: usize = 10;
@@ -212,7 +228,7 @@ pub fn trailing_noise_samples_relative_to(
 
     let window = (sample_rate as usize).saturating_mul(WINDOW_MILLIS) / 1000;
     if window < 2 || pcm.len() < window * 4 {
-        return 0;
+        return 0..0;
     }
 
     // Trailing silence is model output, not artifact; keep it, and analyze what precedes it.
@@ -230,7 +246,7 @@ pub fn trailing_noise_samples_relative_to(
         .rposition(|sample| sample.abs() >= SILENCE_EPSILON)
         .map_or(0, |i| i + 1);
     if voiced_end < window * 4 {
-        return 0;
+        return 0..0;
     }
 
     let rms = |seg: &[f32]| -> f32 {
@@ -257,7 +273,7 @@ pub fn trailing_noise_samples_relative_to(
     // ever looks quiet. It compiled, it passed every whole-buffer test (where the two values
     // coincide), and it made the live path behave differently from the tested one.
     if speech_level <= 0.0 {
-        return 0;
+        return 0..0;
     }
     let quiet_ceiling = speech_level * QUIET_FRACTION;
 
@@ -282,10 +298,10 @@ pub fn trailing_noise_samples_relative_to(
     if trimmed > 0 {
         let run = &pcm[voiced_end - trimmed..voiced_end];
         if rms(run) >= speech_level * RUN_MEAN_FRACTION {
-            return 0;
+            return 0..0;
         }
     }
-    trimmed
+    voiced_end - trimmed..voiced_end
 }
 
 /// A streaming WAV writer that finalises a correct header.
@@ -297,9 +313,11 @@ pub fn trailing_noise_samples_relative_to(
 ///
 /// If the run is cut short — cancellation, a full disk — calling `finish` still yields a valid
 /// file describing the samples that made it, which is the partial-output promise in plan §9.6.
-/// Samples held back when tail trimming is armed: the detector's own ceiling, so the buffer always
-/// holds every sample the trim could possibly want.
-const TAIL_HOLDBACK_SAMPLES: usize = SAMPLE_RATE_HZ as usize * 250 / 1000;
+/// Milliseconds of audio held back when tail trimming is armed: the detector's own
+/// ceiling, so the buffer always holds every sample the trim could possibly want. The
+/// sample count derives from the writer's OWN rate — a constant sized for 24 kHz would
+/// silently halve the trim window at 48 kHz.
+const TAIL_HOLDBACK_MILLIS: usize = 250;
 
 pub struct WavWriter<W: Write + Seek> {
     /// `None` once [`WavWriter::finish`] has handed the sink back.
@@ -312,7 +330,7 @@ pub struct WavWriter<W: Write + Seek> {
     samples_written: usize,
     /// Samples withheld from the file so the end-of-utterance trim can still see them.
     ///
-    /// Writing is delayed by at most `TAIL_HOLDBACK_SAMPLES`, which is why this is opt-in: for a
+    /// Writing is delayed by at most the holdback window, which is why this is opt-in: for a
     /// file that delay is invisible, but on `--stream raw` it would add latency to a path whose
     /// whole contract is time-to-first-audio. `None` means trimming is off and every sample goes
     /// straight through.
@@ -352,8 +370,13 @@ impl<W: Write + Seek> WavWriter<W> {
     /// If the provisional header cannot be written.
     pub fn new_trimming_tail(sink: W, sample_rate: u32) -> io::Result<Self> {
         let mut writer = Self::new(sink, sample_rate)?;
-        writer.holdback = Some(Vec::with_capacity(TAIL_HOLDBACK_SAMPLES * 2));
+        writer.holdback = Some(Vec::with_capacity(writer.holdback_samples() * 2));
         Ok(writer)
+    }
+
+    /// Samples the trimming writer withholds, derived from this writer's own rate.
+    fn holdback_samples(&self) -> usize {
+        (self.sample_rate as usize).saturating_mul(TAIL_HOLDBACK_MILLIS) / 1000
     }
 
     /// Append one packet of decoded `f32` samples.
@@ -363,14 +386,14 @@ impl<W: Write + Seek> WavWriter<W> {
     /// If the sink rejects the write. The count of samples already accepted stays accurate, so a
     /// later [`WavWriter::finish`] still describes the file truthfully.
     pub fn write_samples(&mut self, pcm: &[f32]) -> io::Result<()> {
-        // With trimming armed, keep the newest TAIL_HOLDBACK_SAMPLES back and emit only what has
+        // With trimming armed, keep the newest holdback window back and emit only what has
         // aged out. Those held samples are the only ones the trim can ever remove, so nothing that
         // reaches the file here can need taking back.
         if self.holdback.is_some() {
             self.speech_level = self.speech_level.max(speech_level(pcm, self.sample_rate));
             let mut pending = self.holdback.take().unwrap_or_default();
             pending.extend_from_slice(pcm);
-            let releasable = pending.len().saturating_sub(TAIL_HOLDBACK_SAMPLES);
+            let releasable = pending.len().saturating_sub(self.holdback_samples());
             let released: Vec<f32> = pending.drain(..releasable).collect();
             self.holdback = Some(pending);
             if released.is_empty() {
@@ -436,11 +459,16 @@ impl<W: Write + Seek> WavWriter<W> {
         // Release the held tail, minus whatever the detector identifies as the model's end-of-
         // utterance noise. Done before the header is patched so the length describes what landed.
         if let Some(pending) = self.holdback.take() {
-            let drop =
-                trailing_noise_samples_relative_to(&pending, self.sample_rate, self.speech_level);
-            let keep = pending.len().saturating_sub(drop);
-            if keep > 0 {
-                self.write_through(&pending[..keep])?;
+            // The noise run ends at the last AUDIBLE sample; sub-epsilon silence after
+            // it is genuine model output and is kept, per the detector's contract.
+            // Removing `count` samples from the buffer's literal end instead kept the
+            // audible artifact and deleted the harmless silence whenever the burst was
+            // followed by a quiet tail — the live shape that motivated this feature.
+            let noise =
+                trailing_noise_range_relative_to(&pending, self.sample_rate, self.speech_level);
+            self.write_through(&pending[..noise.start])?;
+            if noise.end < pending.len() {
+                self.write_through(&pending[noise.end..])?;
             }
         }
         self.finalize_header()?;
@@ -755,6 +783,47 @@ mod holdback_tests {
         (0..len)
             .map(|i| amplitude * (i as f32 * 2.0 * std::f32::consts::PI * 200.0 / 24_000.0).sin())
             .collect()
+    }
+
+    /// The trim must remove the AUDIBLE noise burst and keep the inaudible tail after
+    /// it — not shave an equal count off the buffer's literal end. An earlier writer
+    /// did exactly that: identical sample COUNTS, completely inverted sample CHOICE,
+    /// so this asserts on content where the counts cannot distinguish right from wrong.
+    #[test]
+    fn the_trim_removes_the_burst_not_the_silence_after_it() {
+        let mut pcm = tone(24_000, 0.6);
+        // 100 ms audible broadband burst (alternating sign, quiet, high-frequency)...
+        for i in 0..2_400 {
+            pcm.push(if i % 2 == 0 { 0.02 } else { -0.02 });
+        }
+        // ...then 100 ms of sub-epsilon silence, the live f32 shape.
+        pcm.extend(std::iter::repeat_n(1.0e-6_f32, 2_400));
+
+        let mut writer =
+            WavWriter::new_trimming_tail(Cursor::new(Vec::new()), 24_000).expect("writer");
+        writer.write_samples(&pcm).expect("write");
+        let (sink, written) = writer.finish_reporting().expect("finish");
+        let bytes = sink.into_inner();
+
+        let payload: Vec<i16> = bytes[WAV_HEADER_BYTES..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| i16::from_le_bytes(*pair))
+            .collect();
+        assert_eq!(written, payload.len(), "header count describes the payload");
+        assert_eq!(
+            written,
+            pcm.len() - 2_400,
+            "exactly the burst's length is gone"
+        );
+        // Content check the counts cannot fake: everything after the tone must be the
+        // (quantized-to-zero) silence, with no audible burst sample surviving.
+        let audible_after_tone = payload[24_000..].iter().filter(|s| s.abs() > 1).count();
+        assert_eq!(
+            audible_after_tone, 0,
+            "audible burst samples survived the trim: {audible_after_tone}"
+        );
     }
 
     fn write(pcm: &[f32], trimming: bool, chunk: usize) -> Vec<u8> {

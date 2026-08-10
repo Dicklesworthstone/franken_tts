@@ -63,9 +63,11 @@ fn main() {
     let dispatched = Int8Tier::dispatch();
     println!("dispatched int8 route: {}", dispatched.as_str());
     println!("shapes: microdecoder layer at m=1, {ROUNDS} rounds (15 depths x 5 layers)\n");
+    // The ratio columns are SPEED ratios (q4's throughput relative to the q8 variant):
+    // t_q8 / t_q4, so 1.0 means parity and 0.05 means q4 runs at 5% of q8's speed.
     println!(
         "{:<10} {:>6} {:>6} {:>10} {:>10} {:>10} {:>9} {:>9}",
-        "proj", "n", "k", "q8-scalar", "q4-scalar", "q8-route", "q4/q8scal", "q4/route"
+        "proj", "n", "k", "q8-scalar", "q4-scalar", "q8-route", "spd/q8scl", "spd/route"
     );
 
     let mut total_q8_scalar = 0.0_f64;

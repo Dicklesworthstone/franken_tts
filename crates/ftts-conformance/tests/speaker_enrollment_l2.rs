@@ -192,11 +192,16 @@ fn measure() -> Result<Measured, String> {
     if groups != 16 {
         return Err(format!("the codec carries 16 code groups, not {groups}"));
     }
+    // A corrupt or truncated fixture must fail by NAME here, not decode code 0 and
+    // surface later as a mysterious cosine-floor failure blaming the front end.
     let codes: Vec<i32> = raw
         .data
         .iter()
-        .map(|value| i32::try_from(*value).unwrap_or(0))
-        .collect();
+        .map(|value| {
+            i32::try_from(*value)
+                .map_err(|_| format!("codec code {value} does not fit i32; fixture corrupt?"))
+        })
+        .collect::<Result<_, _>>()?;
 
     let codec = CodecCheckpoint::load(&codec_path)
         .map_err(|error| format!("codec checkpoint unusable: {error}"))?;

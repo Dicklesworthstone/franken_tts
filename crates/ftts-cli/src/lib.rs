@@ -2006,7 +2006,10 @@ impl AudioOutput {
     /// Write one packet and return its `audio_chunk` event.
     ///
     /// `raw` is where PCM goes under `--stream raw`; it is ignored by the other sinks. The event's
-    /// `byte_offset` is the offset *before* this packet, so a consumer can seek with it.
+    /// `byte_offset` is the offset *before* this packet, so a consumer can seek with it — on the
+    /// RAW stream. On a trimmed file sink the chunk events describe samples HANDED to the writer,
+    /// up to a quarter second of which the tail trim may withhold, so the final chunk's advertised
+    /// range can exceed the file; `run_complete.audio_bytes` is the authoritative file size.
     ///
     /// `duration_ms` is derived from the sample count rather than taken from a caller-supplied
     /// clock: it describes how much *audio* this packet holds, which is a property of the samples,

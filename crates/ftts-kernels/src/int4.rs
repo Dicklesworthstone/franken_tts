@@ -116,12 +116,12 @@ impl QuantizedMatrixQ4 {
                     *byte = (*byte & 0x0F) | (biased << 4);
                 }
             }
-            // An odd k leaves the final high nibble as the RAW zero the buffer was
-            // initialized with (0b0000, i.e. biased value -8), NOT the biased zero (8) the
-            // zero-scale fill uses. No current reader ever touches it — `dot_i32_q4` and
-            // `dequantize_row` both stop at k — but a future whole-byte SIMD kernel must
-            // either pad activations with a literal 0 (which nullifies any padding nibble)
-            // or normalize this padding first; assuming it is the biased zero would be wrong.
+            // An odd k leaves the final high nibble as the buffer's initialization value,
+            // which is the BIASED zero (0x88 fills both nibbles), so the pad decodes to
+            // exactly 0.0 — see the init comment above and the module docs. No current
+            // reader touches it (`dot_i32_q4` and `dequantize_row` both stop at k), and a
+            // future whole-byte SIMD kernel may consume it freely as long as the matching
+            // activation pad is 0, since biased-zero times anything contributes nothing.
         }
 
         Self { data, scales, n, k }
@@ -367,13 +367,10 @@ mod tests {
         assert_eq!(q4.packed_bytes() * 2, q8.data.len());
     }
 
-    /// Accuracy is WORSE than Q8 by roughly the level ratio, and this test states that honestly
-    /// rather than asserting a tolerance that hides it.
-    ///
-    /// 15 levels against 255 means ~17x the quantization step. The assertion is deliberately loose
-    /// — it exists to catch a broken quantizer (orders of magnitude off), not to claim Q4 is
-    /// accurate. Whether this error is AUDIBLE is a listening-protocol question, not a unit test,
-    /// and doctrine #2 requires that gate before any routing decision.
+    /// The packed layout decodes identically through the kernel and through a naive
+    /// independent unpacking — bit-for-bit, no tolerance. (The loose-tolerance prose
+    /// that used to sit here described `quantization_error_is_bounded_by_the_level_step`
+    /// below, not this test.)
     #[test]
     fn linear_q4_matches_an_independent_nibble_unpack_bit_for_bit() {
         // `linear_q4` itself had zero coverage: `dot_i32_q4` was tested, but not the packed
