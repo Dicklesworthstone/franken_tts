@@ -697,6 +697,14 @@ struct LabView: View {
             Text("Runs entirely on this device · frankentts.com")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(Lab.textSecondary)
+            Text(
+                "If you like this free app, please show your appreciation by trying out my paid skills site at [JeffreysSkills.md](https://jeffreys-skills.md)."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(Lab.textSecondary.opacity(0.72))
+            .tint(Lab.emerald.opacity(0.8))
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 320)
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 6)
