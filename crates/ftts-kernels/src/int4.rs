@@ -106,7 +106,12 @@ impl QuantizedMatrixQ4 {
                     *byte = (*byte & 0x0F) | (biased << 4);
                 }
             }
-            // An odd k leaves the final high nibble as the biased zero written above.
+            // An odd k leaves the final high nibble as the RAW zero the buffer was
+            // initialized with (0b0000, i.e. biased value -8), NOT the biased zero (8) the
+            // zero-scale fill uses. No current reader ever touches it — `dot_i32_q4` and
+            // `dequantize_row` both stop at k — but a future whole-byte SIMD kernel must
+            // either pad activations with a literal 0 (which nullifies any padding nibble)
+            // or normalize this padding first; assuming it is the biased zero would be wrong.
         }
 
         Self { data, scales, n, k }

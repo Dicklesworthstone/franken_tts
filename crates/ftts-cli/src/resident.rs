@@ -48,6 +48,10 @@ fn client_read_timeout() -> Duration {
     std::env::var("FTTS_RESIDENT_CLIENT_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
+        // Zero is rejected rather than honored: `set_read_timeout(Some(ZERO))` is an error
+        // in std, so a literal 0 would fail every connect, orphan a healthy daemon, and eat
+        // the full spawn wait on every run.
+        .filter(|&seconds| seconds > 0)
         .map_or(DEFAULT_CLIENT_READ_TIMEOUT, Duration::from_secs)
 }
 
@@ -118,9 +122,16 @@ fn resident_dir() -> Option<PathBuf> {
 
 /// A short stable digest of the bundle root, so distinct model directories get distinct
 /// daemons. `RandomState` keys vary per process, so this hand-rolls FNV-1a instead.
+///
+/// The path is canonicalized first: `./model` from two different working directories must
+/// key two different daemons (they are different models), while `/x/m` and `/x//m` and a
+/// symlinked spelling of the same directory must share one. Hashing the raw string gave
+/// the opposite of both. A path that cannot be canonicalized (not yet created, permission)
+/// falls back to its literal spelling — resolution refuses such roots before spawn anyway.
 fn root_digest(root: &Path) -> u64 {
+    let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in root.to_string_lossy().as_bytes() {
+    for byte in canonical.to_string_lossy().as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -161,14 +172,24 @@ fn write_state(root: &Path, port: u16, token: &str) -> std::io::Result<PathBuf> 
         "bundle_root": root.to_string_lossy(),
     })
     .to_string();
-    // Write-then-rename so a client never reads a half-written file.
+    // Write-then-rename so a client never reads a half-written file. The staging file is
+    // born 0600 on unix — the token is inside, so there must be no umask-window in which
+    // another user can read it before a later chmod.
     let staging = path.with_extension("json.tmp");
-    fs::write(&staging, body)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&staging, fs::Permissions::from_mode(0o600))?;
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&staging)?;
+        file.write_all(body.as_bytes())?;
     }
+    #[cfg(not(unix))]
+    fs::write(&staging, &body)?;
     fs::rename(&staging, &path)?;
     Ok(path)
 }
@@ -334,9 +355,15 @@ fn roundtrip(
         return Ok(None);
     };
     if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        // The sample count is wire data. Bound it before it sizes an allocation: at 24 kHz
+        // this cap is over two hours of audio, far past anything the engine can produce,
+        // and a corrupt or mismatched daemon claiming more falls back inline instead of
+        // driving a multi-gigabyte (or, unchecked, overflowing) allocation.
+        const MAX_WIRE_SAMPLES: u64 = 200_000_000;
         let samples = reply
             .get("samples")
             .and_then(Value::as_u64)
+            .filter(|&n| n <= MAX_WIRE_SAMPLES)
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(0);
         let mut bytes = vec![0u8; samples * 4];
@@ -488,6 +515,12 @@ fn handle_connection(
 ) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    // A write timeout is the daemon's survival: replies are written inline in the accept
+    // loop, so one client that stops reading (SIGSTOP, wedged pipe) would otherwise fill
+    // the send buffer and park this thread in `write_all` forever — and every later
+    // `ftts say` would then hang against a daemon that accepts but never answers. Sixty
+    // seconds per write on loopback is indistinguishable from a dead peer.
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
     let _ = stream.set_nodelay(true);
 
     // BOUNDED read, and the bound is the point: `read_line` on a raw socket grows its String
@@ -541,6 +574,24 @@ fn handle_connection(
             remove_state_if_ours(&state, port);
         }
         std::process::exit(0);
+    }
+
+    // The client says which bundle root it thinks it is talking to; a daemon keyed by a
+    // colliding or stale state file must refuse rather than synthesize with the wrong
+    // model. Compared canonically so a different spelling of the same directory passes.
+    if let Some(wire_root) = request.get("bundle_root").and_then(Value::as_str) {
+        let wire_canonical =
+            fs::canonicalize(wire_root).unwrap_or_else(|_| PathBuf::from(wire_root));
+        let own_canonical =
+            fs::canonicalize(&bundle.root).unwrap_or_else(|_| bundle.root.clone());
+        if wire_canonical != own_canonical {
+            refuse(
+                &mut stream,
+                "request",
+                "resident daemon serves a different bundle root",
+            );
+            return;
+        }
     }
 
     // A re-pulled or re-converted artifact invalidates the resident weights.
