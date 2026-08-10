@@ -9,8 +9,10 @@ fn main() {
         .expect("usage: tail_writer_probe <wav>");
     let bytes = std::fs::read(&path).expect("readable wav");
     let pcm: Vec<f32> = bytes[44..]
-        .chunks_exact(2)
-        .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32_767.0)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| f32::from(i16::from_le_bytes(*pair)) / 32_767.0)
         .collect();
 
     let offline = ftts_core::audio::trailing_noise_samples(&pcm, 24_000);

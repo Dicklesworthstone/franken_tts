@@ -249,12 +249,13 @@ pub fn trailing_noise_samples_relative_to(
         diff / energy
     };
 
-    // The utterance's own speech level, taken as the loudest window so the threshold scales with
-    // the recording rather than assuming an absolute amplitude.
-    let speech_level = pcm[..voiced_end]
-        .chunks(window)
-        .map(rms)
-        .fold(0.0_f32, f32::max);
+    // The CALLER'S speech level is authoritative, and must not be recomputed from `pcm` here.
+    //
+    // A local `let speech_level = ...` used to shadow the parameter, which silently defeated this
+    // function's entire reason to exist: the streaming writer holds only the last quarter second
+    // when it decides, so recomputing from `pcm` measures the artifact against ITSELF and nothing
+    // ever looks quiet. It compiled, it passed every whole-buffer test (where the two values
+    // coincide), and it made the live path behave differently from the tested one.
     if speech_level <= 0.0 {
         return 0;
     }
@@ -696,6 +697,43 @@ mod tail_tests {
             trailing_noise_samples(&pcm, SR),
             0,
             "only a tail contiguous with the end is in scope"
+        );
+    }
+
+    /// The caller's speech level must actually be honored.
+    ///
+    /// This is the test that was missing when a local binding shadowed the parameter: every
+    /// whole-buffer test still passed, because there the supplied level and the recomputed one are
+    /// the same number. The bug only appeared where it mattered — the streaming writer, which holds
+    /// just the tail. Feeding the same tail with the utterance's level versus the tail's own level
+    /// must give different answers, or the parameter is being ignored.
+    #[test]
+    fn the_supplied_speech_level_is_the_one_used() {
+        // The noise run must be at least as long as the writer's hold-back, or the 250 ms tail
+        // still contains loud speech and the two levels coincide — which is precisely the
+        // condition under which the shadowing bug stayed invisible.
+        let mut pcm = tone(SR as usize / 2, 0.5);
+        pcm.extend(noise(SR as usize * 300 / 1000, 0.02));
+
+        let utterance_level = speech_level(&pcm, SR);
+        let tail = &pcm[pcm.len() - SR as usize * 250 / 1000..];
+        let tail_level = speech_level(tail, SR);
+        assert!(
+            tail_level < utterance_level,
+            "the fixture must have a tail quieter than the utterance"
+        );
+
+        // Against the utterance's level the tail is quiet, so it is trimmed.
+        assert!(
+            trailing_noise_samples_relative_to(tail, SR, utterance_level) > 0,
+            "the supplied utterance level was ignored"
+        );
+        // Against the tail's OWN level nothing looks quiet, so nothing is trimmed. If the function
+        // recomputed internally it would always take this branch and never trim in the live path.
+        assert_eq!(
+            trailing_noise_samples_relative_to(tail, SR, tail_level),
+            0,
+            "a self-referential level must find nothing quiet"
         );
     }
 
