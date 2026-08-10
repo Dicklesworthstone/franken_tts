@@ -651,6 +651,8 @@ mod tests {
     fn preset_vector_round_trips_and_rejects_unknown_names() {
         let name = CString::new("matt").unwrap();
         let mut out = vec![0.0_f32; SPEAKER_WIDTH];
+        // SAFETY: `name` is a live NUL-terminated CString, and `out` is a live buffer of exactly
+        // SPEAKER_WIDTH floats — the width this entry point contracts to fill.
         assert_eq!(
             unsafe { ftts_preset_vector(name.as_ptr(), out.as_mut_ptr()) },
             0
@@ -661,6 +663,8 @@ mod tests {
         );
 
         let missing = CString::new("nobody").unwrap();
+        // SAFETY: as above; an unknown name is a value error, not a pointer error, so the same
+        // liveness argument holds on the failing path.
         assert_eq!(
             unsafe { ftts_preset_vector(missing.as_ptr(), out.as_mut_ptr()) },
             1
@@ -676,14 +680,17 @@ mod tests {
     #[test]
     fn open_refuses_a_missing_model_directory_with_a_message() {
         let dir = CString::new("/nonexistent/franken-model").unwrap();
+        // SAFETY: `dir` is a live NUL-terminated CString for the whole call.
         let engine = unsafe { ftts_engine_open(dir.as_ptr()) };
         assert!(engine.is_null());
+        // SAFETY: reading the thread-local error string this crate owns and keeps alive.
         #[allow(unsafe_code)]
         let message = unsafe { CStr::from_ptr(ftts_last_error_message()) }
             .to_str()
             .unwrap();
         assert!(!message.is_empty());
-        unsafe { ftts_engine_close(engine) }; // null close is a no-op
+        // SAFETY: closing a null handle is explicitly a no-op, which is what is being asserted.
+        unsafe { ftts_engine_close(engine) };
     }
 
     /// Model-gated end-to-end smoke: open, synthesize a word, free, close.

@@ -29,9 +29,25 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-#  The single crate permitted to contain audited `unsafe`, and the only one allowed to name
-#  the frankentorch crates directly (AGENTS.md toolchain + doctrine: one facade).
+#  The crate allowed to name the frankentorch crates directly (AGENTS.md toolchain + doctrine:
+#  one facade).
 KERNEL_CRATE = "ftts-kernels"
+
+#  Crates permitted to contain audited `unsafe`, each for a distinct and narrow reason.
+#
+#  `ftts-kernels` is the doctrine's original island: SIMD intrinsics and raw-pointer partitioning,
+#  every site paired with a bit-identical scalar fallback.
+#
+#  `ftts-ffi` was added 2026-08-10. A C ABI is definitionally unsafe — `extern "C"` entry points
+#  take raw pointers from a caller Rust cannot see, and no amount of design removes that. The crate
+#  already declared the exception for itself (`unsafe_code = "deny"` rather than the workspace's
+#  `forbid`, with the reason in its Cargo.toml); this list had simply never been told, so the
+#  validator failed on committed, intentional work.
+#
+#  What did NOT change: every site in BOTH crates still needs a `// SAFETY:` note. The doctrine is
+#  *audited* unsafe, not permitted unsafe, and an FFI boundary is exactly where an unstated
+#  assumption about a caller's pointer becomes a segfault in someone else's process.
+UNSAFE_CRATES = (KERNEL_CRATE, "ftts-ffi")
 FRANKENTORCH_CRATES = ("ft-core", "ft-kernel-cpu", "ft-serialize")
 FRANKENTORCH_MODULES = ("ft_core", "ft_kernel_cpu", "ft_serialize")
 
@@ -160,6 +176,13 @@ def check_unsafe_islands(report: Report, manifests: dict[str, Path], root: Path)
     """No `unsafe` outside the kernel crate, and every unsafe block carries a SAFETY note."""
     report.checked.append("unsafe-islands")
     unsafe_re = re.compile(r"(^|[^\w])unsafe\s*[{(]|(^|[^\w])unsafe\s+(fn|impl|trait)\b")
+    #  Rust 2024 spells ABI-affecting attributes `#[unsafe(no_mangle)]` / `#[unsafe(export_name)]`,
+    #  which the pattern above matches on the `unsafe(`. Those are ATTRIBUTES, not operations: they
+    #  dereference nothing and have no safety contract a `// SAFETY:` note could discharge. Before
+    #  this exclusion the rule reported every C-ABI export as unaudited unsafe, which is noise that
+    #  would have been silenced by writing meaningless notes — the failure mode the rule exists to
+    #  prevent.
+    unsafe_attr_re = re.compile(r"^\s*#\[\s*unsafe\s*\(")
     for name, manifest in manifests.items():
         for source in rust_sources(manifest.parent):
             lines = source.read_text(encoding="utf-8").splitlines()
@@ -167,13 +190,15 @@ def check_unsafe_islands(report: Report, manifests: dict[str, Path], root: Path)
                 stripped = line.strip()
                 if stripped.startswith("//") or stripped.startswith("#!["):
                     continue
+                if unsafe_attr_re.match(line):
+                    continue
                 if not unsafe_re.search(line):
                     continue
-                if name != KERNEL_CRATE:
+                if name not in UNSAFE_CRATES:
                     report.fail(
                         "unsafe-islands",
                         f"{rel(source, root)}:{lineno}",
-                        f"`unsafe` outside {KERNEL_CRATE}: {stripped[:80]}",
+                        f"`unsafe` outside {' / '.join(UNSAFE_CRATES)}: {stripped[:80]}",
                     )
                     continue
                 window = lines[max(0, lineno - 6) : lineno - 1]
