@@ -222,6 +222,7 @@ struct LabView: View {
     @State private var model = LabModel()
     @State private var showConsent = false
     @State private var showEnrollment = false
+    @State private var showGalaxy = false
     @State private var renameTarget: EnrolledVoice?
     @State private var renameText = ""
     /// Bumped to refresh the play/pause icon, which tracks external playback state.
@@ -251,6 +252,9 @@ struct LabView: View {
         }
         .sheet(isPresented: $showEnrollment) {
             EnrollmentSheet(model: model)
+        }
+        .sheet(isPresented: $showGalaxy) {
+            VoiceGalaxyView(presets: model.presets, enrolled: model.library.voices)
         }
         .alert(
             "Rename voice", isPresented: Binding(
@@ -567,11 +571,23 @@ struct LabView: View {
     }
 
     private var footer: some View {
-        Text("Runs entirely on this device · frankentts.com")
-            .font(.system(size: 11, design: .monospaced))
-            .foregroundStyle(Lab.textSecondary)
-            .frame(maxWidth: .infinity)
-            .padding(.top, 6)
+        VStack(spacing: 14) {
+            Button {
+                showGalaxy = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkles")
+                    Text("Visualize the voices")
+                }
+            }
+            .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+            .accessibilityHint("Shows every voice as a shape; similar voices look alike and sit together")
+            Text("Runs entirely on this device · frankentts.com")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Lab.textSecondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 6)
     }
 
     private static func gigabytes(_ bytes: Int64) -> String {
