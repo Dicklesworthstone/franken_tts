@@ -259,14 +259,14 @@ mod tests {
             // Reference: dequantize the nibbles to signed levels and dot them plainly.
             let packed_row = k.div_ceil(PER_BYTE);
             let mut expected = 0_i32;
-            for position in 0..k {
+            for (position, &activation) in x_q.iter().enumerate().take(k) {
                 let byte = matrix.data[position / PER_BYTE];
                 let nibble = if position % PER_BYTE == 0 {
                     i32::from(byte & 0x0F)
                 } else {
                     i32::from(byte >> 4)
                 };
-                expected += i32::from(x_q[position]) * (nibble - BIAS);
+                expected += i32::from(activation) * (nibble - BIAS);
             }
             assert_eq!(
                 dot_i32_q4(&x_q, &matrix.data[..packed_row], k),
@@ -304,13 +304,18 @@ mod tests {
         let negated: Vec<f32> = weight.iter().map(|value| -value).collect();
         let mirror = QuantizedMatrixQ4::quantize(&negated, 1, k);
         assert!((mirror.scales[0] - scale).abs() <= f32::EPSILON * scale.max(1.0));
+        // Value equality, not bit equality: a zero weight dequantizes to +0.0 on both sides, and
+        // `-(+0.0)` is `-0.0`, whose bits differ while the value does not. For every non-zero
+        // level, f32 equality here is still exact — the levels are small integers times a shared
+        // scale, so no rounding can hide a mismatch.
+        let forward = matrix.dequantize_row(0);
+        let backward = mirror.dequantize_row(0);
         for position in 0..k {
-            let original = matrix.dequantize_row(0)[position];
-            let flipped = mirror.dequantize_row(0)[position];
-            assert_eq!(
-                original.to_bits(),
-                (-flipped).to_bits(),
-                "negation was not exact at {position}"
+            assert!(
+                forward[position] == -backward[position],
+                "negation was not exact at {position}: {} vs {}",
+                forward[position],
+                backward[position]
             );
         }
     }

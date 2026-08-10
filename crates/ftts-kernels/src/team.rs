@@ -461,6 +461,11 @@ impl Team {
     /// # Panics
     ///
     /// Panics on shape mismatches, exactly as the serial kernel does.
+    ///
+    /// The argument count mirrors the serial kernel's signature exactly, which is the point: a
+    /// caller swaps one call for the other with no reshaping, so any divergence would be a
+    /// compile error rather than a silent behavioural difference.
+    #[allow(clippy::too_many_arguments)]
     pub fn linear_f32(
         &self,
         x: &[f32],

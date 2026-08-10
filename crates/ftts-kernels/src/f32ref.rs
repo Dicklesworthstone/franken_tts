@@ -242,11 +242,12 @@ pub fn linear_with_accumulation(
         // work must also be big enough to pay for a dispatch, hence the floor; and a worker thread
         // that is itself inside a kernel must never re-dispatch (`thread_bypassed`).
         const TEAM_FLOOR: usize = 64 * 1024;
-        if m * n >= TEAM_FLOOR && !crate::team::thread_bypassed() {
-            if let Some(team) = crate::team::armed() {
-                team.linear_f32(x, weight, bias, m, k, n, out);
-                return;
-            }
+        if m * n >= TEAM_FLOOR
+            && !crate::team::thread_bypassed()
+            && let Some(team) = crate::team::armed()
+        {
+            team.linear_f32(x, weight, bias, m, k, n, out);
+            return;
         }
         crate::packed_gemm::linear_packed(x, weight, bias, m, k, n, out);
         return;

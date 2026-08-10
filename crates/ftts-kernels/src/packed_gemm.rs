@@ -89,6 +89,11 @@ pub fn linear_packed(
 ///
 /// `out` must be valid for writes of `m * n` floats, and no other reference may alias the columns
 /// `col_start..col_end` for the duration of the call.
+// The argument count is the GEMM contract itself — operands, the (m, k, n) shape, the column
+// stripe, and the destination. Bundling them into a struct would add a layer between the caller
+// and the hot loop without removing a single value, so the lint is allowed here deliberately,
+// matching `f32ref::gqa_attention_head_range_into`.
+#[allow(clippy::too_many_arguments)]
 // SAFETY: discharged by both callers. `linear_packed` passes the pointer of a `&mut [f32]` it
 // holds exclusively, with the full column range. The team passes one worker's disjoint stripe of a
 // buffer the dispatcher owns and blocks on until every partition reports done, so the allocation
