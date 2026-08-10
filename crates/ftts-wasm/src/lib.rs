@@ -179,7 +179,7 @@ pub fn bench_int8_gemv(tier: &str, k: usize, n: usize, rounds: usize) -> Result<
 /// Worker then instantiates this same module against the same `WebAssembly.Memory` and calls
 /// [`worker_loop_entry`] with its index. Once they report parked, call [`arm_worker_team`] with
 /// the count that actually started.
-#[cfg(not(unix))]
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn publish_team_block() {
     ftts_kernels::team::publish_wasm_block();
@@ -190,7 +190,7 @@ pub fn publish_team_block() {
 /// `partitions` counts the dispatcher too, so pass `readyWorkers + 1`. Anything <= 1 arms
 /// nothing and the engine runs serially — the correct outcome on a browser without
 /// `SharedArrayBuffer`, and on one where every Worker failed to start.
-#[cfg(not(unix))]
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn arm_worker_team(partitions: usize) {
     ftts_kernels::team::arm_wasm_team(partitions);
@@ -202,7 +202,7 @@ pub fn arm_worker_team(partitions: usize) {
 ///
 /// Throws if called before [`arm_worker_team`] published the control block, which is a host
 /// sequencing bug — parking on a block that does not exist would hang silently instead.
-#[cfg(not(unix))]
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn worker_loop_entry(worker: usize) -> Result<(), JsValue> {
     if worker == 0 {
@@ -348,6 +348,12 @@ impl ModelStaging {
     ///
     /// Throws when the staged bytes are short of what was reserved, or when the checkpoint does
     /// not parse.
+    ///
+    /// Gated off unix for the same reason as the constructors below: `SafetensorsFile::from_bytes`
+    /// is the byte-oriented loader that exists only where there is no filesystem. Native hosts go
+    /// through the CLI's path-based loader instead, so this arm simply does not exist there — and
+    /// the workspace's `--all-targets` check compiles this crate natively, which is what caught it.
+    #[cfg(not(unix))]
     pub fn finish_codec(&mut self) -> Result<(), JsValue> {
         if self.codec.is_some() {
             return Err(js_error("codec already hydrated", "finish_codec twice"));
