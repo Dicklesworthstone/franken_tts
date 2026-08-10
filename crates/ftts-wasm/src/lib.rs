@@ -157,7 +157,10 @@ pub fn bench_int8_gemv(tier: &str, k: usize, n: usize, rounds: usize) -> Result<
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        ((state >> 33) as f32 / f32::from(u16::MAX)) - 0.5
+        // Top 16 bits → [0, 1) → [-0.5, 0.5). The earlier `>> 33` kept 31 bits, producing
+        // values up to ~32767.5 — all positive and huge, the opposite of the full-sign
+        // small-magnitude spread this comment promises (int8.rs:1090 has the honest form).
+        ((state >> 48) as f32 / f32::from(u16::MAX)) - 0.5
     };
     let weight: Vec<f32> = (0..n * k).map(|_| next()).collect();
     let matrix = QuantizedMatrix::quantize(&weight, n, k);

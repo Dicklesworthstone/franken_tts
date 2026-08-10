@@ -233,7 +233,22 @@ pub fn linear_with_accumulation(
     //
     // `m == 1` keeps the dot path: with one row there is nothing to amortize a packed panel over,
     // and NE-004 measured register blocking as neutral at that geometry.
-    if m > 1 {
+    //
+    // The gate below also keeps the forensic probe orders OFF this path. `Lanes4/8`,
+    // `FusedLanes4/8`, and `WidenedF64` exist solely so the parity harness can reproduce a
+    // specific non-scalar reduction order; routing them through packed/team would silently
+    // hand every probe the Scalar order and turn the attribution sweep into Scalar-vs-Scalar
+    // under five labels. Only the orders packed provably reproduces may take the shortcut:
+    // `Scalar` itself, and the denied-BLAS `Accelerate*` degradations documented above.
+    let packed_preserves_order = matches!(
+        accumulation,
+        F32LinearAccumulation::Scalar
+            | F32LinearAccumulation::Accelerate
+            | F32LinearAccumulation::AccelerateRowInvariant
+            | F32LinearAccumulation::AccelerateBiasSeeded
+            | F32LinearAccumulation::AccelerateBiasSeededRowInvariant
+    );
+    if m > 1 && packed_preserves_order {
         // Hand it to the team when one is armed. This is the codec's entire arithmetic budget —
         // 92% of browser frame time — and it ran on one thread while every worker sat parked.
         //
