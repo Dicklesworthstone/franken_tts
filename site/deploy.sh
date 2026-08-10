@@ -13,7 +13,10 @@ VERSION="$(git rev-parse --short HEAD)-$(date +%s)"
 STAGE="$(mktemp -d /tmp/frankentts-site-deploy.XXXXXX)"
 
 rsync -a --exclude deploy.sh ./ "$STAGE/"
-for f in "$STAGE"/index.html "$STAGE"/app.js "$STAGE"/loader.js "$STAGE"/engine-worker.js; do
+# Every file that CONTAINS the token must be listed, not just the entry points: kernel-worker.js
+# imports ./pkg/ftts_wasm.js?v=@SITEV@ and would otherwise ship the literal placeholder, quietly
+# opting the partition workers out of cache-busting while everything else rotated.
+for f in "$STAGE"/index.html "$STAGE"/app.js "$STAGE"/loader.js "$STAGE"/engine-worker.js "$STAGE"/kernel-worker.js; do
   perl -pi -e "s/\@SITEV\@/$VERSION/g" "$f"
 done
 

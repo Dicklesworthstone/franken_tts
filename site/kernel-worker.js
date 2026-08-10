@@ -8,7 +8,14 @@
 // That is also why this is a Worker rather than anything on the main thread: `atomic.wait` traps
 // on a browser's main thread. A parked partition there would abort the page.
 
-import initSync, { worker_loop_entry } from "./pkg/ftts_wasm.js?v=@SITEV@";
+// NAMED import, and the distinction is load-bearing rather than stylistic. wasm-bindgen's web
+// target exports `initSync` by name and the ASYNC `__wbg_init` as the default, so
+// `import initSync from ...` silently binds the async one. It then takes `module_or_path`, not
+// `module`, so it received undefined, went looking for a URL to fetch, and returned an unawaited
+// promise — after which `worker_loop_entry` ran against uninitialized wasm and threw. Every
+// partition reported `ready: false`, the team armed at width 1, and the engine ran serially while
+// still paying to spawn the Workers. That is why threads measured as no faster, or slower.
+import { initSync, worker_loop_entry } from "./pkg/ftts_wasm.js?v=@SITEV@";
 
 self.onmessage = ({ data }) => {
   try {
