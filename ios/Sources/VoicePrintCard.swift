@@ -152,9 +152,19 @@ enum VoicePrintCard {
             }
         }
         guard let cgImage = image.cgImage else { return nil }
-        let width = cgImage.width
-        let height = cgImage.height
-        guard width > 0, height > 0, width * height <= 40_000_000 else { return nil }
+        var width = cgImage.width
+        var height = cgImage.height
+        guard width > 0, height > 0 else { return nil }
+        // Very large photos (48 MP exports) get downscaled rather than rejected: the
+        // mosaic survives as long as its cells stay a couple of pixels wide, and the
+        // decode buffers stay a sane size.
+        let maxPixels = 24_000_000
+        let oversized = width * height > maxPixels
+        if oversized {
+            let scale = (Double(maxPixels) / Double(width * height)).squareRoot()
+            width = max(Int(Double(width) * scale), 1)
+            height = max(Int(Double(height) * scale), 1)
+        }
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         guard let context = CGContext(
@@ -162,7 +172,8 @@ enum VoicePrintCard {
             bytesPerRow: width * 4, space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
-        context.interpolationQuality = .none
+        // Exact pixels when unscaled; proper area filtering when downscaling.
+        context.interpolationQuality = oversized ? .high : .none
         context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         var rgb = [UInt8](repeating: 0, count: width * height * 3)
         for index in 0..<(width * height) {

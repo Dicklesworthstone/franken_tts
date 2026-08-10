@@ -38,6 +38,12 @@ final class VoiceLibrary {
                     try? JSONDecoder().decode(EnrolledVoice.self, from: $0)
                 }
             }
+            // A truncated or hand-edited file must not reach the engine or the card
+            // renderer; both require exactly the speaker width, all finite.
+            .filter { voice in
+                voice.vector.count == Engine.speakerWidth
+                    && voice.vector.allSatisfy(\.isFinite)
+            }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
