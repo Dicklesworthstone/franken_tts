@@ -26,6 +26,7 @@ pub mod enhance;
 pub mod f32ref;
 pub mod int8;
 pub mod mmap;
+pub mod packed_gemm;
 pub mod route;
 pub mod selftest;
 pub mod sleef;

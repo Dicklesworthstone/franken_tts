@@ -208,6 +208,36 @@ pub fn linear_with_accumulation(
         return;
     }
 
+    // The BLAS-less fall-through: no platform GEMM was available (or none was asked for).
+    //
+    // Every dense op in the codec — both convolutions via im2col, the ConvNeXt pointwise pair, the
+    // transformer's q/k/v/o and FFN — reaches this one function, so the kernel chosen here is the
+    // codec's entire arithmetic budget. In the browser that budget measured 89.1 s of a 97.3 s
+    // frame (92%), because a per-element dot product re-reads the activation row once per output
+    // column and reuses no weight at all.
+    //
+    // `linear_packed` is the register-tiled, panel-packed replacement, and it is safe to
+    // substitute HERE specifically because of what it does not change: each output element still
+    // accumulates over ascending `k` into its own slot, one add at a time, so it is bit-identical
+    // to the `Scalar` reduction (`packed_matches_scalar_bit_for_bit`).
+    //
+    // Two regimes, and only one of them changes any bits:
+    //
+    //   * native non-macOS — a denied BLAS request already degrades to lanes = 1, i.e. the scalar
+    //     order. Packed reproduces it exactly, so this is a pure speed change with NO numerics
+    //     change and nothing to ledger.
+    //   * wasm — the fall-through used eight independent partial chains (a non-reference order,
+    //     adopted because a single scalar chain cannot be autovectorized). Packed replaces that
+    //     with the reference's own order, so the browser moves CLOSER to the oracle while getting
+    //     faster. A speed lever that tightens parity rather than loosening it.
+    //
+    // `m == 1` keeps the dot path: with one row there is nothing to amortize a packed panel over,
+    // and NE-004 measured register blocking as neutral at that geometry.
+    if m > 1 {
+        crate::packed_gemm::linear_packed(x, weight, bias, m, k, n, out);
+        return;
+    }
+
     for row in 0..m {
         let x_row = &x[row * k..row * k + k];
         for col in 0..n {
