@@ -83,6 +83,10 @@ let engine = null;
 // The in-flight load's staging handle, held here so the error path can free its wasm-side
 // buffers (~2 GB) immediately instead of waiting on the FinalizationRegistry.
 let loadStaging = null;
+// Non-null once any armed kernel Worker has died (its partition can never report done, so
+// every future team dispatch would hang). Set from the Worker's onerror; checked before
+// any message that could dispatch. The value is the reason shown to the user.
+let teamDead = null;
 
 /// A shared memory for the threaded build, or null when this engine runs the serial one.
 ///
@@ -179,6 +183,20 @@ async function startTeam(module, memory) {
   // terminate the whole set and run serial, which is always correct.
   const ready = parked.filter(Boolean).length;
   if (ready === desired - 1) {
+    // Post-arm liveness: `panic = "abort"` means a trap in a parked kernel Worker kills
+    // ONLY that Worker; the join counter is never decremented and the next dispatch parks
+    // this engine Worker forever inside `memory.atomic.wait` — where no JS can run. So the
+    // rescue cannot live here: mark the team dead so every message AFTER the wedged one
+    // fails fast with a reason, and the page-side watchdog (app.js) converts the wedged
+    // in-flight call itself into an error instead of an eternal spinner.
+    for (const worker of workers) {
+      worker.onerror = (event) => {
+        teamDead = event?.message
+          ? `a kernel worker crashed: ${event.message}`
+          : "a kernel worker crashed";
+        stage("team-dead", teamDead);
+      };
+    }
     arm_worker_team(desired);
     return worker_team_width();
   }
@@ -359,6 +377,9 @@ async function handleMessage({ data }) {
       }
       case "synthesize": {
         if (!engine) throw new Error("engine not loaded");
+        if (teamDead) {
+          throw new Error(`${teamDead}; reload the page to rebuild the worker team`);
+        }
         const voice =
           data.voiceVector ?? Float32Array.from(preset_vector(data.voiceName ?? "matt"));
         const started = performance.now();
@@ -373,6 +394,9 @@ async function handleMessage({ data }) {
       }
       case "enroll": {
         if (!engine) throw new Error("engine not loaded");
+        if (teamDead) {
+          throw new Error(`${teamDead}; reload the page to rebuild the worker team`);
+        }
         const vector = engine.enroll(new Float32Array(data.pcm));
         reply("enroll", { ok: true, vector: vector.buffer, requestId: data.requestId }, [
           vector.buffer,

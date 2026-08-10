@@ -41,10 +41,43 @@ const worker = new Worker("./engine-worker.js?v=@SITEV@", { type: "module" });
 const pending = new Map();
 let requestCounter = 0;
 
+// The last line of defense against a wedged engine Worker. A dead kernel Worker strands the
+// engine Worker inside `memory.atomic.wait`, where it can run no JS ever again — no reply,
+// no error, nothing (`panic = "abort"` on the wasm build makes in-wasm recovery impossible).
+// Only THIS thread can still speak, so a call that outlives its generous ceiling is failed
+// here with a reload suggestion instead of spinning forever. Ceilings are deliberately far
+// past slow-phone reality (browser synthesis measured 0.31-0.43x realtime; hydration runs
+// minutes on a cold phone): the watchdog exists to catch "never", not "slow".
+const CALL_CEILINGS_MS = { init: 120_000, load: 20 * 60_000, synthesize: 15 * 60_000, enroll: 5 * 60_000 };
+
 function call(type, payload = {}, transfer = []) {
   return new Promise((resolve, reject) => {
     const requestId = ++requestCounter;
-    pending.set(`${type}:${requestId}`, { resolve, reject });
+    const key = `${type}:${requestId}`;
+    const ceiling = CALL_CEILINGS_MS[type];
+    const timer = ceiling
+      ? setTimeout(() => {
+          if (!pending.has(key)) return;
+          pending.delete(key);
+          recordStage(`watchdog:${type}`);
+          reject(
+            new Error(
+              `the engine did not answer "${type}" within ${Math.round(ceiling / 60_000)} minutes — ` +
+                "it is likely wedged (a crashed worker thread); reload the page",
+            ),
+          );
+        }, ceiling)
+      : null;
+    pending.set(key, {
+      resolve: (value) => {
+        if (timer) clearTimeout(timer);
+        resolve(value);
+      },
+      reject: (error) => {
+        if (timer) clearTimeout(timer);
+        reject(error);
+      },
+    });
     worker.postMessage({ type, requestId, ...payload }, transfer);
   });
 }
@@ -112,6 +145,17 @@ worker.onmessage = ({ data }) => {
     recordStage(data.stage, data.detail);
     return;
   }
+  // Streaming-into-wasm progress: also telemetry. The worker emits one of these per slice
+  // precisely so the bar keeps moving during the multi-ten-second hydration phase; they
+  // were silently discarded before, freezing the bar at 100%-downloaded.
+  if (data.type === "loadProgress") {
+    if (hydrateTotalBytes > 0 && Number.isFinite(data.bytesDone)) {
+      const percent = Math.min(100, (data.bytesDone / hydrateTotalBytes) * 100);
+      ui.dlBar.style.width = `${percent.toFixed(1)}%`;
+      ui.dlStatus.textContent = `Streaming into the engine: ${gigabytes(data.bytesDone)} / ${gigabytes(hydrateTotalBytes)} GB`;
+    }
+    return;
+  }
   const key = `${data.type}:${data.requestId ?? ""}`;
   // Every reply now echoes its requestId; the by-type fallback survives only for an older
   // worker script paired with a newer page mid-deploy. It settles exactly ONE promise —
@@ -125,8 +169,13 @@ worker.onmessage = ({ data }) => {
   const entry = matched === undefined ? undefined : pending.get(matched);
   if (!entry) return;
   pending.delete(matched);
-  if (data.ok) entry.resolve(data);
-  else entry.reject(new Error(data.error));
+  if (data.ok) {
+    // The last recorded stage completed without killing the tab; clearing here is what
+    // makes the crash-breadcrumb contract true — a stage still marked "entered" on the
+    // next visit is one that genuinely never finished.
+    clearStage();
+    entry.resolve(data);
+  } else entry.reject(new Error(data.error));
 };
 
 // A worker that dies before (or instead of) replying must fail the calls, not strand them:
@@ -219,7 +268,16 @@ let engineThreads = 1;
 // discoverable without reading source (parity doctrine: no silent numerics switches).
 let engineRoute = "";
 
+// Total bytes the load call will stream into wasm, for the hydration progress bar.
+let hydrateTotalBytes = 0;
+
 async function boot() {
+  // Surface, don't just record: the breadcrumb only helps if somebody reads it back.
+  const crash = reportPreviousCrash();
+  if (crash) {
+    ui.dlStatus.textContent = `Note: the previous visit ended during “${crash.stage}”.`;
+    clearStage();
+  }
   engineRoute = (await call("init"))?.route ?? "";
 
   // Persistence contract: the model downloads ONCE and stays in this browser's storage until
@@ -243,6 +301,7 @@ async function loadFromStore() {
       ui.dlStatus.textContent = `${phase} ${asset ?? ""}: ${gigabytes(bytesDone)} / ${gigabytes(bytesTotal)} GB`;
     });
     ui.dlStatus.textContent = "Hydrating the engine (this takes a minute at wasm speed)…";
+    hydrateTotalBytes = (files.codec?.bytes ?? 0) + (files.fttsq?.bytes ?? 0);
     const loaded = await call(
       "load",
       {
@@ -434,6 +493,7 @@ ui.consentYes.addEventListener("click", async () => {
       ui.dlStatus.textContent = `${phase} ${asset ?? ""}: ${gigabytes(bytesDone)} / ${gigabytes(bytesTotal)} GB${tail}`;
     });
     ui.dlStatus.textContent = "Hydrating the engine (this takes a minute at wasm speed)…";
+    hydrateTotalBytes = (files.codec?.bytes ?? 0) + (files.fttsq?.bytes ?? 0);
     const loaded = await call(
       "load",
       {

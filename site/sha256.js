@@ -60,8 +60,12 @@ export class Sha256 {
     return this;
   }
 
-  /** Lowercase hex digest. The instance must not be updated afterwards. */
+  /** Lowercase hex digest. Idempotent; the instance must not be `update`d afterwards. */
   hex() {
+    // Finalization compresses the padding into `this.h`, so a second call used to fold the
+    // padding in twice and return a different, wrong digest. Cache the first answer instead
+    // of trusting every caller to know the footgun.
+    if (this.digest !== undefined) return this.digest;
     const bitLength = this.totalLength * 8;
     const tail = new Uint8Array(this.blockLength < 56 ? 64 : 128);
     tail.set(this.block.subarray(0, this.blockLength), 0);
@@ -74,6 +78,7 @@ export class Sha256 {
     for (let offset = 0; offset < tail.length; offset += 64) this.#compress(tail, offset);
     let out = "";
     for (const word of this.h) out += word.toString(16).padStart(8, "0");
+    this.digest = out;
     return out;
   }
 
