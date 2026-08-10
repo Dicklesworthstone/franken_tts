@@ -750,7 +750,9 @@ enum ReedSolomon {
                 index += 2
             }
             guard denominator != 0 else { return nil }
-            corrected[position] ^= multiply(numerator, inverse(denominator))
+            // Forney with first consecutive root α^0 carries an extra factor of X_j.
+            let xj = field.exp[(n - 1 - position) % 255]
+            corrected[position] ^= multiply(multiply(numerator, xj), inverse(denominator))
         }
         // Verify: syndromes of the corrected word must vanish.
         for index in 0..<parityCount {

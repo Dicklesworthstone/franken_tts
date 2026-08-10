@@ -37,3 +37,10 @@ Simulator builds are arm64-only (Apple Silicon hosts); an Intel host would need 
 - Shares export as M4A by default (AAC, an order of magnitude smaller than WAV) and as
   a branded MP4 video rendered by the same Rust code behind `ftts make-video`, encoded
   by the phone's hardware H.264/AAC encoders.
+- Enrolled voices export as "voice cards": the picture's emerald mosaic IS the
+  1,024-float voiceprint, encoded at 2 bits per cell across a 144×144 grid with
+  QR-style finder patterns, calibration strips, and interleaved Reed-Solomon (255,223).
+  The decoder self-registers from the finder patterns, so recompressed JPEGs and
+  screenshots from any size of phone import cleanly; a lossless PNG chunk in the same
+  file is used first when the bytes survive intact. Codec lives in
+  `Sources/VoiceCode.swift`, card assembly and import in `Sources/VoicePrintCard.swift`.
