@@ -49,7 +49,51 @@ function call(type, payload = {}, transfer = []) {
   });
 }
 
+// ── crash breadcrumbs ────────────────────────────────────────────────────────────────────────
+//
+// When iOS reclaims the tab there is no error, no unload event, and no console: the diagnosis dies
+// with the page. The only evidence that survives a kill is what reached durable storage BEFORE the
+// dangerous step ran. So the engine Worker announces each hydration stage as it ENTERS it, the
+// page commits that synchronously to localStorage, and a stage still marked "entered" on the next
+// load is — by construction — the one that killed us.
+//
+// It lives here rather than in the Worker because Workers have no localStorage at all.
+const CRASH_KEY = "ftts-last-stage";
+
+function recordStage(stage, detail) {
+  try {
+    localStorage.setItem(CRASH_KEY, JSON.stringify({ stage, detail, at: Date.now() }));
+  } catch {
+    /* private mode: diagnosis is best-effort, never a reason to fail the load */
+  }
+}
+
+function clearStage() {
+  try {
+    localStorage.removeItem(CRASH_KEY);
+  } catch {
+    /* as above */
+  }
+}
+
+/// Surfaces the stage that killed the previous visit, if there was one.
+export function reportPreviousCrash() {
+  let noted;
+  try {
+    noted = JSON.parse(localStorage.getItem(CRASH_KEY) ?? "null");
+  } catch {
+    return null;
+  }
+  return noted?.stage ? noted : null;
+}
+
 worker.onmessage = ({ data }) => {
+  // Stage pings are telemetry, not request replies: they carry no requestId and must not be
+  // matched against the pending map or they would resolve someone else's promise.
+  if (data.type === "stage") {
+    recordStage(data.stage, data.detail);
+    return;
+  }
   const key = `${data.type}:${data.requestId ?? ""}`;
   // init/load replies carry no requestId; match by type alone.
   const entry =

@@ -51,6 +51,35 @@ RUSTFLAGS="-C target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals \
 wasm-bindgen "$TARGET_DIR/wasm32-unknown-unknown/release/ftts_wasm.wasm" \
   --out-dir site/pkg --typescript --target web
 
+# ── the SERIAL build, and why two builds are now mandatory ──────────────────────────────────────
+#
+# Measured on an iPhone 17 Pro Max with a crash-persistent probe (site/memprobe.html), which
+# records each step to localStorage BEFORE attempting it so a killed tab still reports its cause:
+#
+#   flat allocation, shared or unshared, 1 -> 3.5 GB ............ all pass
+#   GROW an UNSHARED memory, 1 -> 2.75 GB ...................... all pass
+#   GROW a SHARED memory ....................................... 1 GB passes, 2 GB KILLS THE TAB
+#
+# Growing a shared memory is what reclaims the tab. That is unavoidable for us: Rust's dlmalloc
+# calls `memory.grow` for every heap request and never reuses space it did not itself request, so
+# a 2 GB model guarantees growth. Pinning `maximum = initial` to forbid growth does not help — it
+# makes the FIRST allocation fail and the module abort with `unreachable` (verified in Node).
+#
+# Threads therefore cannot ship to iOS at any size, and threads require a shared imported memory,
+# which a module either has or does not at link time. Hence: two builds, chosen at runtime. The
+# earlier note here argued one build was enough because the team arms dynamically — that was wrong,
+# because the memory's sharedness is fixed at link time, not at arm time.
+#
+# Cost is one extra ~3 MB artifact that most visitors never fetch, against a phone that works.
+echo "building the serial (unshared-memory) variant for iOS"
+RUSTFLAGS="-C target-feature=+simd128 \
+  -C link-arg=--max-memory=4294967296" \
+  cargo build -p ftts-wasm --target wasm32-unknown-unknown --release
+
+wasm-bindgen "$TARGET_DIR/wasm32-unknown-unknown/release/ftts_wasm.wasm" \
+  --out-dir site/pkg-serial --typescript --target web
+rm -f site/pkg-serial/.gitignore
+
 # wasm-pack writes a .gitignore that would hide the artifacts from Pages' upload.
 rm -f site/pkg/.gitignore
 
@@ -59,13 +88,14 @@ rm -f site/pkg/.gitignore
 # strips the load/store churn that shows up between accumulator streams. Optional by design —
 # a missing wasm-opt should cost speed, not the build. --enable-threads must be passed or wasm-opt
 # rejects the atomics the module now contains.
-WASM="site/pkg/ftts_wasm_bg.wasm"
 if command -v wasm-opt >/dev/null 2>&1; then
-  before=$(wc -c < "$WASM")
-  wasm-opt -O4 --enable-simd --enable-threads --enable-bulk-memory --enable-mutable-globals \
-    "$WASM" -o "$WASM.opt" && mv "$WASM.opt" "$WASM"
-  after=$(wc -c < "$WASM")
-  echo "wasm-opt -O4: $before -> $after bytes"
+  for WASM in site/pkg/ftts_wasm_bg.wasm site/pkg-serial/ftts_wasm_bg.wasm; do
+    before=$(wc -c < "$WASM")
+    wasm-opt -O4 --enable-simd --enable-threads --enable-bulk-memory --enable-mutable-globals \
+      "$WASM" -o "$WASM.opt" && mv "$WASM.opt" "$WASM"
+    after=$(wc -c < "$WASM")
+    echo "wasm-opt -O4 $WASM: $before -> $after bytes"
+  done
 else
   echo "WARNING: wasm-opt not found (brew install binaryen) — shipping wasm-pack's output as-is"
 fi

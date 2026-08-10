@@ -2,7 +2,35 @@
 // at wasm speed, and none of that may block the UI thread. Protocol: postMessage
 // {type, ...}; replies mirror the request type with `ok` or `error`.
 
-import init, {
+/// Whether this engine may use the THREADED build, whose memory is shared and imported.
+///
+/// Threads are opt-IN rather than opt-out, and the default is the safe one, because getting this
+/// wrong does not merely slow the page down — it kills the tab.
+///
+/// Measured on an iPhone 17 Pro Max: growing a SHARED wasm memory past ~1 GB reclaims the tab,
+/// while growing an UNSHARED one to 2.75 GB is fine and flat allocations of either kind are fine
+/// to 3.5 GB. Rust's allocator grows linear memory on every heap request, so a 2 GB model
+/// guarantees growth, so a shared memory guarantees the crash on that device.
+///
+/// This cannot be feature-detected: the only test IS the crash. So it is a capability allow-list —
+/// browsers known to grow shared memory safely get threads, everything else gets the serial build
+/// and still works. Since the team only covers the ~8% of frame time that is talker+microdecoder
+/// (the codec is 92% and single-threaded), the cost of guessing "serial" wrongly is small, and the
+/// cost of guessing "threaded" wrongly is a dead page.
+function threadsAreSafeHere() {
+  if (typeof SharedArrayBuffer === "undefined" || !self.crossOriginIsolated) return false;
+  const ua = navigator.userAgent;
+  // Every iOS browser is WebKit underneath, so Chrome/Firefox on iOS inherit the same behavior.
+  const isApple = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  const isSafari = /Safari/.test(ua) && !/Chrome|Chromium|Edg\//.test(ua);
+  return !isApple && !isSafari;
+}
+
+const THREADED = threadsAreSafeHere();
+const PKG = THREADED ? "./pkg/ftts_wasm.js?v=@SITEV@" : "./pkg-serial/ftts_wasm.js?v=@SITEV@";
+
+const {
+  default: init,
   WasmEngine,
   ModelStaging,
   presets,
@@ -11,7 +39,7 @@ import init, {
   arm_worker_team,
   worker_team_width,
   int8_route,
-} from "./pkg/ftts_wasm.js?v=@SITEV@";
+} = await import(PKG);
 
 // Slice size for streaming OPFS into wasm. Big enough that per-call overhead is noise, small
 // enough that the JS heap never holds a meaningful fraction of the model.
@@ -19,22 +47,49 @@ const INGEST_SLICE = 16 * 1024 * 1024;
 
 let engine = null;
 
-/// A shared memory, or null when this browser cannot give us one.
+/// A shared memory for the threaded build, or null when this engine runs the serial one.
 ///
-/// Threads are all-or-nothing here and the fallback is silent by design: iOS Safari, any page
-/// served without COOP/COEP, and any engine without `SharedArrayBuffer` land on the serial path
-/// from the same bytes rather than failing to start. The module is built with atomics either way —
-/// unshared memory runs it fine as long as nothing ever parks on the team.
+/// # Two things that were tried here and do NOT work
+///
+/// **Pre-reserving the whole model up front** (`initial` = 2.75 GB) so growth never happens: Rust's
+/// `dlmalloc` calls `memory.grow` for every heap request and never reuses space it did not itself
+/// request, so the pre-reserved region below the heap is simply skipped and it grows on top anyway.
+///
+/// **Pinning `maximum = initial`** to forbid growth outright: the first allocation then fails,
+/// `dlmalloc` returns null, and the module aborts with `unreachable` — verified in Node, not
+/// theorized. That briefly shipped, and it made the crash worse rather than better.
+///
+/// So growth is unavoidable, and growth of a SHARED memory is what kills iOS. The fix is not here;
+/// it is [`threadsAreSafeHere`], which routes those devices to the unshared serial build entirely.
+/// This function only ever runs when threads are already known to be safe.
 function createSharedMemory() {
-  if (typeof SharedArrayBuffer === "undefined" || !self.crossOriginIsolated) return null;
+  if (!THREADED) return null;
   try {
-    // 4 GB ceiling matches --max-memory in the build; the initial is deliberately small because
-    // the artifact is streamed in later and growth is cheap where it is supported at all.
+    // The maximum matches --max-memory in the build. Growth within it is the normal path.
     return new WebAssembly.Memory({ initial: 512, maximum: 65536, shared: true });
   } catch {
     return null;
   }
 }
+
+/// Announces the stage about to be entered, for crash forensics on the page side.
+///
+/// Posted BEFORE the work starts, never after: the entire point is that this survives a stage
+/// that does not.
+function stage(name, detail) {
+  self.postMessage({ type: "stage", stage: name, detail });
+}
+
+/// Bytes of wasm linear memory currently committed, for stage telemetry.
+function memoryBytes() {
+  try {
+    return wasmMemory?.buffer.byteLength ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+let wasmMemory = null;
 
 /// Spawns the kernel Workers and arms the team with however many actually parked.
 ///
@@ -90,9 +145,14 @@ self.onmessage = async ({ data }) => {
         // Compile once and keep the module: kernel Workers must instantiate THE SAME module
         // against THE SAME memory, or they get their own linear memory and the team's shared
         // control block means nothing to them.
+        stage("compile-module");
         const module = await WebAssembly.compileStreaming(fetch(wasmUrl));
+        stage("create-memory", THREADED ? "shared/threaded" : "unshared/serial");
         const memory = createSharedMemory();
+        wasmMemory = memory;
+        stage("instantiate");
         const exports = await init({ module_or_path: module, memory: memory ?? undefined });
+        wasmMemory = exports?.memory ?? memory;
         // Arm ONLY if the memory the module actually instantiated against is shared. A build whose
         // memory is defined-and-exported rather than shared-and-imported silently ignores the
         // memory passed above, and every Worker would then get its own linear memory — the team's
@@ -126,6 +186,7 @@ self.onmessage = async ({ data }) => {
         // the reason the page died the moment it reported "hydrating". Draining the codec's source
         // bytes first drops the high-water mark to ~2.67 GB with nothing read twice. See the
         // ModelStaging docs in crates/ftts-wasm/src/lib.rs for the arithmetic.
+        stage("staging-new", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
         const staging = new ModelStaging(data.codec.bytes);
         const drain = async (meta, push) => {
           const blob = await (await root.getFileHandle(meta.asset)).getFile();
@@ -137,12 +198,17 @@ self.onmessage = async ({ data }) => {
           }
         };
 
+        stage("stream-codec", `${(data.codec.bytes / 1e9).toFixed(2)} GB`);
         await drain(data.codec, (chunk) => staging.push_codec(chunk));
+        stage("widen-codec", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
         staging.finish_codec();
 
+        stage("reserve-artifact", `${(data.fttsq.bytes / 1e9).toFixed(2)} GB`);
         staging.reserve_fttsq(data.fttsq.bytes);
+        stage("stream-artifact");
         await drain(data.fttsq, (chunk) => staging.push_fttsq(chunk));
 
+        stage("hydrate-talker", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
         engine = WasmEngine.from_staging(
           staging,
           data.vocab,
