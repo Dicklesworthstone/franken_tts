@@ -42,8 +42,9 @@
 #   macOS aarch64 (M-series) franken_tts-X.Y.Z-darwin_arm64.tar.gz
 #   Windows x64              franken_tts-X.Y.Z-windows_amd64.zip
 #
-# A combined SHA256SUMS manifest plus per-asset <archive>.sha256 sidecars
-# ship alongside every release and are used to verify each download.
+# A combined SHA256SUMS (or SHA256SUMS.txt) manifest plus per-asset
+# <archive>.sha256 sidecars ship alongside every release and are used to verify
+# each download. Some releases publish SHA256SUMS.txt instead of SHA256SUMS.
 #
 # Windows users: this bash installer covers linux + darwin (and WSL). On
 # native Windows, download the windows_amd64.zip from the releases page and
@@ -65,6 +66,9 @@ REPO="${REPO:-franken_tts}"
 BINARY_NAME="franken_tts"
 ALIAS_NAME="ftts"
 CHECKSUMS_ASSET="SHA256SUMS"
+# Fallback basename used when release tooling publishes SHA256SUMS.txt
+# (observed on v0.1.5) instead of the canonical SHA256SUMS name.
+CHECKSUMS_ASSET_FALLBACK="SHA256SUMS.txt"
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
 DEST_EXPLICIT=0
@@ -849,13 +853,26 @@ validate_archive_members() {
         members=$(unzip -Z1 "$archive") || return 1
     else
         members=$(tar -tzf "$archive") || return 1
-        if tar -tvzf "$archive" | awk '{print substr($1, 1, 1)}' | grep -qv '^-'; then
+        # Ignore AppleDouble / __MACOSX paths when classifying entry types.
+        if tar -tvzf "$archive" | awk '{
+            name=$NF
+            sub(/^\.\//, "", name)
+            if (name ~ /^\._/ || name == "__MACOSX" || name ~ /^__MACOSX\//) next
+            if (substr($1, 1, 1) != "-") { bad=1; exit }
+        } END { exit bad ? 0 : 1 }'; then
             log_error "Archive contains a non-regular entry"
             return 1
         fi
     fi
     while IFS= read -r member; do
+        [ -n "$member" ] || continue
         normalized="${member#./}"
+        # macOS packagers often embed AppleDouble / resource-fork junk
+        # (._* and __MACOSX/**). Ignore those so linux installs still work
+        # when a release tarball was built on Darwin without COPYFILE_DISABLE.
+        case "$normalized" in
+            ._*|__MACOSX|__MACOSX/*) continue ;;
+        esac
         case "$normalized" in
             "$BINARY_NAME") binary_count=$((binary_count + 1)) ;;
             "$ALIAS_NAME") alias_count=$((alias_count + 1)) ;;
@@ -863,7 +880,7 @@ validate_archive_members() {
             "LICENSE") license_count=$((license_count + 1)) ;;
             "CHANGELOG.md") changelog_count=$((changelog_count + 1)) ;;
             *)
-                log_error "Archive contains an unexpected member"
+                log_error "Archive contains an unexpected member: $normalized"
                 return 1
                 ;;
         esac
@@ -893,7 +910,9 @@ extract_and_install() {
         unzip -o "$archive" -d "$TMP/extract" >/dev/null 2>&1 || return 1
     else
         mkdir -p "$TMP/extract"
-        tar -xzf "$archive" -C "$TMP/extract" 2>/dev/null || return 1
+        # Exclude AppleDouble / __MACOSX junk if present in the archive.
+        tar --exclude='._*' --exclude='__MACOSX' --exclude='__MACOSX/*' \
+            -xzf "$archive" -C "$TMP/extract" 2>/dev/null || return 1
     fi
 
     local bin="$TMP/extract/$BINARY_NAME"
@@ -1069,8 +1088,19 @@ download_release() {
         if [ -n "$CHECKSUM" ]; then
             expected="${CHECKSUM%% *}"
         else
+            local manifest_file=""
             local checksums_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${CHECKSUMS_ASSET}"
             if download_file "$checksums_url" "$TMP/$CHECKSUMS_ASSET"; then
+                manifest_file="$TMP/$CHECKSUMS_ASSET"
+            else
+                # Some releases publish SHA256SUMS.txt instead of SHA256SUMS.
+                local fallback_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${CHECKSUMS_ASSET_FALLBACK}"
+                log_step "Combined manifest ${CHECKSUMS_ASSET} unavailable; trying ${CHECKSUMS_ASSET_FALLBACK}..."
+                if download_file "$fallback_url" "$TMP/$CHECKSUMS_ASSET_FALLBACK"; then
+                    manifest_file="$TMP/$CHECKSUMS_ASSET_FALLBACK"
+                fi
+            fi
+            if [ -n "$manifest_file" ]; then
                 # Match a line whose filename field equals the exact asset name
                 # (tolerating the `*name` binary-mode marker) so an unrelated
                 # entry can never shadow the real checksum. `|| true` keeps a
@@ -1078,7 +1108,7 @@ download_release() {
                 # we fall through to the sidecar, then the honest error.
                 expected=$(awk -v name="$archive_name" \
                     '$2 == name || $2 == "*" name { print $1; exit }' \
-                    "$TMP/$CHECKSUMS_ASSET" 2>/dev/null || true)
+                    "$manifest_file" 2>/dev/null || true)
             fi
             if [ -z "$expected" ]; then
                 local sidecar_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}.sha256"
@@ -1110,7 +1140,7 @@ download_release() {
                 log_success "Checksum verified: ${actual:0:16}..."
             fi
         else
-            log_error "Checksum not available for $archive_name (not in $CHECKSUMS_ASSET and no ${archive_name}.sha256 sidecar)"
+            log_error "Checksum not available for $archive_name (not in $CHECKSUMS_ASSET or $CHECKSUMS_ASSET_FALLBACK and no ${archive_name}.sha256 sidecar)"
             return 1
         fi
     fi
