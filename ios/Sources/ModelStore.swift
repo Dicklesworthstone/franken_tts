@@ -15,9 +15,10 @@ struct ModelFile {
     let relativePath: String
     let bytes: Int64
     let sha256: String
-    /// Optional assets download alongside the rest but never gate readiness: synthesis
-    /// works without the denoiser, and holding it hostage would brick existing installs
-    /// until an incremental fetch.
+    /// Every current file is required — the denoiser included, because enrollment
+    /// refuses to run without it. The flag stays for any future asset that is
+    /// genuinely decorative; migration for small late-added files is handled by the
+    /// silent completion in `ModelStore.init`.
     var required = true
 }
 
@@ -45,14 +46,15 @@ enum ModelManifest {
         ModelFile(
             asset: "tokenizer_config.json", relativePath: "tokenizer_config.json", bytes: 7344,
             sha256: "dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670"),
-        // The FastEnhancer denoiser. Its presence is what switches enrollment cleanup to
-        // the neural route, matching `ftts pull` + `ftts enroll` on the desktop.
+        // The FastEnhancer denoiser. REQUIRED: enrollment refuses to run without it,
+        // because a profile built from un-denoised audio carries the recording's noise
+        // into every synthesis. Existing installs that predate this file get it
+        // auto-completed silently at launch (it is under a megabyte).
         ModelFile(
             asset: "fastenhancer-s-48k-denoise.safetensors",
             relativePath: "denoise/fastenhancer-s-48k.safetensors",
             bytes: 838_440,
-            sha256: "28c1807fd9113e4ca09d3aacb2ecb07a742917321bfaced8b92598daffbd098b",
-            required: false),
+            sha256: "28c1807fd9113e4ca09d3aacb2ecb07a742917321bfaced8b92598daffbd098b"),
     ]
 
     static let totalBytes = files.reduce(Int64(0)) { $0 + $1.bytes }
@@ -87,7 +89,48 @@ final class ModelStore {
         // artifact re-verifies its own digests at engine load. A full re-hash of 2 GB on
         // every app start would cost tens of seconds for corruption this storage does
         // not produce in practice.
-        if isComplete { phase = .ready }
+        if isComplete {
+            phase = .ready
+        } else if missingFiles().allSatisfy({ $0.bytes < 5_000_000 }), cachedBytes > 0 {
+            // An install from before a small file (the denoiser) joined the manifest:
+            // everything big is here, so completing the sub-megabyte remainder needs
+            // no fresh consent — the user consented to this model. The phone stays
+            // usable meanwhile; enrollment checks the engine directly before running.
+            phase = .ready
+            fetchSmallMissingFiles()
+        }
+    }
+
+    private func missingFiles() -> [ModelFile] {
+        ModelManifest.files.filter { file in
+            let path = modelDirectory.appendingPathComponent(file.relativePath).path
+            let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? nil
+            return size != file.bytes
+        }
+    }
+
+    private func fetchSmallMissingFiles() {
+        Task { [weak self] in
+            guard let self else { return }
+            for file in self.missingFiles() {
+                do {
+                    let data = try await URLSession.shared.data(
+                        from: URL(string: ModelManifest.releaseBase + file.asset)!).0
+                    let digest = SHA256.hash(data: data)
+                        .map { String(format: "%02x", $0) }.joined()
+                    guard digest == file.sha256 else { continue }
+                    let destination = self.modelDirectory
+                        .appendingPathComponent(file.relativePath)
+                    try FileManager.default.createDirectory(
+                        at: destination.deletingLastPathComponent(),
+                        withIntermediateDirectories: true)
+                    try data.write(to: destination, options: .atomic)
+                    self.refreshCachedBytes()
+                } catch {
+                    // Transient network failure; the next launch retries.
+                }
+            }
+        }
     }
 
     var isComplete: Bool {

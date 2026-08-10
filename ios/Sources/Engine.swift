@@ -76,6 +76,26 @@ actor Engine {
         return Array(UnsafeBufferPointer(start: pcm, count: length))
     }
 
+    /// Whether the neural denoiser artifact is in the model directory — asked of the
+    /// engine itself, the same check its enrollment pipeline makes.
+    var denoiseAvailable: Bool {
+        guard let handle else { return false }
+        return ftts_denoise_available(handle) == 1
+    }
+
+    /// Runs the neural denoiser over mono 24 kHz PCM. Throws when unavailable or on
+    /// failure; callers keep their original audio in that case.
+    func denoise(pcm samples: [Float]) throws -> [Float] {
+        guard let handle else { throw EngineError.native("engine not loaded") }
+        var cleaned: UnsafeMutablePointer<Float>?
+        let code = samples.withUnsafeBufferPointer { buffer in
+            ftts_denoise(handle, buffer.baseAddress, buffer.count, &cleaned)
+        }
+        guard code == 0, let cleaned else { throw EngineError.lastFromNative() }
+        defer { ftts_pcm_free(cleaned, samples.count) }
+        return Array(UnsafeBufferPointer(start: cleaned, count: samples.count))
+    }
+
     func enroll(pcm samples: [Float]) throws -> [Float] {
         guard let handle else { throw EngineError.native("engine not loaded") }
         var out = [Float](repeating: 0, count: Self.speakerWidth)

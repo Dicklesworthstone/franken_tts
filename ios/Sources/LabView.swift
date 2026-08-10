@@ -27,6 +27,7 @@ final class LabModel {
     var seed: UInt64 = 0
 
     var isSynthesizing = false
+    var isLoadingModel = false
     var synthesisSeconds = 0.0
     var lastError: String?
     var lastAudio: [Float]?
@@ -40,6 +41,16 @@ final class LabModel {
     var videoProgress = 0.0
     /// Bumped per synthesis so a slow export cannot stamp its output onto a newer clip.
     private var synthesisGeneration = 0
+
+    /// Estimated synthesis progress. Expected speech duration comes from the text
+    /// length (spoken English runs ~14 chars/s), expected wall time from the last
+    /// measured real-time factor on THIS phone; capped so it never claims done early.
+    var synthesisProgress: Double {
+        let speechSeconds = max(Double(text.count) / 14.0, 1.5)
+        let factor = UserDefaults.standard.double(forKey: "measuredRealTimeFactor")
+        let expectedWall = speechSeconds / max(factor > 0 ? factor : 0.3, 0.05)
+        return min(synthesisSeconds / expectedWall, 0.97)
+    }
 
     var lowMemoryDevice: Bool {
         ProcessInfo.processInfo.physicalMemory < 6 * 1024 * 1024 * 1024
@@ -84,13 +95,24 @@ final class LabModel {
             do {
                 let speaker = try speakerVector()
                 if await !engine.isLoaded {
+                    isLoadingModel = true
                     try await engine.load(modelDirectory: store.modelDirectory)
                 }
+                isLoadingModel = false
+                synthesisSeconds = 0
                 let started = Date()
-                let pcm = try await engine.synthesize(text: text, speaker: speaker, seed: seed)
+                var pcm = try await engine.synthesize(text: text, speaker: speaker, seed: seed)
                 let elapsed = Date().timeIntervalSince(started)
+                let factor = (Double(pcm.count) / Double(WavWriter.sampleRate)) / elapsed
+                lastRealTimeFactor = factor
+                UserDefaults.standard.set(factor, forKey: "measuredRealTimeFactor")
+                // The same neural denoiser enrollment uses, run over the OUTPUT: it
+                // strips residual hiss (especially audible with cloned voices) and a
+                // failure just keeps the original audio.
+                if await engine.denoiseAvailable {
+                    pcm = (try? await engine.denoise(pcm: pcm)) ?? pcm
+                }
                 lastAudio = pcm
-                lastRealTimeFactor = (Double(pcm.count) / Double(WavWriter.sampleRate)) / elapsed
                 try startPlayback(of: pcm)
             } catch {
                 lastError = error.localizedDescription
@@ -172,6 +194,13 @@ final class LabModel {
                 }
                 if await !engine.isLoaded {
                     try await engine.load(modelDirectory: store.modelDirectory)
+                }
+                // The denoiser is not optional: a profile built from un-denoised audio
+                // carries the recording's noise into every synthesis. Its absence
+                // means the model download is incomplete — refuse and say so.
+                guard await engine.denoiseAvailable else {
+                    throw EngineError.native(
+                        "the noise-removal file is missing; it downloads automatically — check the connection, relaunch, and try again")
                 }
                 let vector = try await engine.enroll(pcm: pcm)
                 let selected: UUID
@@ -566,11 +595,17 @@ struct LabView: View {
                 .buttonStyle(PrimaryButtonStyle())
                 .disabled(model.isSynthesizing || model.store.phase != .ready)
                 if model.isSynthesizing {
-                    Text(
-                        "\(Int(model.synthesisSeconds))s elapsed · first run also loads the model; no percentage is shown because none would be honest"
-                    )
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(Lab.textSecondary)
+                    if model.isLoadingModel {
+                        Text("waking the model…")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(Lab.textSecondary)
+                    } else {
+                        ProgressView(value: model.synthesisProgress)
+                            .tint(Lab.emerald)
+                        Text("\(Int(model.synthesisProgress * 100))%")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(Lab.textSecondary)
+                    }
                 }
                 if let audio = model.lastAudio {
                     WaveformView(samples: audio)
@@ -624,9 +659,11 @@ struct LabView: View {
                         }
                         Spacer()
                         if let factor = model.lastRealTimeFactor {
-                            Text(String(format: "%.2f× real time", factor))
+                            Text(String(format: "%.2f× real time on this phone", factor))
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundStyle(Lab.textSecondary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.7)
                         }
                     }
                 }
@@ -856,7 +893,7 @@ struct EnrollmentSheet: View {
             VStack(alignment: .leading, spacing: 16) {
                 LabLabel(text: "Clone your voice")
                 Text(
-                    "Read this aloud. The first few sentences are enough for a good clone; the whole script polishes it slightly."
+                    "Read this aloud. The first few sentences are enough for a good clone; the whole script polishes it slightly. Background noise is removed automatically before your voice is learned."
                 )
                 .font(.system(size: 14))
                 .foregroundStyle(Lab.textSecondary)
