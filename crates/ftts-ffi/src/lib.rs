@@ -31,9 +31,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::OnceLock;
 
-use ftts_cli::synth::{LoadedModel, ModelBundle, synthesize};
+use ftts_cli::synth::{
+    DENOISE_ARTIFACT_RELPATH, LoadedModel, ModelBundle, ReferenceCleanup,
+    speaker_from_reference_pcm, synthesize,
+};
 use ftts_core::{CancellationToken, SynthesisRequest, TtsEngine};
-use ftts_model_qwen::speaker::{Encoder as SpeakerEncoder, log_mel_from_24khz_pcm};
 
 /// Floats in a speaker x-vector; the fixed width of every `.spk` file and enroll output.
 pub const SPEAKER_WIDTH: usize = 1024;
@@ -93,7 +95,6 @@ pub struct FttsEngine {
     loaded: LoadedModel,
     engine: TtsEngine,
     bundle: ModelBundle,
-    speaker_encoder: Option<SpeakerEncoder>,
 }
 
 /// Runs a body, converting any panic into an error return value.
@@ -216,7 +217,6 @@ pub unsafe extern "C" fn ftts_engine_open(model_dir: *const c_char) -> *mut Ftts
             loaded,
             engine,
             bundle,
-            speaker_encoder: None,
         }))
     })
 }
@@ -353,34 +353,25 @@ pub unsafe extern "C" fn ftts_enroll(
         // floats; out has room for SPEAKER_WIDTH floats — all per the header contract.
         #[allow(unsafe_code)]
         let (engine, pcm) = unsafe { (&mut *engine, std::slice::from_raw_parts(pcm, len)) };
-        if engine.speaker_encoder.is_none() {
-            let artifact = engine
-                .bundle
-                .canonical_main
-                .as_deref()
-                .unwrap_or(&engine.bundle.main);
-            match SpeakerEncoder::load_fttsq(artifact) {
-                Ok(encoder) => engine.speaker_encoder = Some(encoder),
-                Err(error) => {
-                    set_error(format!("speaker encoder hydration failed: {error}"));
-                    return 1;
-                }
-            }
-        }
-        let mel = match log_mel_from_24khz_pcm(pcm) {
-            Ok(mel) => mel,
+        // Exactly the CLI's enrollment pipeline, cleanup included. Denoising engages
+        // automatically when the FastEnhancer weights are in the model directory - the
+        // same default `ftts enroll` applies - and inside the pipeline the neural route
+        // is preferred with spectral subtraction as its fallback.
+        let mut denoise_report = None;
+        let denoise_available = engine.bundle.root.join(DENOISE_ARTIFACT_RELPATH).is_file();
+        let cleanup = ReferenceCleanup {
+            denoise: denoise_available.then_some(&mut denoise_report),
+            dereverb: None,
+        };
+        let vector = match speaker_from_reference_pcm(&engine.bundle, pcm.to_vec(), cleanup) {
+            Ok(vector) => vector,
             Err(error) => {
-                set_error(format!("cannot extract speaker features: {error}"));
+                set_error(error.to_string());
                 return 1;
             }
         };
-        let encoder = engine
-            .speaker_encoder
-            .as_ref()
-            .expect("hydrated just above");
-        let vector = encoder.encode(&mel.values, mel.frames);
-        if vector.len() != SPEAKER_WIDTH || vector.iter().any(|value| !value.is_finite()) {
-            set_error("speaker encoder produced an invalid x-vector");
+        if vector.len() != SPEAKER_WIDTH {
+            set_error("speaker encoder produced an unexpected vector width");
             return 1;
         }
         // SAFETY: out is non-null and the header requires SPEAKER_WIDTH floats of room.

@@ -68,6 +68,17 @@ The built-ins are ordinary enrolled x-vectors, each approved by listening before
 
 The output format follows the extension. `.wav` comes straight from the built-in pure-Rust encoder; `.m4a`, `.mp3`, and `.flac` are converted from that WAV by whichever system encoder is present (`afconvert` on macOS, `ffmpeg`, `lame`, `flac`), and if none is found you get an error naming the tools rather than a silently different format. Generation stops at the model's EOS, with a text-proportional frame cap as a backstop; set `FTTS_MAX_FRAMES` only when you want an exact cap. `--model`, `--voice`, and `-o` remain available for explicit control.
 
+### Share videos: `ftts make-video`
+
+One command turns a sentence into a share-ready 1080p video — the FrankenTTS artwork with a slow Ken Burns drift, a live waveform of the speech, and the voice's name on a pill:
+
+```bash
+ftts make-video "FrankenTTS renders its own share videos now." demo.mp4 --voice aria
+ftts make-video --audio existing.wav --label "My Voice" clip.mp4   # render audio you already have
+```
+
+Every frame is drawn by memory-safe Rust inside the binary — the embedded illustration (QOI), the waveform, and the text (IBM Plex via `fmd-font`, rasterized in-process). Only the final H.264+AAC encode uses a system encoder, under the same contract as `.m4a` output: `.mp4` needs `ffmpeg`, while a `.y4m` output path renders natively with a `.wav` beside it and needs no encoder at all. Custom voices work exactly as in `say`, so a clip of your own cloned voice carries the project's look when you share it.
+
 ### Warm starts: the resident engine
 
 The first `ftts say` of a session pays the model load; when it finishes, the loaded model stays behind in a small helper process, and the next `say` starts synthesizing at once instead of spending seconds reloading weights. The helper is spawned from the same binary, listens only on a loopback port recorded in a file that only your user can read, keeps no record of what it spoke, and exits on its own after ten minutes without a request (`FTTS_RESIDENT_IDLE_SECS` adjusts the window). Output is byte-identical with and without it, which the e2e suite asserts; a re-pulled model or an upgraded binary retires the old helper automatically. Opt out per run with `--no-resident`, or globally with `FTTS_NO_RESIDENT=1`.
@@ -180,7 +191,7 @@ Weights are not bundled with the binary; `ftts pull` fetches this project's pre-
 
 ### The enrollment passage
 
-Any natural speech works, but a phonetically rich passage measurably beats casual filler; this is to voices what "the quick brown fox" is to fonts. The script below is the Speech Accent Archive's **"Please call Stella"** elicitation paragraph, which packs most English phonemes and the discriminative consonant clusters into four sentences, followed by the opening of the **Rainbow Passage** for connected, flowing prosody. The speaker encoder pools over the whole recording with no truncation, but the voice information it extracts saturates well before a minute, so about thirty seconds of reading is all it needs:
+Any natural speech works, but a phonetically rich passage measurably beats casual filler; this is to voices what "the quick brown fox" is to fonts. The script below is the Speech Accent Archive's **"Please call Stella"** elicitation paragraph, which packs most English phonemes and the discriminative consonant clusters into four sentences, followed by the opening of the **Rainbow Passage** for connected, flowing prosody. The speaker encoder pools over the whole recording with no truncation, but the voice information it extracts saturates well before a minute, so the first few sentences already make a good clone and about thirty seconds of reading is the polished version:
 
 > Please call Stella. Ask her to bring these things with her from the store: six spoons of fresh snow peas, five thick slabs of blue cheese, and maybe a snack for her brother Bob. We also need a small plastic snake and a big toy frog for the kids. She can scoop these things into three red bags, and we will go meet her Wednesday at the train station.
 >

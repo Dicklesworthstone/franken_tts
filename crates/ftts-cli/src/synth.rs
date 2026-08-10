@@ -312,6 +312,24 @@ pub fn speaker_from_voice(
         return decode_speaker_vector(path, &bytes);
     }
     let pcm = decode_reference_audio_any(path)?;
+    speaker_from_reference_pcm(bundle, pcm, cleanup)
+}
+
+/// Derive a speaker vector from already-decoded mono 24 kHz reference PCM.
+///
+/// The PCM-level half of [`speaker_from_voice`], split out so hosts that capture audio
+/// themselves (the iOS app through `ftts-ffi`) run exactly the enrollment pipeline the
+/// CLI runs — same cleanup stages, same encoder, same finiteness refusal — instead of a
+/// parallel one that quietly skips the denoiser.
+///
+/// # Errors
+///
+/// When feature extraction or encoding fails, or the encoder yields a non-finite vector.
+pub fn speaker_from_reference_pcm(
+    bundle: &ModelBundle,
+    pcm: Vec<f32>,
+    cleanup: ReferenceCleanup<'_>,
+) -> Result<Vec<f32>, FttsError> {
     let ReferenceCleanup { denoise, dereverb } = cleanup;
     let pcm = match dereverb {
         Some(report) => {

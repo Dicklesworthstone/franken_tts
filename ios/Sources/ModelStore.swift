@@ -41,6 +41,13 @@ enum ModelManifest {
         ModelFile(
             asset: "tokenizer_config.json", relativePath: "tokenizer_config.json", bytes: 7344,
             sha256: "dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670"),
+        // The FastEnhancer denoiser. Its presence is what switches enrollment cleanup to
+        // the neural route, matching `ftts pull` + `ftts enroll` on the desktop.
+        ModelFile(
+            asset: "fastenhancer-s-48k-denoise.safetensors",
+            relativePath: "denoise/fastenhancer-s-48k.safetensors",
+            bytes: 838_440,
+            sha256: "28c1807fd9113e4ca09d3aacb2ecb07a742917321bfaced8b92598daffbd098b"),
     ]
 
     static let totalBytes = files.reduce(Int64(0)) { $0 + $1.bytes }

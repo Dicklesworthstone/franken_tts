@@ -12,9 +12,14 @@ final class LabModel {
     let recorder = AudioRecorder()
     let presets = Engine.presets()
 
+    let library = VoiceLibrary()
+
+    /// A preset name, or "voice:<uuid>" for an enrolled voice.
     var selectedVoice: String = "matt"
-    var clonedName: String?
-    var clonedVector: [Float]?
+    /// When re-recording an existing voice, its id; nil enrolls a new one.
+    var enrollmentTarget: UUID?
+    /// Set when an enrollment just saved, so the sheet knows to dismiss.
+    var enrollmentSaved = false
 
     var text =
         "The rainbow is a division of white light into many beautiful colors. Now, spoken entirely on this phone."
@@ -33,8 +38,15 @@ final class LabModel {
     }
 
     func speakerVector() throws -> [Float] {
-        if selectedVoice == "__cloned__", let clonedVector { return clonedVector }
+        if let id = enrolledSelection(), let voice = library.voice(id: id) {
+            return voice.vector
+        }
         return try Engine.presetVector(named: selectedVoice)
+    }
+
+    func enrolledSelection() -> UUID? {
+        guard selectedVoice.hasPrefix("voice:") else { return nil }
+        return UUID(uuidString: String(selectedVoice.dropFirst("voice:".count)))
     }
 
     // The engine's load and synthesize are long BLOCKING calls made from an actor, which
@@ -87,22 +99,36 @@ final class LabModel {
 
     func finishEnrollment(named name: String) {
         let raw = recorder.stop()
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            lastError = "name the voice before saving it"
+            return
+        }
         isEnrolling = true
+        enrollmentSaved = false
         Task {
             defer { isEnrolling = false }
             do {
                 let pcm = try Self.conditioned(raw)
                 guard pcm.count >= 3 * Int(AudioRecorder.targetRate) else {
                     throw EngineError.native(
-                        "recording too short; read at least a few sentences of the script")
+                        "recording too short; a few sentences of the script is all it takes")
                 }
                 if await !engine.isLoaded {
                     try await engine.load(modelDirectory: store.modelDirectory)
                 }
                 let vector = try await engine.enroll(pcm: pcm)
-                clonedVector = vector
-                clonedName = name.isEmpty ? "my voice" : name
-                selectedVoice = "__cloned__"
+                let selected: UUID
+                if let target = enrollmentTarget {
+                    try library.replaceVector(id: target, with: vector)
+                    try library.rename(id: target, to: trimmedName)
+                    selected = target
+                } else {
+                    selected = try library.add(name: trimmedName, vector: vector).id
+                }
+                enrollmentTarget = nil
+                selectedVoice = "voice:\(selected.uuidString)"
+                enrollmentSaved = true
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
             } catch {
                 lastError = error.localizedDescription
@@ -142,6 +168,8 @@ struct LabView: View {
     @State private var model = LabModel()
     @State private var showConsent = false
     @State private var showEnrollment = false
+    @State private var renameTarget: EnrolledVoice?
+    @State private var renameText = ""
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -160,6 +188,26 @@ struct LabView: View {
         }
         .sheet(isPresented: $showEnrollment) {
             EnrollmentSheet(model: model)
+        }
+        .alert(
+            "Rename voice", isPresented: Binding(
+                get: { renameTarget != nil },
+                set: { if !$0 { renameTarget = nil } })
+        ) {
+            TextField("name", text: $renameText)
+            Button("Save") {
+                if let target = renameTarget {
+                    let trimmed = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        try? model.library.rename(id: target.id, to: trimmed)
+                    }
+                }
+                renameTarget = nil
+            }
+            Button("Cancel", role: .cancel) { renameTarget = nil }
+        }
+        .onChange(of: renameTarget) { _, target in
+            if let target { renameText = target.name }
         }
         .onReceive(
             NotificationCenter.default.publisher(
@@ -208,7 +256,9 @@ struct LabView: View {
                 switch model.store.phase {
                 case .idle:
                     Text(
-                        "First use downloads the quantized model (≈2.0 GB) into this app's private storage: verified against pinned digests, resumable, kept until you clear it."
+                        model.store.cachedBytes > 0
+                            ? "Part of the model is already here; completing the download fetches only what is missing and re-verifies the rest."
+                            : "First use downloads the quantized model (≈2.0 GB) into this app's private storage: verified against pinned digests, resumable, kept until you clear it."
                     )
                     .font(.system(size: 14))
                     .foregroundStyle(Lab.textSecondary)
@@ -219,7 +269,10 @@ struct LabView: View {
                         .font(.system(size: 13))
                         .foregroundStyle(Lab.danger)
                     }
-                    Button("Download the 2.0 GB model") { showConsent = true }
+                    Button(
+                        model.store.cachedBytes > 0
+                            ? "Complete the download" : "Download the 2.0 GB model"
+                    ) { showConsent = true }
                         .buttonStyle(PrimaryButtonStyle())
                         .confirmationDialog(
                             "Download 2.0 GB now? It stays on this device, resumes if interrupted, and Clear Model removes it.",
@@ -273,16 +326,31 @@ struct LabView: View {
                             selected: model.selectedVoice == preset.name
                         ) { model.selectedVoice = preset.name }
                     }
+                    ForEach(model.library.voices) { voice in
+                        EnrolledVoiceTile(
+                            voice: voice,
+                            selected: model.enrolledSelection() == voice.id,
+                            select: { model.selectedVoice = "voice:\(voice.id.uuidString)" },
+                            rename: { renameTarget = voice },
+                            reRecord: {
+                                model.enrollmentTarget = voice.id
+                                showEnrollment = true
+                            },
+                            delete: {
+                                model.library.delete(id: voice.id)
+                                if model.enrolledSelection() == voice.id {
+                                    model.selectedVoice = "matt"
+                                }
+                            })
+                    }
                     VoiceTile(
-                        name: model.clonedName ?? "your voice",
-                        character: model.clonedVector == nil
-                            ? "read a short script to clone it" : "locally cloned",
-                        selected: model.selectedVoice == "__cloned__",
+                        name: "+ new voice",
+                        character: "read a few sentences to clone one",
+                        selected: false,
                         accent: true
                     ) {
-                        if model.clonedVector != nil {
-                            model.selectedVoice = "__cloned__"
-                        } else if model.store.phase == .ready {
+                        if model.store.phase == .ready {
+                            model.enrollmentTarget = nil
                             showEnrollment = true
                         }
                     }
@@ -429,6 +497,62 @@ struct VoiceTile: View {
     }
 }
 
+/// An enrolled voice: selectable like a preset, with its management row.
+struct EnrolledVoiceTile: View {
+    let voice: EnrolledVoice
+    let selected: Bool
+    let select: () -> Void
+    let rename: () -> Void
+    let reRecord: () -> Void
+    let delete: () -> Void
+    @State private var confirmDelete = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button(action: select) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(voice.name)
+                        .font(.system(size: 15, weight: .black))
+                        .foregroundStyle(Lab.textPrimary)
+                        .lineLimit(1)
+                    Text("locally cloned")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Lab.textSecondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            HStack(spacing: 14) {
+                Button(action: rename) { Image(systemName: "pencil") }
+                    .accessibilityLabel("Rename \(voice.name)")
+                Button(action: reRecord) { Image(systemName: "arrow.clockwise") }
+                    .accessibilityLabel("Re-record \(voice.name)")
+                Spacer()
+                Button { confirmDelete = true } label: {
+                    Image(systemName: "trash")
+                }
+                .foregroundStyle(Lab.danger)
+                .accessibilityLabel("Delete \(voice.name)")
+                .confirmationDialog(
+                    "Delete \"\(voice.name)\"? This cannot be undone.",
+                    isPresented: $confirmDelete, titleVisibility: .visible
+                ) {
+                    Button("Delete", role: .destructive, action: delete)
+                    Button("Cancel", role: .cancel) {}
+                }
+            }
+            .font(.system(size: 13))
+            .foregroundStyle(Lab.textSecondary)
+        }
+        .padding(10)
+        .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(
+                    selected ? Lab.emerald : Lab.emerald.opacity(0.35),
+                    lineWidth: selected ? 1.5 : 1))
+    }
+}
+
 struct EnrollmentSheet: View {
     @Bindable var model: LabModel
     @Environment(\.dismiss) private var dismiss
@@ -450,9 +574,11 @@ struct EnrollmentSheet: View {
             Lab.background.ignoresSafeArea()
             VStack(alignment: .leading, spacing: 16) {
                 LabLabel(text: "Clone your voice")
-                Text("Read this aloud (about thirty seconds):")
-                    .font(.system(size: 14))
-                    .foregroundStyle(Lab.textSecondary)
+                Text(
+                    "Read this aloud. The first few sentences are enough for a good clone; the whole script polishes it slightly."
+                )
+                .font(.system(size: 14))
+                .foregroundStyle(Lab.textSecondary)
                 ScrollView {
                     Text(Self.script)
                         .font(.system(size: 15))
@@ -517,6 +643,10 @@ struct EnrollmentSheet: View {
                             }
                         }
                         .buttonStyle(PrimaryButtonStyle())
+                        // The name is the save key; requiring it up front beats losing a
+                        // recording to a validation error after the read.
+                        .disabled(
+                            cloneName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                     Spacer()
                     Button("Cancel") {
@@ -542,10 +672,18 @@ struct EnrollmentSheet: View {
         }
         .onChange(of: model.isEnrolling) { was, now in
             // Enrollment just finished; leave the sheet only on success.
-            if was, !now, model.clonedVector != nil {
+            if was, !now, model.enrollmentSaved {
                 dismiss()
             }
         }
-        .onAppear { model.lastError = nil }
+        .onAppear {
+            model.lastError = nil
+            model.enrollmentSaved = false
+            if let target = model.enrollmentTarget,
+                let voice = model.library.voice(id: target)
+            {
+                cloneName = voice.name
+            }
+        }
     }
 }
