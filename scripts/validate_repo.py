@@ -143,23 +143,29 @@ def check_workspace_lints(report: Report, workspace: dict) -> None:
 
 
 def check_crate_lint_inheritance(report: Report, manifests: dict[str, Path], root: Path) -> None:
-    """Every crate but the kernel crate inherits the workspace lints; the kernel crate must not.
+    """Every crate but the unsafe islands inherits the workspace lints; those must not.
 
-    A `forbid` cannot be lowered by `allow`, which is exactly why the kernel crate is a separate
-    crate that stays outside the inheritance. If it ever starts inheriting, the audited-unsafe
-    island design silently stops compiling; if any other crate stops inheriting, the memory-safety
-    story silently stops being enforced. Both directions are violations.
+    A `forbid` cannot be lowered by `allow`, which is exactly why the unsafe-bearing crates stay
+    outside the inheritance. If one ever starts inheriting, the audited-unsafe island design
+    silently stops compiling; if any other crate stops inheriting, the memory-safety story silently
+    stops being enforced. Both directions are violations.
+
+    `ftts-ffi` joined `ftts-kernels` here on 2026-08-10: a C ABI cannot exist under `forbid`, and
+    the crate already documented that in its own manifest (`unsafe_code = "deny"`, which still
+    refuses unsafe unless a site opts in explicitly). Checking `UNSAFE_CRATES` rather than the one
+    kernel crate keeps this rule and `unsafe-islands` reading from the same list, so they can never
+    disagree about which crates are islands.
     """
     report.checked.append("crate-lint-inheritance")
     for name, manifest in manifests.items():
         data = load_toml(manifest)
         inherits = data.get("lints", {}).get("workspace") is True
-        if name == KERNEL_CRATE:
+        if name in UNSAFE_CRATES:
             if inherits:
                 report.fail(
                     "crate-lint-inheritance",
                     rel(manifest, root),
-                    f"{KERNEL_CRATE} must NOT inherit workspace lints: a forbid cannot be "
+                    f"{name} must NOT inherit workspace lints: a forbid cannot be "
                     "lowered by allow, so inheriting it makes the audited unsafe islands "
                     "impossible to compile",
                 )
