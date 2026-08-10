@@ -737,12 +737,22 @@ impl FrameGenerator for QwenGenerator<'_> {
         // (frankentts-p7r; the reference reproduces it in that mismatched configuration).
         let sampler = &mut self.sampler;
         let sampling_mode = self.sampling_mode;
+        // A non-finite residual logit (corrupt checkpoint, numeric blowup) must surface as a
+        // `GenerationError` like every other failure in this function, not a panic. The selector
+        // signature is infallible, so the first failure is parked here and re-raised after the
+        // frame call returns; the fallback index 0 is never emitted because the error wins.
+        let mut sampler_failure: Option<crate::sampler::SamplerError> = None;
         let select = |logits: &[f32]| match sampling_mode {
             SamplingMode::CanonicalGreedy => microdecoder::argmax(logits),
-            SamplingMode::Production => sampler
-                .select_microdecoder(logits, SamplingMode::Production)
-                .expect("RESIDUAL_VOCAB rows are well-formed microdecoder logits")
-                as usize,
+            SamplingMode::Production => {
+                match sampler.select_microdecoder(logits, SamplingMode::Production) {
+                    Ok(code) => code as usize,
+                    Err(error) => {
+                        sampler_failure.get_or_insert(error);
+                        0
+                    }
+                }
+            }
         };
         let residuals = match self.int8.as_ref().filter(|route| !route.micro.is_empty()) {
             Some(route) => microdecoder::decode_frame_with_selector_q8(
@@ -769,6 +779,9 @@ impl FrameGenerator for QwenGenerator<'_> {
                 select,
             ),
         };
+        if let Some(error) = sampler_failure {
+            return Err(generation_error(error));
+        }
         let mut codes = Vec::with_capacity(CODE_GROUP_COUNT);
         codes.push(primary);
         codes.extend(residuals.iter().map(|&code| code as u32));
