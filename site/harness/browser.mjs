@@ -18,7 +18,7 @@
 // Every console message and page error is captured, so a silent failure in a Worker — invisible in
 // the page UI, which is how the last one escaped — shows up in the transcript.
 
-import { chromium } from "playwright";
+import { chromium, webkit } from "playwright";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "./serve.mjs";
@@ -26,6 +26,15 @@ import { serve } from "./serve.mjs";
 const siteDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const modelDir = path.join(process.env.HOME, ".cache/franken_tts/model");
 const HEADED = process.argv.includes("--headed");
+// `--webkit` runs the SAME assertions in Safari's engine family.
+//
+// This is the closest reachable proxy for iOS: mobile Safari cannot be driven programmatically
+// (Apple dropped iOS from safaridriver), but WebKit exercises the branch that matters — the
+// engine-worker's Safari detection routes to the UNSHARED serial build, whose growable memory is
+// the configuration the iPhone probe showed to be the safe one. A pass here does not prove the
+// phone works; it proves the serial path is not broken in the engine the phone runs.
+const ENGINE = process.argv.includes("--webkit") ? webkit : chromium;
+const ENGINE_NAME = process.argv.includes("--webkit") ? "webkit" : "chromium";
 const KEEP = process.argv.includes("--keep");
 
 const modelFiles = {
@@ -40,7 +49,8 @@ const { server, port, headers } = await serve({ siteDir, modelFiles });
 console.log(`serving ${siteDir} on :${port}`);
 console.log(`  COOP=${headers["Cross-Origin-Opener-Policy"]} COEP=${headers["Cross-Origin-Embedder-Policy"]}`);
 
-const browser = await chromium.launch({ headless: !HEADED });
+console.log(`browser engine: ${ENGINE_NAME}`);
+const browser = await ENGINE.launch({ headless: !HEADED });
 const page = await browser.newPage();
 
 const transcript = [];
