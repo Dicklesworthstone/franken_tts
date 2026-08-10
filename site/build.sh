@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # Builds the wasm package into site/pkg for local serving or Pages deploy.
 #
-# One build serves every browser. Threads are compiled IN unconditionally and armed at runtime
-# only where `SharedArrayBuffer` and a growable shared memory actually exist, so Chrome and
-# Firefox get the worker team while an iPhone falls back to the serial path from the same bytes.
-# Shipping two builds and choosing between them in JS would double the download of a 2 MB module
-# for no benefit the runtime check does not already give.
+# One build serves every browser, and it is a THREADED build: the memory is shared and imported,
+# so the module cannot be instantiated without `SharedArrayBuffer`. That is safe here because
+# site/_headers sets COOP/COEP site-wide, which is what makes `crossOriginIsolated` — and with it
+# SharedArrayBuffer — true for every visitor, iOS Safari included (supported since 15.2).
+#
+# The team is still ARMED at runtime rather than assumed: `startTeam` only sizes it after the
+# kernel Workers confirm they parked, so a browser that refuses to start Workers runs serially
+# from the same bytes instead of waiting on partitions that never report.
+#
+# LOCAL SERVING CAVEAT: `python3 -m http.server` sends no COOP/COEP, so `crossOriginIsolated` is
+# false and instantiation fails outright. Use a server that sets both headers when testing
+# locally; the deployed site is unaffected.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -21,22 +28,23 @@ cd "$(dirname "$0")/.."
 #                  why this needs nightly plus the rust-src component.
 # --export=...   : symbols wasm-bindgen's threading transform looks up by name.
 #
-# THREADS ARE COMPILED IN BUT NOT YET ARMED, and the runtime notices rather than hanging.
-# Adding `--shared-memory --import-memory` DOES produce the right memory — objdump confirms
-# `memory[0] ... shared <- env.memory` — but wasm-bindgen then fails with "failed to find
-# `__wasm_init_tls`": LLD emitted no TLS segment for it to initialize. That is the one remaining
-# step, and it is a toolchain question (force a `#[thread_local]` symbol so LLD emits the segment,
-# or adopt wasm-bindgen-rayon, which carries this plumbing), not an engine question — the Rust
-# team, the two-phase arm protocol, and the Worker pool are all written and compile.
-#
-# `startTeam` refuses to arm unless the INSTANTIATED memory is really a SharedArrayBuffer, so this
-# ships as a correct serial engine rather than a dispatcher waiting on partitions that never
-# existed.
+# THE TLS EXPORTS ARE THE WHOLE TRICK, and they cost a day to find. wasm-bindgen's threading
+# transform fails with "failed to find `__wasm_init_tls`", which reads like a missing TLS segment
+# and sends you off writing `#[thread_local]` anchors. It is not. `wasm-objdump` showed `.tdata`
+# present at 8,008 bytes the entire time — LLD had built the segment and simply had not EXPORTED
+# the symbols that describe it, and wasm-bindgen looks them up by name among the exports. Exporting
+# the set below fixes it outright; each one was discovered by the transform naming the next missing
+# symbol in turn (`__wasm_init_tls`, then `__tls_size`).
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 RUSTFLAGS="-C target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals \
+  -C link-arg=--shared-memory \
+  -C link-arg=--import-memory \
   -C link-arg=--max-memory=4294967296 \
   -C link-arg=--export=__heap_base \
-  -C link-arg=--export=__tls_base" \
+  -C link-arg=--export=__tls_base \
+  -C link-arg=--export=__tls_size \
+  -C link-arg=--export=__tls_align \
+  -C link-arg=--export=__wasm_init_tls" \
   cargo build -p ftts-wasm --target wasm32-unknown-unknown --release \
     -Z build-std=std,panic_abort
 
