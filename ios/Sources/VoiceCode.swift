@@ -86,6 +86,7 @@ enum VoiceCode {
 
     /// Encode name + vector into an RGB24 mosaic image (cardSize × cardSize).
     static func renderMosaicPixels(name: String, vector: [Float]) -> [UInt8] {
+        precondition(vector.count == 1024, "the mosaic carries exactly 1,024 floats")
         var plaintext = magic
         let nameBytes = Array(name.utf8.prefix(64))
         plaintext += [UInt8(nameBytes.count >> 8), UInt8(nameBytes.count & 0xFF)]
@@ -282,121 +283,121 @@ enum VoiceCode {
         /// One full fit + sample + error-correct pass with a fixed sample footprint.
         func attempt(footprint: Double) -> (String, [Float])? {
 
-        /// Matched box sample of one cell, anchored at the top-left finder so a scale
-        /// tweak grows outward from a fixed point.
-        func sample(
-            row: Double, column: Double,
-            scaleX: Double, scaleY: Double, dx: Double, dy: Double
-        ) -> Double {
-            let x = topLeft.x + (column - 3.0) * cellW * scaleX + dx
-            let y = topLeft.y + (row - 3.0) * cellH * scaleY + dy
-            guard footprint > 0 else { return bilinear(x, y) }
-            let rx = cellW * footprint
-            let ry = cellH * footprint
-            return (bilinear(x, y)
-                + bilinear(x - rx, y - ry) + bilinear(x + rx, y - ry)
-                + bilinear(x - rx, y + ry) + bilinear(x + rx, y + ry)) / 5
-        }
+            /// Matched box sample of one cell, anchored at the top-left finder so a scale
+            /// tweak grows outward from a fixed point.
+            func sample(
+                row: Double, column: Double,
+                scaleX: Double, scaleY: Double, dx: Double, dy: Double
+            ) -> Double {
+                let x = topLeft.x + (column - 3.0) * cellW * scaleX + dx
+                let y = topLeft.y + (row - 3.0) * cellH * scaleY + dy
+                guard footprint > 0 else { return bilinear(x, y) }
+                let rx = cellW * footprint
+                let ry = cellH * footprint
+                return (bilinear(x, y)
+                    + bilinear(x - rx, y - ry) + bilinear(x + rx, y - ry)
+                    + bilinear(x - rx, y + ry) + bilinear(x + rx, y + ry)) / 5
+            }
 
-        /// Fit one axis against its known calibration strip: search a small offset and
-        /// scale range. The score is separation between adjacent levels MINUS the
-        /// spread within each level — a misaligned grid still averages to clean means
-        /// (the strip repeats every four flat cells) but bleeds neighboring cells into
-        /// individual samples, and the variance term is what catches that.
-        func fitAxis(
-            horizontal: Bool
-        ) -> (score: Double, scale: Double, offset: Double, means: [Double])? {
-            var best: (score: Double, scale: Double, offset: Double, means: [Double])?
-            for scaleStep in -3...3 {
-                let scale = 1.0 + Double(scaleStep) * 0.0018
-                for offsetStep in -4...4 {
-                    let offset = Double(offsetStep) * (horizontal ? cellW : cellH) * 0.1
-                    var sums = [Double](repeating: 0, count: 4)
-                    var squares = [Double](repeating: 0, count: 4)
-                    var counts = [Double](repeating: 0, count: 4)
-                    if horizontal {
-                        for column in 0..<gridN {
-                            let value = sample(
-                                row: Double(calibrationRow), column: Double(column),
-                                scaleX: scale, scaleY: 1, dx: offset, dy: 0)
-                            sums[column % 4] += value
-                            squares[column % 4] += value * value
-                            counts[column % 4] += 1
+            /// Fit one axis against its known calibration strip: search a small offset and
+            /// scale range. The score is separation between adjacent levels MINUS the
+            /// spread within each level — a misaligned grid still averages to clean means
+            /// (the strip repeats every four flat cells) but bleeds neighboring cells into
+            /// individual samples, and the variance term is what catches that.
+            func fitAxis(
+                horizontal: Bool
+            ) -> (score: Double, scale: Double, offset: Double, means: [Double])? {
+                var best: (score: Double, scale: Double, offset: Double, means: [Double])?
+                for scaleStep in -3...3 {
+                    let scale = 1.0 + Double(scaleStep) * 0.0018
+                    for offsetStep in -4...4 {
+                        let offset = Double(offsetStep) * (horizontal ? cellW : cellH) * 0.1
+                        var sums = [Double](repeating: 0, count: 4)
+                        var squares = [Double](repeating: 0, count: 4)
+                        var counts = [Double](repeating: 0, count: 4)
+                        if horizontal {
+                            for column in 0..<gridN {
+                                let value = sample(
+                                    row: Double(calibrationRow), column: Double(column),
+                                    scaleX: scale, scaleY: 1, dx: offset, dy: 0)
+                                sums[column % 4] += value
+                                squares[column % 4] += value * value
+                                counts[column % 4] += 1
+                            }
+                        } else {
+                            for row in (calibrationRow + 1)..<(gridN - finderSpan - 1) {
+                                let value = sample(
+                                    row: Double(row), column: Double(calibrationColumn),
+                                    scaleX: 1, scaleY: scale, dx: 0, dy: offset)
+                                sums[row % 4] += value
+                                squares[row % 4] += value * value
+                                counts[row % 4] += 1
+                            }
                         }
-                    } else {
-                        for row in (calibrationRow + 1)..<(gridN - finderSpan - 1) {
-                            let value = sample(
-                                row: Double(row), column: Double(calibrationColumn),
-                                scaleX: 1, scaleY: scale, dx: 0, dy: offset)
-                            sums[row % 4] += value
-                            squares[row % 4] += value * value
-                            counts[row % 4] += 1
+                        let means = zip(sums, counts).map { $0 / max($1, 1) }
+                        var spread = 0.0
+                        for level in 0..<4 {
+                            let count = max(counts[level], 1)
+                            let variance = max(
+                                squares[level] / count - means[level] * means[level], 0)
+                            spread += variance.squareRoot() / 4
                         }
-                    }
-                    let means = zip(sums, counts).map { $0 / max($1, 1) }
-                    var spread = 0.0
-                    for level in 0..<4 {
-                        let count = max(counts[level], 1)
-                        let variance = max(
-                            squares[level] / count - means[level] * means[level], 0)
-                        spread += variance.squareRoot() / 4
-                    }
-                    let gaps = [
-                        means[1] - means[0], means[2] - means[1], means[3] - means[2],
-                    ]
-                    let score = (gaps.min() ?? -1) - 2 * spread
-                    if score > (best?.score ?? -.infinity) {
-                        best = (score, scale, offset, means)
+                        let gaps = [
+                            means[1] - means[0], means[2] - means[1], means[3] - means[2],
+                        ]
+                        let score = (gaps.min() ?? -1) - 2 * spread
+                        if score > (best?.score ?? -.infinity) {
+                            best = (score, scale, offset, means)
+                        }
                     }
                 }
+                return best
             }
-            return best
-        }
 
-        guard let fitX = fitAxis(horizontal: true), fitX.score > 4,
-            let fitY = fitAxis(horizontal: false), fitY.score > 4
-        else { return nil }
-        let means = zip(fitX.means, fitY.means).map { ($0 + $1) / 2 }
-        let thresholds = [
-            (means[0] + means[1]) / 2,
-            (means[1] + means[2]) / 2,
-            (means[2] + means[3]) / 2,
-        ]
+            guard let fitX = fitAxis(horizontal: true), fitX.score > 4,
+                let fitY = fitAxis(horizontal: false), fitY.score > 4
+            else { return nil }
+            let means = zip(fitX.means, fitY.means).map { ($0 + $1) / 2 }
+            let thresholds = [
+                (means[0] + means[1]) / 2,
+                (means[1] + means[2]) / 2,
+                (means[2] + means[3]) / 2,
+            ]
 
-        // Sample every data cell in layout order.
-        let codedCount = (dataBytesPerBlock + parityBytesPerBlock) * blocks
-        var coded = [UInt8](repeating: 0, count: codedCount)
-        var bitCursor = 0
-        let totalBits = codedCount * 8
-        outer: for row in 0..<gridN {
-            for column in 0..<gridN {
-                if isReserved(row: row, column: column) { continue }
-                if bitCursor + 2 > totalBits { break outer }
-                let value = sample(
-                    row: Double(row), column: Double(column),
-                    scaleX: fitX.scale, scaleY: fitY.scale, dx: fitX.offset, dy: fitY.offset)
-                var level = 0
-                for threshold in thresholds where value > threshold {
-                    level += 1
+            // Sample every data cell in layout order.
+            let codedCount = (dataBytesPerBlock + parityBytesPerBlock) * blocks
+            var coded = [UInt8](repeating: 0, count: codedCount)
+            var bitCursor = 0
+            let totalBits = codedCount * 8
+            outer: for row in 0..<gridN {
+                for column in 0..<gridN {
+                    if isReserved(row: row, column: column) { continue }
+                    if bitCursor + 2 > totalBits { break outer }
+                    let value = sample(
+                        row: Double(row), column: Double(column),
+                        scaleX: fitX.scale, scaleY: fitY.scale, dx: fitX.offset, dy: fitY.offset)
+                    var level = 0
+                    for threshold in thresholds where value > threshold {
+                        level += 1
+                    }
+                    let shift = 6 - (bitCursor & 7)
+                    coded[bitCursor >> 3] |= UInt8(level << shift)
+                    bitCursor += 2
                 }
-                let shift = 6 - (bitCursor & 7)
-                coded[bitCursor >> 3] |= UInt8(level << shift)
-                bitCursor += 2
             }
-        }
 
-        // Unmask, then de-interleave and correct each block.
-        whiten(&coded)
-        var plaintext = [UInt8]()
-        for block in 0..<blocks {
-            var received = [UInt8]()
-            for position in 0..<(dataBytesPerBlock + parityBytesPerBlock) {
-                received.append(coded[position * blocks + block])
+            // Unmask, then de-interleave and correct each block.
+            whiten(&coded)
+            var plaintext = [UInt8]()
+            for block in 0..<blocks {
+                var received = [UInt8]()
+                for position in 0..<(dataBytesPerBlock + parityBytesPerBlock) {
+                    received.append(coded[position * blocks + block])
+                }
+                guard let corrected = ReedSolomon.correct(received) else { return nil }
+                plaintext += corrected.prefix(dataBytesPerBlock)
             }
-            guard let corrected = ReedSolomon.correct(received) else { return nil }
-            plaintext += corrected.prefix(dataBytesPerBlock)
-        }
-        return parse(plaintext)
+            return parse(plaintext)
         }
     }
 

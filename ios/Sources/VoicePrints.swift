@@ -23,8 +23,7 @@ enum VoiceMath {
             normA += x * x
             normB += y * y
         }
-        let denominator = (normA.squareRoot() * normB.squareRoot()).ulp > 0
-            ? normA.squareRoot() * normB.squareRoot() : 1
+        let denominator = normA.squareRoot() * normB.squareRoot()
         return denominator > 0 ? dot / denominator : 0
     }
 

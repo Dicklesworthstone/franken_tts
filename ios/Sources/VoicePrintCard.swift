@@ -140,9 +140,18 @@ enum VoicePrintCard {
 
     /// Decode from the rendered pixels: works for recompressed JPEGs and screenshots.
     private static func decodePixels(_ data: Data) -> (name: String, vector: [Float])? {
-        guard let image = UIImage(data: data), let cgImage = image.cgImage else {
-            return nil
+        guard var image = UIImage(data: data) else { return nil }
+        // A photo-library round trip can attach an EXIF orientation; the pixel grid
+        // must be upright before sampling, so bake the rotation in first.
+        if image.imageOrientation != .up {
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            image = UIGraphicsImageRenderer(size: image.size, format: format).image {
+                _ in
+                image.draw(in: CGRect(origin: .zero, size: image.size))
+            }
         }
+        guard let cgImage = image.cgImage else { return nil }
         let width = cgImage.width
         let height = cgImage.height
         guard width > 0, height > 0, width * height <= 40_000_000 else { return nil }

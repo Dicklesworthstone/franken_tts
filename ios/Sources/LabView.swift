@@ -229,7 +229,7 @@ struct LabView: View {
     @State private var cardVoice: EnrolledVoice?
     @State private var importItem: PhotosPickerItem?
     @State private var importFailed = false
-    @State private var importedName: String?
+    @State private var importCount = 0
     /// Bumped to refresh the play/pause icon, which tracks external playback state.
     @State private var playbackTick = 0
     @Environment(\.scenePhase) private var scenePhase
@@ -287,11 +287,11 @@ struct LabView: View {
                     if let existing = model.library.voices.first(
                         where: { $0.vector == vector }) {
                         model.selectedVoice = "voice:\(existing.id.uuidString)"
-                        importedName = existing.name
+                        importCount += 1
                     } else if let voice = try? model.library.add(
                         name: name, vector: vector) {
                         model.selectedVoice = "voice:\(voice.id.uuidString)"
-                        importedName = voice.name
+                        importCount += 1
                     } else {
                         importFailed = true
                     }
@@ -332,7 +332,7 @@ struct LabView: View {
         .sensoryFeedback(.selection, trigger: model.selectedVoice)
         .sensoryFeedback(.success, trigger: model.lastAudio?.count)
         .sensoryFeedback(.success, trigger: model.enrollmentSaved) { _, saved in saved }
-        .sensoryFeedback(.success, trigger: importedName) { _, name in name != nil }
+        .sensoryFeedback(.success, trigger: importCount) { _, count in count > 0 }
         .onAppear(perform: debugCardHook)
         .scrollDismissesKeyboard(.interactively)
     }
