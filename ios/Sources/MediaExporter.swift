@@ -10,10 +10,12 @@ import Foundation
 
 enum MediaExporter {
     /// Transcode the played WAV into an AAC .m4a (an order of magnitude smaller).
+    ///
+    /// Outputs get unique names: a fixed name would let a new synthesis overwrite a file
+    /// an in-flight share sheet still references.
     static func exportM4A(fromWav wavUrl: URL) async throws -> URL {
         let output = FileManager.default.temporaryDirectory
-            .appendingPathComponent("franken_tts.m4a")
-        try? FileManager.default.removeItem(at: output)
+            .appendingPathComponent("franken_tts-\(ProcessInfo.processInfo.globallyUniqueString).m4a")
         let asset = AVURLAsset(url: wavUrl)
         guard
             let session = AVAssetExportSession(
@@ -32,8 +34,8 @@ enum MediaExporter {
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL {
         let output = FileManager.default.temporaryDirectory
-            .appendingPathComponent("franken_tts_video.mp4")
-        try? FileManager.default.removeItem(at: output)
+            .appendingPathComponent(
+                "franken_tts-\(ProcessInfo.processInfo.globallyUniqueString).mp4")
 
         let width = Int(ftts_video_width())
         let height = Int(ftts_video_height())
@@ -148,6 +150,11 @@ enum MediaExporter {
             }
         }
         audioInput.markAsFinished()
+        // nil from copyNextSampleBuffer means EITHER end-of-track or failure; only the
+        // status distinguishes a finished read from a video shipped with truncated audio.
+        if reader.status == .failed {
+            throw reader.error ?? EngineError.native("reading the share WAV failed midway")
+        }
 
         await writer.finishWriting()
         if writer.status != .completed {

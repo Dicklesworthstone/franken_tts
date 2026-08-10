@@ -37,6 +37,8 @@ final class LabModel {
     var videoUrl: URL?
     var isExportingVideo = false
     var videoProgress = 0.0
+    /// Bumped per synthesis so a slow export cannot stamp its output onto a newer clip.
+    private var synthesisGeneration = 0
 
     var lowMemoryDevice: Bool {
         ProcessInfo.processInfo.physicalMemory < 6 * 1024 * 1024 * 1024
@@ -98,18 +100,24 @@ final class LabModel {
 
     private func startPlayback(of pcm: [Float]) throws {
         let wav = WavWriter.data(from: pcm)
+        // Unique per synthesis: an in-flight video export reads the previous WAV for its
+        // audio track, and overwriting it mid-read would mux corrupt audio.
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("franken_tts.wav")
+            .appendingPathComponent(
+                "franken_tts-\(ProcessInfo.processInfo.globallyUniqueString).wav")
         try wav.write(to: url)
         wavUrl = url
         m4aUrl = nil
         videoUrl = nil
+        synthesisGeneration += 1
+        let generation = synthesisGeneration
         try AVAudioSession.sharedInstance().setCategory(.playback)
         player = try AVAudioPlayer(contentsOf: url)
         player?.play()
         // The share default is the small file; convert as soon as audio exists.
         Task {
-            m4aUrl = try? await MediaExporter.exportM4A(fromWav: url)
+            let converted = try? await MediaExporter.exportM4A(fromWav: url)
+            if generation == synthesisGeneration { m4aUrl = converted }
         }
     }
 
@@ -126,14 +134,16 @@ final class LabModel {
         isExportingVideo = true
         videoProgress = 0
         let label = currentVoiceLabel
+        let generation = synthesisGeneration
         Task {
             defer { isExportingVideo = false }
             do {
-                videoUrl = try await MediaExporter.exportVideo(
+                let rendered = try await MediaExporter.exportVideo(
                     pcm: audio, voiceLabel: label, wavUrl: wavUrl
                 ) { [weak self] fraction in
                     Task { @MainActor in self?.videoProgress = fraction }
                 }
+                if generation == synthesisGeneration { videoUrl = rendered }
             } catch {
                 lastError = error.localizedDescription
             }
