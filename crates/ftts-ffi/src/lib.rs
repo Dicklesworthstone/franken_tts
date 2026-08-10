@@ -707,10 +707,12 @@ mod tests {
             return;
         }
         let c_dir = CString::new(dir.to_str().unwrap()).unwrap();
+        // SAFETY: `c_dir` is a live NUL-terminated CString naming a directory that exists.
         let engine = unsafe { ftts_engine_open(c_dir.as_ptr()) };
         assert!(!engine.is_null(), "open failed: {}", last_error());
         let mut speaker = vec![0.0_f32; SPEAKER_WIDTH];
         let matt = CString::new("matt").unwrap();
+        // SAFETY: live CString name, and `speaker` holds exactly SPEAKER_WIDTH floats.
         assert_eq!(
             unsafe { ftts_preset_vector(matt.as_ptr(), speaker.as_mut_ptr()) },
             0
@@ -718,6 +720,9 @@ mod tests {
         let text = CString::new("Hi.").unwrap();
         let mut pcm: *mut f32 = std::ptr::null_mut();
         let mut len = 0_usize;
+        // SAFETY: `engine` is a non-null handle from a successful open; `text` is a live CString;
+        // `speaker` holds SPEAKER_WIDTH floats and its length is passed alongside; `pcm` and `len`
+        // are live out-parameters this call writes and the caller frees below.
         let code = unsafe {
             ftts_synthesize(
                 engine,
@@ -731,7 +736,10 @@ mod tests {
         };
         assert_eq!(code, 0, "synthesize failed: {}", last_error());
         assert!(len > 0 && !pcm.is_null());
+        // SAFETY: `pcm`/`len` are exactly the buffer this crate allocated in the call above, freed
+        // once; `engine` is the handle from the matching open, closed once.
         unsafe { ftts_pcm_free(pcm, len) };
+        // SAFETY: as above — one close for one successful open.
         unsafe { ftts_engine_close(engine) };
     }
 
@@ -739,25 +747,36 @@ mod tests {
     fn video_renderer_round_trips_through_the_abi() {
         let pcm: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.01).sin() * 0.4).collect();
         let label = CString::new("matt").unwrap();
+        // SAFETY: `pcm` is a live Vec whose length is passed alongside it, and `label` is a live
+        // NUL-terminated CString; both outlive the call.
         let renderer = unsafe { ftts_video_open(pcm.as_ptr(), pcm.len(), 24_000, label.as_ptr()) };
         assert!(!renderer.is_null(), "{}", last_error());
+        // SAFETY: `renderer` is a non-null handle from the open above.
         let frames = unsafe { ftts_video_frame_count(renderer) };
         assert_eq!(frames, 30, "one second at 30 fps");
+        // Sized in RGB24, matching `ftts_video_render_frame`'s contract. The BGRA32 entry point is
+        // a separate function with its own stride parameter; do not conflate the two here.
         let mut rgb = vec![0u8; (ftts_video_width() * ftts_video_height() * 3) as usize];
+        // SAFETY: live renderer, and `rgb` is exactly width * height * 3 bytes as contracted.
         assert_eq!(
             unsafe { ftts_video_render_frame(renderer, 0, rgb.as_mut_ptr()) },
             0
         );
         assert!(rgb.iter().any(|&b| b != 0), "frame should not be black");
+        // SAFETY: as above; a past-the-end index is a value error the callee rejects before it
+        // touches `out`, so the buffer contract is unchanged.
         assert_eq!(
             unsafe { ftts_video_render_frame(renderer, frames, rgb.as_mut_ptr()) },
             1,
             "past-the-end frame must refuse"
         );
+        // SAFETY: one close for one successful open, with no render in flight.
         unsafe { ftts_video_close(renderer) };
     }
 
     fn last_error() -> String {
+        // SAFETY: reading the thread-local error string this crate owns; it is always a valid
+        // NUL-terminated buffer, empty before any failure, and never freed while borrowed here.
         #[allow(unsafe_code)]
         unsafe { CStr::from_ptr(ftts_last_error_message()) }
             .to_string_lossy()
