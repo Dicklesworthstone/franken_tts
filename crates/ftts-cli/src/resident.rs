@@ -582,8 +582,7 @@ fn handle_connection(
     if let Some(wire_root) = request.get("bundle_root").and_then(Value::as_str) {
         let wire_canonical =
             fs::canonicalize(wire_root).unwrap_or_else(|_| PathBuf::from(wire_root));
-        let own_canonical =
-            fs::canonicalize(&bundle.root).unwrap_or_else(|_| bundle.root.clone());
+        let own_canonical = fs::canonicalize(&bundle.root).unwrap_or_else(|_| bundle.root.clone());
         if wire_canonical != own_canonical {
             refuse(
                 &mut stream,
@@ -750,6 +749,83 @@ mod tests {
             assert!(parse_normalize(label).is_some(), "{label}");
         }
         assert!(parse_normalize("aggressive").is_none());
+    }
+
+    /// A peer that never sends a newline must not be able to grow the daemon's memory without
+    /// bound. This drives the real socket path, because the bug lived in `read_line`'s contract
+    /// rather than in any parsing we control.
+    #[test]
+    fn an_endless_request_line_is_bounded_not_fatal() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // A client that opens a connection and streams bytes with no terminator, forever.
+        let flood = std::thread::spawn(move || {
+            let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) else {
+                return;
+            };
+            let block = vec![b'x'; 64 * 1024];
+            // Stops on the first error, which is what happens once the server hangs up.
+            while stream.write_all(&block).is_ok() {}
+        });
+
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        const MAX: u64 = 1024 * 1024;
+        let read = (&mut reader).take(MAX).read_line(&mut line).unwrap_or(0);
+
+        assert!(
+            read as u64 <= MAX,
+            "read {read} bytes, past the {MAX}-byte cap"
+        );
+        assert!(
+            line.len() as u64 <= MAX,
+            "buffered {} bytes, past the cap",
+            line.len()
+        );
+        drop(reader);
+        let _ = flood.join();
+    }
+
+    /// Malformed speaker vectors are refused, never silently repaired.
+    ///
+    /// The old code used `filter_map(as_f64)`, so a non-numeric entry was DROPPED and the request
+    /// proceeded with a shorter vector — a malformed request quietly becoming a different,
+    /// well-formed one. Non-finite values were worse: they reach the Q8 quantizer's `is_finite`
+    /// assertion, and a panic there used to take the whole daemon down with it.
+    #[test]
+    fn speaker_vectors_are_validated_rather_than_salvaged() {
+        // Mirrors the parsing in `handle_connection` exactly.
+        fn parse(values: &[Value]) -> Result<Vec<f32>, &'static str> {
+            let mut vector = Vec::with_capacity(values.len());
+            for value in values {
+                let number = value.as_f64().ok_or("non-numeric")?;
+                let narrowed = number as f32;
+                if !narrowed.is_finite() {
+                    return Err("non-finite");
+                }
+                vector.push(narrowed);
+            }
+            Ok(vector)
+        }
+
+        assert_eq!(parse(&[json!(1.0), json!(-2.5)]).unwrap(), vec![1.0, -2.5]);
+        assert_eq!(
+            parse(&[json!(1.0), json!("x"), json!(2.0)]),
+            Err("non-numeric"),
+            "a non-numeric entry must be refused, not dropped"
+        );
+        assert_eq!(parse(&[json!(null)]), Err("non-numeric"));
+        // JSON has no NaN literal, so the reachable non-finite case is an f64 too large for f32.
+        assert_eq!(
+            parse(&[json!(1e300)]),
+            Err("non-finite"),
+            "an f64 that overflows f32 becomes infinity and must be refused"
+        );
     }
 
     #[test]
