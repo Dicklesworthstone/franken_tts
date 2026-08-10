@@ -184,6 +184,13 @@ applySharedFragment();
 updateVoiceCharacter();
 updateCharCount();
 
+/// Partitions the engine actually armed, reported by the worker after hydration.
+///
+/// Read rather than assumed: the team is sized from the workers that genuinely parked, so a build
+/// where they failed to start runs serially and must say so. A page that cannot tell 1 from 6 is
+/// how a fully-serial run went unnoticed for a whole session.
+let engineThreads = 1;
+
 async function boot() {
   await call("init");
 
@@ -208,7 +215,7 @@ async function loadFromStore() {
       ui.dlStatus.textContent = `${phase} ${asset ?? ""}: ${gigabytes(bytesDone)} / ${gigabytes(bytesTotal)} GB`;
     });
     ui.dlStatus.textContent = "Hydrating the engine (this takes a minute at wasm speed)…";
-    await call(
+    const loaded = await call(
       "load",
       {
         fttsq: files.fttsq,
@@ -218,8 +225,12 @@ async function loadFromStore() {
         tokenizerConfig: files.tokenizerConfig,
       },
     );
+    engineThreads = loaded?.threads ?? 1;
     ui.dlBar.style.width = "100%";
-    ui.dlStatus.textContent = "Model loaded. Ready to speak.";
+    ui.dlStatus.textContent =
+      engineThreads > 1
+        ? `Model loaded - ${engineThreads} kernel threads. Ready to speak.`
+        : "Model loaded (single thread). Ready to speak.";
     ui.speak.disabled = false;
   } catch (error) {
     showError(error);
@@ -392,7 +403,7 @@ ui.consentYes.addEventListener("click", async () => {
       ui.dlStatus.textContent = `${phase} ${asset ?? ""}: ${gigabytes(bytesDone)} / ${gigabytes(bytesTotal)} GB${tail}`;
     });
     ui.dlStatus.textContent = "Hydrating the engine (this takes a minute at wasm speed)…";
-    await call(
+    const loaded = await call(
       "load",
       {
         fttsq: files.fttsq,
@@ -402,8 +413,12 @@ ui.consentYes.addEventListener("click", async () => {
         tokenizerConfig: files.tokenizerConfig,
       },
     );
+    engineThreads = loaded?.threads ?? 1;
     ui.dlBar.style.width = "100%";
-    ui.dlStatus.textContent = "Model loaded. Ready to speak.";
+    ui.dlStatus.textContent =
+      engineThreads > 1
+        ? `Model loaded - ${engineThreads} kernel threads. Ready to speak.`
+        : "Model loaded (single thread). Ready to speak.";
     ui.speak.disabled = false;
   } catch (error) {
     showError(error);
@@ -419,8 +434,13 @@ ui.speak.addEventListener("click", async () => {
   const startedAt = performance.now();
   const ticker = setInterval(() => {
     const seconds = ((performance.now() - startedAt) / 1000).toFixed(0);
-    ui.synthStatus.textContent = `synthesizing… ${seconds}s (single-thread wasm runs ~0.03–0.05× real time, so a sentence takes a couple of minutes)`;
-    ui.synthBar.style.width = `${Math.min(90, 10 + seconds * 2)}%`;
+    // The engine reports its own team width at load; say what THIS session is actually running
+    // rather than a figure baked in at authoring time, which is how the previous copy ended up
+    // claiming "single-thread ... a couple of minutes" on a six-partition build ~6x faster.
+    const how = engineThreads > 1 ? `${engineThreads} threads` : "single thread";
+    ui.synthStatus.textContent = `synthesizing… ${seconds}s (${how}, ~0.3× real time)`;
+    // Progress paced to the measured rate: roughly 3.2 s of compute per second of speech.
+    ui.synthBar.style.width = `${Math.min(90, 10 + seconds * 8)}%`;
   }, 500);
   try {
     const payload = {

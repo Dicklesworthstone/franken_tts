@@ -233,6 +233,7 @@
       <span class="pg-chip">100% Rust</span>
       <span class="pg-chip">no Python, no PyTorch</span>
       <span class="pg-chip">1.4–1.6× real time native</span>
+      <span class="pg-chip">0.31× real time in the browser</span>
       <span class="pg-chip">28/28 layers verified</span>
       <span class="pg-chip">zero-shot voice cloning</span>
     </div>
@@ -359,11 +360,13 @@
           </p>
           <p id="error" class="pg-error hidden"></p>
           <p class="pg-note">
-            Speed honesty, measured: this single-threaded WASM build synthesizes at roughly
-            <strong>0.03–0.05× real time</strong>, so a full sentence takes a couple of minutes,
-            with live progress. The native CLI runs the same engine faster than real time;
-            browser threads are the tracked path to closing the gap. Desktop browsers only:
-            the engine needs several GB of memory.
+            Speed honesty, measured: this multi-threaded WASM build synthesizes at roughly
+            <strong>0.31× real time</strong> — about 3.2 seconds of compute per second of speech,
+            so a sentence lands in seconds rather than minutes, with live progress. That is a
+            ~6× improvement over the previous single-threaded build's 0.05×, from a
+            register-tiled packed GEMM plus a six-partition kernel team, both bit-identical to
+            the scalar reference. The native CLI runs the same engine faster than real time.
+            Desktop browsers only: the engine needs several GB of memory.
           </p>
         </div>
       </div>
@@ -624,11 +627,13 @@
         mapped; wasm has no files, so the same loader runs from a byte slice instead.</p>
       </div>
       <div class="pg-card rounded-2xl border border-white/5 bg-black/40 p-6">
-        <div class="pg-label mb-3">Ready for threads</div>
-        <p class="pg-note">The page already serves the cross-origin isolation headers that
-        unlock SharedArrayBuffer. When the engine's worker team lands in wasm, multi-threaded
-        synthesis needs no infrastructure change. That, plus relaxed SIMD, is the tracked path
-        toward real time in the tab.</p>
+        <div class="pg-label mb-3">Threads, landed</div>
+        <p class="pg-note">The cross-origin isolation headers this page serves unlock
+        SharedArrayBuffer, and the engine's kernel team now runs on it: six persistent worker
+        partitions over disjoint output columns, so the parallel result is bit-identical to the
+        serial one per element. Apple devices get an unshared-memory serial build instead —
+        growing a shared wasm memory reclaims the tab on iOS. Relaxed SIMD and an int4
+        microdecoder are the remaining tracked path toward real time in the tab.</p>
       </div>
     </div>
   </section>

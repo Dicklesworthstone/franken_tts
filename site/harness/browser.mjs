@@ -44,7 +44,13 @@ const browser = await chromium.launch({ headless: !HEADED });
 const page = await browser.newPage();
 
 const transcript = [];
-page.on("console", (message) => transcript.push(`[${message.type()}] ${message.text()}`));
+page.on("console", (message) => {
+  const text = message.text();
+  transcript.push(`[${message.type()}] ${text}`);
+  // The engine's own stage timing goes to the worker console, which never reaches the page.
+  // Surfacing it here is how the codec-vs-talker split becomes visible.
+  if (text.includes("ftts-wasm timing")) console.log(`\n      ${text}`);
+});
 page.on("pageerror", (error) => transcript.push(`[pageerror] ${error.message}`));
 // Worker consoles and errors do NOT surface on the page by default, which is exactly how a fatal
 // error inside engine-worker.js looked like an innocent stall. Attach to every worker, including
@@ -121,6 +127,23 @@ try {
     return button ? !button.disabled : null;
   });
   check("synthesize control is enabled", ready === true, `enabled=${ready}`);
+
+  // The number that actually matters. Everything above only proves the page loads; this measures
+  // whether the kernel work bought anything, in the browser, on the real model.
+  if (ready) {
+    await page.fill("#text, textarea", "The quick brown fox jumps over the lazy dog.").catch(() => {});
+    const started = Date.now();
+    await page.click("#speak");
+    // Synthesis is minutes at wasm speed; wait for the control to re-enable.
+    await page
+      .waitForFunction(() => !document.getElementById("speak").disabled, null, { timeout: 900_000 })
+      .catch(() => {});
+    const seconds = (Date.now() - started) / 1000;
+    const status = await page.evaluate(
+      () => document.getElementById("synth-status")?.textContent?.trim() ?? "",
+    );
+    console.log(`\nSYNTHESIS: ${seconds.toFixed(1)} s wall — status: ${status}`);
+  }
 } finally {
   console.log("\n--- browser transcript ---");
   for (const line of transcript.slice(-60)) console.log(line);
