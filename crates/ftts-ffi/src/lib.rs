@@ -566,6 +566,48 @@ pub unsafe extern "C" fn ftts_video_render_frame(
     })
 }
 
+/// Renders one frame as BGRA32 with the given row stride (bytes), the layout
+/// CoreVideo pixel buffers use. Same concurrency contract as
+/// [`ftts_video_render_frame`].
+///
+/// # Safety
+/// `renderer` from [`ftts_video_open`]; `out` valid for `stride * ftts_video_height()`
+/// bytes with `stride >= ftts_video_width() * 4`; open/close serialized against
+/// in-flight renders.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ftts_video_render_frame_bgra(
+    renderer: *const FttsVideoRenderer,
+    frame: usize,
+    out: *mut u8,
+    stride: usize,
+) -> i32 {
+    guarded(1, || {
+        if renderer.is_null() || out.is_null() {
+            set_error("null pointer to ftts_video_render_frame_bgra");
+            return 1;
+        }
+        if stride < ftts_video::WIDTH * 4 {
+            set_error("stride narrower than a BGRA row");
+            return 1;
+        }
+        // SAFETY: per the contract above.
+        #[allow(unsafe_code)]
+        let (renderer, bgra) = unsafe {
+            (
+                &*renderer,
+                std::slice::from_raw_parts_mut(out, stride * ftts_video::HEIGHT),
+            )
+        };
+        if frame >= renderer.inner.total_frames() {
+            set_error("frame index past the end of the clip");
+            return 1;
+        }
+        renderer.inner.render_into_bgra(frame, bgra, stride);
+        0
+    })
+}
+
 /// Releases a renderer. Null is a no-op.
 ///
 /// # Safety

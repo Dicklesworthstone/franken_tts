@@ -77,6 +77,10 @@ size_t ftts_video_frame_count(const FttsVideoRenderer *renderer);
  * allowed (open/close still serialized against renders). */
 int32_t ftts_video_render_frame(const FttsVideoRenderer *renderer, size_t frame,
                                 uint8_t *out);
+/* As above, but BGRA32 with a caller-chosen row stride in bytes (CoreVideo's
+ * layout). out must hold stride * height bytes; stride >= width * 4. */
+int32_t ftts_video_render_frame_bgra(const FttsVideoRenderer *renderer, size_t frame,
+                                     uint8_t *out, size_t stride);
 void ftts_video_close(FttsVideoRenderer *renderer);
 
 #ifdef __cplusplus

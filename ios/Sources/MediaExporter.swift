@@ -64,13 +64,16 @@ enum MediaExporter {
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
             ])
+        // No explicit bitrate: mono AAC at 24 kHz rejects 96 kbps outright (the
+        // encoder's per-channel ceiling at that sample rate is lower), and error
+        // -11861 from that mismatch killed the whole export. The encoder's own
+        // default for this format is well within range and sounds fine for speech.
         let audioInput = AVAssetWriterInput(
             mediaType: .audio,
             outputSettings: [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVSampleRateKey: 24_000,
                 AVNumberOfChannelsKey: 1,
-                AVEncoderBitRateKey: 96_000,
             ])
         audioInput.expectsMediaDataInRealTime = false
         writer.add(videoInput)
@@ -119,7 +122,9 @@ enum MediaExporter {
             }()
 
             // The Rust renderer is a pure function of (frame, immutable state), so a
-            // chunk of frames renders in parallel across cores; appends stay in order.
+            // chunk of frames renders in parallel across cores — straight into BGRA
+            // (Rust does the swizzle; Swift only copies rows). Appends stay in order.
+            let bgraStride = width * 4
             let window = 4
             var chunkStart = 0
             while chunkStart < frames {
@@ -129,22 +134,23 @@ enum MediaExporter {
                 ) { group in
                     for frame in chunk {
                         group.addTask {
-                            var rgb = [UInt8](repeating: 0, count: width * height * 3)
-                            let code = rgb.withUnsafeMutableBufferPointer { buffer in
-                                ftts_video_render_frame(renderer, frame, buffer.baseAddress)
+                            var bgra = [UInt8](repeating: 0, count: bgraStride * height)
+                            let code = bgra.withUnsafeMutableBufferPointer { buffer in
+                                ftts_video_render_frame_bgra(
+                                    renderer, frame, buffer.baseAddress, bgraStride)
                             }
                             guard code == 0 else { throw EngineError.lastFromNative() }
-                            return (frame, rgb)
+                            return (frame, bgra)
                         }
                     }
                     var out = [Int: [UInt8]]()
-                    for try await (frame, rgb) in group {
-                        out[frame] = rgb
+                    for try await (frame, bgra) in group {
+                        out[frame] = bgra
                     }
                     return out
                 }
                 for frame in chunk {
-                    guard let rgb = rendered[frame] else {
+                    guard let bgra = rendered[frame] else {
                         throw EngineError.native("frame \(frame) went missing")
                     }
                     while !videoInput.isReadyForMoreMediaData {
@@ -161,18 +167,15 @@ enum MediaExporter {
                     CVPixelBufferLockBaseAddress(pixelBuffer, [])
                     if let base = CVPixelBufferGetBaseAddress(pixelBuffer) {
                         let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
-                        let destination = base.assumingMemoryBound(to: UInt8.self)
-                        rgb.withUnsafeBufferPointer { source in
-                            for row in 0..<height {
-                                var from = row * width * 3
-                                var to = row * stride
-                                for _ in 0..<width {
-                                    destination[to] = source[from + 2] // B
-                                    destination[to + 1] = source[from + 1] // G
-                                    destination[to + 2] = source[from] // R
-                                    destination[to + 3] = 255 // A
-                                    from += 3
-                                    to += 4
+                        bgra.withUnsafeBufferPointer { source in
+                            if stride == bgraStride {
+                                base.copyMemory(
+                                    from: source.baseAddress!, byteCount: bgraStride * height)
+                            } else {
+                                for row in 0..<height {
+                                    (base + row * stride).copyMemory(
+                                        from: source.baseAddress! + row * bgraStride,
+                                        byteCount: bgraStride)
                                 }
                             }
                         }

@@ -24,6 +24,8 @@
 	<false/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Your recording is processed entirely on this device into a 4 KB voice fingerprint for synthesis, then discarded. Nothing is uploaded.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Saving keeps your voice card in Photos so you can send it from any app. The card holds only the 4 KB voice fingerprint, never a recording.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

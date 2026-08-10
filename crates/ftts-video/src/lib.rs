@@ -102,6 +102,35 @@ impl FrameRenderer {
         self.total_frames
     }
 
+    /// Draw frame `frame` as BGRA32 with a caller-chosen row stride — the layout
+    /// CoreVideo pixel buffers want, so the iOS exporter copies rows instead of
+    /// swizzling two million pixels per frame in Swift.
+    ///
+    /// # Panics
+    ///
+    /// If `stride < WIDTH * 4` or `bgra` is shorter than `stride * HEIGHT`.
+    pub fn render_into_bgra(&self, frame: usize, bgra: &mut [u8], stride: usize) {
+        assert!(stride >= WIDTH * 4, "stride must cover a BGRA row");
+        assert!(bgra.len() >= stride * HEIGHT, "bgra must hold HEIGHT rows");
+        let mut rgb = vec![0u8; WIDTH * HEIGHT * 3];
+        self.render_into(frame, &mut rgb);
+        for (source_row, target_row) in rgb
+            .as_chunks::<{ WIDTH * 3 }>()
+            .0
+            .iter()
+            .zip(bgra.chunks_mut(stride))
+        {
+            for (source, target) in source_row
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(target_row.as_chunks_mut::<4>().0.iter_mut())
+            {
+                *target = [source[2], source[1], source[0], 255];
+            }
+        }
+    }
+
     /// Draw frame `frame` into `rgb`, which must be `WIDTH * HEIGHT * 3` bytes.
     ///
     /// # Panics
