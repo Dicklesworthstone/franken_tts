@@ -15,7 +15,8 @@ individual commits are intentionally not cited.
 
 | Version | Date | Status | Summary |
 |---------|------|--------|---------|
-| 0.1.4 | 2026-08-09 | current | faster than real time: worker team, pipelined codec, 2.5× faster startup |
+| 0.1.5 | 2026-08-10 | current | browser engine 9.4× faster; iOS survives; enrollment denoises itself; Windows installer |
+| 0.1.4 | 2026-08-09 | superseded | faster than real time: worker team, pipelined codec, 2.5× faster startup |
 | 0.1.3 | 2026-08-09 | superseded | optimized route becomes the library-wide default; 48 kHz enrollment fix |
 | 0.1.2 | 2026-08-08 | superseded | `ftts convert` works on the real checkpoint; `ftts pull` ships the quantized `.fttsq` |
 | 0.1.1 | 2026-08-08 | superseded | zero-config UX: `ftts pull`, default model cache, m4a/mp3 enrollment |
@@ -23,7 +24,46 @@ individual commits are intentionally not cited.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-08-10
+
+The browser engine gets 9.4x faster, Apple devices stop crashing, and enrollment
+cleans its own reference audio.
+
 ### Added
+
+- The browser runs at **0.31–0.43x real time**, measured, against 0.05x before.
+  Three seconds of speech now costs seconds of compute rather than minutes. Two
+  levers did it, and both are bit-identical to the scalar reference rather than
+  approximations traded for speed:
+  - A register-tiled, panel-packed f32 GEMM (`ftts-kernels/src/packed_gemm.rs`),
+    ported from `franken_numpy`'s `fnp-linalg` and adapted to this project's
+    `[n, k]` weight layout so no transpose is ever materialized. WebAssembly has
+    no BLAS, so every codec convolution and projection had been falling through
+    to a dot product per output element. All six codec GEMM sites reach one
+    function, so one kernel upgraded every convolution, ConvNeXt pointwise pair
+    and transformer projection at once.
+  - The codec's dense route now dispatches to the `KernelTeam` across six
+    partitions. It had been 92% of frame time running on a single thread while
+    every worker sat parked.
+
+  Per-stage, in a real browser against the real model: codec 89.1 s -> 6.8 s
+  (13.2x), talker+microdecoder 7.6 s -> 3.4 s (2.2x), total 97.3 s -> 10.35 s.
+  Recorded as `PERF-005`, labelled PROVISIONAL_LOCAL_WIN: single runs, unequal
+  utterance lengths, no interleaved thermal pairs, and the incumbent is our own
+  previous build rather than a pinned external one.
+
+- Symmetric int4 (W4A8) weight quantization for the microdecoder
+  (`ftts-kernels/src/int4.rs`): two biased nibbles per byte with the +8 bias
+  cancelled by a single correction term, so the inner loop is mask/shift/MAC
+  with no per-element sign extension. **Nothing routes to it yet** — doctrine #2
+  requires both a per-ISA speed test including unpack cost and a blind-listening
+  equivalence test first, and neither has been run. See `NE-005`.
+
+- A real-browser test harness (`site/harness/`): the actual site in actual
+  Chromium, with real OPFS, real Workers, real COOP/COEP from the shipped
+  `_headers`, and real byte-Range downloads of the real model. No mocks, because
+  a previous shim-based Node harness passed every one of its cases while the
+  deployed site was broken in every browser. It now runs as a `check.sh` stage.
 
 - Enrollment denoises automatically. Every `ftts enroll` now cleans the reference with
   a neural denoiser before computing the embedding — no flag to remember — and the
@@ -45,7 +85,7 @@ individual commits are intentionally not cited.
   clean-source enrollment (cosine 0.9613 vs 0.9548). The engine is thread-free and
   mmap-free and compiles unchanged for wasm32. See `docs/DENOISER.md` for the truth pack.
 
-## [0.1.5] - 2026-08-09
+### Windows installer and human console output
 
 Windows gets a real installer, and the terminal stops printing NDJSON at people.
 
@@ -71,6 +111,33 @@ Windows gets a real installer, and the terminal stops printing NDJSON at people.
 
 ### Fixed
 
+- **Apple devices no longer crash loading the model.** Measured on an iPhone 17
+  Pro Max with a crash-persistent probe: growing a *shared* wasm memory reclaims
+  the tab past ~1 GB, while growing an unshared one to 2.75 GB is fine and flat
+  allocations of either kind are fine to 3.5 GB. Rust's allocator grows linear
+  memory on every heap request, so a 2 GB model guarantees growth and a threaded
+  build could never work there. The site now ships two builds and picks at
+  runtime: shared/threaded where it is known safe, unshared/serial on WebKit.
+  Two approaches that do *not* work are recorded in `engine-worker.js` so they
+  are not retried — pre-reserving (the allocator ignores it and grows on top)
+  and pinning `maximum = initial` (the first allocation fails and the module
+  aborts).
+- **A dropped message bricked the engine in every browser.** A module worker
+  starts its event loop while the module is still evaluating, so the `init`
+  message posted at construction was dispatched to no listener and lost — never
+  queued. Chrome hung inside `ModelStaging`; Safari threw
+  `undefined is not an object (evaluating 'wasm.modelstaging_new')`. Same cause,
+  two unrecognizable symptoms. The handler is now installed before the first
+  `await` and buffers until the wasm glue is bound, and messages are serialized
+  so `load` can no longer race `init`.
+- **Resident daemon hardening**, three defects, all locally reachable and the
+  first needing no token at all: the pre-auth `read_line` was unbounded (a peer
+  that never sends a newline grew the buffer until the process died, now capped
+  at 1 MiB); speaker vectors were parsed with `filter_map`, silently *dropping*
+  non-numeric entries so a malformed request quietly became a well-formed one,
+  and non-finite values reached the quantizer's assertion and panicked; and
+  `handle_connection` ran bare in the accept loop, so any panic killed the
+  process holding the only warm model. All three now refuse or contain.
 - `LICENSE` shipped correctly. It had been truncated to zero bytes in the
   working tree; release artifacts are built from a pinned worktree, which is
   what kept the published packages intact.
