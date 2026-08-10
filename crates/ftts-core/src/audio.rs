@@ -156,6 +156,40 @@ pub fn encode_wav(pcm: &[f32], sample_rate: u32) -> Vec<u8> {
 /// Returns 0 whenever the input is too short to judge, which keeps every caller total.
 #[must_use]
 pub fn trailing_noise_samples(pcm: &[f32], sample_rate: u32) -> usize {
+    let level = speech_level(pcm, sample_rate);
+    trailing_noise_samples_relative_to(pcm, sample_rate, level)
+}
+
+/// The loudest 10 ms window in `pcm`, the reference "speech level" the tail rule compares against.
+#[must_use]
+pub fn speech_level(pcm: &[f32], sample_rate: u32) -> f32 {
+    let window = (sample_rate as usize).saturating_mul(10) / 1000;
+    if window < 2 || pcm.is_empty() {
+        return 0.0;
+    }
+    pcm.chunks(window)
+        .map(|chunk| {
+            if chunk.is_empty() {
+                0.0
+            } else {
+                (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt()
+            }
+        })
+        .fold(0.0_f32, f32::max)
+}
+
+/// [`trailing_noise_samples`] against a caller-supplied speech level.
+///
+/// Exists because the streaming writer only holds the last quarter second when it decides, and the
+/// "quiet" test is meaningless against a window that contains nothing but the artifact — the
+/// artifact would become its own reference and never look quiet. The writer therefore measures the
+/// level across the whole utterance as it goes and passes it in here.
+#[must_use]
+pub fn trailing_noise_samples_relative_to(
+    pcm: &[f32],
+    sample_rate: u32,
+    speech_level: f32,
+) -> usize {
     /// Analysis window. 10 ms is short enough to localize the burst and long enough that a
     /// single glottal pulse does not dominate the statistic.
     const WINDOW_MILLIS: usize = 10;
@@ -273,6 +307,11 @@ pub struct WavWriter<W: Write + Seek> {
     /// whole contract is time-to-first-audio. `None` means trimming is off and every sample goes
     /// straight through.
     holdback: Option<Vec<f32>>,
+    /// Loudest 10 ms window seen across the WHOLE utterance.
+    ///
+    /// Tracked as samples arrive because the tail decision happens when only the last quarter
+    /// second is still in hand, and a "quiet relative to speech" rule needs the speech.
+    speech_level: f32,
 }
 
 impl<W: Write + Seek> WavWriter<W> {
@@ -288,6 +327,7 @@ impl<W: Write + Seek> WavWriter<W> {
             sample_rate,
             samples_written: 0,
             holdback: None,
+            speech_level: 0.0,
         })
     }
 
@@ -317,6 +357,7 @@ impl<W: Write + Seek> WavWriter<W> {
         // aged out. Those held samples are the only ones the trim can ever remove, so nothing that
         // reaches the file here can need taking back.
         if self.holdback.is_some() {
+            self.speech_level = self.speech_level.max(speech_level(pcm, self.sample_rate));
             let mut pending = self.holdback.take().unwrap_or_default();
             pending.extend_from_slice(pcm);
             let releasable = pending.len().saturating_sub(TAIL_HOLDBACK_SAMPLES);
@@ -371,7 +412,8 @@ impl<W: Write + Seek> WavWriter<W> {
         // Release the held tail, minus whatever the detector identifies as the model's end-of-
         // utterance noise. Done before the header is patched so the length describes what landed.
         if let Some(pending) = self.holdback.take() {
-            let drop = trailing_noise_samples(&pending, self.sample_rate);
+            let drop =
+                trailing_noise_samples_relative_to(&pending, self.sample_rate, self.speech_level);
             let keep = pending.len().saturating_sub(drop);
             if keep > 0 {
                 self.write_through(&pending[..keep])?;
