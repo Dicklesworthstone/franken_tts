@@ -31,8 +31,15 @@ pub const SCHEMA_VERSION: u8 = 1;
 /// It lives beside the catalogue rather than in `lib.rs` because it is part of the promised
 /// agent-facing contract, and the frozen fixture pins it: adding a variable without documenting
 /// it here fails the contract test.
+/// The ONE list of user-facing environment levers. `ftts doctor` reports exactly this set,
+/// and the frozen schema fixture pins it, so a lever added anywhere else without an entry
+/// here fails the contract test — the split-brain where `robot schema` and `doctor`
+/// disagreed (and neither mentioned the resident daemon's levers) is what this fixes.
+/// Development-only probes (`FTTS_SPEC_PROBE`, `FTTS_ORACLE_FIXTURES`, `FTTS_RECEIPTS`,
+/// `FTTS_TOKENIZER_REGEX`, `FTTS_LOAD_THREADS`) are deliberately not part of the promise.
 pub const DOCUMENTED_ENVIRONMENT: &[&str] = &[
     "FTTS_MODEL_DIR",
+    "FTTS_DEFAULT_VOICE",
     "FTTS_THREADS",
     "FTTS_PROFILE",
     "FTTS_PACKET_FRAMES",
@@ -40,9 +47,25 @@ pub const DOCUMENTED_ENVIRONMENT: &[&str] = &[
     "FTTS_QUANT",
     "FTTS_FORCE_ARCH",
     "FTTS_NUMA",
+    "FTTS_MAX_FRAMES",
+    "FTTS_MEMORY_BUDGET_MB",
     "FTTS_STAGE_BUDGET_SYNTHESIS_MS",
     "FTTS_STAGE_BUDGET_FRAME_MS",
     "FTTS_STAGE_BUDGET_ENROLL_MS",
+    "FTTS_NO_RESIDENT",
+    "FTTS_RESIDENT_IDLE_SECS",
+    "FTTS_RESIDENT_DIR",
+    "FTTS_RESIDENT_LOG",
+    "FTTS_RESIDENT_SPAWN_WAIT_SECS",
+    "FTTS_RESIDENT_CLIENT_TIMEOUT_SECS",
+    "FTTS_DENOISE_ENGINE",
+    "FTTS_INT8",
+    "FTTS_INT8_TIER",
+    "FTTS_INT8_SCOPE",
+    "FTTS_INT8_CODEC",
+    "FTTS_INT8_THREADS",
+    "FTTS_ARTIFACT_Q8",
+    "FTTS_FAST_SNAKE",
 ];
 
 /// Which stream an object is written to.
