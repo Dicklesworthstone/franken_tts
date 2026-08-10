@@ -1,17 +1,21 @@
-// The dense visual voice code: 4 KB of x-vector as an emerald mosaic.
+// The voice mosaic: 4 KB of x-vector as a self-locating field of emerald cells.
 //
-// Why this shape:
+// Design, and why:
 // - 144×144 cells, 2 bits per cell as one of FOUR brightness levels on a constant-hue
-//   emerald ramp. JPEG stores luminance at full resolution and chroma at half, so the
-//   information rides in the channel compression treats best, and the constant hue is
-//   also what makes the code look like the lab instead of like a barcode.
-// - Interleaved Reed-Solomon (255, 223) over GF(2^8): JPEG artifacts are local, the
-//   interleave spreads any damaged patch across every block, and each block corrects
-//   up to 16 wrong bytes. A CRC over the plaintext refuses any silent miscorrection.
-// - Row zero is a known calibration pattern: the decoder learns the four levels from
-//   it (so global brightness shifts do not matter) and uses its fit to refine grid
-//   alignment by a small search. Shared images are axis-aligned — the channel is the
-//   file itself, not a camera — so scale and offset are the only geometry.
+//   emerald ramp. JPEG keeps luminance at full resolution and halves chroma, so the
+//   information rides in the channel compression treats best; the constant hue is also
+//   what makes the code look like the lab instead of a barcode. Four levels per cell is
+//   what makes this denser than a QR code's one bit per module.
+// - Three QR-style finder patterns (bright/dark/bright concentric squares) in the
+//   corners. The decoder scans the WHOLE image for their 1:1:3:1:1 run signature, so a
+//   screenshot from any iPhone — any size, any aspect ratio, status bar and all —
+//   registers automatically. Shared images stay axis-aligned (the channel is a file,
+//   not a camera), so scale and offset per axis is the full geometry.
+// - A known calibration row teaches the decoder the four brightness levels as they
+//   survived compression, and refines the grid registration by a small local search.
+// - Interleaved Reed-Solomon (255, 223): compression artifacts are local, the
+//   interleave spreads any damaged patch across all 19 blocks, and each block corrects
+//   up to 16 wrong bytes. A CRC over the plaintext refuses silent miscorrection.
 //
 // The core is pure byte arrays in and out, so the exact codec is testable off-device.
 
@@ -20,10 +24,9 @@ import Foundation
 enum VoiceCode {
     static let gridN = 144
     static let cardSize = 1024
-    /// The mosaic square inside the card: integer 6-px cells, 80-px quiet margins.
+    /// The mosaic square inside the rendered card: integer 6-px cells, 80-px quiet margin.
     static let regionOrigin = 80
     static let cellPx = 6
-    static var regionSize: Int { gridN * cellPx } // 864
 
     /// Emerald ramp, darkest to brightest. Constant hue family, widely separated luma.
     static let levels: [(r: UInt8, g: UInt8, b: UInt8)] = [
@@ -36,10 +39,43 @@ enum VoiceCode {
     private static let blocks = 19
     static var plaintextCapacity: Int { dataBytesPerBlock * blocks } // 4237
 
-    // ------------------------------------------------------------------ public API
+    private static let finderSpan = 7 // finder pattern cells, plus a 1-cell separator
+    private static let calibrationRow = 8
 
-    /// Encode name + vector into an RGB24 card image (cardSize × cardSize).
-    static func renderCardPixels(name: String, vector: [Float]) -> [UInt8] {
+    // ------------------------------------------------------------------ layout
+
+    /// Finder + separator zones: top-left, top-right, bottom-left (8×8 cells each).
+    private static func inFinderZone(row: Int, column: Int) -> Bool {
+        let zone = finderSpan + 1
+        if row < zone && column < zone { return true }
+        if row < zone && column >= gridN - zone { return true }
+        if row >= gridN - zone && column < zone { return true }
+        return false
+    }
+
+    private static func isReserved(row: Int, column: Int) -> Bool {
+        row == calibrationRow || inFinderZone(row: row, column: column)
+    }
+
+    /// Level for a reserved cell: finder rings or the known calibration pattern.
+    private static func reservedLevel(row: Int, column: Int) -> Int {
+        if row == calibrationRow { return column % 4 }
+        // Local coordinates within whichever finder square this is.
+        var r = row
+        var c = column
+        if column >= gridN - finderSpan - 1 { c = column - (gridN - finderSpan) }
+        if row >= gridN - finderSpan - 1 { r = row - (gridN - finderSpan) }
+        guard (0..<finderSpan).contains(r), (0..<finderSpan).contains(c) else {
+            return 0 // separator ring: darkest
+        }
+        let ring = min(r, c, finderSpan - 1 - r, finderSpan - 1 - c)
+        return ring == 1 ? 0 : 3 // bright border, dark ring, bright 3×3 core
+    }
+
+    // ------------------------------------------------------------------ encode
+
+    /// Encode name + vector into an RGB24 mosaic image (cardSize × cardSize).
+    static func renderMosaicPixels(name: String, vector: [Float]) -> [UInt8] {
         var plaintext = magic
         let nameBytes = Array(name.utf8.prefix(64))
         plaintext += [UInt8(nameBytes.count >> 8), UInt8(nameBytes.count & 0xFF)]
@@ -56,20 +92,19 @@ enum VoiceCode {
         plaintext += [UInt8](repeating: 0, count: plaintextCapacity - plaintext.count)
 
         // Reed-Solomon per block, then byte-interleave across blocks.
-        var coded = [UInt8]()
         var blocksOut = [[UInt8]]()
         for block in 0..<blocks {
             let start = block * dataBytesPerBlock
             let data = Array(plaintext[start..<start + dataBytesPerBlock])
             blocksOut.append(data + ReedSolomon.parity(for: data))
         }
+        var coded = [UInt8]()
         for position in 0..<(dataBytesPerBlock + parityBytesPerBlock) {
             for block in 0..<blocks {
                 coded.append(blocksOut[block][position])
             }
         }
 
-        // Paint the card.
         var pixels = [UInt8](repeating: 0, count: cardSize * cardSize * 3)
         let background = levels[0]
         for index in stride(from: 0, to: pixels.count, by: 3) {
@@ -82,8 +117,8 @@ enum VoiceCode {
         for row in 0..<gridN {
             for column in 0..<gridN {
                 let level: Int
-                if row == 0 {
-                    level = column % 4 // calibration + alignment row
+                if isReserved(row: row, column: column) {
+                    level = reservedLevel(row: row, column: column)
                 } else if bitCursor + 2 <= totalBits {
                     let byte = Int(coded[bitCursor >> 3])
                     let shift = 6 - (bitCursor & 7)
@@ -98,51 +133,93 @@ enum VoiceCode {
         return pixels
     }
 
-    /// Decode a voice from RGB24 pixels of any uniformly scaled copy of the card.
-    static func decode(pixels: [UInt8], width: Int, height: Int) -> (String, [Float])? {
-        guard width > gridN, height > gridN else { return nil }
-        let scaleX = Double(width) / Double(cardSize)
-        let scaleY = Double(height) / Double(cardSize)
+    private static func paintCell(_ pixels: inout [UInt8], row: Int, column: Int, level: Int) {
+        let color = levels[level]
+        let x0 = regionOrigin + column * cellPx
+        let y0 = regionOrigin + row * cellPx
+        for y in y0..<(y0 + cellPx) {
+            var at = (y * cardSize + x0) * 3
+            for _ in 0..<cellPx {
+                pixels[at] = color.r
+                pixels[at + 1] = color.g
+                pixels[at + 2] = color.b
+                at += 3
+            }
+        }
+    }
 
-        func luma(atX x: Double, y: Double) -> Double {
+    // ------------------------------------------------------------------ decode
+
+    /// Decode a voice from RGB24 pixels of any image containing the mosaic:
+    /// original PNG, recompressed JPEG, or a screenshot from any size of phone.
+    static func decode(pixels: [UInt8], width: Int, height: Int) -> (String, [Float])? {
+        guard width >= gridN, height >= gridN, pixels.count >= width * height * 3 else {
+            return nil
+        }
+        var luma = [Double](repeating: 0, count: width * height)
+        var minLuma = 255.0
+        var maxLuma = 0.0
+        for index in 0..<(width * height) {
+            let at = index * 3
+            let value = 0.299 * Double(pixels[at]) + 0.587 * Double(pixels[at + 1])
+                + 0.114 * Double(pixels[at + 2])
+            luma[index] = value
+            minLuma = min(minLuma, value)
+            maxLuma = max(maxLuma, value)
+        }
+        guard maxLuma - minLuma > 30 else { return nil }
+        let threshold = (minLuma + maxLuma) / 2
+
+        let finders = findFinderPatterns(
+            luma: luma, width: width, height: height, threshold: threshold)
+        guard let (topLeft, topRight, bottomLeft) = pickFinderTriple(finders) else {
+            return nil
+        }
+
+        // Grid geometry from the finder centers: cell k's center sits at (k + 0.5)
+        // cell-units; the finder centers sit at 3.5 and gridN − 3.5.
+        let centerSpan = Double(gridN - finderSpan)
+        let cellW = (topRight.x - topLeft.x) / centerSpan
+        let cellH = (bottomLeft.y - topLeft.y) / centerSpan
+        guard cellW > 0.8, cellH > 0.8 else { return nil } // below ~1 px/cell is gone
+        let originX = topLeft.x - 3.5 * cellW
+        let originY = topLeft.y - 3.5 * cellH
+
+        func sample(row: Double, column: Double, dx: Double, dy: Double) -> Double {
+            let x = originX + (column + 0.5) * cellW + dx
+            let y = originY + (row + 0.5) * cellH + dy
             let xi = min(max(Int(x.rounded()), 0), width - 1)
             let yi = min(max(Int(y.rounded()), 0), height - 1)
             var sum = 0.0
             var count = 0.0
-            for dy in -1...1 {
-                for dx in -1...1 {
-                    let sx = min(max(xi + dx, 0), width - 1)
-                    let sy = min(max(yi + dy, 0), height - 1)
-                    let at = (sy * width + sx) * 3
-                    sum += 0.299 * Double(pixels[at]) + 0.587 * Double(pixels[at + 1])
-                        + 0.114 * Double(pixels[at + 2])
+            let reach = cellW >= 3 ? 1 : 0
+            for oy in -reach...reach {
+                for ox in -reach...reach {
+                    let sx = min(max(xi + ox, 0), width - 1)
+                    let sy = min(max(yi + oy, 0), height - 1)
+                    sum += luma[sy * width + sx]
                     count += 1
                 }
             }
             return sum / count
         }
 
-        func cellCenter(row: Int, column: Int, dx: Double, dy: Double) -> (Double, Double) {
-            let x = (Double(regionOrigin) + (Double(column) + 0.5) * Double(cellPx) + dx) * scaleX
-            let y = (Double(regionOrigin) + (Double(row) + 0.5) * Double(cellPx) + dy) * scaleY
-            return (x, y)
-        }
-
-        // Fit the calibration row under a small offset search; keep the best fit.
+        // Calibration row: learn the four levels as they survived compression, and
+        // refine registration with a small offset search (units of the cell size).
         var best: (score: Double, dx: Double, dy: Double, means: [Double])?
-        for dyStep in -4...4 {
-            for dxStep in -4...4 {
-                let dx = Double(dxStep) * 0.75
-                let dy = Double(dyStep) * 0.75
+        for dyStep in -3...3 {
+            for dxStep in -3...3 {
+                let dx = Double(dxStep) * cellW * 0.12
+                let dy = Double(dyStep) * cellH * 0.12
                 var sums = [Double](repeating: 0, count: 4)
                 var counts = [Double](repeating: 0, count: 4)
                 for column in 0..<gridN {
-                    let (x, y) = cellCenter(row: 0, column: column, dx: dx, dy: dy)
-                    sums[column % 4] += luma(atX: x, y: y)
+                    let value = sample(
+                        row: Double(calibrationRow), column: Double(column), dx: dx, dy: dy)
+                    sums[column % 4] += value
                     counts[column % 4] += 1
                 }
                 let means = zip(sums, counts).map { $0 / max($1, 1) }
-                // Score: monotone separation of the four recovered levels.
                 let gaps = [means[1] - means[0], means[2] - means[1], means[3] - means[2]]
                 let score = gaps.min() ?? -1
                 if score > (best?.score ?? -.infinity) {
@@ -157,16 +234,17 @@ enum VoiceCode {
             (fit.means[2] + fit.means[3]) / 2,
         ]
 
-        // Sample every data cell.
+        // Sample every data cell in layout order.
         let codedCount = (dataBytesPerBlock + parityBytesPerBlock) * blocks
         var coded = [UInt8](repeating: 0, count: codedCount)
         var bitCursor = 0
         let totalBits = codedCount * 8
-        outer: for row in 1..<gridN {
+        outer: for row in 0..<gridN {
             for column in 0..<gridN {
+                if isReserved(row: row, column: column) { continue }
                 if bitCursor + 2 > totalBits { break outer }
-                let (x, y) = cellCenter(row: row, column: column, dx: fit.dx, dy: fit.dy)
-                let value = luma(atX: x, y: y)
+                let value = sample(
+                    row: Double(row), column: Double(column), dx: fit.dx, dy: fit.dy)
                 var level = 0
                 for threshold in thresholds where value > threshold {
                     level += 1
@@ -190,22 +268,163 @@ enum VoiceCode {
         return parse(plaintext)
     }
 
-    // ------------------------------------------------------------------ internals
+    // ------------------------------------------------------------------ finder search
 
-    private static func paintCell(_ pixels: inout [UInt8], row: Int, column: Int, level: Int) {
-        let color = levels[level]
-        let x0 = regionOrigin + column * cellPx
-        let y0 = regionOrigin + row * cellPx
-        for y in y0..<(y0 + cellPx) {
-            var at = (y * cardSize + x0) * 3
-            for _ in 0..<cellPx {
-                pixels[at] = color.r
-                pixels[at + 1] = color.g
-                pixels[at + 2] = color.b
-                at += 3
+    struct FinderCandidate {
+        var x: Double
+        var y: Double
+        var module: Double
+        var votes: Int
+    }
+
+    /// Scan rows for the bright-dark-bright(3)-dark-bright 1:1:3:1:1 run signature,
+    /// verify each hit vertically, and cluster the survivors.
+    private static func findFinderPatterns(
+        luma: [Double], width: Int, height: Int, threshold: Double
+    ) -> [FinderCandidate] {
+        var candidates = [FinderCandidate]()
+        let rowStep = max(1, height / 700)
+
+        func matchesRatio(_ runs: [Double], module: Double) -> Bool {
+            guard module > 0.6 else { return false }
+            return abs(runs[0] - module) < module * 0.65
+                && abs(runs[1] - module) < module * 0.65
+                && abs(runs[2] - 3 * module) < module * 1.2
+                && abs(runs[3] - module) < module * 0.65
+                && abs(runs[4] - module) < module * 0.65
+        }
+
+        /// Vertical confirmation at a candidate x: bright core of ~3 modules with a
+        /// dark ring then a bright ring above and below. Returns center y and module.
+        func verticalCheck(x: Int, y: Int, module: Double) -> (Double, Double)? {
+            func bright(_ yy: Int) -> Bool { luma[yy * width + x] > threshold }
+            guard bright(y) else { return nil }
+            let limit = Int(module * 6) + 2
+            var top = y
+            while top > 0 && bright(top - 1) && y - top < limit { top -= 1 }
+            var bottom = y
+            while bottom < height - 1 && bright(bottom + 1) && bottom - y < limit {
+                bottom += 1
+            }
+            let core = Double(bottom - top + 1)
+            guard abs(core - 3 * module) < module * 1.6 else { return nil }
+            func ringSpan(from start: Int, step: Int) -> (dark: Int, brightRun: Int)? {
+                var yy = start + step
+                var dark = 0
+                while yy >= 0 && yy < height && !bright(yy) && dark < limit {
+                    dark += 1
+                    yy += step
+                }
+                var brightRun = 0
+                while yy >= 0 && yy < height && bright(yy) && brightRun < limit {
+                    brightRun += 1
+                    yy += step
+                }
+                return dark > 0 && brightRun > 0 ? (dark, brightRun) : nil
+            }
+            guard let above = ringSpan(from: top, step: -1),
+                let below = ringSpan(from: bottom, step: 1),
+                abs(Double(above.dark) - module) < module * 0.9,
+                abs(Double(below.dark) - module) < module * 0.9,
+                abs(Double(above.brightRun) - module) < module * 0.9,
+                abs(Double(below.brightRun) - module) < module * 0.9
+            else { return nil }
+            return ((Double(top) + Double(bottom)) / 2, core / 3)
+        }
+
+        for y in stride(from: 0, to: height, by: rowStep) {
+            let rowBase = y * width
+            var runs = [Double]()
+            var runIsBright = [Bool]()
+            var current = luma[rowBase] > threshold
+            var length = 1.0
+            for x in 1..<width {
+                let bright = luma[rowBase + x] > threshold
+                if bright == current {
+                    length += 1
+                } else {
+                    runs.append(length)
+                    runIsBright.append(current)
+                    current = bright
+                    length = 1
+                }
+            }
+            runs.append(length)
+            runIsBright.append(current)
+
+            var position = 0.0
+            for index in 0..<runs.count {
+                defer { position += runs[index] }
+                guard index + 4 < runs.count, runIsBright[index] else { continue }
+                let window = Array(runs[index...index + 4])
+                let module = window.reduce(0, +) / 7
+                guard matchesRatio(window, module: module) else { continue }
+                let centerX = position + window.reduce(0, +) / 2
+                let xi = min(max(Int(centerX.rounded()), 0), width - 1)
+                guard let (centerY, moduleV) = verticalCheck(x: xi, y: y, module: module),
+                    moduleV / module > 0.5, moduleV / module < 2
+                else { continue }
+                var merged = false
+                for at in 0..<candidates.count {
+                    let candidate = candidates[at]
+                    if abs(candidate.x - centerX) < module * 4,
+                        abs(candidate.y - centerY) < module * 4 {
+                        let weight = Double(candidate.votes)
+                        candidates[at].x = (candidate.x * weight + centerX) / (weight + 1)
+                        candidates[at].y = (candidate.y * weight + centerY) / (weight + 1)
+                        candidates[at].module =
+                            (candidate.module * weight + module) / (weight + 1)
+                        candidates[at].votes += 1
+                        merged = true
+                        break
+                    }
+                }
+                if !merged {
+                    candidates.append(
+                        FinderCandidate(x: centerX, y: centerY, module: module, votes: 1))
+                }
             }
         }
+        return candidates.filter { $0.votes >= 2 }
     }
+
+    /// Choose the (topLeft, topRight, bottomLeft) triple: axis-aligned arms of similar
+    /// length meeting at the corner, with consistent module sizes.
+    private static func pickFinderTriple(
+        _ candidates: [FinderCandidate]
+    ) -> (FinderCandidate, FinderCandidate, FinderCandidate)? {
+        guard candidates.count >= 3 else { return nil }
+        var best: (score: Double, triple: (FinderCandidate, FinderCandidate, FinderCandidate))?
+        for i in 0..<candidates.count {
+            for j in 0..<candidates.count where j != i {
+                for k in 0..<candidates.count where k != i && k != j {
+                    let corner = candidates[i]
+                    let right = candidates[j]
+                    let down = candidates[k]
+                    let armX = (right.x - corner.x, right.y - corner.y)
+                    let armY = (down.x - corner.x, down.y - corner.y)
+                    guard armX.0 > 0, armY.1 > 0 else { continue } // orientation
+                    let lengthX = (armX.0 * armX.0 + armX.1 * armX.1).squareRoot()
+                    let lengthY = (armY.0 * armY.0 + armY.1 * armY.1).squareRoot()
+                    guard lengthX > 10, lengthY > 10 else { continue }
+                    guard abs(armX.1) < lengthX * 0.15, abs(armY.0) < lengthY * 0.15,
+                        lengthX / lengthY > 0.6, lengthX / lengthY < 1.7
+                    else { continue }
+                    let modules = [corner.module, right.module, down.module]
+                    let moduleSpread = (modules.max() ?? 1) / max(modules.min() ?? 1, 0.1)
+                    guard moduleSpread < 2 else { continue }
+                    let score = Double(corner.votes + right.votes + down.votes)
+                        - moduleSpread
+                    if score > (best?.score ?? -.infinity) {
+                        best = (score, (corner, right, down))
+                    }
+                }
+            }
+        }
+        return best?.triple
+    }
+
+    // ------------------------------------------------------------------ payload
 
     private static func parse(_ plaintext: [UInt8]) -> (String, [Float])? {
         guard plaintext.count >= magic.count + 2,
@@ -306,12 +525,11 @@ enum ReedSolomon {
     /// Correct up to 16 byte errors in a 255-byte codeword. Nil when unrecoverable.
     static func correct(_ received: [UInt8]) -> [UInt8]? {
         let n = received.count
-        // Syndromes.
         var syndromes = [UInt8](repeating: 0, count: parityCount)
         var clean = true
         for index in 0..<parityCount {
             var value: UInt8 = 0
-            for &byte in received {
+            for byte in received {
                 value = multiply(value, field.exp[index]) ^ byte
             }
             syndromes[index] = value
@@ -326,30 +544,25 @@ enum ReedSolomon {
         var m = 1
         for step in 0..<parityCount {
             var discrepancy = syndromes[step]
-            for index in 1..<sigma.count {
-                if step >= index {
-                    discrepancy ^= multiply(sigma[index], syndromes[step - index])
-                }
+            for index in 1..<sigma.count where step >= index {
+                discrepancy ^= multiply(sigma[index], syndromes[step - index])
             }
             if discrepancy == 0 {
                 m += 1
-            } else if 2 * (sigma.count - 1) <= step {
+                continue
+            }
+            let scale = multiply(discrepancy, inverse(discrepancyLast))
+            var shifted = [UInt8](repeating: 0, count: m) + previous
+            for index in 0..<shifted.count {
+                shifted[index] = multiply(shifted[index], scale)
+            }
+            if 2 * (sigma.count - 1) <= step {
                 let old = sigma
-                let scale = multiply(discrepancy, inverse(discrepancyLast))
-                var shifted = [UInt8](repeating: 0, count: m) + previous
-                for index in 0..<shifted.count {
-                    shifted[index] = multiply(shifted[index], scale)
-                }
                 sigma = xorPolynomials(sigma, shifted)
                 previous = old
                 discrepancyLast = discrepancy
                 m = 1
             } else {
-                let scale = multiply(discrepancy, inverse(discrepancyLast))
-                var shifted = [UInt8](repeating: 0, count: m) + previous
-                for index in 0..<shifted.count {
-                    shifted[index] = multiply(shifted[index], scale)
-                }
                 sigma = xorPolynomials(sigma, shifted)
                 m += 1
             }
@@ -371,7 +584,7 @@ enum ReedSolomon {
         }
         guard positions.count == errorCount else { return nil }
 
-        // Forney for magnitudes: omega = (syndromes * sigma) mod x^parity.
+        // Forney magnitudes: omega = (syndromes · sigma) mod x^parityCount.
         var omega = [UInt8](repeating: 0, count: parityCount)
         for index in 0..<parityCount {
             var value: UInt8 = 0
@@ -396,10 +609,10 @@ enum ReedSolomon {
             guard denominator != 0 else { return nil }
             corrected[position] ^= multiply(numerator, inverse(denominator))
         }
-        // Verify: recompute syndromes on the corrected word.
+        // Verify: syndromes of the corrected word must vanish.
         for index in 0..<parityCount {
             var value: UInt8 = 0
-            for &byte in corrected {
+            for byte in corrected {
                 value = multiply(value, field.exp[index]) ^ byte
             }
             if value != 0 { return nil }
