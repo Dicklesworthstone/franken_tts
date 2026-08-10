@@ -15,6 +15,10 @@ struct ModelFile {
     let relativePath: String
     let bytes: Int64
     let sha256: String
+    /// Optional assets download alongside the rest but never gate readiness: synthesis
+    /// works without the denoiser, and holding it hostage would brick existing installs
+    /// until an incremental fetch.
+    var required = true
 }
 
 enum ModelManifest {
@@ -47,7 +51,8 @@ enum ModelManifest {
             asset: "fastenhancer-s-48k-denoise.safetensors",
             relativePath: "denoise/fastenhancer-s-48k.safetensors",
             bytes: 838_440,
-            sha256: "28c1807fd9113e4ca09d3aacb2ecb07a742917321bfaced8b92598daffbd098b"),
+            sha256: "28c1807fd9113e4ca09d3aacb2ecb07a742917321bfaced8b92598daffbd098b",
+            required: false),
     ]
 
     static let totalBytes = files.reduce(Int64(0)) { $0 + $1.bytes }
@@ -86,7 +91,7 @@ final class ModelStore {
     }
 
     var isComplete: Bool {
-        ModelManifest.files.allSatisfy { file in
+        ModelManifest.files.filter(\.required).allSatisfy { file in
             let path = modelDirectory.appendingPathComponent(file.relativePath).path
             let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? nil
             return size == file.bytes
@@ -128,7 +133,12 @@ final class ModelStore {
 
             var doneBytes: Int64 = 0
             for file in ModelManifest.files {
-                try await ensure(file: file, alreadyDone: doneBytes)
+                do {
+                    try await ensure(file: file, alreadyDone: doneBytes)
+                } catch where !file.required && !(error is CancellationError) {
+                    // The denoiser is an enhancement; a failed optional fetch must not
+                    // block a usable model. The next download attempt retries it.
+                }
                 doneBytes += file.bytes
                 refreshCachedBytes()
             }

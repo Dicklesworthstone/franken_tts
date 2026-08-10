@@ -38,7 +38,10 @@ final class LabModel {
     }
 
     func speakerVector() throws -> [Float] {
-        if let id = enrolledSelection(), let voice = library.voice(id: id) {
+        if let id = enrolledSelection() {
+            guard let voice = library.voice(id: id) else {
+                throw EngineError.native("that enrolled voice no longer exists; pick another")
+            }
             return voice.vector
         }
         return try Engine.presetVector(named: selectedVoice)
@@ -63,8 +66,13 @@ final class LabModel {
         let ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.synthesisSeconds += 0.5 }
         }
+        // The screen must not sleep mid-run: suspension kills a minutes-long synthesis.
+        UIApplication.shared.isIdleTimerDisabled = true
         Task {
-            defer { ticker.invalidate() }
+            defer {
+                ticker.invalidate()
+                UIApplication.shared.isIdleTimerDisabled = false
+            }
             do {
                 let speaker = try speakerVector()
                 if await !engine.isLoaded {
@@ -76,7 +84,6 @@ final class LabModel {
                 lastAudio = pcm
                 lastRealTimeFactor = (Double(pcm.count) / Double(WavWriter.sampleRate)) / elapsed
                 try startPlayback(of: pcm)
-                UINotificationFeedbackGenerator().notificationOccurred(.success)
             } catch {
                 lastError = error.localizedDescription
             }
@@ -129,7 +136,6 @@ final class LabModel {
                 enrollmentTarget = nil
                 selectedVoice = "voice:\(selected.uuidString)"
                 enrollmentSaved = true
-                UINotificationFeedbackGenerator().notificationOccurred(.success)
             } catch {
                 lastError = error.localizedDescription
             }
@@ -170,7 +176,10 @@ struct LabView: View {
     @State private var showEnrollment = false
     @State private var renameTarget: EnrolledVoice?
     @State private var renameText = ""
+    /// Bumped to refresh the play/pause icon, which tracks external playback state.
+    @State private var playbackTick = 0
     @Environment(\.scenePhase) private var scenePhase
+    @FocusState private var focusedField: Bool
 
     var body: some View {
         ZStack {
@@ -184,6 +193,12 @@ struct LabView: View {
                     footer
                 }
                 .padding(16)
+            }
+        }
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") { focusedField = false }
             }
         }
         .sheet(isPresented: $showEnrollment) {
@@ -218,6 +233,10 @@ struct LabView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { model.unloadEngineForMemoryPressure() }
         }
+        .sensoryFeedback(.selection, trigger: model.selectedVoice)
+        .sensoryFeedback(.success, trigger: model.lastAudio?.count)
+        .sensoryFeedback(.success, trigger: model.enrollmentSaved) { _, saved in saved }
+        .scrollDismissesKeyboard(.interactively)
     }
 
     private var header: some View {
@@ -355,6 +374,7 @@ struct LabView: View {
                         }
                     }
                 }
+                .animation(.snappy, value: model.library.voices)
                 Text(
                     "Cloning runs the speaker encoder on this phone; the recording is discarded once the 4 KB voice vector exists. Clone only voices you have the right to use."
                 )
@@ -378,6 +398,7 @@ struct LabView: View {
                 .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
                 .foregroundStyle(Lab.textPrimary)
                 .font(.system(size: 15))
+                .focused($focusedField)
                 HStack {
                     Text("\(model.text.count) / 600")
                         .font(.system(size: 11, design: .monospaced))
@@ -394,6 +415,7 @@ struct LabView: View {
                         )
                     )
                     .keyboardType(.numberPad)
+                    .focused($focusedField)
                     .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(Lab.textPrimary)
                     .frame(width: 74)
@@ -409,8 +431,16 @@ struct LabView: View {
                     .buttonStyle(GhostButtonStyle())
                     .accessibilityLabel("Randomize seed")
                 }
-                Button(model.isSynthesizing ? "Synthesizing…" : "⚡ Synthesize") {
+                Button {
+                    focusedField = false
                     model.synthesize()
+                } label: {
+                    HStack(spacing: 8) {
+                        if model.isSynthesizing {
+                            ProgressView().tint(.white).controlSize(.small)
+                        }
+                        Text(model.isSynthesizing ? "Synthesizing" : "⚡ Synthesize")
+                    }
                 }
                 .buttonStyle(PrimaryButtonStyle())
                 .disabled(model.isSynthesizing || model.store.phase != .ready)
@@ -424,11 +454,30 @@ struct LabView: View {
                 if let audio = model.lastAudio {
                     WaveformView(samples: audio)
                     HStack(spacing: 10) {
-                        Button("▶ Play again") {
-                            model.player?.currentTime = 0
-                            model.player?.play()
+                        Button {
+                            if model.player?.isPlaying == true {
+                                model.player?.pause()
+                            } else {
+                                if model.player?.currentTime == model.player?.duration {
+                                    model.player?.currentTime = 0
+                                }
+                                model.player?.play()
+                            }
+                            playbackTick += 1
+                        } label: {
+                            Image(
+                                systemName: model.player?.isPlaying == true
+                                    ? "pause.fill" : "play.fill")
                         }
                         .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+                        .accessibilityLabel(
+                            model.player?.isPlaying == true ? "Pause" : "Play")
+                        .id(playbackTick)
+                        .onReceive(
+                            Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+                        ) { _ in
+                            playbackTick += 1
+                        }
                         if let url = model.shareUrl {
                             ShareLink(item: url) {
                                 Text("Share WAV")
@@ -521,14 +570,18 @@ struct EnrolledVoiceTile: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            HStack(spacing: 14) {
-                Button(action: rename) { Image(systemName: "pencil") }
-                    .accessibilityLabel("Rename \(voice.name)")
-                Button(action: reRecord) { Image(systemName: "arrow.clockwise") }
-                    .accessibilityLabel("Re-record \(voice.name)")
+            HStack(spacing: 6) {
+                Button(action: rename) {
+                    Image(systemName: "pencil").frame(width: 34, height: 30)
+                }
+                .accessibilityLabel("Rename \(voice.name)")
+                Button(action: reRecord) {
+                    Image(systemName: "arrow.clockwise").frame(width: 34, height: 30)
+                }
+                .accessibilityLabel("Re-record \(voice.name)")
                 Spacer()
                 Button { confirmDelete = true } label: {
-                    Image(systemName: "trash")
+                    Image(systemName: "trash").frame(width: 34, height: 30)
                 }
                 .foregroundStyle(Lab.danger)
                 .accessibilityLabel("Delete \(voice.name)")
@@ -591,7 +644,9 @@ struct EnrollmentSheet: View {
                     .padding(10)
                     .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
                     .foregroundStyle(Lab.textPrimary)
-                    .disabled(model.isEnrolling)
+                    // Locked once recording starts: the name is required to save, and
+                    // clearing it mid-read would cost the whole take at auto-stop.
+                    .disabled(model.isEnrolling || model.recorder.isRecording)
                 if model.recorder.isRecording {
                     // The live meter is the tell that the microphone is actually hearing
                     // you; a silent bar during the script means stop and fix it now, not
@@ -651,6 +706,7 @@ struct EnrollmentSheet: View {
                     Spacer()
                     Button("Cancel") {
                         _ = model.recorder.stop()
+                        model.enrollmentTarget = nil
                         dismiss()
                     }
                     .buttonStyle(GhostButtonStyle())
