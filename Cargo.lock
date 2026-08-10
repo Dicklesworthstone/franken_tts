@@ -719,6 +719,7 @@ dependencies = [
  "ftts-cli",
  "ftts-core",
  "ftts-model-qwen",
+ "ftts-video",
  "serde_json",
 ]
 

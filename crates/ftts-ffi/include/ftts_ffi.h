@@ -51,6 +51,23 @@ void ftts_pcm_free(float *pcm, size_t len);
 /* Enrolls a voice from mono 24 kHz f32 PCM into out[FTTS_SPEAKER_WIDTH]. 0 on success. */
 int32_t ftts_enroll(FttsEngine *engine, const float *pcm, size_t len, float *out);
 
+/* ---- branded share video: identical frames to `ftts make-video` -------------------- */
+
+typedef struct FttsVideoRenderer FttsVideoRenderer;
+
+uint32_t ftts_video_width(void);
+uint32_t ftts_video_height(void);
+uint32_t ftts_video_fps(void);
+
+/* Opens a renderer over finished speech PCM. NULL on failure. */
+FttsVideoRenderer *ftts_video_open(const float *pcm, size_t len, uint32_t sample_rate,
+                                   const char *voice_label);
+size_t ftts_video_frame_count(const FttsVideoRenderer *renderer);
+/* Renders RGB24 into out (width*height*3 bytes). Serialize calls. 0 on success. */
+int32_t ftts_video_render_frame(const FttsVideoRenderer *renderer, size_t frame,
+                                uint8_t *out);
+void ftts_video_close(FttsVideoRenderer *renderer);
+
 #ifdef __cplusplus
 }
 #endif

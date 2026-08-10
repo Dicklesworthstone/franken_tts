@@ -210,7 +210,7 @@ pub fn trailing_noise_samples(pcm: &[f32], sample_rate: u32) -> usize {
     // the recording rather than assuming an absolute amplitude.
     let speech_level = pcm[..voiced_end]
         .chunks(window)
-        .map(|chunk| rms(chunk))
+        .map(rms)
         .fold(0.0_f32, f32::max);
     if speech_level <= 0.0 {
         return 0;

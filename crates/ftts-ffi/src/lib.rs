@@ -382,6 +382,131 @@ pub unsafe extern "C" fn ftts_enroll(
     })
 }
 
+// ------------------------------------------------------------------------ share video
+
+/// The branded share-video frame renderer, host-encoded (AVAssetWriter on iOS).
+pub struct FttsVideoRenderer {
+    inner: ftts_video::FrameRenderer,
+}
+
+/// Frame width in pixels. Matches the CLI's `ftts make-video` output exactly.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+pub extern "C" fn ftts_video_width() -> u32 {
+    ftts_video::WIDTH as u32
+}
+
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+pub extern "C" fn ftts_video_height() -> u32 {
+    ftts_video::HEIGHT as u32
+}
+
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+pub extern "C" fn ftts_video_fps() -> u32 {
+    ftts_video::FPS
+}
+
+/// Opens a renderer over finished speech PCM. Null on failure (see the error message).
+///
+/// # Safety
+/// `pcm` must be valid for `len` floats; `voice_label` NUL-terminated UTF-8.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ftts_video_open(
+    pcm: *const f32,
+    len: usize,
+    sample_rate: u32,
+    voice_label: *const c_char,
+) -> *mut FttsVideoRenderer {
+    guarded(std::ptr::null_mut(), || {
+        if pcm.is_null() || voice_label.is_null() {
+            set_error("null pointer to ftts_video_open");
+            return std::ptr::null_mut();
+        }
+        // SAFETY: pcm valid for len floats and voice_label NUL-terminated, per the header.
+        #[allow(unsafe_code)]
+        let (samples, label) = unsafe {
+            (
+                std::slice::from_raw_parts(pcm, len).to_vec(),
+                CStr::from_ptr(voice_label),
+            )
+        };
+        let Ok(label) = label.to_str() else {
+            set_error("voice label is not UTF-8");
+            return std::ptr::null_mut();
+        };
+        match ftts_video::FrameRenderer::new(samples, sample_rate, label) {
+            Ok(inner) => Box::into_raw(Box::new(FttsVideoRenderer { inner })),
+            Err(error) => {
+                set_error(error);
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Total frames the clip renders to.
+///
+/// # Safety
+/// `renderer` must come from [`ftts_video_open`] and not yet be closed.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ftts_video_frame_count(renderer: *const FttsVideoRenderer) -> usize {
+    if renderer.is_null() {
+        return 0;
+    }
+    // SAFETY: valid per the contract above; shared read only.
+    #[allow(unsafe_code)]
+    unsafe { &*renderer }.inner.total_frames()
+}
+
+/// Renders one frame as RGB24 into `out`, which must hold width*height*3 bytes.
+///
+/// # Safety
+/// `renderer` from [`ftts_video_open`]; `out` valid for `ftts_video_width() *
+/// ftts_video_height() * 3` bytes; calls serialized by the caller.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ftts_video_render_frame(
+    renderer: *const FttsVideoRenderer,
+    frame: usize,
+    out: *mut u8,
+) -> i32 {
+    guarded(1, || {
+        if renderer.is_null() || out.is_null() {
+            set_error("null pointer to ftts_video_render_frame");
+            return 1;
+        }
+        let bytes = ftts_video::WIDTH * ftts_video::HEIGHT * 3;
+        // SAFETY: per the contract above.
+        #[allow(unsafe_code)]
+        let (renderer, rgb) = unsafe { (&*renderer, std::slice::from_raw_parts_mut(out, bytes)) };
+        if frame >= renderer.inner.total_frames() {
+            set_error("frame index past the end of the clip");
+            return 1;
+        }
+        renderer.inner.render_into(frame, rgb);
+        0
+    })
+}
+
+/// Releases a renderer. Null is a no-op.
+///
+/// # Safety
+/// `renderer` must be null or from [`ftts_video_open`], passed exactly once.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ftts_video_close(renderer: *mut FttsVideoRenderer) {
+    if renderer.is_null() {
+        return;
+    }
+    // SAFETY: exactly-once ownership transfer per the contract above.
+    #[allow(unsafe_code)]
+    drop(unsafe { Box::from_raw(renderer) });
+}
+
 #[cfg(test)]
 #[allow(unsafe_code)] // tests exercise the C ABI exactly as a caller would
 mod tests {
@@ -485,6 +610,28 @@ mod tests {
         assert!(len > 0 && !pcm.is_null());
         unsafe { ftts_pcm_free(pcm, len) };
         unsafe { ftts_engine_close(engine) };
+    }
+
+    #[test]
+    fn video_renderer_round_trips_through_the_abi() {
+        let pcm: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.01).sin() * 0.4).collect();
+        let label = CString::new("matt").unwrap();
+        let renderer = unsafe { ftts_video_open(pcm.as_ptr(), pcm.len(), 24_000, label.as_ptr()) };
+        assert!(!renderer.is_null(), "{}", last_error());
+        let frames = unsafe { ftts_video_frame_count(renderer) };
+        assert_eq!(frames, 30, "one second at 30 fps");
+        let mut rgb = vec![0u8; (ftts_video_width() * ftts_video_height() * 3) as usize];
+        assert_eq!(
+            unsafe { ftts_video_render_frame(renderer, 0, rgb.as_mut_ptr()) },
+            0
+        );
+        assert!(rgb.iter().any(|&b| b != 0), "frame should not be black");
+        assert_eq!(
+            unsafe { ftts_video_render_frame(renderer, frames, rgb.as_mut_ptr()) },
+            1,
+            "past-the-end frame must refuse"
+        );
+        unsafe { ftts_video_close(renderer) };
     }
 
     fn last_error() -> String {
