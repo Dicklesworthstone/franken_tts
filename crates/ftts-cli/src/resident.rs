@@ -213,6 +213,12 @@ pub fn try_synthesize(
     bundle: &ModelBundle,
     request: &WireRequest<'_>,
 ) -> Result<Option<SynthesizedAudio>, FttsError> {
+    // JSON cannot carry NaN or infinity (serde_json writes null), so a speaker vector
+    // containing one would silently shrink in transit. The inline path passes such a
+    // vector through verbatim; parity therefore requires skipping the wire entirely.
+    if request.speaker.iter().any(|value| !value.is_finite()) {
+        return Ok(None);
+    }
     match connect(bundle) {
         Some(stream) => roundtrip(stream, bundle, request),
         None => Ok(None),
@@ -220,9 +226,19 @@ pub fn try_synthesize(
 }
 
 fn connect(bundle: &ModelBundle) -> Option<TcpStream> {
-    // A live daemon answers immediately.
-    if let Some(stream) = connect_once(bundle) {
-        return Some(stream);
+    // A live daemon answers immediately; under heavy load one connect can miss its
+    // timeout, and treating that as death would orphan a healthy daemon and briefly
+    // double model memory with a duplicate. Three attempts before giving up on it.
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if let Some(stream) = connect_once(bundle) {
+            return Some(stream);
+        }
+        if read_state(&bundle.root).is_none() {
+            break; // no state file at all: nothing to retry against
+        }
     }
     // None listening: clear any stale state file and spawn one from this same binary.
     if let Some(path) = state_path(&bundle.root)
@@ -245,7 +261,7 @@ fn connect_once(bundle: &ModelBundle) -> Option<TcpStream> {
     let state = read_state(&bundle.root)?;
     let stream = TcpStream::connect_timeout(
         &(Ipv4Addr::LOCALHOST, state.port).into(),
-        Duration::from_millis(500),
+        Duration::from_millis(1000),
     )
     .ok()?;
     stream.set_read_timeout(Some(client_read_timeout())).ok()?;
@@ -463,6 +479,9 @@ fn handle_connection(
         // A different binary version must not be served by this process; the client falls
         // back inline and this daemon retires so the next spawn matches.
         refuse(&mut stream, "version", "resident daemon version mismatch");
+        if let Some(state) = state_path(&bundle.root) {
+            let _ = fs::remove_file(state);
+        }
         std::process::exit(0);
     }
 
@@ -472,6 +491,9 @@ fn handle_connection(
         && *loaded_stamp != stamp_now
     {
         refuse(&mut stream, "stale", "model artifact changed since load");
+        if let Some(state) = state_path(&bundle.root) {
+            let _ = fs::remove_file(state);
+        }
         std::process::exit(0);
     }
 
