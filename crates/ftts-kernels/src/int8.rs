@@ -394,9 +394,16 @@ fn plan_cache_path() -> Option<std::path::PathBuf> {
 /// The cache key: anything here changing invalidates the measurement.
 fn plan_cache_key() -> String {
     let tiers: Vec<&str> = Int8Tier::available().iter().map(|t| t.as_str()).collect();
+    // `tiers` is runtime ISA detection, so a CPU with different features already misses the
+    // cache; arch/OS and core count additionally invalidate a plan replayed on a same-ISA but
+    // different machine (an NFS or migrated `$HOME`), where the measured winner may differ by
+    // microarchitecture. Cost of a false miss is one ~second re-probe.
     format!(
-        "v0|crate={}|tiers={}",
+        "v1|crate={}|arch={}-{}|cores={}|tiers={}",
         env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        std::thread::available_parallelism().map_or(1, usize::from),
         tiers.join(",")
     )
 }
@@ -471,10 +478,16 @@ fn fastest_tier(probes: &[(usize, usize, usize)]) -> Int8Tier {
                 k,
             };
             let mut out = vec![0.0_f32; m * n];
+            // Serial on purpose: the decode-GEMV probe crosses the team work threshold, so an
+            // un-bypassed call would lazily spawn the team mid-measurement and time dispatch
+            // overhead + contention instead of the tier. Tier choice is about the inner loop;
+            // the team partitions whatever tier wins identically.
             let mut rounds: Vec<f64> = (0..3)
                 .map(|_| {
                     let start = Instant::now();
-                    linear_q8(&x_q, &x_scales, &weight, None, m, &mut out, tier);
+                    crate::team::with_team_bypassed(|| {
+                        linear_q8(&x_q, &x_scales, &weight, None, m, &mut out, tier);
+                    });
                     start.elapsed().as_secs_f64()
                 })
                 .collect();

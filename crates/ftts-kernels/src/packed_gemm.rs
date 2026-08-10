@@ -38,8 +38,8 @@
 /// Rows of the output tile held in registers.
 ///
 /// Four rows of eight `f32` is 32 accumulators — eight v128 registers on wasm, which fits the
-/// 16-register file with room for the operands. Wider tiles spill; `MR = 2` is the fallback for
-/// short calls where a 4-row tile would be mostly remainder.
+/// 16-register file with room for the operands. Wider tiles spill. Row remainders shorter than
+/// `MR` run one row at a time (`accumulate_tile::<1>`); there is no intermediate 2-row tile.
 const MR: usize = 4;
 
 /// Columns of the output tile held in registers: two full v128 lanes of `f32`.
@@ -134,58 +134,73 @@ pub(crate) unsafe fn linear_packed_range(
         (columns / NR).max(1) * NR
     };
 
-    let mut panel = vec![0.0_f32; k * NR];
+    // Thread-local scratch instead of a per-dispatch `vec!`: this function runs once per
+    // stripe per dispatch on the steady-state decode path, and the doctrine pins "no
+    // allocator activity in steady-state decode" as load-bearing. Each team worker (and the
+    // dispatcher) owns its thread's buffer, so there is no sharing to reason about; the
+    // buffer only ever grows, to the largest `k * NR` this thread has seen.
+    thread_local! {
+        static PANEL_SCRATCH: std::cell::RefCell<Vec<f32>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    PANEL_SCRATCH.with(|scratch| {
+        let mut panel_guard = scratch.borrow_mut();
+        if panel_guard.len() < k * NR {
+            panel_guard.resize(k * NR, 0.0);
+        }
+        let panel = &mut panel_guard[..k * NR];
 
-    let mut jc = col_start;
-    while jc < n_full {
-        let jc_end = (jc + nc).min(n_full);
-        let mut j0 = jc;
-        while j0 < jc_end {
-            // Pack NR weight columns into k-major order.
-            //
-            // This is the one place the `[n, k]` layout costs something: the reference kernel
-            // copies a contiguous run, while here each of the NR sources is a separate row and the
-            // gather has stride `k`. It is paid once per panel and amortized over every one of the
-            // `m` rows that consume it, which is the entire point of packing.
-            for (column, offset) in (j0..j0 + NR).enumerate() {
-                let source = &weight[offset * k..offset * k + k];
-                for (depth, &value) in source.iter().enumerate() {
-                    panel[depth * NR + column] = value;
+        let mut jc = col_start;
+        while jc < n_full {
+            let jc_end = (jc + nc).min(n_full);
+            let mut j0 = jc;
+            while j0 < jc_end {
+                // Pack NR weight columns into k-major order.
+                //
+                // This is the one place the `[n, k]` layout costs something: the reference kernel
+                // copies a contiguous run, while here each of the NR sources is a separate row and the
+                // gather has stride `k`. It is paid once per panel and amortized over every one of the
+                // `m` rows that consume it, which is the entire point of packing.
+                for (column, offset) in (j0..j0 + NR).enumerate() {
+                    let source = &weight[offset * k..offset * k + k];
+                    for (depth, &value) in source.iter().enumerate() {
+                        panel[depth * NR + column] = value;
+                    }
                 }
-            }
 
-            let mut i0 = 0;
-            while i0 < m_full {
-                // SAFETY: rows `i0..i0+MR` are below `m` and columns `j0..j0+NR` are inside the
-                // caller's stripe, so every write lands within the `m * n` buffer.
-                unsafe { accumulate_tile::<MR>(x, &panel, out, i0, j0, k, n) };
-                i0 += MR;
+                let mut i0 = 0;
+                while i0 < m_full {
+                    // SAFETY: rows `i0..i0+MR` are below `m` and columns `j0..j0+NR` are inside the
+                    // caller's stripe, so every write lands within the `m * n` buffer.
+                    unsafe { accumulate_tile::<MR>(x, &panel, out, i0, j0, k, n) };
+                    i0 += MR;
+                }
+                // Rows below the last full tile still benefit from the packed panel; run them one row
+                // at a time rather than dropping to the unpacked tail path.
+                for row in m_full..m {
+                    // SAFETY: as above, with a single row.
+                    unsafe { accumulate_tile::<1>(x, &panel, out, row, j0, k, n) };
+                }
+                j0 += NR;
             }
-            // Rows below the last full tile still benefit from the packed panel; run them one row
-            // at a time rather than dropping to the unpacked tail path.
-            for row in m_full..m {
-                // SAFETY: as above, with a single row.
-                unsafe { accumulate_tile::<1>(x, &panel, out, row, j0, k, n) };
-            }
-            j0 += NR;
+            jc += nc;
         }
-        jc += nc;
-    }
 
-    // Remainder columns: fewer than NR left over, so there is no panel to amortize and the plain
-    // ascending-k dot is both simplest and exact.
-    for row in 0..m {
-        let x_row = &x[row * k..row * k + k];
-        for column in n_full..col_end {
-            let w_row = &weight[column * k..column * k + k];
-            let mut sum = 0.0_f32;
-            for depth in 0..k {
-                sum += x_row[depth] * w_row[depth];
+        // Remainder columns: fewer than NR left over, so there is no panel to amortize and the plain
+        // ascending-k dot is both simplest and exact.
+        for row in 0..m {
+            let x_row = &x[row * k..row * k + k];
+            for column in n_full..col_end {
+                let w_row = &weight[column * k..column * k + k];
+                let mut sum = 0.0_f32;
+                for depth in 0..k {
+                    sum += x_row[depth] * w_row[depth];
+                }
+                // SAFETY: `row < m`, `column < n`, inside the caller's buffer and stripe.
+                unsafe { *out.add(row * n + column) += sum };
             }
-            // SAFETY: `row < m`, `column < n`, inside the caller's buffer and stripe.
-            unsafe { *out.add(row * n + column) += sum };
         }
-    }
+    });
 }
 
 /// Accumulates one `ROWS x NR` output tile from a packed weight panel.

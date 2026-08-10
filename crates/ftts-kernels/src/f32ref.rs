@@ -999,6 +999,40 @@ pub fn gqa_attention_with_arithmetic(
         return;
     }
 
+    // Team partitioning over query heads: the workers run the SAME extracted per-head loop
+    // (`gqa_attention_head_range_with_arithmetic`), heads are independent, and no reduction
+    // crosses a head — so the partitioned result is bit-identical to the serial reference
+    // (`attention_partitioning_is_bit_exact` in team.rs). Gated to the default arithmetic
+    // pair because `AttentionJob` runs exactly that; the forensic softmax and accumulation
+    // probe orders must keep the serial path, same rule as the packed-GEMM gate in
+    // `linear_with_accumulation`. The floor keeps decode steps over short contexts off the
+    // dispatch (mul-add count ≈ heads × qp × kp × dim).
+    const TEAM_ATTENTION_FLOOR_MADDS: usize = 512 * 1024;
+    if softmax_arithmetic == F32SoftmaxArithmetic::ReciprocalMultiply
+        && accumulation == F32LinearAccumulation::Scalar
+        && q_heads
+            .saturating_mul(query_positions)
+            .saturating_mul(key_positions)
+            .saturating_mul(head_dim)
+            >= TEAM_ATTENTION_FLOOR_MADDS
+        && !crate::team::thread_bypassed()
+        && let Some(team) = crate::team::armed()
+    {
+        team.gqa_attention(
+            queries,
+            keys,
+            values,
+            additive_mask,
+            query_positions,
+            key_positions,
+            q_heads,
+            kv_heads,
+            head_dim,
+            out,
+        );
+        return;
+    }
+
     gqa_attention_head_range_with_arithmetic(
         queries,
         keys,
@@ -1104,38 +1138,52 @@ pub(crate) unsafe fn gqa_attention_head_range_into(
     assert!(q_head_range.end <= q_heads, "head range exceeds q_heads");
     let scale = (head_dim as f32).sqrt().recip();
     let kv_group = q_heads / kv_heads;
-    let mut scores = vec![0.0f32; key_positions];
-
-    for query_position in 0..query_positions {
-        let mask =
-            &additive_mask[query_position * key_positions..(query_position + 1) * key_positions];
-        for q_head in q_head_range.clone() {
-            let kv_head = q_head / kv_group;
-            let query_base = (query_position * q_heads + q_head) * head_dim;
-            let query = &queries[query_base..query_base + head_dim];
-            for (key_position, score) in scores.iter_mut().enumerate() {
-                let key_base = (key_position * kv_heads + kv_head) * head_dim;
-                let key = &keys[key_base..key_base + head_dim];
-                let dot = dot_with_accumulation(query, key, accumulation);
-                *score = dot * scale + mask[key_position];
-            }
-            softmax_rows_with_arithmetic(&mut scores, 1, key_positions, softmax_arithmetic);
-
-            // SAFETY: `query_base` indexes [query_position, q_head, head_dim] inside the bounds
-            // the caller guaranteed, and this borrow spans only this head — the one span this
-            // partition owns, disjoint from every other partition's.
-            let head_out = unsafe { std::slice::from_raw_parts_mut(out.add(query_base), head_dim) };
-            attention_weighted_sum(
-                &scores,
-                values,
-                kv_head,
-                kv_heads,
-                head_dim,
-                accumulation,
-                head_out,
-            );
-        }
+    // Per-thread scratch, not a per-call `vec!`: this runs per attention dispatch on the
+    // steady-state decode path (doctrine: no allocator activity there). Grows monotonically
+    // to the longest context this thread has scored.
+    thread_local! {
+        static SCORES_SCRATCH: std::cell::RefCell<Vec<f32>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
+    SCORES_SCRATCH.with(|scratch| {
+        let mut scores_guard = scratch.borrow_mut();
+        if scores_guard.len() < key_positions {
+            scores_guard.resize(key_positions, 0.0);
+        }
+        let scores = &mut scores_guard[..key_positions];
+
+        for query_position in 0..query_positions {
+            let mask = &additive_mask
+                [query_position * key_positions..(query_position + 1) * key_positions];
+            for q_head in q_head_range.clone() {
+                let kv_head = q_head / kv_group;
+                let query_base = (query_position * q_heads + q_head) * head_dim;
+                let query = &queries[query_base..query_base + head_dim];
+                for (key_position, score) in scores.iter_mut().enumerate() {
+                    let key_base = (key_position * kv_heads + kv_head) * head_dim;
+                    let key = &keys[key_base..key_base + head_dim];
+                    let dot = dot_with_accumulation(query, key, accumulation);
+                    *score = dot * scale + mask[key_position];
+                }
+                softmax_rows_with_arithmetic(scores, 1, key_positions, softmax_arithmetic);
+
+                // SAFETY: `query_base` indexes [query_position, q_head, head_dim] inside the bounds
+                // the caller guaranteed, and this borrow spans only this head — the one span this
+                // partition owns, disjoint from every other partition's.
+                let head_out =
+                    unsafe { std::slice::from_raw_parts_mut(out.add(query_base), head_dim) };
+                attention_weighted_sum(
+                    scores,
+                    values,
+                    kv_head,
+                    kv_heads,
+                    head_dim,
+                    accumulation,
+                    head_out,
+                );
+            }
+        }
+    });
 }
 
 /// Executes the two attention matrix products through the exact macOS SGEMM candidate.

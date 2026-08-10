@@ -216,6 +216,11 @@ pub fn linear_q4(
     assert_eq!(x_q.len(), m * k, "activations must be [m, k]");
     assert_eq!(x_scales.len(), m, "one activation scale per row");
     assert_eq!(out.len(), m * n, "out must be [m, n]");
+    // Every sibling kernel pins this; without it a too-long bias is silently
+    // prefix-consumed and a too-short one panics mid-row with a bare index message.
+    if let Some(bias) = bias {
+        assert_eq!(bias.len(), n, "bias must have one entry per output channel");
+    }
     let packed_row = k.div_ceil(PER_BYTE);
 
     for row in 0..m {
@@ -343,6 +348,69 @@ mod tests {
     /// — it exists to catch a broken quantizer (orders of magnitude off), not to claim Q4 is
     /// accurate. Whether this error is AUDIBLE is a listening-protocol question, not a unit test,
     /// and doctrine #2 requires that gate before any routing decision.
+    #[test]
+    fn linear_q4_matches_an_independent_nibble_unpack_bit_for_bit() {
+        // `linear_q4` itself had zero coverage: `dot_i32_q4` was tested, but not the packed
+        // row stride, the multi-row walk, the activation scales, or the bias path. The
+        // reference here unpacks nibbles directly from storage (independently of
+        // `dot_i32_q4`) and reproduces the kernel's exact arithmetic order, so equality is
+        // bit-for-bit, not approximate. Odd k exercises the padded final nibble.
+        for (m, n, k, seed) in [
+            (1_usize, 4_usize, 16_usize, 1_u64),
+            (2, 5, 13, 2),
+            (3, 7, 31, 3),
+        ] {
+            let weight_f32 = deterministic(n * k, seed * 100 + 7);
+            let weight = QuantizedMatrixQ4::quantize(&weight_f32, n, k);
+            let bias: Vec<f32> = deterministic(n, seed * 100 + 11);
+            let mut x_q = Vec::with_capacity(m * k);
+            let mut x_scales = Vec::with_capacity(m);
+            for row in 0..m {
+                let activation = deterministic(k, seed * 100 + 13 + row as u64);
+                let mut quantized = vec![0_i8; k];
+                let scale = quantize_row_q8(&activation, &mut quantized);
+                x_q.extend_from_slice(&quantized);
+                x_scales.push(scale);
+            }
+
+            let mut out = vec![0.0_f32; m * n];
+            linear_q4(&x_q, &x_scales, &weight, Some(&bias), m, &mut out);
+
+            let packed_row = k.div_ceil(PER_BYTE);
+            for row in 0..m {
+                for column in 0..n {
+                    let bytes = &weight.data[column * packed_row..(column + 1) * packed_row];
+                    let mut accumulated = 0_i32;
+                    for index in 0..k {
+                        let byte = bytes[index / PER_BYTE];
+                        let nibble = if index % PER_BYTE == 0 {
+                            i32::from(byte & 0x0F)
+                        } else {
+                            i32::from(byte >> 4)
+                        };
+                        accumulated += i32::from(x_q[row * k + index]) * (nibble - BIAS);
+                    }
+                    #[allow(clippy::cast_precision_loss)]
+                    let expected =
+                        accumulated as f32 * (x_scales[row] * weight.scales[column]) + bias[column];
+                    assert_eq!(
+                        out[row * n + column].to_bits(),
+                        expected.to_bits(),
+                        "m={m} n={n} k={k} row={row} column={column}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "bias must have one entry per output channel")]
+    fn linear_q4_refuses_a_missized_bias() {
+        let weight = QuantizedMatrixQ4::quantize(&deterministic(8, 5), 2, 4);
+        let mut out = vec![0.0_f32; 2];
+        linear_q4(&[1, 2, 3, 4], &[1.0], &weight, Some(&[0.5]), 1, &mut out);
+    }
+
     #[test]
     fn quantization_error_is_bounded_by_the_level_step() {
         let k = 8192;

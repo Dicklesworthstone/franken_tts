@@ -22,6 +22,16 @@
 //!
 //! A stress test drives thousands of mixed-shape dispatches and a watchdog test bounds wall
 //! time, per the `many_utterances_without_deadlock` policy.
+//!
+//! ## Relation to the plan's "sense-reversing barrier"
+//!
+//! The doctrine text describes the steady-state rendezvous as a sense-reversing atomic
+//! barrier. What ships here is a mutex/condvar **generation-counter** barrier: same protocol
+//! shape (a monotone epoch replaces the flipped sense; workers wait for the epoch to advance,
+//! the dispatcher waits for `remaining` to reach zero), but the ordering guarantees come from
+//! the mutex, not from raw atomics — so an audit of this module should trace the lock, not
+//! look for `AtomicBool` sense flags. The atomic flavor remains a candidate once dispatch
+//! overhead itself shows up on a profile.
 
 use crate::int8::{Int8Tier, QuantizedMatrix, dot_i32};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -119,7 +129,8 @@ struct Shared {
     done: Condvar,
 }
 
-/// The process-wide team. Exists only when `FTTS_INT8_THREADS` requests more than one thread.
+/// The process-wide team. Armed by default at min(6, cores) partitions on native
+/// (`FTTS_INT8_THREADS` overrides; 1 disarms), and explicitly by the host on wasm.
 pub struct Team {
     shared: &'static Shared,
     /// Total partitions per dispatch: spawned workers + the calling thread.
@@ -147,6 +158,20 @@ pub fn partitions() -> usize {
 /// interleave the two through the dispatch gate instead of running them concurrently.
 pub fn bypass_team_on_this_thread() {
     TEAM_BYPASS.with(|cell| cell.set(true));
+}
+
+/// Runs `body` with team dispatch bypassed on this thread, restoring the previous state after.
+///
+/// For callers that need the SERIAL kernel for a bounded stretch — the int8 autotuner probes
+/// tier cost, and a probe routed through the team would time dispatch overhead plus whatever
+/// the workers are doing, not the tier — without permanently opting the thread out the way
+/// [`bypass_team_on_this_thread`] (meant for worker threads) does.
+pub fn with_team_bypassed<R>(body: impl FnOnce() -> R) -> R {
+    let previous = TEAM_BYPASS.with(std::cell::Cell::get);
+    TEAM_BYPASS.with(|cell| cell.set(true));
+    let result = body();
+    TEAM_BYPASS.with(|cell| cell.set(previous));
+    result
 }
 
 /// Whether the current thread opted out of team dispatch.
@@ -309,7 +334,16 @@ fn worker_loop(shared: &'static Shared, worker: usize) {
         // A panicking partition must still report done, or the caller hangs forever waiting
         // for a decrement that will never come. The panic is recorded and re-raised loudly on
         // the caller's thread instead.
-        let outcome = std::panic::catch_unwind(|| run_partition(&job, worker));
+        #[cfg(test)]
+        let injected = worker > 0 && tests::panic_injected_for(shared);
+        #[cfg(not(test))]
+        let injected = false;
+        let outcome = std::panic::catch_unwind(|| {
+            if injected {
+                panic!("injected worker panic for the hang-hardening test");
+            }
+            run_partition(&job, worker)
+        });
         let mut control = lock_control(shared);
         if outcome.is_err() {
             control.panicked = true;
@@ -334,10 +368,7 @@ fn lock_control(shared: &Shared) -> std::sync::MutexGuard<'_, Control> {
 /// Computes one worker's contiguous column range. Identical arithmetic to the serial
 /// weight-stationary loop in [`crate::int8::linear_q8`], restricted to `[start, end)`.
 fn run_partition(job: &Job, worker: usize) {
-    #[cfg(test)]
-    if worker > 0 && tests::PANIC_INJECT.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        panic!("injected worker panic for the hang-hardening test");
-    }
+    let _ = worker;
     match job {
         Job::Linear(job) => run_linear_partition(job, worker),
         Job::Attention(job) => run_attention_partition(job, worker),
@@ -645,9 +676,28 @@ mod tests {
     use super::*;
     use crate::int8::linear_q8;
 
-    /// One-shot fuse consumed by [`run_partition`] on a worker thread.
-    pub(super) static PANIC_INJECT: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    /// One-shot fuse consumed by a worker of ONE SPECIFIC team.
+    ///
+    /// Targeted by the `Shared` block's address rather than a bare bool: the test binary
+    /// runs concurrently, other tests (and, since the attention wiring, plain f32ref calls)
+    /// dispatch on the default-armed GLOBAL team, and an untargeted fuse was consumed by
+    /// whichever team's worker happened to run first — failing this test and panicking an
+    /// innocent one.
+    pub(super) static PANIC_INJECT_TARGET: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Consumes the fuse iff it targets `shared`'s team.
+    pub(super) fn panic_injected_for(shared: &Shared) -> bool {
+        let target = std::ptr::from_ref(shared) as usize;
+        PANIC_INJECT_TARGET
+            .compare_exchange(
+                target,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
 
     #[test]
     fn a_panicking_worker_fails_the_dispatch_loudly_instead_of_hanging() {
@@ -655,7 +705,10 @@ mod tests {
         let weight = matrix(64, 32, 5);
         let x_q = vec![1_i8; 32];
         let mut out = vec![0.0_f32; 64];
-        PANIC_INJECT.store(true, std::sync::atomic::Ordering::SeqCst);
+        PANIC_INJECT_TARGET.store(
+            std::ptr::from_ref(team.shared) as usize,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             team.linear_q8(&x_q, &[1.0], &weight, None, 1, &mut out, Int8Tier::Scalar);
         }));
