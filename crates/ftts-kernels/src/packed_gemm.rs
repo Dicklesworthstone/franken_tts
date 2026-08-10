@@ -172,14 +172,14 @@ pub(crate) unsafe fn linear_packed_range(
                 while i0 < m_full {
                     // SAFETY: rows `i0..i0+MR` are below `m` and columns `j0..j0+NR` are inside the
                     // caller's stripe, so every write lands within the `m * n` buffer.
-                    unsafe { accumulate_tile::<MR>(x, &panel, out, i0, j0, k, n) };
+                    unsafe { accumulate_tile::<MR>(x, panel, out, i0, j0, k, n) };
                     i0 += MR;
                 }
                 // Rows below the last full tile still benefit from the packed panel; run them one row
                 // at a time rather than dropping to the unpacked tail path.
                 for row in m_full..m {
                     // SAFETY: as above, with a single row.
-                    unsafe { accumulate_tile::<1>(x, &panel, out, row, j0, k, n) };
+                    unsafe { accumulate_tile::<1>(x, panel, out, row, j0, k, n) };
                 }
                 j0 += NR;
             }
