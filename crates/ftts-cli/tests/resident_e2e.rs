@@ -63,7 +63,11 @@ fn run_say(resident_dir: &std::path::Path, out: &std::path::Path, extra: &[&str]
         .env("FTTS_RESIDENT_CLIENT_TIMEOUT_SECS", "1800")
         // A freshly built debug exe can sit in an antivirus scan for tens of seconds on
         // its first launch; the daemon-reuse contract does not care how long boot takes.
-        .env("FTTS_RESIDENT_SPAWN_WAIT_SECS", "180");
+        .env("FTTS_RESIDENT_SPAWN_WAIT_SECS", "180")
+        .env(
+            "FTTS_RESIDENT_LOG",
+            resident_dir.parent().unwrap().join("daemon.log"),
+        );
     let output = command.output().expect("ftts say runs");
     assert!(
         output.status.success(),
@@ -119,7 +123,18 @@ fn resident_daemon_reuse_parity_and_idle_exit() {
         .expect("state dir exists after a resident run")
         .filter_map(Result::ok)
         .find(|entry| entry.file_name().to_string_lossy().starts_with("resident-"))
-        .expect("resident state file present");
+        .unwrap_or_else(|| {
+            // Self-diagnosing failure: the daemon's log tells whether it ever bound,
+            // served, or idled out, which is the difference between a product bug and a
+            // machine that outran a timing window.
+            let daemon_log = std::fs::read_to_string(scratch.join("daemon.log"))
+                .unwrap_or_else(|_| "<no daemon log written>".to_owned());
+            panic!(
+                "resident state file missing after run 1                  (synthesis {} ms; daemon log follows)
+{daemon_log}",
+                first.synthesis_ms,
+            );
+        });
     let pid_after_first = std::fs::read_to_string(state_file.path())
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
