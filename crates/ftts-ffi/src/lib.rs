@@ -32,7 +32,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use ftts_cli::synth::{
-    DENOISE_ARTIFACT_RELPATH, LoadedModel, ModelBundle, ReferenceCleanup,
+    DENOISE_ARTIFACT_RELPATH, LoadedModel, ModelBundle, ReferenceCleanup, denoise_pcm_24k,
     speaker_from_reference_pcm, synthesize,
 };
 use ftts_core::{CancellationToken, SynthesisRequest, TtsEngine};
@@ -332,6 +332,76 @@ pub unsafe extern "C" fn ftts_pcm_free(pcm: *mut f32, len: usize) {
     drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(pcm, len)) });
 }
 
+/// 1 when the neural denoiser artifact is present in the engine's model directory,
+/// 0 when it is not. This is the same check the enrollment pipeline makes, asked of
+/// the engine itself so the host UI can report the truth instead of guessing.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+/// # Safety
+/// `engine` from [`ftts_engine_open`] with serialized access.
+pub unsafe extern "C" fn ftts_denoise_available(engine: *const FttsEngine) -> i32 {
+    guarded(0, || {
+        if engine.is_null() {
+            return 0;
+        }
+        // SAFETY: engine from ftts_engine_open with serialized access; shared read only.
+        #[allow(unsafe_code)]
+        let engine = unsafe { &*engine };
+        i32::from(engine.bundle.root.join(DENOISE_ARTIFACT_RELPATH).is_file())
+    })
+}
+
+/// Denoises mono 24 kHz f32 PCM through the neural denoiser. Writes an owned buffer of
+/// the same length to `out_pcm` (release with [`ftts_pcm_free`]). Returns 0 on success;
+/// nonzero when the denoiser is absent or fails (the caller keeps its original audio).
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+/// # Safety
+/// `engine` from [`ftts_engine_open`] with serialized access; `pcm` valid for `len`
+/// floats; `out_pcm` non-null.
+pub unsafe extern "C" fn ftts_denoise(
+    engine: *const FttsEngine,
+    pcm: *const f32,
+    len: usize,
+    out_pcm: *mut *mut f32,
+) -> i32 {
+    guarded(1, || {
+        if engine.is_null() || pcm.is_null() || out_pcm.is_null() {
+            set_error("null pointer to ftts_denoise");
+            return 1;
+        }
+        // SAFETY: per the contract above; the engine is only read.
+        #[allow(unsafe_code)]
+        let (engine, pcm) = unsafe { (&*engine, std::slice::from_raw_parts(pcm, len)) };
+        match denoise_pcm_24k(&engine.bundle, pcm) {
+            Ok(Some(cleaned)) => {
+                let mut cleaned = cleaned.into_boxed_slice();
+                let pointer = cleaned.as_mut_ptr();
+                let cleaned_len = cleaned.len();
+                if cleaned_len != len {
+                    set_error("denoiser changed the sample count");
+                    return 1;
+                }
+                std::mem::forget(cleaned);
+                // SAFETY: out_pcm is non-null per the check above; written once.
+                #[allow(unsafe_code)]
+                unsafe {
+                    *out_pcm = pointer;
+                }
+                0
+            }
+            Ok(None) => {
+                set_error("the neural denoiser is not in the model directory");
+                1
+            }
+            Err(error) => {
+                set_error(error.to_string());
+                1
+            }
+        }
+    })
+}
+
 /// Enrolls a voice from mono 24 kHz f32 PCM, writing the x-vector into `out`. 0 on success.
 #[allow(unsafe_code)] // audited export, part of the C ABI surface
 #[unsafe(no_mangle)]
@@ -464,9 +534,13 @@ pub unsafe extern "C" fn ftts_video_frame_count(renderer: *const FttsVideoRender
 
 /// Renders one frame as RGB24 into `out`, which must hold width*height*3 bytes.
 ///
+/// Concurrent calls over one renderer are sound: rendering reads immutable state
+/// (`FrameRenderer` is `Sync` by construction, asserted in `ftts-video`), and the iOS
+/// exporter leans on this to render chunks of frames in parallel.
+///
 /// # Safety
 /// `renderer` from [`ftts_video_open`]; `out` valid for `ftts_video_width() *
-/// ftts_video_height() * 3` bytes; calls serialized by the caller.
+/// ftts_video_height() * 3` bytes; open/close serialized against in-flight renders.
 #[allow(unsafe_code)] // audited export, part of the C ABI surface
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ftts_video_render_frame(

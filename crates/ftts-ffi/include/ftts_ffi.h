@@ -53,6 +53,15 @@ int32_t ftts_enroll(FttsEngine *engine, const float *pcm, size_t len, float *out
 
 /* ---- branded share video: identical frames to `ftts make-video` -------------------- */
 
+/* 1 when the neural denoiser artifact is in the engine's model directory. */
+int32_t ftts_denoise_available(const FttsEngine *engine);
+
+/* Denoises mono 24 kHz f32 PCM. Writes an owned buffer of the SAME length to out_pcm
+ * (release with ftts_pcm_free). 0 on success; nonzero when the denoiser is absent or
+ * fails — the caller keeps its original audio. */
+int32_t ftts_denoise(const FttsEngine *engine, const float *pcm, size_t len,
+                     float **out_pcm);
+
 typedef struct FttsVideoRenderer FttsVideoRenderer;
 
 uint32_t ftts_video_width(void);
@@ -63,7 +72,9 @@ uint32_t ftts_video_fps(void);
 FttsVideoRenderer *ftts_video_open(const float *pcm, size_t len, uint32_t sample_rate,
                                    const char *voice_label);
 size_t ftts_video_frame_count(const FttsVideoRenderer *renderer);
-/* Renders RGB24 into out (width*height*3 bytes). Serialize calls. 0 on success. */
+/* Renders RGB24 into out (width*height*3 bytes). 0 on success. Frames are pure
+ * functions of immutable renderer state, so concurrent calls over ONE renderer are
+ * allowed (open/close still serialized against renders). */
 int32_t ftts_video_render_frame(const FttsVideoRenderer *renderer, size_t frame,
                                 uint8_t *out);
 void ftts_video_close(FttsVideoRenderer *renderer);

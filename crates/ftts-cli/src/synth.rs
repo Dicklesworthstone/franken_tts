@@ -891,6 +891,20 @@ fn neural_denoise_reference(
     Ok(Some(enhancer.enhance_24k(pcm24k)))
 }
 
+/// Denoise arbitrary mono 24 kHz PCM through the pulled neural denoiser, if present.
+///
+/// `Ok(None)` when the neural route is unavailable — the caller keeps the original.
+/// Split out for hosts (the iOS app through `ftts-ffi`) that clean synthesized OUTPUT;
+/// enrollment keeps its own opt-in path through [`ReferenceCleanup`].
+///
+/// # Errors
+///
+/// When the artifact is present but unreadable — a broken denoiser is repaired, not
+/// silently swapped for a different one.
+pub fn denoise_pcm_24k(bundle: &ModelBundle, pcm: &[f32]) -> Result<Option<Vec<f32>>, FttsError> {
+    neural_denoise_reference(bundle, pcm)
+}
+
 fn denoise_reference(pcm: &[f32]) -> Vec<f32> {
     // A floor estimated from a handful of frames is just the clip's own spectrum; below ~a
     // quarter second there is nothing honest to subtract, so the clip passes through untouched
