@@ -1,0 +1,25 @@
+[package]
+name = "ftts-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "franken_tts C ABI: the native engine behind the iOS app"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+ftts-cli = { path = "../ftts-cli", version = "0.1.5" }
+ftts-core = { path = "../ftts-core", version = "0.1.5" }
+ftts-model-qwen = { path = "../ftts-model-qwen", version = "0.1.5" }
+serde_json = "1.0"
+
+# NOT `workspace = true`: the workspace forbids `unsafe_code`, and a C ABI is definitionally
+# an unsafe boundary (raw pointers from Swift must become slices). This crate follows the
+# ftts-kernels policy instead: deny by default, tiny audited islands, every one carrying a
+# SAFETY comment. See the crate docs.
+[lints.rust]
+unsafe_code = "deny"

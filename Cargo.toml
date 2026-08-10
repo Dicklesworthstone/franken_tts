@@ -8,6 +8,7 @@ members = [
     "crates/ftts-video",
     "crates/ftts-conformance",
     "crates/ftts-wasm",
+    "crates/ftts-ffi",
 ]
 resolver = "3"
 

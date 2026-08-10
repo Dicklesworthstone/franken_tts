@@ -713,6 +713,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ftts-ffi"
+version = "0.1.5"
+dependencies = [
+ "ftts-cli",
+ "ftts-core",
+ "ftts-model-qwen",
+ "serde_json",
+]
+
+[[package]]
 name = "ftts-kernels"
 version = "0.1.5"
 dependencies = [
