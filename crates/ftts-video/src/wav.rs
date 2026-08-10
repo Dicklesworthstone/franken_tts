@@ -122,3 +122,111 @@ pub fn decode(data: &[u8]) -> Result<MonoAudio, String> {
         samples,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wav(format_tag: u16, channels: u16, rate: u32, bits: u16, data: &[u8]) -> Vec<u8> {
+        wav_with_fmt_extra(format_tag, channels, rate, bits, &[], data)
+    }
+
+    fn wav_with_fmt_extra(
+        format_tag: u16,
+        channels: u16,
+        rate: u32,
+        bits: u16,
+        fmt_extra: &[u8],
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&format_tag.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        fmt.extend_from_slice(&(rate * u32::from(channels) * u32::from(bits) / 8).to_le_bytes());
+        fmt.extend_from_slice(&(channels * bits / 8).to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+        fmt.extend_from_slice(fmt_extra);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // RIFF size: unread
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&fmt);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    #[test]
+    fn s16_mono_decodes_exactly() {
+        let data: Vec<u8> = [0_i16, 16384, -16384, 32767]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let audio = decode(&wav(1, 1, 24000, 16, &data)).expect("valid wav");
+        assert_eq!(audio.sample_rate, 24000);
+        assert_eq!(audio.samples, [0.0, 0.5, -0.5, 32767.0 / 32768.0]);
+    }
+
+    #[test]
+    fn stereo_downmixes_to_the_channel_mean() {
+        let data: Vec<u8> = [16384_i16, -16384, 8192, 8192]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let audio = decode(&wav(1, 2, 48000, 16, &data)).expect("valid wav");
+        assert_eq!(audio.samples, [0.0, 0.25]);
+    }
+
+    #[test]
+    fn extensible_resolves_the_subformat_and_float_decodes() {
+        // WAVE_FORMAT_EXTENSIBLE (0xFFFE): cbSize(22) + validBits + channelMask + SubFormat
+        // GUID whose first two bytes are the real format code — 3 = IEEE float here. The old
+        // reader pattern-matched 0xFFFE as int PCM, decoding float bytes as garbage ints.
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&22_u16.to_le_bytes());
+        extra.extend_from_slice(&32_u16.to_le_bytes());
+        extra.extend_from_slice(&0_u32.to_le_bytes());
+        extra.extend_from_slice(&3_u16.to_le_bytes()); // SubFormat: IEEE float
+        extra.extend_from_slice(&[0; 14]);
+        let data: Vec<u8> = [0.25_f32, -1.0]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let audio =
+            decode(&wav_with_fmt_extra(0xFFFE, 1, 24000, 32, &extra, &data)).expect("valid wav");
+        assert_eq!(audio.samples, [0.25, -1.0]);
+    }
+
+    #[test]
+    fn a_placeholder_data_size_clamps_to_the_bytes_present() {
+        // Streaming writers leave 0xFFFFFFFF in the final data chunk header.
+        let mut bytes = wav(1, 1, 24000, 16, &1234_i16.to_le_bytes());
+        let data_size_at = bytes.len() - 2 - 4;
+        bytes[data_size_at..data_size_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let audio = decode(&bytes).expect("clamped, not refused");
+        assert_eq!(audio.samples.len(), 1);
+    }
+
+    #[test]
+    fn hostile_headers_are_refused() {
+        assert!(decode(b"RIFFxxxxWAVE").is_err(), "no chunks");
+        assert!(
+            decode(&wav(1, 1, 0, 16, &[0, 0])).is_err(),
+            "zero sample rate would divide by zero downstream"
+        );
+        assert!(
+            decode(&wav(1, 0, 24000, 16, &[0, 0])).is_err(),
+            "zero channels"
+        );
+        assert!(
+            decode(&wav(85, 1, 24000, 16, &[0, 0])).is_err(),
+            "compressed encodings are a typed refusal"
+        );
+        assert!(decode(&wav(1, 1, 24000, 16, &[])).is_err(), "no samples");
+    }
+}

@@ -93,3 +93,83 @@ pub fn decode(data: &[u8]) -> Result<Image, String> {
         rgba,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a QOI stream by hand: 14-byte header, the given op bytes, no end marker
+    /// (the decoder stops at the pixel count, which the embedded-asset path relies on).
+    fn stream(width: u32, height: u32, ops: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"qoif");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[4, 0]); // channels, colorspace: read but unused
+        bytes.extend_from_slice(ops);
+        bytes
+    }
+
+    #[test]
+    fn every_op_decodes_to_the_specified_pixels() {
+        // 6 pixels: RGB, RUN(1), DIFF(+1,+1,+1), LUMA(dg=8, dr-dg=2, db-dg=-2), INDEX, RGBA.
+        let ops = [
+            0xFE,
+            100,
+            150,
+            200,         // px0: RGB (100, 150, 200, 255)
+            0xC0,        // px1: RUN 1 -> repeat px0
+            0b0111_1111, // px2: DIFF +1/+1/+1 -> (101, 151, 201, 255)
+            0b10_101000, // px3: LUMA dg=8 (40-32) ...
+            0b1010_0110, // ... dr-dg=2, db-dg=-2 -> (111, 159, 207, 255)
+            // px4: INDEX of px0's hash slot
+            (100_usize * 3 + 150 * 5 + 200 * 7 + 255 * 11) as u8 % 64,
+            0xFF,
+            1,
+            2,
+            3,
+            4, // px5: RGBA (1, 2, 3, 4)
+        ];
+        let image = decode(&stream(6, 1, &ops)).expect("valid stream");
+        let expected: &[[u8; 4]] = &[
+            [100, 150, 200, 255],
+            [100, 150, 200, 255],
+            [101, 151, 201, 255],
+            [111, 159, 207, 255],
+            [100, 150, 200, 255],
+            [1, 2, 3, 4],
+        ];
+        for (index, pixel) in expected.iter().enumerate() {
+            assert_eq!(
+                &image.rgba[index * 4..index * 4 + 4],
+                pixel,
+                "pixel {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_and_overrunning_streams_are_refused() {
+        assert!(decode(b"qoif").is_err(), "short header");
+        assert!(decode(&stream(2, 1, &[0xFE, 1, 2])).is_err(), "cut RGB op");
+        assert!(
+            decode(&stream(2, 1, &[0xFE, 1, 2, 3, 0xC4])).is_err(),
+            "a run past the pixel count must refuse, not write out of bounds"
+        );
+        assert!(decode(&stream(0, 5, &[])).is_err(), "zero dimension");
+    }
+
+    #[test]
+    fn the_embedded_illustration_decodes() {
+        let image = decode(crate::ILLUSTRATION_QOI).expect("embedded asset");
+        assert_eq!((image.width, image.height), (1672, 941));
+        assert_eq!(image.rgba.len(), 1672 * 941 * 4);
+        // Not all-black and not all-white: a trivially wrong decode would be one of those.
+        let sum: u64 = image.rgba.iter().map(|&byte| u64::from(byte)).sum();
+        let max = image.rgba.len() as u64 * 255;
+        assert!(
+            sum > max / 100 && sum < max * 99 / 100,
+            "implausible content"
+        );
+    }
+}

@@ -307,3 +307,91 @@ impl FontStack<'_> {
         self.draw(surface, text, x, baseline_y, px_size, color, 1.0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plex_bold() -> Font {
+        Font::parse(fmd_font::bundled::PLEX_BOLD.to_vec()).expect("bundled face parses")
+    }
+
+    #[test]
+    fn a_glyph_rasterizes_with_plausible_coverage() {
+        let font = plex_bold();
+        let gid = font.glyph_index('F');
+        assert_ne!(gid, 0, "'F' must map");
+        let bitmap = rasterize(&font, gid, 96.0).expect("solid glyph");
+        // Structural facts that hold for any correct rasterization of a 96 px capital F:
+        // it covers a real area, coverage peaks at full opacity somewhere (a stem interior),
+        // and the bitmap is not solid (edges are anti-aliased).
+        assert!(
+            bitmap.height > 50 && bitmap.height < 110,
+            "height {}",
+            bitmap.height
+        );
+        assert!(
+            bitmap.width > 20 && bitmap.width < 90,
+            "width {}",
+            bitmap.width
+        );
+        assert!(
+            bitmap.alpha.contains(&255),
+            "no fully-covered pixel"
+        );
+        let covered = bitmap.alpha.iter().filter(|&&a| a > 0).count();
+        let total = bitmap.alpha.len();
+        assert!(
+            covered * 10 > total && covered < total,
+            "covered {covered}/{total}"
+        );
+    }
+
+    #[test]
+    fn spaces_produce_no_bitmap_but_advance_the_pen() {
+        let font = plex_bold();
+        let space = font.glyph_index(' ');
+        assert_ne!(space, 0);
+        assert!(
+            rasterize(&font, space, 40.0).is_none(),
+            "space has no contours"
+        );
+        let stack = FontStack { faces: vec![&font] };
+        assert!(stack.measure(" ", 40.0) > 0.0, "the pen must still advance");
+    }
+
+    #[test]
+    fn measure_matches_the_pen_advance_of_draw() {
+        // The voice pill sizes its box with `measure` and fills it with `draw`; if the two
+        // ever disagree the text escapes the pill.
+        let font = plex_bold();
+        let stack = FontStack { faces: vec![&font] };
+        let text = "Voice: Aria";
+        let measured = stack.measure(text, 44.0);
+        let mut surface = Surface::new(600, 120);
+        let pen = stack.draw(&mut surface, text, 10.0, 80.0, 44.0, [255, 255, 255], 1.0);
+        assert!(
+            (pen - 10.0 - measured).abs() < 1e-9,
+            "measure {measured} vs drawn advance {}",
+            pen - 10.0
+        );
+        // And the draw actually landed ink inside the surface.
+        assert!(surface.rgba.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
+    }
+
+    #[test]
+    fn symbol_fallback_finds_arrows_and_dots() {
+        let plex = plex_bold();
+        let noto = Font::parse(fmd_font::bundled::NOTO_SANS_MATH_SYMBOLS.to_vec())
+            .expect("bundled math face parses");
+        let stack = FontStack {
+            faces: vec![&plex, &noto],
+        };
+        for ch in ['\u{2192}', '\u{00B7}', '\u{2014}'] {
+            assert!(
+                stack.measure(&ch.to_string(), 34.0) > 0.0,
+                "{ch:?} must map through the stack"
+            );
+        }
+    }
+}
