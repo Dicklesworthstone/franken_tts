@@ -13,6 +13,7 @@ import Foundation
 private final class CaptureSink: @unchecked Sendable {
     private let lock = NSLock()
     private var samples: [Float] = []
+    private var recentPeak: Float = 0
     let converter: AVAudioConverter
     let format: AVAudioFormat
 
@@ -45,9 +46,19 @@ private final class CaptureSink: @unchecked Sendable {
         }
         guard let channel = out.floatChannelData?[0], out.frameLength > 0 else { return }
         let chunk = UnsafeBufferPointer(start: channel, count: Int(out.frameLength))
+        var peak: Float = 0
+        for value in chunk { peak = max(peak, abs(value)) }
         lock.lock()
         samples.append(contentsOf: chunk)
+        recentPeak = peak
         lock.unlock()
+    }
+
+    /// Most recent chunk's peak, for the live level meter.
+    func levelPeek() -> Float {
+        lock.lock()
+        defer { lock.unlock() }
+        return recentPeak
     }
 
     func drain() -> [Float] {
@@ -66,6 +77,8 @@ final class AudioRecorder {
 
     var isRecording = false
     var seconds: Double = 0
+    /// 0...1 input level for the meter, updated a few times a second.
+    var level: Float = 0
 
     private let audioEngine = AVAudioEngine()
     private var sink: CaptureSink?
@@ -73,7 +86,12 @@ final class AudioRecorder {
 
     func start() throws {
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker])
+        // .default keeps the system input chain, including automatic gain control.
+        // .measurement disables it and hands over raw low-gain samples: on a phone held
+        // at arm's length that is whisper-level PCM, the speaker encoder embeds the
+        // whisper, and everything synthesized with that vector is near-silent. Found
+        // the hard way on a real device.
+        try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
         try session.setActive(true)
 
         let input = audioEngine.inputNode
@@ -90,7 +108,11 @@ final class AudioRecorder {
         isRecording = true
         seconds = 0
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.seconds += 0.25 }
+            Task { @MainActor in
+                guard let self else { return }
+                self.seconds += 0.25
+                self.level = min(1, (self.sink?.levelPeek() ?? 0) * 1.6)
+            }
         }
     }
 
@@ -104,6 +126,7 @@ final class AudioRecorder {
         try? AVAudioSession.sharedInstance().setCategory(.playback)
         let samples = sink?.drain() ?? []
         sink = nil
+        level = 0
         return samples
     }
 }

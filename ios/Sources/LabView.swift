@@ -83,14 +83,19 @@ final class LabModel {
         player?.play()
     }
 
+    var isEnrolling = false
+
     func finishEnrollment(named name: String) {
-        let pcm = recorder.stop()
-        guard pcm.count >= 3 * Int(AudioRecorder.targetRate) else {
-            lastError = "recording too short; read at least a few seconds of the script"
-            return
-        }
+        let raw = recorder.stop()
+        isEnrolling = true
         Task {
+            defer { isEnrolling = false }
             do {
+                let pcm = try Self.conditioned(raw)
+                guard pcm.count >= 3 * Int(AudioRecorder.targetRate) else {
+                    throw EngineError.native(
+                        "recording too short; read at least a few sentences of the script")
+                }
                 if await !engine.isLoaded {
                     try await engine.load(modelDirectory: store.modelDirectory)
                 }
@@ -98,10 +103,32 @@ final class LabModel {
                 clonedVector = vector
                 clonedName = name.isEmpty ? "my voice" : name
                 selectedVoice = "__cloned__"
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
             } catch {
                 lastError = error.localizedDescription
             }
         }
+    }
+
+    /// Trim edge silence and peak-normalize before enrollment. The encoder embeds
+    /// whatever it is given: a quiet recording embeds "a quiet voice" and everything
+    /// synthesized from it inherits that, which on a real device meant inaudible output.
+    /// Refusing outright silence beats enrolling it.
+    private static func conditioned(_ pcm: [Float]) throws -> [Float] {
+        var peak: Float = 0
+        for value in pcm { peak = max(peak, abs(value)) }
+        guard peak > 0.01 else {
+            throw EngineError.native(
+                "we couldn't hear you (peak level \(String(format: "%.3f", peak))); check the microphone and try again")
+        }
+        let gate = peak * 0.02
+        let first = pcm.firstIndex { abs($0) > gate } ?? 0
+        let last = pcm.lastIndex { abs($0) > gate } ?? pcm.count - 1
+        let pad = Int(AudioRecorder.targetRate * 0.2)
+        let low = max(0, first - pad)
+        let high = min(pcm.count, last + 1 + pad)
+        let scale = 0.85 / peak
+        return pcm[low..<high].map { $0 * scale }
     }
 
     /// Frees the ~2.3 GB engine heap; the next synthesis reloads it.
@@ -438,14 +465,50 @@ struct EnrollmentSheet: View {
                     .padding(10)
                     .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
                     .foregroundStyle(Lab.textPrimary)
+                    .disabled(model.isEnrolling)
+                if model.recorder.isRecording {
+                    // The live meter is the tell that the microphone is actually hearing
+                    // you; a silent bar during the script means stop and fix it now, not
+                    // after a minute of reading.
+                    HStack(spacing: 10) {
+                        Image(systemName: "waveform")
+                            .foregroundStyle(Lab.emerald)
+                        GeometryReader { proxy in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.white.opacity(0.06))
+                                Capsule()
+                                    .fill(Lab.emerald)
+                                    .frame(
+                                        width: proxy.size.width
+                                            * CGFloat(max(0.02, model.recorder.level)))
+                                    .animation(.linear(duration: 0.2), value: model.recorder.level)
+                            }
+                        }
+                        .frame(height: 8)
+                        Text("\(Int(model.recorder.seconds))s")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(Lab.textSecondary)
+                    }
+                    .accessibilityLabel("Recording level meter")
+                    Text("Thirty seconds is plenty; recording stops itself at sixty.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Lab.textSecondary)
+                }
+                if model.isEnrolling {
+                    HStack(spacing: 10) {
+                        ProgressView().tint(Lab.emerald)
+                        Text("computing your voice vector…")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(Lab.textSecondary)
+                    }
+                }
                 HStack {
                     if model.recorder.isRecording {
-                        Button("⏹ Stop & clone (\(Int(model.recorder.seconds))s)") {
+                        Button("⏹ Stop & clone") {
                             model.finishEnrollment(named: cloneName)
-                            dismiss()
                         }
                         .buttonStyle(PrimaryButtonStyle())
-                    } else {
+                    } else if !model.isEnrolling {
                         Button("🎙 Start recording") {
                             do {
                                 try model.recorder.start()
@@ -461,10 +524,28 @@ struct EnrollmentSheet: View {
                         dismiss()
                     }
                     .buttonStyle(GhostButtonStyle())
+                    .disabled(model.isEnrolling)
+                }
+                if let error = model.lastError, !model.recorder.isRecording, !model.isEnrolling {
+                    Text(error).font(.system(size: 13)).foregroundStyle(Lab.danger)
                 }
             }
             .padding(18)
         }
         .presentationDetents([.large])
+        .interactiveDismissDisabled(model.isEnrolling)
+        .onChange(of: model.recorder.seconds) { _, seconds in
+            // Backstop: the script reads in about half a minute.
+            if seconds >= 60, model.recorder.isRecording {
+                model.finishEnrollment(named: cloneName)
+            }
+        }
+        .onChange(of: model.isEnrolling) { was, now in
+            // Enrollment just finished; leave the sheet only on success.
+            if was, !now, model.clonedVector != nil {
+                dismiss()
+            }
+        }
+        .onAppear { model.lastError = nil }
     }
 }
