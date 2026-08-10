@@ -246,31 +246,56 @@ pub fn try_synthesize(
     }
 }
 
+/// Why one connect attempt did not produce a stream — the removal decision needs the kind.
+enum ConnectFailure {
+    /// No state file exists; there is nothing to retry against and nothing to clear.
+    NoState,
+    /// The kernel actively refused: nothing is listening on the recorded port, so the state
+    /// file is provably stale and safe to clear.
+    Refused,
+    /// A timeout or any other error: the daemon may be alive but slow or mid-request, and
+    /// deleting its state file would orphan a healthy multi-gigabyte process.
+    Other,
+}
+
 fn connect(bundle: &ModelBundle) -> Option<TcpStream> {
     // A live daemon answers immediately; under heavy load one connect can miss its
     // timeout, and treating that as death would orphan a healthy daemon and briefly
     // double model memory with a duplicate. Three attempts before giving up on it.
+    let mut last = ConnectFailure::NoState;
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(300));
         }
-        if let Some(stream) = connect_once(bundle) {
-            return Some(stream);
-        }
-        if read_state(&bundle.root).is_none() {
-            break; // no state file at all: nothing to retry against
+        match connect_once(bundle) {
+            Ok(stream) => return Some(stream),
+            Err(ConnectFailure::NoState) => {
+                last = ConnectFailure::NoState;
+                break; // no state file at all: nothing to retry against
+            }
+            Err(failure) => last = failure,
         }
     }
-    // None listening: clear any stale state file and spawn one from this same binary.
-    if let Some(path) = state_path(&bundle.root)
-        && path.exists()
-    {
-        let _ = fs::remove_file(&path);
+    match last {
+        // Provably nothing listening: clear the stale state and spawn a fresh daemon.
+        ConnectFailure::Refused => {
+            if let Some(path) = state_path(&bundle.root)
+                && path.exists()
+            {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        ConnectFailure::NoState => {}
+        // Possibly a live-but-busy daemon. Removing its state here was the ownership hole:
+        // the daemon would be orphaned (never again findable, idling ~2 GB until its timer)
+        // while a duplicate spawned beside it. Fall back to the inline engine instead and
+        // leave the daemon to answer the next run.
+        ConnectFailure::Other => return None,
     }
     spawn_daemon(&bundle.root)?;
     let deadline = Instant::now() + spawn_wait();
     while Instant::now() < deadline {
-        if let Some(stream) = connect_once(bundle) {
+        if let Ok(stream) = connect_once(bundle) {
             return Some(stream);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -278,16 +303,24 @@ fn connect(bundle: &ModelBundle) -> Option<TcpStream> {
     None
 }
 
-fn connect_once(bundle: &ModelBundle) -> Option<TcpStream> {
-    let state = read_state(&bundle.root)?;
+fn connect_once(bundle: &ModelBundle) -> Result<TcpStream, ConnectFailure> {
+    let state = read_state(&bundle.root).ok_or(ConnectFailure::NoState)?;
     let stream = TcpStream::connect_timeout(
         &(Ipv4Addr::LOCALHOST, state.port).into(),
         Duration::from_millis(1000),
     )
-    .ok()?;
-    stream.set_read_timeout(Some(client_read_timeout())).ok()?;
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::ConnectionRefused {
+            ConnectFailure::Refused
+        } else {
+            ConnectFailure::Other
+        }
+    })?;
+    stream
+        .set_read_timeout(Some(client_read_timeout()))
+        .map_err(|_| ConnectFailure::Other)?;
     stream.set_nodelay(true).ok();
-    Some(stream)
+    Ok(stream)
 }
 
 fn spawn_daemon(root: &Path) -> Option<()> {
@@ -523,32 +556,48 @@ fn handle_connection(
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
     let _ = stream.set_nodelay(true);
 
-    // BOUNDED read, and the bound is the point: `read_line` on a raw socket grows its String
-    // until it meets a newline, so a peer that opens a connection and sends bytes forever (or
-    // simply never sends `\n`) drives this process to OOM. That happens BEFORE the token is
-    // checked, so it is reachable by any local process, authenticated or not.
+    // BOUNDED read, in bytes AND in time, and both bounds are the point. The byte cap:
+    // a peer that opens a connection and sends bytes forever (or never sends `\n`) must not
+    // drive this process to OOM — that happens BEFORE the token check, so it is reachable
+    // by any local process. The deadline: the 10 s read timeout above is per SYSCALL, so a
+    // peer trickling one byte every nine seconds held this single-threaded accept loop
+    // quasi-indefinitely, pre-auth, with bounded memory but unbounded time. A `read_line`
+    // loops internally across syscalls and never surfaces between them, which is why this
+    // is a manual chunk loop with the deadline checked at every hop.
     //
-    // The cap is generous against the largest legitimate request — a 1,024-float speaker vector
-    // serialized as JSON text runs on the order of 20 KB — and still bounds the damage.
-    const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    if (&mut reader)
-        .take(MAX_REQUEST_BYTES)
-        .read_line(&mut line)
-        .is_err()
-    {
-        return;
-    }
-    let mut stream = reader.into_inner();
-    // A request that filled the cap without terminating is refused rather than parsed: the JSON
-    // would be truncated anyway, and saying so beats a silent disconnect.
-    if line.len() as u64 >= MAX_REQUEST_BYTES {
-        let reply = json!({ "ok": false, "kind": "request", "message": "request too large" });
-        let _ = stream.write_all(format!("{reply}\n").as_bytes());
-        return;
-    }
-    let Ok(request) = serde_json::from_str::<Value>(&line) else {
+    // The byte cap is generous against the largest legitimate request — a 1,024-float
+    // speaker vector serialized as JSON text runs on the order of 20 KB.
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+    const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+    let mut stream = stream;
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let newline = loop {
+        if Instant::now() >= deadline {
+            return; // transport-shaped failure: drop, like every other read error here
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return, // EOF without a terminated request
+            Ok(count) => {
+                buffer.extend_from_slice(&chunk[..count]);
+                if let Some(position) = buffer.iter().position(|&byte| byte == b'\n') {
+                    break position;
+                }
+                // A request that filled the cap without terminating is refused rather than
+                // parsed: the JSON would be truncated anyway, and saying so beats a silent
+                // disconnect.
+                if buffer.len() >= MAX_REQUEST_BYTES {
+                    let reply =
+                        json!({ "ok": false, "kind": "request", "message": "request too large" });
+                    let _ = stream.write_all(format!("{reply}\n").as_bytes());
+                    return;
+                }
+            }
+            Err(_) => return, // per-syscall timeout or hard error
+        }
+    };
+    let Ok(request) = serde_json::from_slice::<Value>(&buffer[..newline]) else {
         return;
     };
 

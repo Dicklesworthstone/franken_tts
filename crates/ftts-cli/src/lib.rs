@@ -136,19 +136,10 @@ const APACHE_LICENSE: &str = include_str!("../pinned/QWEN_APACHE_LICENSE");
 const PINNED_MODEL_MANIFEST: &str = include_str!("../pinned/model_manifest.json");
 /// Subdirectory of `$HOME/.cache` that `ftts pull` fills and model resolution falls back to.
 const DEFAULT_MODEL_CACHE_SUBDIR: &str = ".cache/franken_tts/model";
-const ENVIRONMENT_VARIABLES: [&str; 11] = [
-    "FTTS_MODEL_DIR",
-    "FTTS_DEFAULT_VOICE",
-    "FTTS_THREADS",
-    "FTTS_PROFILE",
-    "FTTS_PACKET_FRAMES",
-    "FTTS_MATH_MODE",
-    "FTTS_QUANT",
-    "FTTS_FORCE_ARCH",
-    "FTTS_NUMA",
-    "FTTS_MAX_FRAMES",
-    "FTTS_MEMORY_BUDGET_MB",
-];
+// The environment snapshot and the agent-facing contract share ONE list —
+// `robot::DOCUMENTED_ENVIRONMENT` — so `doctor`, `robot schema`, and the actual readers can
+// never disagree about which levers exist (they did: neither list mentioned the resident
+// daemon's variables, and each had entries the other lacked).
 
 /// Runs the shared `ftts` / `franken_tts` command-line interface.
 pub fn cli_main() -> ExitCode {
@@ -370,7 +361,12 @@ struct EnrollArgs {
     #[arg(long, conflicts_with = "output")]
     default: bool,
 
-    /// Explicitly proceed after an enrollment-quality warning where safe.
+    /// Reserved: will accept a warned-about enrollment quality once the quality gate ships.
+    ///
+    /// No gate fires today — enrollment currently measures its cleanup stages but refuses
+    /// nothing — so this flag is accepted for script compatibility and does nothing. Exit
+    /// code 8 (enrollment-quality refusal) is likewise reserved. Building the real gate
+    /// needs owner-validated thresholds (listening protocol), not a guessed dBFS cutoff.
     #[arg(long)]
     force: bool,
 
@@ -605,9 +601,9 @@ struct Environment {
 
 impl Environment {
     fn from_process() -> Self {
-        let values = ENVIRONMENT_VARIABLES
-            .into_iter()
-            .map(|name| (name, std::env::var_os(name)))
+        let values = robot::DOCUMENTED_ENVIRONMENT
+            .iter()
+            .map(|&name| (name, std::env::var_os(name)))
             .collect();
         let stage_budget_values = std::env::vars_os()
             .filter(|(name, _)| {
@@ -2131,6 +2127,8 @@ fn run_enroll(
     environment: &Environment,
     stdout: &mut dyn Write,
 ) -> Result<(), FttsError> {
+    // Reserved (see the flag's help): consumed here so the gate, when it ships with
+    // validated thresholds, changes behavior without changing the CLI surface.
     let _ = args.force;
     let model = resolve_model(args.model.as_deref(), environment)?;
     let bundle = synth::ModelBundle::resolve(Path::new(&model))?;
