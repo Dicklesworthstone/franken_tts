@@ -424,22 +424,57 @@ pub fn run_daemon(bundle_root: &Path) -> Result<(), FttsError> {
         match listener.accept() {
             Ok((stream, _peer)) => {
                 // Serve strictly serially; a second client queues in the OS backlog.
-                handle_connection(stream, &bundle, &token, &mut resident);
+                //
+                // Isolated from panics on purpose. This daemon exists to hold a hydrated 2 GB
+                // model across many calls, so one malformed request must not cost every later
+                // caller that work: without this, a panic anywhere in request handling unwinds
+                // straight out of the accept loop and the process dies holding the only warm copy.
+                //
+                // `AssertUnwindSafe` is sound for `resident` because it is only ever replaced
+                // wholesale (`*resident = Some(...)` after the model is fully built), never mutated
+                // in place, so an unwind can leave it either untouched or fully valid — there is no
+                // half-initialized state for a later request to observe.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_connection(stream, &bundle, &token, &mut resident);
+                }));
+                if outcome.is_err() {
+                    // The panic hook has already printed the location; say what it cost.
+                    eprintln!("resident daemon: request panicked; connection dropped, model kept");
+                }
                 deadline = Instant::now() + idle;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     eprintln!("resident daemon idle exit");
-                    let _ = fs::remove_file(&state_file);
+                    remove_state_if_ours(&state_file, port);
                     return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(_) => {
-                let _ = fs::remove_file(&state_file);
+                remove_state_if_ours(&state_file, port);
                 return Ok(());
             }
         }
+    }
+}
+
+/// Removes the state file only when it still describes THIS daemon.
+///
+/// Two `say` invocations racing on a cold start both spawn a daemon; both write the same
+/// state path and the second write wins, orphaning the first. The orphan serves nobody and
+/// idle-exits ten minutes later — and an unconditional remove at that exit would delete the
+/// SUCCESSOR's state file, making the healthy daemon undiscoverable and spawning a third
+/// copy of the model. Retirement cascades forever that way, one duplicate model per idle
+/// period. A retiring daemon therefore checks that the file still names its own port.
+fn remove_state_if_ours(state_file: &Path, port: u16) {
+    let ours = fs::read_to_string(state_file)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| value.get("port")?.as_u64())
+        .is_some_and(|recorded| recorded == u64::from(port));
+    if ours {
+        let _ = fs::remove_file(state_file);
     }
 }
 
@@ -453,15 +488,35 @@ fn handle_connection(
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_nodelay(true);
+
+    // BOUNDED read, and the bound is the point: `read_line` on a raw socket grows its String
+    // until it meets a newline, so a peer that opens a connection and sends bytes forever (or
+    // simply never sends `\n`) drives this process to OOM. That happens BEFORE the token is
+    // checked, so it is reachable by any local process, authenticated or not.
+    //
+    // The cap is generous against the largest legitimate request — a 1,024-float speaker vector
+    // serialized as JSON text runs on the order of 20 KB — and still bounds the damage.
+    const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
+    if (&mut reader)
+        .take(MAX_REQUEST_BYTES)
+        .read_line(&mut line)
+        .is_err()
+    {
+        return;
+    }
+    let mut stream = reader.into_inner();
+    // A request that filled the cap without terminating is refused rather than parsed: the JSON
+    // would be truncated anyway, and saying so beats a silent disconnect.
+    if line.len() as u64 >= MAX_REQUEST_BYTES {
+        let reply = json!({ "ok": false, "kind": "request", "message": "request too large" });
+        let _ = stream.write_all(format!("{reply}\n").as_bytes());
         return;
     }
     let Ok(request) = serde_json::from_str::<Value>(&line) else {
         return;
     };
-    let mut stream = reader.into_inner();
 
     let refuse = |stream: &mut TcpStream, kind: &str, message: &str| {
         let reply = json!({ "ok": false, "kind": kind, "message": message });
@@ -507,17 +562,44 @@ fn handle_connection(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let seed = request.get("seed").and_then(Value::as_u64).unwrap_or(0);
-    let speaker: Vec<f32> = request
-        .get("speaker")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|v| v.as_f64())
-                .map(|v| v as f32)
-                .collect()
-        })
-        .unwrap_or_default();
+    // The speaker vector is validated rather than salvaged, and both halves of that matter.
+    //
+    // `filter_map(as_f64)` used to DROP entries that were not numbers, so `[1.0, "x", 2.0]`
+    // silently became a 2-element vector — a malformed request quietly became a different,
+    // well-formed one, conditioning generation on the wrong thing.
+    //
+    // Non-finite values are worse. A NaN or infinity reaching the Q8 quantizer trips its
+    // `is_finite` assertion, and because `handle_connection` runs inline in the accept loop a
+    // panic there takes down the daemon serving every other caller. Refusing here keeps a bad
+    // request a bad request instead of an outage.
+    let speaker: Vec<f32> = match request.get("speaker").and_then(Value::as_array) {
+        Some(values) => {
+            let mut vector = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(number) = value.as_f64() else {
+                    refuse(
+                        &mut stream,
+                        "request",
+                        "speaker vector contains a non-numeric entry",
+                    );
+                    return;
+                };
+                #[allow(clippy::cast_possible_truncation)]
+                let narrowed = number as f32;
+                if !narrowed.is_finite() {
+                    refuse(
+                        &mut stream,
+                        "request",
+                        "speaker vector contains a non-finite value",
+                    );
+                    return;
+                }
+                vector.push(narrowed);
+            }
+            vector
+        }
+        None => Vec::new(),
+    };
     let Some(mode) = normalize else {
         refuse(&mut stream, "request", "unknown normalize mode");
         return;
