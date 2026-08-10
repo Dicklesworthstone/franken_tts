@@ -367,6 +367,24 @@
           "required": false,
           "summary": "synthesis start to first decoded PCM packet; excludes model load (bounded by the load stage events)",
           "type": "u64"
+        },
+        {
+          "name": "samples",
+          "required": false,
+          "summary": "PCM samples synthesized (24 kHz mono)",
+          "type": "u64"
+        },
+        {
+          "name": "duration_ms",
+          "required": false,
+          "summary": "duration of the synthesized audio itself",
+          "type": "u64"
+        },
+        {
+          "name": "prepared_token_count",
+          "required": false,
+          "summary": "prompt tokens after normalization and template assembly",
+          "type": "u64"
         }
       ],
       "kind": "stream",

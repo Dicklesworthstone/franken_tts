@@ -402,6 +402,28 @@ pub const EVENTS: &[EventSpec] = &[
                 summary: "synthesis start to first decoded PCM packet; excludes model load \
                           (bounded by the load stage events)",
             },
+            // The three fields below are emitted by synthesizing runs only; `--check` and
+            // non-synthesis commands close their runs without them. They were emitted (and
+            // consumed by the human presenter) before they were catalogued — documenting
+            // them here is what makes a strict validator accept a real `say` stream.
+            FieldSpec {
+                name: "samples",
+                ty: "u64",
+                required: false,
+                summary: "PCM samples synthesized (24 kHz mono)",
+            },
+            FieldSpec {
+                name: "duration_ms",
+                ty: "u64",
+                required: false,
+                summary: "duration of the synthesized audio itself",
+            },
+            FieldSpec {
+                name: "prepared_token_count",
+                ty: "u64",
+                required: false,
+                summary: "prompt tokens after normalization and template assembly",
+            },
         ],
     },
     EventSpec {
