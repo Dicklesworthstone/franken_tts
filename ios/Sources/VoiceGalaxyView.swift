@@ -22,6 +22,7 @@ struct VoiceGalaxyView: View {
 
     @State private var entries: [GalaxyEntry] = []
     @State private var similarity: [[Double]] = []
+    @State private var contexts: [String: GlyphContext] = [:]
     @State private var selected: String?
     @State private var appeared = false
 
@@ -65,7 +66,8 @@ struct VoiceGalaxyView: View {
                         }
                         ForEach(laidOut) { entry in
                             VStack(spacing: 4) {
-                                VoicePrintGlyph(vector: entry.vector)
+                                VoicePrintGlyph(
+                                    vector: entry.vector, context: contexts[entry.id])
                                     .frame(width: 74, height: 74)
                                 Text(entry.name)
                                     .font(.system(size: 11, weight: .bold, design: .monospaced))
@@ -128,6 +130,52 @@ struct VoiceGalaxyView: View {
             built[index].position = raw[index]
         }
         entries = built
+        contexts = Self.glyphContexts(for: built, mapPositions: raw)
+    }
+
+    /// Cohort-relative drawing context: shapes amplify each voice's departure from the
+    /// average profile, and color comes from the similarity map itself — the angle
+    /// around the map's center picks the hue (neighbors match), the distance from the
+    /// center picks saturation (outliers get vivid).
+    private static func glyphContexts(
+        for entries: [GalaxyEntry], mapPositions: [CGPoint]
+    ) -> [String: GlyphContext] {
+        guard !entries.isEmpty else { return [:] }
+        let profiles = entries.map { VoiceMath.pooledProfile($0.vector, bins: 72) }
+        let bins = profiles[0].count
+        var mean = [Double](repeating: 0, count: bins)
+        for profile in profiles {
+            for bin in 0..<bins {
+                mean[bin] += profile[bin] / Double(profiles.count)
+            }
+        }
+        var variance = 0.0
+        for profile in profiles {
+            for bin in 0..<bins {
+                let deviation = profile[bin] - mean[bin]
+                variance += deviation * deviation
+            }
+        }
+        let deviationScale = (variance / Double(profiles.count * bins)).squareRoot()
+
+        let centerX = mapPositions.map(\.x).reduce(0, +) / CGFloat(mapPositions.count)
+        let centerY = mapPositions.map(\.y).reduce(0, +) / CGFloat(mapPositions.count)
+        let radii = mapPositions.map { position in
+            (pow(position.x - centerX, 2) + pow(position.y - centerY, 2)).squareRoot()
+        }
+        let maxRadius = max(radii.max() ?? 1, 1e-9)
+
+        var out = [String: GlyphContext]()
+        for (index, entry) in entries.enumerated() {
+            let position = mapPositions[index]
+            let hue = Double(
+                atan2(position.y - centerY, position.x - centerX) / (2 * .pi) + 0.5)
+            let saturation = 0.45 + 0.5 * Double(radii[index] / maxRadius)
+            out[entry.id] = GlyphContext(
+                meanProfile: mean, deviationScale: deviationScale,
+                hue: hue, saturation: saturation)
+        }
+        return out
     }
 
     /// Fit MDS coordinates into the canvas with padding, then relax overlaps.
@@ -184,7 +232,9 @@ struct VoiceGalaxyView: View {
         return LabPanel {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 10) {
-                    VoicePrintGlyph(vector: entries[index].vector)
+                    VoicePrintGlyph(
+                        vector: entries[index].vector,
+                        context: contexts[entries[index].id])
                         .frame(width: 40, height: 40)
                     Text(entries[index].name)
                         .font(.system(size: 16, weight: .black))
