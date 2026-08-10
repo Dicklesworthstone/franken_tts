@@ -33,6 +33,30 @@ enum Job {
     Linear(LinearJob),
     /// f32 GQA attention partitioned over query heads.
     Attention(AttentionJob),
+    /// f32 dense linear (the packed GEMM) partitioned over output columns.
+    F32Linear(F32LinearJob),
+}
+
+/// The codec's dense route, partitioned over output columns.
+///
+/// This is the codec's whole arithmetic budget: every convolution (via im2col), every ConvNeXt
+/// pointwise pair, and every transformer projection reaches one function, and that function
+/// measured 92% of browser frame time while running on a single thread.
+///
+/// Column partitioning is exact here for the same reason it is for the int8 job: no reduction
+/// crosses a column, so a stripe computed in isolation has the bits the whole call would have
+/// written (`packed_gemm::column_partitions_are_bit_identical_to_the_whole`).
+#[derive(Clone, Copy)]
+struct F32LinearJob {
+    x: *const f32,
+    weight: *const f32,
+    /// Null when the projection is bias-free.
+    bias: *const f32,
+    out: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+    partitions: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -317,6 +341,7 @@ fn run_partition(job: &Job, worker: usize) {
     match job {
         Job::Linear(job) => run_linear_partition(job, worker),
         Job::Attention(job) => run_attention_partition(job, worker),
+        Job::F32Linear(job) => run_f32_linear_partition(job, worker),
     }
 }
 
@@ -404,7 +429,67 @@ fn run_linear_partition(job: &LinearJob, worker: usize) {
     }
 }
 
+/// Computes this worker's column stripe of an f32 dense linear.
+fn run_f32_linear_partition(job: &F32LinearJob, worker: usize) {
+    // Stripes are NR-aligned so every partition stays on the packed register-tiled path; a ragged
+    // boundary would push one partition onto the scalar remainder loop for no reason.
+    const NR: usize = 8;
+    let chunk = job.n.div_ceil(job.partitions).next_multiple_of(NR);
+    let start = (worker * chunk).min(job.n);
+    let end = ((worker + 1) * chunk).min(job.n);
+    if start >= end {
+        return;
+    }
+    // SAFETY: module-docs facts 1-3. The pointers outlive the dispatch (the caller blocks until
+    // every partition reports done), the reads are shared-immutable for its duration, and this
+    // worker writes only columns in its own [start, end) stripe. `out` stays a raw pointer for the
+    // same reason as the int8 job: several whole-buffer `&mut` would be UB even with disjoint
+    // writes, because `rustc` marks `&mut` `noalias`.
+    unsafe {
+        let x = std::slice::from_raw_parts(job.x, job.m * job.k);
+        let weight = std::slice::from_raw_parts(job.weight, job.n * job.k);
+        let bias = (!job.bias.is_null()).then(|| std::slice::from_raw_parts(job.bias, job.n));
+        crate::packed_gemm::linear_packed_range(
+            x, weight, bias, job.m, job.k, job.n, start, end, job.out,
+        );
+    }
+}
+
 impl Team {
+    /// Runs one f32 dense linear across the team, bit-identically to the serial packed kernel.
+    ///
+    /// # Panics
+    ///
+    /// Panics on shape mismatches, exactly as the serial kernel does.
+    pub fn linear_f32(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        bias: Option<&[f32]>,
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) {
+        assert_eq!(x.len(), m * k, "x must be [m, k]");
+        assert_eq!(weight.len(), n * k, "weight must be [n, k]");
+        assert_eq!(out.len(), m * n, "out must be [m, n]");
+        if let Some(bias) = bias {
+            assert_eq!(bias.len(), n, "bias must be [n]");
+        }
+        let job = Job::F32Linear(F32LinearJob {
+            x: x.as_ptr(),
+            weight: weight.as_ptr(),
+            bias: bias.map_or(std::ptr::null(), <[f32]>::as_ptr),
+            out: out.as_mut_ptr(),
+            m,
+            k,
+            n,
+            partitions: self.partitions,
+        });
+        self.dispatch(job);
+    }
+
     /// Runs one W8A8 linear across the team. Bit-identical to the serial path per element.
     ///
     /// # Panics

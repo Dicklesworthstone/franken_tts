@@ -234,6 +234,20 @@ pub fn linear_with_accumulation(
     // `m == 1` keeps the dot path: with one row there is nothing to amortize a packed panel over,
     // and NE-004 measured register blocking as neutral at that geometry.
     if m > 1 {
+        // Hand it to the team when one is armed. This is the codec's entire arithmetic budget —
+        // 92% of browser frame time — and it ran on one thread while every worker sat parked.
+        //
+        // Partitioning is a pure speed knob: stripes are disjoint columns, no reduction is split,
+        // so the parallel result is bit-identical per element to the serial packed kernel. The
+        // work must also be big enough to pay for a dispatch, hence the floor; and a worker thread
+        // that is itself inside a kernel must never re-dispatch (`thread_bypassed`).
+        const TEAM_FLOOR: usize = 64 * 1024;
+        if m * n >= TEAM_FLOOR && !crate::team::thread_bypassed() {
+            if let Some(team) = crate::team::armed() {
+                team.linear_f32(x, weight, bias, m, k, n, out);
+                return;
+            }
+        }
         crate::packed_gemm::linear_packed(x, weight, bias, m, k, n, out);
         return;
     }

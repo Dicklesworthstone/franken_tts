@@ -71,26 +71,56 @@ pub fn linear_packed(
     if let Some(bias) = bias {
         assert_eq!(bias.len(), n, "bias must be [n]");
     }
+    // SAFETY: `out` is a `&mut [f32]` of exactly `m * n`, and the full column range is requested,
+    // so every write below lands inside it. The borrow checker guarantees no other alias.
+    unsafe {
+        linear_packed_range(x, weight, bias, m, k, n, 0, n, out.as_mut_ptr());
+    }
+}
 
-    // Seed with the bias so the tile can accumulate in place and the store is a plain write.
-    match bias {
-        Some(bias) => {
-            for row in out.chunks_exact_mut(n) {
-                row.copy_from_slice(bias);
+/// Computes only output columns `col_start..col_end`, writing into a `[m, n]` buffer.
+///
+/// This is the shape the [`crate::team`] needs: each worker owns a disjoint column stripe and
+/// writes it in place, so no partition ever touches another's elements and no reduction is split
+/// across partitions. The result is bit-identical to the serial whole-matrix call, which is why
+/// threading this changes speed only — pinned by `column_partitions_are_bit_identical_to_the_whole`.
+///
+/// # Safety
+///
+/// `out` must be valid for writes of `m * n` floats, and no other reference may alias the columns
+/// `col_start..col_end` for the duration of the call.
+// SAFETY: discharged by both callers. `linear_packed` passes the pointer of a `&mut [f32]` it
+// holds exclusively, with the full column range. The team passes one worker's disjoint stripe of a
+// buffer the dispatcher owns and blocks on until every partition reports done, so the allocation
+// outlives all writes and no two stripes address the same element.
+pub(crate) unsafe fn linear_packed_range(
+    x: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    m: usize,
+    k: usize,
+    n: usize,
+    col_start: usize,
+    col_end: usize,
+    out: *mut f32,
+) {
+    // Seed this stripe with the bias so the tile accumulates in place.
+    for row in 0..m {
+        for column in col_start..col_end {
+            // SAFETY: `row < m` and `column < n` by the caller's contract.
+            unsafe {
+                *out.add(row * n + column) = bias.map_or(0.0, |values| values[column]);
             }
         }
-        None => out.fill(0.0),
     }
 
-    if m == 0 || n == 0 {
-        return;
-    }
-    if k == 0 {
+    if m == 0 || k == 0 || col_start >= col_end {
         return; // bias-only result, already written
     }
 
+    let columns = col_end - col_start;
     let m_full = m - m % MR;
-    let n_full = n - n % NR;
+    let n_full = col_start + columns - columns % NR;
 
     // Column panels sized so one packed panel plus its consumers stay resident. At least one
     // panel always, however large `k` is.
@@ -101,7 +131,7 @@ pub fn linear_packed(
 
     let mut panel = vec![0.0_f32; k * NR];
 
-    let mut jc = 0;
+    let mut jc = col_start;
     while jc < n_full {
         let jc_end = (jc + nc).min(n_full);
         let mut j0 = jc;
@@ -121,13 +151,16 @@ pub fn linear_packed(
 
             let mut i0 = 0;
             while i0 < m_full {
-                accumulate_tile::<MR>(x, &panel, out, i0, j0, k, n);
+                // SAFETY: rows `i0..i0+MR` are below `m` and columns `j0..j0+NR` are inside the
+                // caller's stripe, so every write lands within the `m * n` buffer.
+                unsafe { accumulate_tile::<MR>(x, &panel, out, i0, j0, k, n) };
                 i0 += MR;
             }
             // Rows below the last full tile still benefit from the packed panel; run them one row
             // at a time rather than dropping to the unpacked tail path.
             for row in m_full..m {
-                accumulate_tile::<1>(x, &panel, out, row, j0, k, n);
+                // SAFETY: as above, with a single row.
+                unsafe { accumulate_tile::<1>(x, &panel, out, row, j0, k, n) };
             }
             j0 += NR;
         }
@@ -138,13 +171,14 @@ pub fn linear_packed(
     // ascending-k dot is both simplest and exact.
     for row in 0..m {
         let x_row = &x[row * k..row * k + k];
-        for column in n_full..n {
+        for column in n_full..col_end {
             let w_row = &weight[column * k..column * k + k];
             let mut sum = 0.0_f32;
             for depth in 0..k {
                 sum += x_row[depth] * w_row[depth];
             }
-            out[row * n + column] += sum;
+            // SAFETY: `row < m`, `column < n`, inside the caller's buffer and stripe.
+            unsafe { *out.add(row * n + column) += sum };
         }
     }
 }
@@ -154,11 +188,19 @@ pub fn linear_packed(
 /// Generic over `ROWS` so the full-tile and single-row cases share one body and one reduction
 /// order; a const generic keeps the accumulator a fixed-size array, which is what lets LLVM keep
 /// it in registers and vectorize the inner update.
+///
+/// # Safety
+///
+/// `out` must be valid for writes covering rows `i0..i0+ROWS` and columns `j0..j0+NR` of an
+/// `[m, n]` matrix.
+// SAFETY: both call sites sit inside `linear_packed_range`'s loops, where `i0 + ROWS <= m` and
+// `j0 + NR <= n_full <= col_end` hold by the loop bounds, so every tile lies inside the caller's
+// stripe and therefore inside its `m * n` buffer.
 #[inline]
-fn accumulate_tile<const ROWS: usize>(
+unsafe fn accumulate_tile<const ROWS: usize>(
     x: &[f32],
     panel: &[f32],
-    out: &mut [f32],
+    out: *mut f32,
     i0: usize,
     j0: usize,
     k: usize,
@@ -177,8 +219,9 @@ fn accumulate_tile<const ROWS: usize>(
     }
     for (row, slots) in acc.iter().enumerate() {
         let base = (i0 + row) * n + j0;
-        for (cell, &value) in out[base..base + NR].iter_mut().zip(slots) {
-            *cell += value;
+        for (column, &value) in slots.iter().enumerate() {
+            // SAFETY: the caller guarantees this tile lies inside the output matrix.
+            unsafe { *out.add(base + column) += value };
         }
     }
 }
@@ -255,6 +298,62 @@ mod tests {
                     expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                     "m={m} k={k} n={n} bias={}: packed GEMM diverged from the scalar reference",
                     carry_bias.is_some()
+                );
+            }
+        }
+    }
+
+    /// Every partition count reproduces the serial bits at real codec geometry.
+    ///
+    /// This is the law the team dispatch rests on. It runs the SAME stripe function the workers
+    /// run, at the codec's binding worst case (`block_00`, 1024 -> 1536 with kernel 7, so
+    /// K = 7168), and at the transformer's shapes — because a partitioning that is exact at toy
+    /// sizes and wrong at NR boundaries is exactly the bug that would ship.
+    #[test]
+    fn every_partition_count_reproduces_the_serial_bits() {
+        let shapes = [
+            (32, 7168, 1536),
+            (72, 512, 512),
+            (48, 512, 1024),
+            (17, 96, 40),
+        ];
+        for (index, &(m, k, n)) in shapes.iter().enumerate() {
+            let x = deterministic(m * k, 0x9E11_0000 + index as u64);
+            let weight = deterministic(n * k, 0x7A31_0000 + index as u64);
+            let bias = deterministic(n, 0x1CE5_0000 + index as u64);
+
+            let mut serial = vec![0.0_f32; m * n];
+            linear_packed(&x, &weight, Some(&bias), m, k, n, &mut serial);
+
+            for partitions in [1, 2, 3, 5, 6, 8] {
+                let mut parallel = vec![0.0_f32; m * n];
+                // Exactly the stripe arithmetic in `run_f32_linear_partition`.
+                let chunk = n.div_ceil(partitions).next_multiple_of(NR);
+                for worker in 0..partitions {
+                    let start = (worker * chunk).min(n);
+                    let end = ((worker + 1) * chunk).min(n);
+                    if start >= end {
+                        continue;
+                    }
+                    // SAFETY: stripes are disjoint and inside the m*n buffer.
+                    unsafe {
+                        linear_packed_range(
+                            &x,
+                            &weight,
+                            Some(&bias),
+                            m,
+                            k,
+                            n,
+                            start,
+                            end,
+                            parallel.as_mut_ptr(),
+                        );
+                    }
+                }
+                assert_eq!(
+                    parallel.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    serial.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "m={m} k={k} n={n} partitions={partitions}"
                 );
             }
         }
