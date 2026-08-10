@@ -60,7 +60,10 @@ fn run_say(resident_dir: &std::path::Path, out: &std::path::Path, extra: &[&str]
         .env("FTTS_RESIDENT_IDLE_SECS", "30")
         // Debug-build synthesis on the slowest test machines outlives the production
         // client timeout; the contract under test is reuse and parity, not speed.
-        .env("FTTS_RESIDENT_CLIENT_TIMEOUT_SECS", "1800");
+        .env("FTTS_RESIDENT_CLIENT_TIMEOUT_SECS", "1800")
+        // A freshly built debug exe can sit in an antivirus scan for tens of seconds on
+        // its first launch; the daemon-reuse contract does not care how long boot takes.
+        .env("FTTS_RESIDENT_SPAWN_WAIT_SECS", "180");
     let output = command.output().expect("ftts say runs");
     assert!(
         output.status.success(),

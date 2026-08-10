@@ -52,8 +52,18 @@ fn client_read_timeout() -> Duration {
 }
 
 /// How long the client waits for a freshly spawned daemon to write its state file and
-/// accept. The daemon binds before loading the model, so this covers process start only.
-const SPAWN_WAIT: Duration = Duration::from_secs(10);
+/// accept. The daemon binds before loading the model, so this covers process start only;
+/// thirty seconds absorbs a first-launch antivirus scan of the binary on Windows, which
+/// measured well past ten seconds on a Surface Book. `FTTS_RESIDENT_SPAWN_WAIT_SECS`
+/// overrides it.
+const DEFAULT_SPAWN_WAIT: Duration = Duration::from_secs(30);
+
+fn spawn_wait() -> Duration {
+    std::env::var("FTTS_RESIDENT_SPAWN_WAIT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(DEFAULT_SPAWN_WAIT, Duration::from_secs)
+}
 
 const PROTOCOL: u64 = 1;
 
@@ -221,7 +231,7 @@ fn connect(bundle: &ModelBundle) -> Option<TcpStream> {
         let _ = fs::remove_file(&path);
     }
     spawn_daemon(&bundle.root)?;
-    let deadline = Instant::now() + SPAWN_WAIT;
+    let deadline = Instant::now() + spawn_wait();
     while Instant::now() < deadline {
         if let Some(stream) = connect_once(bundle) {
             return Some(stream);
