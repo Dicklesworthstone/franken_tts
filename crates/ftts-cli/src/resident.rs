@@ -435,7 +435,7 @@ pub fn run_daemon(bundle_root: &Path) -> Result<(), FttsError> {
                 // in place, so an unwind can leave it either untouched or fully valid — there is no
                 // half-initialized state for a later request to observe.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle_connection(stream, &bundle, &token, &mut resident);
+                    handle_connection(stream, &bundle, &token, port, &mut resident);
                 }));
                 if outcome.is_err() {
                     // The panic hook has already printed the location; say what it cost.
@@ -483,6 +483,7 @@ fn handle_connection(
     stream: TcpStream,
     bundle: &ModelBundle,
     token: &str,
+    port: u16,
     resident: &mut Option<(LoadedModel, ftts_core::TtsEngine, (u64, u64))>,
 ) {
     let _ = stream.set_nonblocking(false);
@@ -534,8 +535,10 @@ fn handle_connection(
         // A different binary version must not be served by this process; the client falls
         // back inline and this daemon retires so the next spawn matches.
         refuse(&mut stream, "version", "resident daemon version mismatch");
+        // Ownership-checked for the same reason as the idle exit: the state file may
+        // already belong to a successor daemon spawned between the client's read and now.
         if let Some(state) = state_path(&bundle.root) {
-            let _ = fs::remove_file(state);
+            remove_state_if_ours(&state, port);
         }
         std::process::exit(0);
     }
@@ -547,7 +550,7 @@ fn handle_connection(
     {
         refuse(&mut stream, "stale", "model artifact changed since load");
         if let Some(state) = state_path(&bundle.root) {
-            let _ = fs::remove_file(state);
+            remove_state_if_ours(&state, port);
         }
         std::process::exit(0);
     }
@@ -764,7 +767,7 @@ mod tests {
                 codec: PathBuf::from("/nonexistent/codec"),
             };
             let mut resident = None;
-            handle_connection(stream, &bundle, "right-token", &mut resident);
+            handle_connection(stream, &bundle, "right-token", 0, &mut resident);
         });
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
         let request = json!({
