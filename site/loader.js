@@ -245,13 +245,17 @@ export async function cachedBytes() {
 /** Remove every cached model file (user-facing "free up storage"). */
 export async function clearCache() {
   const root = await opfsRoot();
-  for (const file of MODEL_FILES) {
-    for (const name of [file.asset, `${file.asset}.part`]) {
-      try {
-        await root.removeEntry(name);
-      } catch {
-        /* absent */
-      }
+  // The trust ledger goes too: a cleared cache must not leave behind a memo claiming files
+  // were verified, or a future file planted at the same name and size would inherit trust
+  // it never earned.
+  for (const name of [
+    VERIFIED_MARKER,
+    ...MODEL_FILES.flatMap((file) => [file.asset, `${file.asset}.part`]),
+  ]) {
+    try {
+      await root.removeEntry(name);
+    } catch {
+      /* absent */
     }
   }
 }

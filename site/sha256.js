@@ -118,7 +118,7 @@ export class Sha256 {
  *
  * @param {Blob} blob
  * @param {number} sliceBytes
- * @param {(read: number) => void} [onProgress]
+ * @param {(read: number) => void | Promise<void>} [onProgress]
  */
 export async function digestBlob(blob, sliceBytes = 8 * 1024 * 1024, onProgress) {
   const hash = new Sha256();
@@ -127,7 +127,10 @@ export async function digestBlob(blob, sliceBytes = 8 * 1024 * 1024, onProgress)
     // One slice at a time: the buffer from the previous iteration is collectable before the next
     // is allocated, which is the entire point of doing this rather than one arrayBuffer() call.
     hash.update(new Uint8Array(await blob.slice(offset, end).arrayBuffer()));
-    if (onProgress) onProgress(end);
+    // Awaited so a caller can pass an event-loop yield here and actually get one: an unawaited
+    // setTimeout promise yields nothing, and the whole point of the callback for the loader is
+    // giving the browser a macrotask between slices of a multi-second digest.
+    if (onProgress) await onProgress(end);
   }
   return hash.hex();
 }

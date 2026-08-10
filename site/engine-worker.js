@@ -160,9 +160,22 @@ async function startTeam(module, memory) {
     }),
   );
 
+  // All-or-nothing, and the reason is stripe arithmetic, not tidiness. A worker computes its
+  // partition stripe FROM ITS SPAWN INDEX, and every parked worker decrements the join counter
+  // on every dispatch. Arm width 5 with worker 2 dead and stripe 2 is silently never written —
+  // the join still completes and the output carries a hole. Arm a smaller width with orphaned
+  // parked workers and the counter is decremented more times than it was set, which underflows.
+  // A tail failure would happen to stay contiguous, but distinguishing that from a middle
+  // failure buys little: boot failures are all-or-nothing in practice, so any failure means
+  // terminate the whole set and run serial, which is always correct.
   const ready = parked.filter(Boolean).length;
-  arm_worker_team(ready + 1);
-  return worker_team_width();
+  if (ready === desired - 1) {
+    arm_worker_team(desired);
+    return worker_team_width();
+  }
+  for (const worker of workers) worker.terminate();
+  arm_worker_team(1);
+  return 1;
 }
 
 function reply(type, payload, transfer = []) {
