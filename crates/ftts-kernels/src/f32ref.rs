@@ -1022,6 +1022,9 @@ pub fn gqa_attention_head_range_with_arithmetic(
 ///
 /// `out` must be valid for writes across `[query_positions, q_heads, head_dim]`, and no other
 /// reference may alias the `head_dim` spans this call's `q_head_range` writes for its duration.
+// SAFETY: discharged by both callers — the safe wrapper asserts `out.len()` and holds the only
+// `&mut`; the team gives each worker a disjoint `q_head_range` whose `head_dim` spans cannot
+// overlap, and blocks until every partition reports done, so `out` outlives all writes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn gqa_attention_head_range_into(
     queries: &[f32],

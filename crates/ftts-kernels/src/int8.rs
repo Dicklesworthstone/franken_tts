@@ -607,6 +607,10 @@ mod neon_dotprod {
         unsafe { dot_i32_sdot(a, b) }
     }
 
+    // SAFETY: callers must have confirmed FEAT_DotProd via `available()` — the sole caller
+    // `dot_i32` above does, and `super::dot_i32` asserts it at the dispatch site. All loads are
+    // bounded by `a.len()`, which the caller asserts equals `b.len()`, and the tail is handled
+    // scalar-side, so no read passes either slice's end.
     #[target_feature(enable = "neon,dotprod")]
     unsafe fn dot_i32_sdot(a: &[i8], b: &[i8]) -> i32 {
         let len = a.len();
@@ -702,6 +706,8 @@ mod wasm_simd128 {
     /// # Safety
     ///
     /// `a` and `b` must each be valid for a 16-byte read.
+    // SAFETY: the contract above is discharged at both call sites, where the block loop runs only
+    // while `offset + 16 <= len` and `len` is the asserted-common length of the two slices.
     #[inline]
     unsafe fn accumulate_block(acc: v128, a: *const i8, b: *const i8) -> v128 {
         // SAFETY: the caller guarantees both pointers address 16 readable bytes.
@@ -762,6 +768,9 @@ mod wasm_simd128 {
     /// # Safety
     ///
     /// `weights` must be valid for `4 * k` readable bytes and `x` for `k`.
+    // SAFETY: the caller enters this path only when four whole weight rows remain (`col + 4 <= n`)
+    // and slices `weights` at `col * k` for `4 * k` bytes, with `x` the full k-length activation
+    // row; every load below is bounded by `index < k` against those same lengths.
     unsafe fn dot4_simd128(x: &[i8], weights: &[i8], k: usize) -> [i32; 4] {
         let x_ptr = x.as_ptr();
         let w_ptr = weights.as_ptr();
@@ -807,6 +816,9 @@ mod wasm_simd128 {
     /// # Safety
     ///
     /// `a` and `b` must have equal length; the caller asserts this.
+    // SAFETY: `super::dot_i32` asserts the two lengths are equal before dispatching here, and the
+    // only other caller is the public `dot_i32` wrapper directly above, which forwards the same
+    // pair. Every block load is guarded by `offset + 64 <= len` and the remainder runs scalar.
     unsafe fn dot_i32_simd128(a: &[i8], b: &[i8]) -> i32 {
         let len = a.len();
         let a_ptr = a.as_ptr();
