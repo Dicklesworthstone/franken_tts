@@ -1,0 +1,23 @@
+# ftts-video — the branded `ftts make-video` renderer.
+#
+# Every pixel is produced by memory-safe Rust in this crate: QOI background
+# decode, Ken Burns resampling, waveform drawing, glyph rasterization over
+# fmd-font outlines, RGB→YUV conversion, Y4M emission. The one external
+# boundary is the final H.264+AAC encode, which follows the same
+# first-available-system-encoder contract as `ftts say`'s .m4a path
+# (and franken_manim's ffmpeg protocol): native Y4M+WAV always works,
+# MP4 is an encoder post-step, never a rendering dependency.
+[package]
+name = "ftts-video"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "franken_tts branded video renderer: pure-Rust frames, waveform, and text for `ftts make-video`"
+
+[dependencies]
+fmd-font = { version = "0.1.0", features = ["bundled-faces"] }
+
+[lints]
+workspace = true

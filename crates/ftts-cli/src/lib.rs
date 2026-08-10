@@ -220,6 +220,9 @@ struct Cli {
 enum Command {
     /// Validate or synthesize text with an optional voice pack.
     Say(SayArgs),
+    /// Synthesize text and render a share-ready branded video of it.
+    #[command(name = "make-video")]
+    MakeVideo(MakeVideoArgs),
     /// Build a consent-bearing voice pack from reference audio.
     Enroll(EnrollArgs),
     /// Inspect a portable voice pack.
@@ -295,6 +298,47 @@ struct SayArgs {
     /// invocation starts without the multi-second load, unloading itself after ten idle
     /// minutes (FTTS_RESIDENT_IDLE_SECS overrides). This flag, or FTTS_NO_RESIDENT=1,
     /// opts a run out; results are identical either way.
+    #[arg(long)]
+    no_resident: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct MakeVideoArgs {
+    /// Text to synthesize. Use `-` to read UTF-8 text from stdin.
+    #[arg(value_name = "TEXT")]
+    text: Option<String>,
+
+    /// Output video. `.mp4` uses the first available system encoder (ffmpeg);
+    /// `.y4m` renders natively with a `.wav` sibling and needs no encoder.
+    #[arg(value_name = "OUTPUT", conflicts_with = "output")]
+    output_positional: Option<PathBuf>,
+
+    /// Read UTF-8 text from PATH. Use `-` for stdin.
+    #[arg(long, value_name = "PATH", conflicts_with = "text")]
+    file: Option<PathBuf>,
+
+    /// Explicit .fttsq model artifact. No network lookup is performed.
+    #[arg(long, value_name = "PATH")]
+    model: Option<PathBuf>,
+
+    /// Voice source: a .spk vector, reference audio, or a built-in voice name
+    /// (matt, james, leo, robert, judy, aria, ember).
+    #[arg(long, value_name = "PATH|NAME")]
+    voice: Option<PathBuf>,
+
+    /// Write the video here. Same as the positional OUTPUT.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    output: Option<PathBuf>,
+
+    /// Skip synthesis and render this existing PCM WAV instead.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["text", "file"])]
+    audio: Option<PathBuf>,
+
+    /// Voice name shown on the video. Defaults to the voice's name.
+    #[arg(long, value_name = "NAME")]
+    label: Option<String>,
+
+    /// Load the model in this process instead of using the resident engine.
     #[arg(long)]
     no_resident: bool,
 }
@@ -688,6 +732,7 @@ fn dispatch(
 ) -> Result<(), FttsError> {
     match &cli.command {
         Command::Say(args) => run_say(&cli, args, environment, stdin, stdout, stderr),
+        Command::MakeVideo(args) => run_make_video(&cli, args, environment, stdin, stdout, stderr),
         Command::Enroll(args) => run_enroll(args, environment, stdout),
         Command::Voice(VoiceArgs {
             command: VoiceCommand::Inspect { path },
@@ -1147,6 +1192,169 @@ fn run_say(
     }
 
     outcome
+}
+
+/// `ftts make-video`: synthesize (or take a WAV) and render the branded
+/// share video. Frames, waveform, and text are pure Rust (`ftts-video`);
+/// `.mp4` goes through the same first-available-system-encoder contract as
+/// `ftts say`'s `.m4a` path, and `.y4m` + `.wav` is the native no-encoder
+/// output.
+fn run_make_video(
+    cli: &Cli,
+    args: &MakeVideoArgs,
+    environment: &Environment,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<(), FttsError> {
+    let output = args
+        .output
+        .clone()
+        .or_else(|| args.output_positional.clone())
+        .ok_or_else(|| {
+            FttsError::Usage(
+                "`ftts make-video` needs an output path (`ftts make-video \"text\" out.mp4`)"
+                    .to_owned(),
+            )
+        })?;
+    let extension = output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let is_mp4 = match extension.as_deref() {
+        Some("mp4") => true,
+        Some("y4m") => false,
+        other => {
+            return Err(FttsError::Usage(format!(
+                "unsupported video extension `.{}`; use .mp4 (system encoder) or .y4m (native)",
+                other.unwrap_or("<none>")
+            )));
+        }
+    };
+
+    // The voice pill needs a human name: an explicit --label wins, a preset
+    // keeps its capitalized name, a custom voice shows its file stem. With
+    // no voice given, the label follows the same default chain `say` uses
+    // (FTTS_DEFAULT_VOICE, then an enrolled default.spk, then built-in matt)
+    // rather than claiming "Matt" over someone's enrolled voice.
+    let capitalize = |raw: &str| {
+        let mut chars = raw.chars();
+        chars
+            .next()
+            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+            .unwrap_or_else(|| raw.to_owned())
+    };
+    let stem_of = |path: &Path| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_owned)
+    };
+    let label = args.label.clone().unwrap_or_else(|| {
+        if let Some(voice) = &args.voice {
+            return stem_of(voice)
+                .map(|stem| capitalize(&stem))
+                .unwrap_or_else(|| "Voice".to_owned());
+        }
+        if let Some(audio) = &args.audio {
+            // Rendering someone's own recording: name it after the file.
+            return stem_of(audio)
+                .map(|stem| capitalize(&stem))
+                .unwrap_or_else(|| "Voice".to_owned());
+        }
+        if let Some(default_voice) = environment.value("FTTS_DEFAULT_VOICE")
+            && let Some(stem) = stem_of(Path::new(default_voice))
+        {
+            return capitalize(&stem);
+        }
+        let enrolled_default = resolve_model(args.model.as_deref(), environment)
+            .ok()
+            .and_then(|model| synth::ModelBundle::resolve(Path::new(&model)).ok())
+            .is_some_and(|bundle| bundle.root.join("default.spk").is_file());
+        if enrolled_default {
+            "My voice".to_owned()
+        } else {
+            "Matt".to_owned()
+        }
+    });
+
+    // Audio: either supplied, or synthesized through the full `say` pipeline
+    // (same events, presenter, and resident engine). An mp4 gets a staging
+    // WAV that is consumed by the encoder; a y4m synthesizes straight into
+    // its `.wav` sibling, which stays as the video's audio track.
+    let staging: Option<PathBuf> = if args.audio.is_none() {
+        if is_mp4 {
+            let mut path = output.as_os_str().to_owned();
+            path.push(".ftts-staging.wav");
+            Some(PathBuf::from(path))
+        } else {
+            Some(output.with_extension("wav"))
+        }
+    } else {
+        None
+    };
+    if let Some(staging_path) = &staging {
+        let say_args = SayArgs {
+            text: args.text.clone(),
+            output_positional: None,
+            file: args.file.clone(),
+            model: args.model.clone(),
+            voice: args.voice.clone(),
+            output: Some(staging_path.clone()),
+            stream: None,
+            check: false,
+            robot: false,
+            no_resident: args.no_resident,
+        };
+        run_say(cli, &say_args, environment, stdin, stdout, stderr)?;
+    }
+    let audio_path = args
+        .audio
+        .clone()
+        .or_else(|| staging.clone())
+        .unwrap_or_default();
+
+    let interactive = style::is_interactive();
+    if interactive {
+        writeln!(stdout, "rendering video: {}", output.display())
+            .map_err(|error| FttsError::Generic(format!("cannot write progress: {error}")))?;
+    }
+    let request = ftts_video::VideoRequest {
+        audio: &audio_path,
+        output: &output,
+        voice_label: &label,
+    };
+    let mut last_percent = 0usize;
+    let render_result = ftts_video::render(&request, &mut |progress| {
+        if !interactive {
+            return;
+        }
+        let percent = progress.frame * 100 / progress.total_frames;
+        if percent >= last_percent + 10 || progress.frame == progress.total_frames {
+            last_percent = percent;
+            let _ = write!(
+                stdout,
+                "\r  frame {}/{} ({percent}%)",
+                progress.frame, progress.total_frames
+            );
+            let _ = stdout.flush();
+        }
+    });
+    if interactive {
+        let _ = writeln!(stdout);
+    }
+    render_result.map_err(FttsError::Generic)?;
+
+    // The staging WAV is consumed into the mp4; remove it exactly as the
+    // `.m4a` OutputPlan removes its staging file. The `.y4m` path keeps its
+    // audio, renamed to the output's `.wav` sibling by the renderer.
+    if is_mp4 && let Some(staging_path) = &staging {
+        let _ = fs::remove_file(staging_path);
+    }
+    if interactive {
+        writeln!(stdout, "wrote {}", output.display())
+            .map_err(|error| FttsError::Generic(format!("cannot write result: {error}")))?;
+    }
+    Ok(())
 }
 
 /// Emit one `stage` event and advance the run's stage counter.
@@ -2800,7 +3008,10 @@ mod tests {
         );
     }
 
-    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,enroll,voice,convert,pull,robot,doctor,resident-daemon\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check,robot,no-resident\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
+    // Updated 2026-08-10 for the `make-video` subcommand, which landed without re-baselining this
+    // snapshot. The snapshot exists to make CLI-surface changes deliberate rather than accidental,
+    // so it is re-baselined only alongside a real, intended command — never widened to stop failing.
+    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,make-video,enroll,voice,convert,pull,robot,doctor,resident-daemon\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check,robot,no-resident\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
 
     #[test]
     fn clap_surface_matches_snapshot() {

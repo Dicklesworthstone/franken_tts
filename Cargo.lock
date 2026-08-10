@@ -633,6 +633,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "fmd-font"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "736d4c2ef124465df44622e06d57ec75a337d75341476ead985b4f070d6e0ca6"
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -680,6 +686,7 @@ dependencies = [
  "ftts-core",
  "ftts-kernels",
  "ftts-model-qwen",
+ "ftts-video",
  "rustfft",
  "serde_json",
  "symphonia",
@@ -723,6 +730,13 @@ dependencies = [
  "rustfft",
  "serde_json",
  "unicode-normalization",
+]
+
+[[package]]
+name = "ftts-video"
+version = "0.1.5"
+dependencies = [
+ "fmd-font",
 ]
 
 [[package]]

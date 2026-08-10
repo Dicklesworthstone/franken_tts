@@ -1,0 +1,194 @@
+//! ftts-video — the branded renderer behind `ftts make-video`.
+//!
+//! Takes synthesized speech (a WAV) and produces a share-ready 1920×1080
+//! video: a Ken Burns pass over the FrankenTTS illustration, a live waveform
+//! lane, and the project's overlay text with the voice's name. Every frame
+//! is rendered by memory-safe Rust in this crate; the only external step is
+//! the optional H.264+AAC encode through the first available system encoder
+//! (the same contract as `ftts say`'s `.m4a` path). Without an encoder the
+//! renderer still ships its native pair: YUV4MPEG2 video + WAV audio.
+//!
+//! Design lineage: the glyph pipeline consumes `fmd-font` outlines
+//! (franken_markdown's clean-room font subsystem, the same engine
+//! franken_manim's Scribe builds on), and the native-output-or-typed-refusal
+//! encoder boundary mirrors franken_manim's ffmpeg protocol.
+
+pub mod encode;
+pub mod kenburns;
+pub mod overlay;
+pub mod qoi;
+pub mod raster;
+pub mod wav;
+pub mod waveform;
+pub mod yuv;
+
+use std::fs;
+use std::io::{BufWriter, Write};
+use std::path::Path;
+
+/// The illustration from the repository README, compiled in as QOI.
+const ILLUSTRATION_QOI: &[u8] = include_bytes!("../assets/illustration.qoi");
+
+pub const WIDTH: usize = 1920;
+pub const HEIGHT: usize = 1080;
+pub const FPS: u32 = 30;
+
+/// What to render.
+pub struct VideoRequest<'a> {
+    /// The finished speech audio (PCM WAV path).
+    pub audio: &'a Path,
+    /// Destination: `.mp4` (system encoder) or `.y4m` (native).
+    pub output: &'a Path,
+    /// Voice name shown in the pill, e.g. `Matt` or a custom voice's stem.
+    pub voice_label: &'a str,
+}
+
+/// Rendering progress, reported once per percent step.
+pub struct Progress {
+    pub frame: usize,
+    pub total_frames: usize,
+}
+
+enum Sink {
+    Encoder(encode::EncoderSink),
+    Y4m(BufWriter<fs::File>),
+}
+
+/// Render the video. Calls `progress` as frames complete.
+///
+/// With a `.y4m` output the WAV is left beside it (same stem) so the pair
+/// stays playable; with `.mp4` the audio is muxed in by the encoder.
+pub fn render(
+    request: &VideoRequest<'_>,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<(), String> {
+    let extension = request
+        .output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let is_mp4 = match extension.as_deref() {
+        Some("mp4") => true,
+        Some("y4m") => false,
+        other => {
+            return Err(format!(
+                "unsupported video extension {:?}; use .mp4 (system encoder) or .y4m (native)",
+                other.unwrap_or("<none>")
+            ));
+        }
+    };
+
+    let audio_bytes = fs::read(request.audio)
+        .map_err(|error| format!("cannot read audio {}: {error}", request.audio.display()))?;
+    let audio = wav::decode(&audio_bytes)?;
+    let duration = audio.samples.len() as f64 / f64::from(audio.sample_rate);
+    let total_frames = (duration * f64::from(FPS)).ceil().max(1.0) as usize;
+
+    let background = qoi::decode(ILLUSTRATION_QOI)?;
+    let camera = kenburns::Camera::new(&background);
+    let overlay = overlay::build(request.voice_label)?;
+
+    let mut sink = if is_mp4 {
+        if encode::available().is_none() {
+            return Err(encode::refusal());
+        }
+        Sink::Encoder(encode::EncoderSink::spawn(request.audio, request.output)?)
+    } else {
+        let file = fs::File::create(request.output)
+            .map_err(|error| format!("cannot create {}: {error}", request.output.display()))?;
+        Sink::Y4m(BufWriter::new(file))
+    };
+
+    {
+        let stream: &mut dyn Write = match &mut sink {
+            Sink::Encoder(encoder) => encoder.stdin()?,
+            Sink::Y4m(file) => file,
+        };
+        yuv::write_y4m_header(stream, WIDTH, HEIGHT, FPS)
+            .map_err(|error| format!("writing video header: {error}"))?;
+
+        let mut rgb = vec![0u8; WIDTH * HEIGHT * 3];
+        let mut y_plane = vec![0u8; WIDTH * HEIGHT];
+        let mut u_plane = vec![0u8; WIDTH * HEIGHT / 4];
+        let mut v_plane = vec![0u8; WIDTH * HEIGHT / 4];
+
+        for frame in 0..total_frames {
+            camera.render(frame, total_frames, WIDTH, HEIGHT, &mut rgb);
+            composite_overlay(&mut rgb, &overlay);
+            waveform::draw(
+                &mut rgb,
+                WIDTH,
+                HEIGHT,
+                &audio.samples,
+                audio.sample_rate,
+                FPS,
+                frame,
+                885,
+                135.0,
+            );
+            yuv::rgb_to_i420(
+                &rgb,
+                WIDTH,
+                HEIGHT,
+                &mut y_plane,
+                &mut u_plane,
+                &mut v_plane,
+            );
+            yuv::write_y4m_frame(stream, &y_plane, &u_plane, &v_plane)
+                .map_err(|error| format!("writing frame {frame}: {error}"))?;
+            progress(Progress {
+                frame: frame + 1,
+                total_frames,
+            });
+        }
+        stream
+            .flush()
+            .map_err(|error| format!("flushing video stream: {error}"))?;
+    }
+
+    match sink {
+        Sink::Encoder(encoder) => encoder.finish()?,
+        Sink::Y4m(file) => {
+            drop(file);
+            // Keep the audio playable next to the native video. Comparing
+            // canonical paths (not spellings) keeps `fs::copy` from ever
+            // truncating the source when both names reach the same file.
+            let wav_sibling = request.output.with_extension("wav");
+            let same_file = match (
+                fs::canonicalize(request.audio),
+                fs::canonicalize(&wav_sibling),
+            ) {
+                (Ok(audio), Ok(sibling)) => audio == sibling,
+                _ => false,
+            };
+            if !same_file {
+                fs::copy(request.audio, &wav_sibling).map_err(|error| {
+                    format!("cannot place audio at {}: {error}", wav_sibling.display())
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Composite the premultiplied-free (straight alpha) overlay onto RGB24.
+fn composite_overlay(rgb: &mut [u8], overlay: &raster::Surface) {
+    for (pixel, source) in rgb
+        .as_chunks_mut::<3>()
+        .0
+        .iter_mut()
+        .zip(overlay.rgba.as_chunks::<4>().0.iter())
+    {
+        let alpha = f32::from(source[3]) / 255.0;
+        if alpha <= 0.0 {
+            continue;
+        }
+        for c in 0..3 {
+            let dst = f32::from(pixel[c]);
+            let src = f32::from(source[c]);
+            pixel[c] = (src * alpha + dst * (1.0 - alpha))
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+    }
+}
