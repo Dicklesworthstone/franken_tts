@@ -15,6 +15,9 @@ struct VoiceCardSheet: View {
     var body: some View {
         ZStack {
             Lab.background.ignoresSafeArea()
+            // Scrolls so the share button stays reachable on small screens, where the
+            // preview plus the explanation outgrow the sheet.
+            ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 HStack {
                     LabLabel(text: "Voice card")
@@ -58,9 +61,9 @@ struct VoiceCardSheet: View {
                     }
                     .buttonStyle(PrimaryButtonStyle())
                 }
-                Spacer(minLength: 0)
             }
             .padding(18)
+            }
         }
         .presentationDetents([.large])
         .task {

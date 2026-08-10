@@ -671,6 +671,23 @@ struct LabView: View {
                 return Float(Double(state >> 40) / Double(1 << 24) - 0.5) * 3
             }
             cardVoice = EnrolledVoice(id: UUID(), name: "Jeff", vector: vector)
+            // Round-trip the REAL composed PNG through both import paths: the raw
+            // bytes exercise the lossless chunk; a re-encode via UIImage strips the
+            // private chunk, forcing the pixel decoder against the exact pixels
+            // ImageRenderer produced (which the off-device harness only approximates).
+            Task {
+                guard let png = try? VoicePrintCard.pngData(name: "Jeff", vector: vector)
+                else {
+                    NSLog("FTTS_DEBUG_CARD render FAILED")
+                    return
+                }
+                let chunk = VoicePrintCard.decode(png)
+                let chunkOk = chunk?.vector == vector && chunk?.name == "Jeff"
+                let stripped = UIImage(data: png)?.pngData()
+                let pixels = stripped.flatMap { VoicePrintCard.decode($0) }
+                let pixelsOk = pixels?.vector == vector && pixels?.name == "Jeff"
+                NSLog("FTTS_DEBUG_CARD roundtrip chunk=\(chunkOk) pixels=\(pixelsOk)")
+            }
         #endif
     }
 
@@ -738,22 +755,24 @@ struct EnrolledVoiceTile: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            HStack(spacing: 6) {
+            // Four controls must fit the narrowest two-column tile (~146 pt of
+            // content width on an SE-class phone): 4 × 32 + 3 × 4 = 140.
+            HStack(spacing: 4) {
                 Button(action: rename) {
-                    Image(systemName: "pencil").frame(width: 34, height: 30)
+                    Image(systemName: "pencil").frame(width: 32, height: 30)
                 }
                 .accessibilityLabel("Rename \(voice.name)")
                 Button(action: reRecord) {
-                    Image(systemName: "arrow.clockwise").frame(width: 34, height: 30)
+                    Image(systemName: "arrow.clockwise").frame(width: 32, height: 30)
                 }
                 .accessibilityLabel("Re-record \(voice.name)")
                 Button(action: share) {
-                    Image(systemName: "square.and.arrow.up").frame(width: 34, height: 30)
+                    Image(systemName: "square.and.arrow.up").frame(width: 32, height: 30)
                 }
                 .accessibilityLabel("Share \(voice.name) as a voice card")
                 Spacer()
                 Button { confirmDelete = true } label: {
-                    Image(systemName: "trash").frame(width: 34, height: 30)
+                    Image(systemName: "trash").frame(width: 32, height: 30)
                 }
                 .foregroundStyle(Lab.danger)
                 .accessibilityLabel("Delete \(voice.name)")
