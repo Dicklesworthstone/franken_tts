@@ -213,8 +213,14 @@ updateCharCount();
 /// how a fully-serial run went unnoticed for a whole session.
 let engineThreads = 1;
 
+// The armed int8/fast-math route, straight from the engine. Surfaced in the ready line
+// because the wasm build arms quantized codec paths by default while native does not:
+// same seed + same artifact can differ in PCM bits by platform, and that must be
+// discoverable without reading source (parity doctrine: no silent numerics switches).
+let engineRoute = "";
+
 async function boot() {
-  await call("init");
+  engineRoute = (await call("init"))?.route ?? "";
 
   // Persistence contract: the model downloads ONCE and stays in this browser's storage until
   // "Clear model cache". When a complete cache exists, hydrate immediately on page open —
@@ -250,9 +256,11 @@ async function loadFromStore() {
     engineThreads = loaded?.threads ?? 1;
     ui.dlBar.style.width = "100%";
     ui.dlStatus.textContent =
-      engineThreads > 1
-        ? `Model loaded - ${engineThreads} kernel threads. Ready to speak.`
-        : "Model loaded (single thread). Ready to speak.";
+      (engineThreads > 1
+        ? `Model loaded - ${engineThreads} kernel threads.`
+        : "Model loaded (single thread).") +
+      (engineRoute ? ` int8 route: ${engineRoute}.` : "") +
+      " Ready to speak.";
     ui.speak.disabled = false;
   } catch (error) {
     showError(error);
@@ -439,9 +447,11 @@ ui.consentYes.addEventListener("click", async () => {
     engineThreads = loaded?.threads ?? 1;
     ui.dlBar.style.width = "100%";
     ui.dlStatus.textContent =
-      engineThreads > 1
-        ? `Model loaded - ${engineThreads} kernel threads. Ready to speak.`
-        : "Model loaded (single thread). Ready to speak.";
+      (engineThreads > 1
+        ? `Model loaded - ${engineThreads} kernel threads.`
+        : "Model loaded (single thread).") +
+      (engineRoute ? ` int8 route: ${engineRoute}.` : "") +
+      " Ready to speak.";
     ui.speak.disabled = false;
   } catch (error) {
     showError(error);
