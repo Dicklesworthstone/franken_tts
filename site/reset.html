@@ -1,0 +1,117 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FrankenTTS — clear cached model</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 1.25rem; max-width: 34rem; }
+  h1 { font-size: 1.05rem; margin: 0 0 .5rem; }
+  p { opacity: .8; font-size: .9rem; }
+  button { font: inherit; padding: .7rem 1.1rem; margin: .75rem .5rem .75rem 0; }
+  #out { margin-top: 1rem; padding: .75rem; border: 1px solid currentColor; border-radius: .4rem; white-space: pre-wrap; }
+  .ok { color: #0a7d32; } .fail { color: #c0392b; }
+  @media (prefers-color-scheme: dark) { .ok { color: #4ade80; } .fail { color: #f87171; } }
+</style>
+
+<h1>Clear the cached model</h1>
+<p>
+  This page deliberately loads <b>no engine, no WebAssembly, and no worker</b>. It only deletes the
+  model files from this browser's private storage. It is safe to open on a device where the
+  playground itself crashes, which is exactly why it exists as a separate page.
+</p>
+
+<button id="clear">Delete cached model</button>
+<button id="stats">Show what is cached</button>
+<div id="out">ready</div>
+
+<script type="module">
+  const out = document.getElementById("out");
+  const say = (text, cls = "") => {
+    out.textContent = text;
+    out.className = cls;
+  };
+
+  /// Everything the loader may have written, plus the page's own crash breadcrumb.
+  ///
+  /// Deliberately NOT imported from model-manifest.js: this page must keep working even when the
+  /// site's module graph is what is broken, so it enumerates OPFS instead of trusting a list.
+  async function wipe() {
+    let removed = 0;
+    let bytes = 0;
+    const root = await navigator.storage.getDirectory();
+    // Enumerate rather than delete by name, so a renamed or partial file cannot survive.
+    const names = [];
+    for await (const [name, handle] of root.entries()) {
+      if (handle.kind === "file") {
+        try {
+          bytes += (await handle.getFile()).size;
+        } catch {
+          /* size is nice to report, never a reason to skip the delete */
+        }
+      }
+      names.push(name);
+    }
+    for (const name of names) {
+      try {
+        await root.removeEntry(name, { recursive: true });
+        removed += 1;
+      } catch (error) {
+        say(`could not remove ${name}: ${error}`, "fail");
+        return null;
+      }
+    }
+    // The breadcrumb records the stage that killed the last visit; clearing the model should clear
+    // the accusation too, or the page will keep refusing to auto-load for a cache that is gone.
+    try {
+      localStorage.removeItem("ftts-last-stage");
+      localStorage.removeItem("ftts-autoload-blocked");
+    } catch {
+      /* private mode */
+    }
+    return { removed, bytes };
+  }
+
+  document.getElementById("clear").onclick = async () => {
+    say("deleting…");
+    try {
+      const result = await wipe();
+      if (result) {
+        say(
+          `deleted ${result.removed} item(s), ${(result.bytes / 1024 ** 3).toFixed(2)} GB freed.\n` +
+            `the playground will start from scratch next time you open it.`,
+          "ok",
+        );
+      }
+    } catch (error) {
+      say(`failed: ${error}`, "fail");
+    }
+  };
+
+  document.getElementById("stats").onclick = async () => {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const rows = [];
+      let total = 0;
+      for await (const [name, handle] of root.entries()) {
+        if (handle.kind !== "file") continue;
+        const size = (await handle.getFile()).size;
+        total += size;
+        rows.push(`${(size / 1024 ** 2).toFixed(1)} MB  ${name}`);
+      }
+      let note = "";
+      try {
+        const last = JSON.parse(localStorage.getItem("ftts-last-stage") ?? "null");
+        if (last?.stage) note = `\nlast visit stopped at: ${last.stage}${last.detail ? ` [${last.detail}]` : ""}`;
+      } catch {
+        /* private mode */
+      }
+      say(
+        (rows.length ? rows.join("\n") : "nothing cached") +
+          `\n\ntotal ${(total / 1024 ** 3).toFixed(2)} GB` +
+          note,
+      );
+    } catch (error) {
+      say(`failed: ${error}`, "fail");
+    }
+  };
+</script>
