@@ -72,6 +72,15 @@ The output format follows the extension. `.wav` comes straight from the built-in
 
 The first `ftts say` of a session pays the model load; when it finishes, the loaded model stays behind in a small helper process, and the next `say` starts synthesizing at once instead of spending seconds reloading weights. The helper is spawned from the same binary, listens only on a loopback port recorded in a file that only your user can read, keeps no record of what it spoke, and exits on its own after ten minutes without a request (`FTTS_RESIDENT_IDLE_SECS` adjusts the window). Output is byte-identical with and without it, which the e2e suite asserts; a re-pulled model or an upgraded binary retires the old helper automatically. Opt out per run with `--no-resident`, or globally with `FTTS_NO_RESIDENT=1`.
 
+## The iOS app
+
+`ios/` holds a native SwiftUI version of the playground, built on the same Rust engine
+through a small C ABI (`crates/ftts-ffi`): on-device model download with pinned-digest
+verification, the seven preset voices, microphone enrollment, and on-device synthesis.
+Design, phone-vs-Mac arithmetic, and memory strategy live in `docs/IOS_APP_PLAN.md`;
+build instructions in `ios/README.md`. No speed figure is claimed until one is measured
+on A18-class hardware.
+
 ## Try it in your browser
 
 **[frankentts.com](https://frankentts.com)** (also [frankentts.pages.dev](https://frankentts.pages.dev)) runs the whole pipeline as WebAssembly — type, pick a voice, clone your own by reading a half-minute script into the mic, listen, download. Nothing you type or record leaves the tab: the model downloads once (~2.0 GB, resumable, SHA-256-verified into browser storage) and inference is local. Honest speed note: the single-threaded wasm build runs ~0.2–0.3× real time (measured 258 ms per 80 ms frame for the talker+microdecoder schedule) — a five-second line takes twenty-odd seconds with a progress bar; browser threads + relaxed SIMD are the tracked path to real time. Desktop browsers only (~3.5 GB peak memory). The site lives in `site/`; the bindings in `crates/ftts-wasm`.
