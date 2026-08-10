@@ -28,8 +28,15 @@
 //!
 //! # Packing
 //!
-//! Two nibbles per byte, low nibble first, along `k`. A row of odd length pads with a zero nibble,
-//! which is exact: the padded lane multiplies against an activation that is never read.
+//! Two nibbles per byte, low nibble first, along `k`. A row of odd length pads its final high
+//! nibble with the BIASED zero (`8`), not a raw `0`.
+//!
+//! That distinction matters and is easy to get backwards. A raw `0` nibble decodes to `0 - 8 = -8`,
+//! the largest negative weight in the range — so zero-initialized padding is not neutral, it is
+//! maximally *non*-neutral. Today nothing reads past `k` and it would not matter, but the entire
+//! reason to store int4 is a future SIMD unpack that processes whole BYTES, and such a kernel would
+//! silently fold that `-8` into the last accumulator. Padding with the biased zero makes the pad
+//! decode to `0.0` and keeps any whole-byte kernel correct by construction.
 //!
 //! Storing the nibble biased by +8 (so [-7, 7] becomes [1, 15]) makes unpacking a shift-and-mask
 //! with no sign extension, and the bias cancels exactly in the dot product — see
@@ -70,7 +77,10 @@ impl QuantizedMatrixQ4 {
     pub fn quantize(weight: &[f32], n: usize, k: usize) -> Self {
         assert_eq!(weight.len(), n * k, "weight must be [n, k]");
         let packed_row = k.div_ceil(PER_BYTE);
-        let mut data = vec![0_u8; n * packed_row];
+        // Initialized to the BIASED zero in both nibbles (`0x88`), never to `0x00`: an unwritten
+        // nibble must decode to 0.0, and a raw zero nibble decodes to -8. See the packing note in
+        // the module docs.
+        let mut data = vec![0x88_u8; n * packed_row];
         let mut scales = Vec::with_capacity(n);
 
         for row in 0..n {
@@ -327,6 +337,22 @@ mod tests {
                 forward[position],
                 backward[position]
             );
+        }
+    }
+
+    /// The padding nibble of an odd-length row must decode to ZERO, not to -8.
+    ///
+    /// Nothing reads past `k` today, so this cannot bite yet. It is pinned because the point of
+    /// int4 is a SIMD unpack over whole bytes, and such a kernel WILL read the pad; if it decodes
+    /// to -8 the last accumulator is silently wrong in a way no shape or size check would catch.
+    #[test]
+    fn the_padding_nibble_of_an_odd_row_is_a_neutral_zero() {
+        for k in [1_usize, 3, 5, 7, 65] {
+            let weight = deterministic(k, 0x0DD0_0000 + k as u64);
+            let matrix = QuantizedMatrixQ4::quantize(&weight, 1, k);
+            let last = *matrix.data.last().expect("a packed row");
+            let pad = i32::from(last >> 4) - BIAS;
+            assert_eq!(pad, 0, "k={k}: padding nibble decodes to {pad}, not 0");
         }
     }
 

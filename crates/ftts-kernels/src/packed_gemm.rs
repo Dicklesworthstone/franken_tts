@@ -127,11 +127,12 @@ pub(crate) unsafe fn linear_packed_range(
     let m_full = m - m % MR;
     let n_full = col_start + columns - columns % NR;
 
-    // Column panels sized so one packed panel plus its consumers stay resident. At least one
-    // panel always, however large `k` is.
-    let nc = {
-        let columns = PANEL_BYTES / (k.max(1) * size_of::<f32>());
-        (columns / NR).max(1) * NR
+    // Columns per L2 panel block, sized so one packed panel plus its consumers stay resident; at
+    // least one panel always, however large `k` is. Named distinctly from the `columns` above,
+    // which is this stripe's WIDTH — reusing that name read as though a panel spanned the stripe.
+    let panel_columns = {
+        let fitting = PANEL_BYTES / (k.max(1) * size_of::<f32>());
+        (fitting / NR).max(1) * NR
     };
 
     // Thread-local scratch instead of a per-dispatch `vec!`: this function runs once per
@@ -152,7 +153,7 @@ pub(crate) unsafe fn linear_packed_range(
 
         let mut jc = col_start;
         while jc < n_full {
-            let jc_end = (jc + nc).min(n_full);
+            let jc_end = (jc + panel_columns).min(n_full);
             let mut j0 = jc;
             while j0 < jc_end {
                 // Pack NR weight columns into k-major order.
@@ -183,7 +184,7 @@ pub(crate) unsafe fn linear_packed_range(
                 }
                 j0 += NR;
             }
-            jc += nc;
+            jc += panel_columns;
         }
 
         // Remainder columns: fewer than NR left over, so there is no panel to amortize and the plain
