@@ -253,6 +253,10 @@ pub fn trailing_noise_samples(pcm: &[f32], sample_rate: u32) -> usize {
 ///
 /// If the run is cut short — cancellation, a full disk — calling `finish` still yields a valid
 /// file describing the samples that made it, which is the partial-output promise in plan §9.6.
+/// Samples held back when tail trimming is armed: the detector's own ceiling, so the buffer always
+/// holds every sample the trim could possibly want.
+const TAIL_HOLDBACK_SAMPLES: usize = SAMPLE_RATE_HZ as usize * 250 / 1000;
+
 pub struct WavWriter<W: Write + Seek> {
     /// `None` once [`WavWriter::finish`] has handed the sink back.
     ///
@@ -262,6 +266,13 @@ pub struct WavWriter<W: Write + Seek> {
     sink: Option<W>,
     sample_rate: u32,
     samples_written: usize,
+    /// Samples withheld from the file so the end-of-utterance trim can still see them.
+    ///
+    /// Writing is delayed by at most `TAIL_HOLDBACK_SAMPLES`, which is why this is opt-in: for a
+    /// file that delay is invisible, but on `--stream raw` it would add latency to a path whose
+    /// whole contract is time-to-first-audio. `None` means trimming is off and every sample goes
+    /// straight through.
+    holdback: Option<Vec<f32>>,
 }
 
 impl<W: Write + Seek> WavWriter<W> {
@@ -276,7 +287,23 @@ impl<W: Write + Seek> WavWriter<W> {
             sink: Some(sink),
             sample_rate,
             samples_written: 0,
+            holdback: None,
         })
+    }
+
+    /// As [`WavWriter::new`], but drops the model's end-of-utterance noise burst.
+    ///
+    /// See [`trailing_noise_samples`] for what is removed and why it is safe. The cost is that the
+    /// last quarter second is held in memory until [`WavWriter::finish`], so this is for file
+    /// output only; a raw PCM stream must keep its latency and stays untrimmed.
+    ///
+    /// # Errors
+    ///
+    /// If the provisional header cannot be written.
+    pub fn new_trimming_tail(sink: W, sample_rate: u32) -> io::Result<Self> {
+        let mut writer = Self::new(sink, sample_rate)?;
+        writer.holdback = Some(Vec::with_capacity(TAIL_HOLDBACK_SAMPLES * 2));
+        Ok(writer)
     }
 
     /// Append one packet of decoded `f32` samples.
@@ -286,6 +313,25 @@ impl<W: Write + Seek> WavWriter<W> {
     /// If the sink rejects the write. The count of samples already accepted stays accurate, so a
     /// later [`WavWriter::finish`] still describes the file truthfully.
     pub fn write_samples(&mut self, pcm: &[f32]) -> io::Result<()> {
+        // With trimming armed, keep the newest TAIL_HOLDBACK_SAMPLES back and emit only what has
+        // aged out. Those held samples are the only ones the trim can ever remove, so nothing that
+        // reaches the file here can need taking back.
+        if self.holdback.is_some() {
+            let mut pending = self.holdback.take().unwrap_or_default();
+            pending.extend_from_slice(pcm);
+            let releasable = pending.len().saturating_sub(TAIL_HOLDBACK_SAMPLES);
+            let released: Vec<f32> = pending.drain(..releasable).collect();
+            self.holdback = Some(pending);
+            if released.is_empty() {
+                return Ok(());
+            }
+            return self.write_through(&released);
+        }
+        self.write_through(pcm)
+    }
+
+    /// Writes samples straight to the sink, bypassing the hold-back.
+    fn write_through(&mut self, pcm: &[f32]) -> io::Result<()> {
         // Buffer the packet so one short write cannot leave half a sample in the file, which
         // would desynchronise every subsequent frame by one byte.
         let mut bytes = Vec::with_capacity(pcm.len() * 2);
@@ -322,6 +368,15 @@ impl<W: Write + Seek> WavWriter<W> {
     ///
     /// If seeking back to the header, rewriting it, or flushing fails.
     pub fn finish(mut self) -> io::Result<W> {
+        // Release the held tail, minus whatever the detector identifies as the model's end-of-
+        // utterance noise. Done before the header is patched so the length describes what landed.
+        if let Some(pending) = self.holdback.take() {
+            let drop = trailing_noise_samples(&pending, self.sample_rate);
+            let keep = pending.len().saturating_sub(drop);
+            if keep > 0 {
+                self.write_through(&pending[..keep])?;
+            }
+        }
         self.finalize_header()?;
         self.sink
             .take()

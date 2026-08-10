@@ -1933,13 +1933,24 @@ impl AudioOutput {
                 path.display()
             ))
         })?;
-        let writer = ftts_core::audio::WavWriter::new(file, ftts_core::audio::SAMPLE_RATE_HZ)
-            .map_err(|error| {
-                FttsError::Generic(format!(
-                    "cannot write WAV header to {}: {error}",
-                    path.display()
-                ))
-            })?;
+        // File output trims the model's end-of-utterance noise burst (DISC-005). The raw PCM
+        // stream deliberately does not: trimming needs the last quarter second held back, and
+        // `--stream raw` exists for latency. `FTTS_TRIM_TAIL=0` restores the untrimmed bytes.
+        let trim_tail = !matches!(
+            std::env::var("FTTS_TRIM_TAIL").ok().as_deref(),
+            Some("0") | Some("false")
+        );
+        let writer = if trim_tail {
+            ftts_core::audio::WavWriter::new_trimming_tail(file, ftts_core::audio::SAMPLE_RATE_HZ)
+        } else {
+            ftts_core::audio::WavWriter::new(file, ftts_core::audio::SAMPLE_RATE_HZ)
+        }
+        .map_err(|error| {
+            FttsError::Generic(format!(
+                "cannot write WAV header to {}: {error}",
+                path.display()
+            ))
+        })?;
         Ok(Self {
             sink: AudioSink::Wav(Box::new(writer)),
             byte_offset: 0,
