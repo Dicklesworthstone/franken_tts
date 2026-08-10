@@ -402,6 +402,12 @@
           "required": false,
           "summary": "prompt tokens after normalization and template assembly",
           "type": "u64"
+        },
+        {
+          "name": "video_bytes",
+          "required": false,
+          "summary": "container bytes written by a make-video run (its `frames` are video frames)",
+          "type": "u64"
         }
       ],
       "kind": "stream",

@@ -447,6 +447,12 @@ pub const EVENTS: &[EventSpec] = &[
                 required: false,
                 summary: "prompt tokens after normalization and template assembly",
             },
+            FieldSpec {
+                name: "video_bytes",
+                ty: "u64",
+                required: false,
+                summary: "container bytes written by a make-video run (its `frames` are video frames)",
+            },
         ],
     },
     EventSpec {

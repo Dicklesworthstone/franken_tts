@@ -1325,7 +1325,35 @@ fn run_make_video(
         .or_else(|| staging.clone())
         .unwrap_or_default();
 
+    // The video phase reports on the same machine contract as everything else: its own
+    // run (the synthesis phase above already closed a `say` run), with `stage` events
+    // around rendering and a `run_complete` carrying the video frame count. A terminal
+    // gets the human progress line instead; agents were previously left with silence
+    // between the say run ending and the process exiting.
     let interactive = style::is_interactive();
+    let settings = EffectiveSettings::resolve(cli, environment)?;
+    let run = robot::RunContext::generate();
+    let mut seq = 0_u64;
+    let emit = |event: &Value, stdout: &mut dyn Write| -> Result<(), FttsError> {
+        if interactive {
+            return Ok(());
+        }
+        write_json_line(stdout, event)
+    };
+    let mut start = run.event(robot::EventType::RunStart);
+    start.insert("command".to_owned(), json!("make-video"));
+    start.insert("profile".to_owned(), json!(settings.profile.as_str()));
+    start.insert(
+        "packet_frames".to_owned(),
+        json!(settings.packet_frames.as_str()),
+    );
+    start.insert("math_mode".to_owned(), json!(settings.math_mode.as_str()));
+    start.insert("stateless".to_owned(), json!(true));
+    start.insert("seed".to_owned(), json!(cli.seed));
+    start.insert("model".to_owned(), json!(args.model.as_deref()));
+    start.insert("voice".to_owned(), json!(label));
+    emit(&Value::Object(start), stdout)?;
+
     if interactive {
         writeln!(stdout, "rendering video: {}", output.display())
             .map_err(|error| FttsError::Generic(format!("cannot write progress: {error}")))?;
@@ -1335,8 +1363,17 @@ fn run_make_video(
         output: &output,
         voice_label: &label,
     };
+    emit_stage(
+        &run,
+        &mut |e| emit(e, stdout),
+        "video_render",
+        "begin",
+        &mut seq,
+    )?;
     let mut last_percent = 0usize;
+    let mut video_frames = 0_u64;
     let render_result = ftts_video::render(&request, &mut |progress| {
+        video_frames = progress.total_frames as u64;
         if !interactive {
             return;
         }
@@ -1354,7 +1391,40 @@ fn run_make_video(
     if interactive {
         let _ = writeln!(stdout);
     }
+    match &render_result {
+        Ok(()) => {
+            emit_stage(
+                &run,
+                &mut |e| emit(e, stdout),
+                "video_render",
+                "end",
+                &mut seq,
+            )?;
+        }
+        Err(message) => {
+            // `run_error` is a stderr event by the catalogue, on both stream shapes.
+            let mut event = run.event(robot::EventType::RunError);
+            let error = FttsError::Generic(message.clone());
+            event.insert("exit_code".to_owned(), json!(error.exit_code().as_u8()));
+            event.insert("kind".to_owned(), json!(error.exit_code().description()));
+            event.insert("message".to_owned(), json!(message));
+            event.insert("remediation".to_owned(), json!(error.remediation()));
+            event.insert("elapsed_ms".to_owned(), json!(run.elapsed_ms()));
+            if !interactive {
+                write_json_line(stderr, &Value::Object(event))?;
+            }
+        }
+    }
     render_result.map_err(FttsError::Generic)?;
+    let video_bytes = fs::metadata(&output).map_or(0, |meta| meta.len());
+    let mut complete = run.event(robot::EventType::RunComplete);
+    complete.insert("exit_code".to_owned(), json!(FttsExitCode::Success.as_u8()));
+    complete.insert("elapsed_ms".to_owned(), json!(run.elapsed_ms()));
+    complete.insert("frames".to_owned(), json!(video_frames));
+    // The say run above already reported the PCM bytes; this run's product is the video.
+    complete.insert("audio_bytes".to_owned(), json!(0));
+    complete.insert("video_bytes".to_owned(), json!(video_bytes));
+    emit(&Value::Object(complete), stdout)?;
 
     // The staging WAV is consumed into the mp4; remove it exactly as the
     // `.m4a` OutputPlan removes its staging file. The `.y4m` path keeps its
