@@ -90,7 +90,15 @@ fn materialize_preset_voice(name: &str) -> Option<Result<PathBuf, FttsError>> {
     let (_, _, bytes) = PRESET_VOICES
         .iter()
         .find(|(preset, _, _)| *preset == name)?;
-    let path = std::env::temp_dir().join(format!("ftts-preset-{name}-{}.spk", std::process::id()));
+    let staging_dir = match synth::private_staging_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            return Some(Err(FttsError::Generic(format!(
+                "cannot create staging directory for preset voice {name}: {error}"
+            ))));
+        }
+    };
+    let path = staging_dir.join(format!("ftts-preset-{name}-{}.spk", std::process::id()));
     Some(
         fs::write(&path, bytes)
             .map(|()| path.clone())

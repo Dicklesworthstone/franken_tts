@@ -299,7 +299,16 @@ pub fn speaker_from_voice(
             path.display()
         ))
     })?;
-    if bytes.len() == SPEAKER_VECTOR_BYTES {
+    // Size alone must not decide: a perfectly plausible 4,096-byte audio clip would
+    // otherwise reinterpret as garbage floats and enroll a nonsense voice without any
+    // error. A recognizable audio container magic wins over the size sniff.
+    let looks_like_audio = bytes.len() >= 12
+        && (bytes.starts_with(b"RIFF")
+            || bytes.starts_with(b"fLaC")
+            || bytes.starts_with(b"ID3")
+            || bytes.starts_with(b"OggS")
+            || &bytes[4..8] == b"ftyp");
+    if bytes.len() == SPEAKER_VECTOR_BYTES && !looks_like_audio {
         return decode_speaker_vector(path, &bytes);
     }
     let pcm = decode_reference_audio_any(path)?;
@@ -449,6 +458,30 @@ fn decode_speaker_vector(path: &Path, bytes: &[u8]) -> Result<Vec<f32>, FttsErro
 /// on one.
 const SYSTEM_DECODED_EXTENSIONS: [&str; 6] = ["m4a", "mp3", "aac", "mp4", "ogg", "opus"];
 
+/// A user-owned staging directory for temporary artifacts (transcoded references,
+/// materialized preset voices).
+///
+/// This deliberately avoids the shared system temp dir: on Linux, `/tmp` is world-writable,
+/// the staging names here are predictable (pid + stem), and the files are written by
+/// external decoders that happily follow a pre-planted symlink — so another local user
+/// could truncate an arbitrary victim-writable file, or swap content between our write and
+/// read. A directory under the user's own cache root closes the whole class. Falls back to
+/// the system temp dir only when no home directory exists at all.
+pub(crate) fn private_staging_dir() -> std::io::Result<PathBuf> {
+    #[allow(deprecated)] // un-deprecated in current Rust; the lint fires on older stables
+    let base = std::env::home_dir()
+        .map(|home| home.join(".cache/franken_tts"))
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("staging");
+    fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
 /// Decodes reference audio of any supported container to mono f32 PCM.
 ///
 /// WAV and FLAC decode through the embedded pure-Rust path. Compressed containers (m4a, mp3, …)
@@ -466,7 +499,9 @@ fn decode_reference_audio_any(path: &Path) -> Result<Vec<f32>, FttsError> {
         return decode_reference_audio(path);
     }
 
-    let staging = std::env::temp_dir().join(format!(
+    let staging_dir = private_staging_dir()
+        .map_err(|error| FttsError::Generic(format!("cannot create staging directory: {error}")))?;
+    let staging = staging_dir.join(format!(
         "ftts-enroll-{}-{}.wav",
         std::process::id(),
         path.file_stem()
