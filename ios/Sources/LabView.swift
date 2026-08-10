@@ -334,6 +334,7 @@ struct LabView: View {
         .sensoryFeedback(.success, trigger: model.enrollmentSaved) { _, saved in saved }
         .sensoryFeedback(.success, trigger: importCount) { _, count in count > 0 }
         .onAppear(perform: debugCardHook)
+        .onAppear(perform: debugVideoHook)
         .scrollDismissesKeyboard(.interactively)
     }
 
@@ -687,6 +688,42 @@ struct LabView: View {
                 let pixels = stripped.flatMap { VoicePrintCard.decode($0) }
                 let pixelsOk = pixels?.vector == vector && pixels?.name == "Jeff"
                 NSLog("FTTS_DEBUG_CARD roundtrip chunk=\(chunkOk) pixels=\(pixelsOk)")
+            }
+        #endif
+    }
+
+    /// Reproduction harness: FTTS_DEBUG_VIDEO=1 runs a full video export over 20 s of
+    /// synthetic tone on launch, logging progress and per-frame timing. Debug only.
+    private func debugVideoHook() {
+        #if DEBUG
+            guard ProcessInfo.processInfo.environment["FTTS_DEBUG_VIDEO"] != nil else {
+                return
+            }
+            let pcm: [Float] = (0..<(24_000 * 20)).map { index in
+                sinf(Float(index) * 2 * .pi * 220 / 24_000) * 0.4
+            }
+            let wav = WavWriter.data(from: pcm)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ftts-debug-video.wav")
+            try? wav.write(to: url)
+            let started = Date()
+            NSLog("FTTS_DEBUG_VIDEO starting: \(pcm.count) samples")
+            Task {
+                do {
+                    let out = try await MediaExporter.exportVideo(
+                        pcm: pcm, voiceLabel: "debug", wavUrl: url
+                    ) { fraction in
+                        let percent = Int(fraction * 100)
+                        if percent % 10 == 0 {
+                            NSLog("FTTS_DEBUG_VIDEO %d%% at %.1fs", percent,
+                                Date().timeIntervalSince(started))
+                        }
+                    }
+                    NSLog("FTTS_DEBUG_VIDEO done in %.1fs: %@",
+                        Date().timeIntervalSince(started), out.path)
+                } catch {
+                    NSLog("FTTS_DEBUG_VIDEO FAILED: \(error.localizedDescription)")
+                }
             }
         #endif
     }

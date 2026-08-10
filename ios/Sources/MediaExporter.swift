@@ -80,56 +80,9 @@ enum MediaExporter {
         }
         writer.startSession(atSourceTime: .zero)
 
-        // Video first: Rust renders RGB24, converted here into the adaptor's BGRA pool.
-        var rgb = [UInt8](repeating: 0, count: width * height * 3)
-        for frame in 0..<frames {
-            let code = rgb.withUnsafeMutableBufferPointer { buffer in
-                ftts_video_render_frame(renderer, frame, buffer.baseAddress)
-            }
-            guard code == 0 else { throw EngineError.lastFromNative() }
-            while !videoInput.isReadyForMoreMediaData {
-                try await Task.sleep(for: .milliseconds(4))
-            }
-            guard let pool = adaptor.pixelBufferPool else {
-                throw EngineError.native("no pixel buffer pool")
-            }
-            var slot: CVPixelBuffer?
-            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &slot)
-            guard let pixelBuffer = slot else {
-                throw EngineError.native("cannot allocate a pixel buffer")
-            }
-            CVPixelBufferLockBaseAddress(pixelBuffer, [])
-            if let base = CVPixelBufferGetBaseAddress(pixelBuffer) {
-                let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
-                let destination = base.assumingMemoryBound(to: UInt8.self)
-                rgb.withUnsafeBufferPointer { source in
-                    for row in 0..<height {
-                        var from = row * width * 3
-                        var to = row * stride
-                        for _ in 0..<width {
-                            destination[to] = source[from + 2] // B
-                            destination[to + 1] = source[from + 1] // G
-                            destination[to + 2] = source[from] // R
-                            destination[to + 3] = 255 // A
-                            from += 3
-                            to += 4
-                        }
-                    }
-                }
-            }
-            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
-            let time = CMTime(value: CMTimeValue(frame), timescale: fps)
-            guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
-                throw writer.error ?? EngineError.native("appending frame \(frame) failed")
-            }
-            progress(Double(frame + 1) / Double(frames) * 0.9)
-            try Task.checkCancellation()
-        }
-        videoInput.markAsFinished()
-
-        // Then the audio track, decoded from the WAV and AAC-encoded by the writer.
-        // One asset instance throughout: a reader can only consume tracks belonging to
-        // the exact asset it was created over, not an equal asset at the same URL.
+        // Audio reader, set up before feeding starts. One asset instance throughout: a
+        // reader can only consume tracks belonging to the exact asset it was created
+        // over, not an equal asset at the same URL.
         let audioAsset = AVURLAsset(url: wavUrl)
         let reader = try AVAssetReader(asset: audioAsset)
         guard let track = try await audioAsset.loadTracks(withMediaType: .audio).first
@@ -141,19 +94,105 @@ enum MediaExporter {
         guard reader.startReading() else {
             throw reader.error ?? EngineError.native("cannot read the share WAV")
         }
-        while let sample = readerOutput.copyNextSampleBuffer() {
-            while !audioInput.isReadyForMoreMediaData {
-                try await Task.sleep(for: .milliseconds(4))
+
+        // Audio and video MUST feed concurrently: with two inputs the writer
+        // interleaves media, so after buffering a fraction of a second of video it
+        // stops accepting more until audio for those timestamps arrives. Feeding all
+        // video first deadlocks at the buffer depth — the "stuck at 19%" bug.
+        do {
+            async let audioDone: Void = {
+                while let sample = readerOutput.copyNextSampleBuffer() {
+                    while !audioInput.isReadyForMoreMediaData {
+                        try await Task.sleep(for: .milliseconds(4))
+                    }
+                    guard audioInput.append(sample) else {
+                        throw writer.error ?? EngineError.native("appending audio failed")
+                    }
+                }
+                audioInput.markAsFinished()
+                // nil from copyNextSampleBuffer means EITHER end-of-track or failure;
+                // only the status separates a finished read from truncated audio.
+                if reader.status == .failed {
+                    throw reader.error
+                        ?? EngineError.native("reading the share WAV failed midway")
+                }
+            }()
+
+            // The Rust renderer is a pure function of (frame, immutable state), so a
+            // chunk of frames renders in parallel across cores; appends stay in order.
+            let window = 4
+            var chunkStart = 0
+            while chunkStart < frames {
+                let chunk = Array(chunkStart..<min(chunkStart + window, frames))
+                let rendered = try await withThrowingTaskGroup(
+                    of: (Int, [UInt8]).self
+                ) { group in
+                    for frame in chunk {
+                        group.addTask {
+                            var rgb = [UInt8](repeating: 0, count: width * height * 3)
+                            let code = rgb.withUnsafeMutableBufferPointer { buffer in
+                                ftts_video_render_frame(renderer, frame, buffer.baseAddress)
+                            }
+                            guard code == 0 else { throw EngineError.lastFromNative() }
+                            return (frame, rgb)
+                        }
+                    }
+                    var out = [Int: [UInt8]]()
+                    for try await (frame, rgb) in group {
+                        out[frame] = rgb
+                    }
+                    return out
+                }
+                for frame in chunk {
+                    guard let rgb = rendered[frame] else {
+                        throw EngineError.native("frame \(frame) went missing")
+                    }
+                    while !videoInput.isReadyForMoreMediaData {
+                        try await Task.sleep(for: .milliseconds(4))
+                    }
+                    guard let pool = adaptor.pixelBufferPool else {
+                        throw EngineError.native("no pixel buffer pool")
+                    }
+                    var slot: CVPixelBuffer?
+                    CVPixelBufferPoolCreatePixelBuffer(nil, pool, &slot)
+                    guard let pixelBuffer = slot else {
+                        throw EngineError.native("cannot allocate a pixel buffer")
+                    }
+                    CVPixelBufferLockBaseAddress(pixelBuffer, [])
+                    if let base = CVPixelBufferGetBaseAddress(pixelBuffer) {
+                        let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+                        let destination = base.assumingMemoryBound(to: UInt8.self)
+                        rgb.withUnsafeBufferPointer { source in
+                            for row in 0..<height {
+                                var from = row * width * 3
+                                var to = row * stride
+                                for _ in 0..<width {
+                                    destination[to] = source[from + 2] // B
+                                    destination[to + 1] = source[from + 1] // G
+                                    destination[to + 2] = source[from] // R
+                                    destination[to + 3] = 255 // A
+                                    from += 3
+                                    to += 4
+                                }
+                            }
+                        }
+                    }
+                    CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+                    let time = CMTime(value: CMTimeValue(frame), timescale: fps)
+                    guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
+                        throw writer.error
+                            ?? EngineError.native("appending frame \(frame) failed")
+                    }
+                    progress(Double(frame + 1) / Double(frames) * 0.9)
+                    try Task.checkCancellation()
+                }
+                chunkStart += window
             }
-            guard audioInput.append(sample) else {
-                throw writer.error ?? EngineError.native("appending audio failed")
-            }
-        }
-        audioInput.markAsFinished()
-        // nil from copyNextSampleBuffer means EITHER end-of-track or failure; only the
-        // status distinguishes a finished read from a video shipped with truncated audio.
-        if reader.status == .failed {
-            throw reader.error ?? EngineError.native("reading the share WAV failed midway")
+            videoInput.markAsFinished()
+            try await audioDone
+        } catch {
+            writer.cancelWriting()
+            throw error
         }
 
         await writer.finishWriting()
