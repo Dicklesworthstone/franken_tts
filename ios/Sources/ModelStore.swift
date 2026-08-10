@@ -70,6 +70,11 @@ final class ModelStore {
 
     init() {
         refreshCachedBytes()
+        // Size-only trust at launch, the same tradeoff the website makes with its memo
+        // file: every byte was digest-verified when it was downloaded, and the .fttsq
+        // artifact re-verifies its own digests at engine load. A full re-hash of 2 GB on
+        // every app start would cost tens of seconds for corruption this storage does
+        // not produce in practice.
         if isComplete { phase = .ready }
     }
 

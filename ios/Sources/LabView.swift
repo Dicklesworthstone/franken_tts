@@ -288,9 +288,24 @@ struct LabView: View {
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(Lab.textSecondary)
                     Spacer()
-                    Text("seed \(model.seed)")
+                    Text("seed")
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(Lab.textSecondary)
+                    TextField(
+                        "0",
+                        text: Binding(
+                            get: { String(model.seed) },
+                            set: { model.seed = UInt64($0.filter(\.isNumber).prefix(10)) ?? 0 }
+                        )
+                    )
+                    .keyboardType(.numberPad)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(Lab.textPrimary)
+                    .frame(width: 74)
+                    .padding(.vertical, 5)
+                    .padding(.horizontal, 8)
+                    .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityLabel("Seed")
                     Button {
                         model.seed = UInt64.random(in: 0..<100_000)
                     } label: {
