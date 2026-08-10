@@ -54,6 +54,69 @@ enum Sink {
     Y4m(BufWriter<fs::File>),
 }
 
+/// Everything needed to draw any frame of the branded video, host-agnostic.
+///
+/// The CLI drives this through [`render`] into Y4M/ffmpeg; the iOS app drives it through
+/// `ftts-ffi` into `AVAssetWriter`, where the system's hardware H.264 encoder replaces
+/// ffmpeg. One implementation, two encoders — the frames are identical by construction.
+pub struct FrameRenderer {
+    background: qoi::Image,
+    overlay: raster::Surface,
+    samples: Vec<f32>,
+    sample_rate: u32,
+    total_frames: usize,
+}
+
+impl FrameRenderer {
+    /// Build a renderer over finished speech PCM (mono, any positive sample rate).
+    ///
+    /// # Errors
+    ///
+    /// When the embedded assets fail to decode or the overlay cannot be built.
+    pub fn new(samples: Vec<f32>, sample_rate: u32, voice_label: &str) -> Result<Self, String> {
+        if samples.is_empty() || sample_rate == 0 {
+            return Err("video needs non-empty audio and a positive sample rate".to_owned());
+        }
+        let duration = samples.len() as f64 / f64::from(sample_rate);
+        let total_frames = (duration * f64::from(FPS)).ceil().max(1.0) as usize;
+        Ok(Self {
+            background: qoi::decode(ILLUSTRATION_QOI)?,
+            overlay: overlay::build(voice_label)?,
+            samples,
+            sample_rate,
+            total_frames,
+        })
+    }
+
+    #[must_use]
+    pub fn total_frames(&self) -> usize {
+        self.total_frames
+    }
+
+    /// Draw frame `frame` into `rgb`, which must be `WIDTH * HEIGHT * 3` bytes.
+    ///
+    /// # Panics
+    ///
+    /// If `rgb` has the wrong length.
+    pub fn render_into(&self, frame: usize, rgb: &mut [u8]) {
+        assert_eq!(rgb.len(), WIDTH * HEIGHT * 3, "rgb must be WIDTH*HEIGHT*3");
+        let camera = kenburns::Camera::new(&self.background);
+        camera.render(frame, self.total_frames, WIDTH, HEIGHT, rgb);
+        composite_overlay(rgb, &self.overlay);
+        waveform::draw(
+            rgb,
+            WIDTH,
+            HEIGHT,
+            &self.samples,
+            self.sample_rate,
+            FPS,
+            frame,
+            885,
+            135.0,
+        );
+    }
+}
+
 /// Render the video. Calls `progress` as frames complete.
 ///
 /// With a `.y4m` output the WAV is left beside it (same stem) so the pair
@@ -81,12 +144,8 @@ pub fn render(
     let audio_bytes = fs::read(request.audio)
         .map_err(|error| format!("cannot read audio {}: {error}", request.audio.display()))?;
     let audio = wav::decode(&audio_bytes)?;
-    let duration = audio.samples.len() as f64 / f64::from(audio.sample_rate);
-    let total_frames = (duration * f64::from(FPS)).ceil().max(1.0) as usize;
-
-    let background = qoi::decode(ILLUSTRATION_QOI)?;
-    let camera = kenburns::Camera::new(&background);
-    let overlay = overlay::build(request.voice_label)?;
+    let renderer = FrameRenderer::new(audio.samples, audio.sample_rate, request.voice_label)?;
+    let total_frames = renderer.total_frames();
 
     let mut sink = if is_mp4 {
         if encode::available().is_none() {
@@ -113,19 +172,7 @@ pub fn render(
         let mut v_plane = vec![0u8; WIDTH * HEIGHT / 4];
 
         for frame in 0..total_frames {
-            camera.render(frame, total_frames, WIDTH, HEIGHT, &mut rgb);
-            composite_overlay(&mut rgb, &overlay);
-            waveform::draw(
-                &mut rgb,
-                WIDTH,
-                HEIGHT,
-                &audio.samples,
-                audio.sample_rate,
-                FPS,
-                frame,
-                885,
-                135.0,
-            );
+            renderer.render_into(frame, &mut rgb);
             yuv::rgb_to_i420(
                 &rgb,
                 WIDTH,
