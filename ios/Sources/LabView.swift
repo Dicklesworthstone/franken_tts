@@ -294,7 +294,9 @@ struct LabView: View {
                     ) { showConsent = true }
                         .buttonStyle(PrimaryButtonStyle())
                         .confirmationDialog(
-                            "Download 2.0 GB now? It stays on this device, resumes if interrupted, and Clear Model removes it.",
+                            model.store.cachedBytes > 0
+                                ? "Fetch the missing files now? Existing files are kept and re-verified, not re-downloaded."
+                                : "Download 2.0 GB now? It stays on this device, resumes if interrupted, and Clear Model removes it.",
                             isPresented: $showConsent, titleVisibility: .visible
                         ) {
                             Button("Start the download") { model.store.startDownload() }
@@ -719,7 +721,10 @@ struct EnrollmentSheet: View {
             .padding(18)
         }
         .presentationDetents([.large])
-        .interactiveDismissDisabled(model.isEnrolling)
+        // Recording must also block swipe-dismissal: a dismissed sheet takes its
+        // observers with it, and a recorder nobody is watching would keep the
+        // microphone live indefinitely.
+        .interactiveDismissDisabled(model.isEnrolling || model.recorder.isRecording)
         .onChange(of: model.recorder.seconds) { _, seconds in
             // Backstop: the script reads in about half a minute.
             if seconds >= 60, model.recorder.isRecording {
@@ -739,6 +744,13 @@ struct EnrollmentSheet: View {
                 let voice = model.library.voice(id: target)
             {
                 cloneName = voice.name
+            }
+        }
+        .onDisappear {
+            // Failsafe for any dismissal path: the microphone never outlives the sheet.
+            if model.recorder.isRecording {
+                _ = model.recorder.stop()
+                model.enrollmentTarget = nil
             }
         }
     }
