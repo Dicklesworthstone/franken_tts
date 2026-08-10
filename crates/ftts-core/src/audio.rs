@@ -125,6 +125,125 @@ pub fn encode_wav(pcm: &[f32], sample_rate: u32) -> Vec<u8> {
     bytes
 }
 
+/// Samples of low-level, high-frequency junk at the very end of an utterance.
+///
+/// # The artifact
+///
+/// The model reliably ends an utterance with a short burst of broadband noise after speech has
+/// decayed and before its own trailing silence. Measured on real synthesis at 24 kHz, the burst
+/// sits around RMS 20-90 against speech at 500-1200, and its first-difference energy ratio (a cheap
+/// high-frequency proxy) runs 0.3-0.9 where speech runs 0.02-0.10. It is what a listener hears as
+/// "a little noise right at the end".
+///
+/// It is NOT a quantization artifact: an interleaved A/B against the f32 reference route on the
+/// same text and seed showed the reference producing MORE of it (sustained ~90 ms at ratio up to
+/// 0.94) than the int8 route. So it comes from the model's own final frames, and no kernel change
+/// removes it.
+///
+/// # What this does, and what it deliberately does not
+///
+/// Returns how many samples to drop from the end. The rule is conjunctive on purpose, because each
+/// condition alone has a false positive that would eat real audio:
+///
+/// * **quiet** relative to this utterance's own speech level, so a loud ending is never touched;
+/// * **high-frequency dominated**, so a soft voiced ending (a low hum, a sustained vowel) is never
+///   touched — those are the tonal opposite of this artifact;
+/// * **contiguous from the end**, so noise in the middle of a sentence is left alone entirely.
+///
+/// Trailing pure silence is skipped before analysis and kept afterwards: it is genuine model output
+/// (measured runs carry 0-71 ms of it), and trimming it would change utterance timing.
+///
+/// Returns 0 whenever the input is too short to judge, which keeps every caller total.
+#[must_use]
+pub fn trailing_noise_samples(pcm: &[f32], sample_rate: u32) -> usize {
+    /// Analysis window. 10 ms is short enough to localize the burst and long enough that a
+    /// single glottal pulse does not dominate the statistic.
+    const WINDOW_MILLIS: usize = 10;
+    /// Never remove more than this. Measured artifact runs: 30 ms (nz5), 80 ms (f32 reference),
+    /// and just over 200 ms on the preset voice samples. 250 ms covers the observed range while
+    /// still bounding the damage if the rule ever misfires.
+    const MAX_TRIM_MILLIS: usize = 250;
+    /// A window must be under this fraction of the utterance's speech level to be a candidate.
+    /// Artifact windows measured at most 0.08 of the utterance peak, so 0.15 leaves headroom
+    /// without reaching the level a real final consonant occupies.
+    const QUIET_FRACTION: f32 = 0.15;
+    /// First-difference energy ratio above which a window is high-frequency dominated. Voiced
+    /// speech measured 0.005-0.10; the artifact measured 0.31-1.92. 0.25 sits in the empty gap
+    /// between those two populations.
+    const HF_RATIO: f32 = 0.25;
+    /// The whole trimmed run must also be this quiet on average. A sustained final fricative is
+    /// high-frequency too, and this is what separates it from the artifact: /s/ carries real
+    /// level, the artifact does not.
+    const RUN_MEAN_FRACTION: f32 = 0.10;
+
+    let window = (sample_rate as usize).saturating_mul(WINDOW_MILLIS) / 1000;
+    if window < 2 || pcm.len() < window * 4 {
+        return 0;
+    }
+
+    // Trailing exact silence is model output, not artifact; keep it, and analyze what precedes it.
+    let voiced_end = pcm
+        .iter()
+        .rposition(|sample| *sample != 0.0)
+        .map_or(0, |i| i + 1);
+    if voiced_end < window * 4 {
+        return 0;
+    }
+
+    let rms = |seg: &[f32]| -> f32 {
+        if seg.is_empty() {
+            return 0.0;
+        }
+        (seg.iter().map(|s| s * s).sum::<f32>() / seg.len() as f32).sqrt()
+    };
+    // First-difference energy over signal energy: high for broadband noise, low for voiced speech.
+    let hf = |seg: &[f32]| -> f32 {
+        let energy: f32 = seg.iter().map(|s| s * s).sum();
+        if energy <= f32::MIN_POSITIVE {
+            return 0.0;
+        }
+        let diff: f32 = seg.windows(2).map(|p| (p[1] - p[0]) * (p[1] - p[0])).sum();
+        diff / energy
+    };
+
+    // The utterance's own speech level, taken as the loudest window so the threshold scales with
+    // the recording rather than assuming an absolute amplitude.
+    let speech_level = pcm[..voiced_end]
+        .chunks(window)
+        .map(|chunk| rms(chunk))
+        .fold(0.0_f32, f32::max);
+    if speech_level <= 0.0 {
+        return 0;
+    }
+    let quiet_ceiling = speech_level * QUIET_FRACTION;
+
+    let max_trim = (sample_rate as usize).saturating_mul(MAX_TRIM_MILLIS) / 1000;
+    let mut trimmed = 0_usize;
+    let mut end = voiced_end;
+    while end >= window && trimmed + window <= max_trim {
+        let start = end - window;
+        let segment = &pcm[start..end];
+        if rms(segment) < quiet_ceiling && hf(segment) > HF_RATIO {
+            trimmed += window;
+            end = start;
+        } else {
+            break;
+        }
+    }
+
+    // Final guard on the run as a whole. Each window passing individually is not enough: a
+    // sustained final fricative is quiet-ish AND high-frequency window by window, and would walk
+    // the loop above backwards through real speech. The artifact's run mean sits far below a
+    // fricative's, so this is the condition that separates them.
+    if trimmed > 0 {
+        let run = &pcm[voiced_end - trimmed..voiced_end];
+        if rms(run) >= speech_level * RUN_MEAN_FRACTION {
+            return 0;
+        }
+    }
+    trimmed
+}
+
 /// A streaming WAV writer that finalises a correct header.
 ///
 /// Streaming synthesis does not know the sample count until the run ends, so a provisional header
@@ -362,5 +481,94 @@ mod tests {
         assert_eq!(wav.len(), WAV_HEADER_BYTES);
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().expect("size")), 0);
         assert_eq!(u32::from_le_bytes(wav[4..8].try_into().expect("riff")), 36);
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    const SR: u32 = 24_000;
+
+    fn noise(len: usize, amplitude: f32) -> Vec<f32> {
+        // Alternating sign: maximal first-difference energy, i.e. the broadband shape the
+        // artifact has.
+        (0..len)
+            .map(|i| if i % 2 == 0 { amplitude } else { -amplitude })
+            .collect()
+    }
+
+    fn tone(len: usize, amplitude: f32) -> Vec<f32> {
+        // 200 Hz: voiced, low first-difference energy.
+        (0..len)
+            .map(|i| amplitude * (i as f32 * 2.0 * std::f32::consts::PI * 200.0 / SR as f32).sin())
+            .collect()
+    }
+
+    #[test]
+    fn a_quiet_high_frequency_tail_is_trimmed() {
+        let mut pcm = tone(SR as usize / 2, 0.5);
+        pcm.extend(noise(SR as usize * 40 / 1000, 0.02));
+        let trimmed = trailing_noise_samples(&pcm, SR);
+        assert!(trimmed > 0, "the artifact shape must be detected");
+        assert!(
+            trimmed <= SR as usize * 40 / 1000 + SR as usize / 100,
+            "trim {trimmed} reached past the noise into speech"
+        );
+    }
+
+    #[test]
+    fn a_loud_ending_is_never_trimmed() {
+        // Speech that simply stops at full level: nothing to remove, however abrupt.
+        let pcm = tone(SR as usize / 2, 0.5);
+        assert_eq!(trailing_noise_samples(&pcm, SR), 0);
+    }
+
+    #[test]
+    fn a_quiet_voiced_ending_is_never_trimmed() {
+        // The dangerous false positive: a soft sustained vowel is quiet but TONAL, so the
+        // high-frequency condition must save it.
+        let mut pcm = tone(SR as usize / 2, 0.5);
+        pcm.extend(tone(SR as usize * 60 / 1000, 0.02));
+        assert_eq!(
+            trailing_noise_samples(&pcm, SR),
+            0,
+            "a soft voiced ending must survive"
+        );
+    }
+
+    #[test]
+    fn trailing_silence_is_preserved_and_the_noise_before_it_is_found() {
+        let mut pcm = tone(SR as usize / 2, 0.5);
+        pcm.extend(noise(SR as usize * 30 / 1000, 0.02));
+        let silence = SR as usize * 50 / 1000;
+        pcm.extend(std::iter::repeat_n(0.0_f32, silence));
+        let trimmed = trailing_noise_samples(&pcm, SR);
+        assert!(
+            trimmed > 0,
+            "silence after the burst must not hide the burst"
+        );
+        // The reported count covers only the noise; the caller keeps the silence.
+        assert!(trimmed <= SR as usize * 40 / 1000);
+    }
+
+    #[test]
+    fn noise_in_the_middle_is_left_alone() {
+        let mut pcm = tone(SR as usize / 4, 0.5);
+        pcm.extend(noise(SR as usize * 30 / 1000, 0.02));
+        pcm.extend(tone(SR as usize / 4, 0.5));
+        assert_eq!(
+            trailing_noise_samples(&pcm, SR),
+            0,
+            "only a tail contiguous with the end is in scope"
+        );
+    }
+
+    #[test]
+    fn short_and_empty_inputs_are_total() {
+        assert_eq!(trailing_noise_samples(&[], SR), 0);
+        assert_eq!(trailing_noise_samples(&[0.1; 16], SR), 0);
+        assert_eq!(trailing_noise_samples(&[0.0; 4096], SR), 0);
+        assert_eq!(trailing_noise_samples(&tone(4096, 0.5), 0), 0);
     }
 }
