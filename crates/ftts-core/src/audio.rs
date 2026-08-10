@@ -417,7 +417,21 @@ impl<W: Write + Seek> WavWriter<W> {
     /// # Errors
     ///
     /// If seeking back to the header, rewriting it, or flushing fails.
-    pub fn finish(mut self) -> io::Result<W> {
+    pub fn finish(self) -> io::Result<W> {
+        self.finish_reporting().map(|(sink, _)| sink)
+    }
+
+    /// As [`WavWriter::finish`], also reporting how many samples the file actually contains.
+    ///
+    /// Callers that publish a sample count need this rather than their own tally: tail trimming
+    /// (and any short write) makes "samples handed to the writer" differ from "samples in the
+    /// file", and a reported count that describes audio the file does not hold is a false number
+    /// in a machine-readable stream.
+    ///
+    /// # Errors
+    ///
+    /// If flushing the held tail, seeking back to the header, rewriting it, or flushing fails.
+    pub fn finish_reporting(mut self) -> io::Result<(W, usize)> {
         // Release the held tail, minus whatever the detector identifies as the model's end-of-
         // utterance noise. Done before the header is patched so the length describes what landed.
         if let Some(pending) = self.holdback.take() {
@@ -429,9 +443,12 @@ impl<W: Write + Seek> WavWriter<W> {
             }
         }
         self.finalize_header()?;
-        self.sink
+        let written = self.samples_written;
+        let sink = self
+            .sink
             .take()
-            .ok_or_else(|| io::Error::other("WavWriter already finished"))
+            .ok_or_else(|| io::Error::other("WavWriter already finished"))?;
+        Ok((sink, written))
     }
 
     fn finalize_header(&mut self) -> io::Result<()> {
@@ -456,6 +473,18 @@ impl<W: Write + Seek> Drop for WavWriter<W> {
     fn drop(&mut self) {
         // `finish` takes the sink, so a still-present sink means an abnormal end.
         if self.sink.is_some() {
+            // Release the held tail FIRST, and deliberately without trimming.
+            //
+            // Two reasons. Losing it would silently shorten the file by up to a quarter second and
+            // break this type's partial-output promise: a run cut short must still describe every
+            // sample that made it. And an abnormal end means the tail is not an end-of-utterance
+            // artifact at all — it is wherever synthesis happened to stop, most likely mid-word —
+            // so the trim's premise does not hold and applying it would remove real audio.
+            if let Some(pending) = self.holdback.take()
+                && !pending.is_empty()
+            {
+                let _ = self.write_through(&pending);
+            }
             let _ = self.finalize_header();
         }
     }
@@ -741,6 +770,43 @@ mod holdback_tests {
             payload / 2 < pcm.len(),
             "the artifact tail should have been removed"
         );
+    }
+
+    /// A writer dropped without `finish` must still contain every sample it accepted.
+    ///
+    /// This is the partial-output promise, and the hold-back is exactly what threatens it: the last
+    /// quarter second lives in memory, so a `Drop` that only patched the header would silently
+    /// shorten a cancelled run's file by up to 250 ms. Nothing else in the type would notice —
+    /// the header would agree with the payload, and the file would play.
+    #[test]
+    fn a_dropped_writer_keeps_every_sample_it_accepted() {
+        let path = std::env::temp_dir().join(format!(
+            "ftts-drop-holdback-{}-{}.wav",
+            std::process::id(),
+            line!()
+        ));
+        let pcm = tone(24_000, 0.5);
+        {
+            let file = std::fs::File::create(&path).expect("create");
+            let mut writer = WavWriter::new_trimming_tail(file, SAMPLE_RATE_HZ).expect("header");
+            for packet in pcm.chunks(1_920) {
+                writer.write_samples(packet).expect("write");
+            }
+            // Deliberately NOT calling finish: this models a panic or a cancelled run.
+        }
+        let written = std::fs::read(&path).expect("read back");
+        let _ = std::fs::remove_file(&path);
+
+        let payload = written.len() - WAV_HEADER_BYTES;
+        assert_eq!(
+            payload / 2,
+            pcm.len(),
+            "the dropped writer lost {} held samples",
+            pcm.len() - payload / 2
+        );
+        let declared =
+            u32::from_le_bytes([written[40], written[41], written[42], written[43]]) as usize;
+        assert_eq!(declared, payload, "header disagrees with the payload");
     }
 
     /// An empty run must still produce a valid, playable, zero-length file.

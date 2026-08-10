@@ -1679,8 +1679,17 @@ fn run_say_events(
         let event = audio.write_packet(packet, raw_audio, run.run_id(), packet_frame_count)?;
         emit(&event)?;
     }
-    let audio_bytes = audio.byte_offset();
+    let streamed_bytes = audio.byte_offset();
     let samples = audio.finish()?;
+    // `audio_bytes` must agree with `samples`, and `samples` now reports what the file really
+    // holds after tail trimming. Deriving the byte count from it keeps `run_complete` internally
+    // consistent instead of pairing a trimmed sample count with an untrimmed byte count. The raw
+    // stream is never trimmed, so its running total is already the truth and is used as-is.
+    let audio_bytes = if raw_stream {
+        streamed_bytes
+    } else {
+        samples * u64::from(ftts_core::audio::BITS_PER_SAMPLE / 8)
+    };
     if let Some(plan) = &output_plan {
         plan.finalize()?;
     }
@@ -2055,11 +2064,16 @@ impl AudioOutput {
     ///
     /// If the header cannot be rewritten.
     pub fn finish(self) -> Result<u64, FttsError> {
-        let samples = self.samples_written;
+        let mut samples = self.samples_written;
         if let AudioSink::Wav(writer) = self.sink {
-            writer.finish().map_err(|error| {
+            // Report what the FILE contains, not what was handed to the sink. Tail trimming makes
+            // those differ, and `run_complete.samples` claiming audio the file does not hold is a
+            // false number in a machine-readable stream: a consumer that trusts it computes the
+            // wrong duration. `finish_reporting` exists precisely to close that gap.
+            let (_, written) = writer.finish_reporting().map_err(|error| {
                 FttsError::Generic(format!("cannot finalize the WAV header: {error}"))
             })?;
+            samples = written as u64;
         }
         Ok(samples)
     }
