@@ -1267,10 +1267,14 @@ pub fn decode_frame_greedy_speculative(
         ),
     };
     let accepted_prefix_len = verification.accepted_greedy_prefix_len(&drafted_codes);
+    // Postcondition, uniform across BOTH exits: `state` leaves this function EMPTY. The
+    // verifier used its own per-layer caches, so on a full accept the caller's state would
+    // otherwise keep the previous frame's entries; and if the repair path left the frame's
+    // 16 positions cached while the accept path left none, whether the draft was lucky
+    // would leak to the caller through cache state — the exact class of divergence this
+    // module exists to make impossible. Every decode entry resets on the way in as well;
+    // the reset here is what makes that a guarantee instead of a convention.
     let (codes, repaired) = if accepted_prefix_len == RESIDUAL_DEPTHS {
-        // The sequential decoder's postcondition is "state caches exactly this frame's
-        // positions"; the verifier used its own per-layer caches, so on a full accept the
-        // caller's state would otherwise silently keep the PREVIOUS frame's entries.
         state.reset();
         (drafted_codes, false)
     } else {
@@ -1287,6 +1291,8 @@ pub fn decode_frame_greedy_speculative(
             ),
             None => decode_frame_greedy(config, rope, weights, state, talker_hidden, primary_code),
         };
+        // Discard the repair pass's cached positions so both exits agree (see above).
+        state.reset();
         (
             sequential
                 .try_into()
@@ -2624,6 +2630,98 @@ mod tests {
                          {a:?} vs sequential {b:?}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn q8_block_verifier_accepts_the_sequential_q8_draft_with_refined_heads() {
+        // Independent index-map coverage for the QUANTIZED route with head refine armed: the
+        // sequential engine builds its inputs one position at a time, so agreement with the
+        // packed verifier here cannot come from a shared block-construction helper. The
+        // packed-vs-scalar sweep above runs `heads: None`; this is the only test where the
+        // q8 head-refine path crosses the block verifier.
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let layers: Vec<TestLayer> = (0..config.num_layers)
+            .map(|layer| TestLayer::new_seeded(&config, 800 + layer as u32 * 8))
+            .collect();
+        let borrowed: Vec<LayerWeights<'_>> = layers.iter().map(TestLayer::borrow).collect();
+        let quant: Vec<MicroLayerQuant> = borrowed
+            .iter()
+            .map(|layer| MicroLayerQuant::quantize(&config, layer))
+            .collect();
+        let talker_codec = weights_of(TALKER_CODEC_VOCAB * config.hidden_size, 61);
+        let residual_tables: Vec<Vec<f32>> = (0..RESIDUAL_DEPTHS - 1)
+            .map(|depth| weights_of(RESIDUAL_VOCAB * config.hidden_size, 70 + depth as u32))
+            .collect();
+        let head_tables: Vec<Vec<f32>> = (0..RESIDUAL_DEPTHS)
+            .map(|depth| weights_of(RESIDUAL_VOCAB * config.hidden_size, 90 + depth as u32))
+            .collect();
+        let residual_refs: Vec<&[f32]> = residual_tables.iter().map(Vec::as_slice).collect();
+        let head_refs: Vec<&[f32]> = head_tables.iter().map(Vec::as_slice).collect();
+        let final_norm = vec![1.0_f32; config.hidden_size];
+        let weights = MicrodecoderWeights {
+            layers: &borrowed,
+            talker_codec_embedding: &talker_codec,
+            residual_embeddings: &residual_refs,
+            heads: &head_refs,
+            final_norm: &final_norm,
+        };
+        let heads_q8: Vec<ftts_kernels::int8::QuantizedMatrix> = head_tables
+            .iter()
+            .map(|head| {
+                ftts_kernels::int8::QuantizedMatrix::quantize(
+                    head,
+                    RESIDUAL_VOCAB,
+                    config.hidden_size,
+                )
+            })
+            .collect();
+
+        for tier in ftts_kernels::int8::Int8Tier::available() {
+            let route = MicroQuantRoute {
+                layers: &quant,
+                heads: Some(&heads_q8),
+                mode: QuantLinearMode::W8A8(tier),
+            };
+            for seed in 0..3_u32 {
+                let talker_hidden = weights_of(config.hidden_size, 950 + seed);
+                let primary = (seed as usize * 29) % TALKER_CODEC_VOCAB;
+                let mut state = FrameState::new(&config);
+                let sequential = decode_frame_with_selector_q8(
+                    &config,
+                    &rope,
+                    &weights,
+                    &route,
+                    &mut state,
+                    &talker_hidden,
+                    primary,
+                    argmax,
+                );
+                let verified = verify_frame_draft_q8(
+                    &config,
+                    &rope,
+                    &weights,
+                    &route,
+                    &talker_hidden,
+                    primary,
+                    &sequential,
+                );
+                assert_eq!(
+                    verified.greedy_codes(),
+                    sequential,
+                    "tier {} seed {seed}: verifier rows must reproduce the sequential q8 \
+                     trajectory",
+                    tier.as_str()
+                );
+                assert_eq!(
+                    verified.accepted_greedy_prefix_len(&sequential),
+                    RESIDUAL_DEPTHS,
+                    "tier {} seed {seed}: the exact sequential q8 greedy draft must be fully \
+                     accepted",
+                    tier.as_str()
+                );
             }
         }
     }

@@ -127,6 +127,16 @@ pub enum CheckpointError {
         expected: usize,
         actual: usize,
     },
+    /// A tensor has the right element count but the wrong declared axes.
+    ///
+    /// This is the silent-transpose defense: a `[in, out]` projection stored where `[out, in]`
+    /// is required passes every element-count check and produces confident wrong audio. The
+    /// declared shape metadata is the one place the orientation is visible before compute.
+    TensorAxes {
+        tensor: String,
+        expected: String,
+        actual: Vec<usize>,
+    },
     /// A digest-verified canonical artifact carries a tensor representation this f32 engine
     /// cannot hydrate safely.
     ArtifactTensor {
@@ -163,6 +173,15 @@ impl fmt::Display for CheckpointError {
                 formatter,
                 "tensor `{tensor}` holds {actual} elements, expected {expected}"
             ),
+            Self::TensorAxes {
+                tensor,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "tensor `{tensor}` declares shape {actual:?}, expected {expected}; \
+                 a transposed or reshaped export cannot be hydrated"
+            ),
             Self::ArtifactTensor {
                 path,
                 tensor,
@@ -195,11 +214,66 @@ pub(crate) fn widen(
             path: path.to_path_buf(),
             tensor: name.to_owned(),
         })?;
+    // One upfront probe instead of a per-element branch: `get_f32` only fails on byte-range
+    // overflow, and the range is contiguous, so if the LAST element is readable every element
+    // is. Silently hydrating unreadable elements as 0.0 (the old behavior) is exactly the kind
+    // of quiet corruption `gather` already refuses loudly.
+    if !view.is_empty() && view.get_f32(view.len() - 1).is_none() {
+        return Err(CheckpointError::ArtifactTensor {
+            path: path.to_path_buf(),
+            tensor: name.to_owned(),
+            detail: "declared element count exceeds the stored bytes".to_owned(),
+        });
+    }
     let mut out = vec![0.0f32; view.len()];
     for (index, slot) in out.iter_mut().enumerate() {
         *slot = view.get_f32(index).unwrap_or(0.0);
     }
     Ok(out)
+}
+
+/// Expected declared axes for one hydrated tensor.
+///
+/// `Matrix { rows: None, .. }` pins only the input axis — used where the output axis is a
+/// vocabulary whose size this crate does not own — which still catches every transpose,
+/// because a transposed `[in, out]` store puts the wrong extent in the input position.
+#[derive(Clone)]
+pub(crate) enum ShapeSpec {
+    Vector(usize),
+    Matrix { rows: Option<usize>, cols: usize },
+}
+
+impl ShapeSpec {
+    fn describe(&self) -> String {
+        match self {
+            Self::Vector(n) => format!("[{n}]"),
+            Self::Matrix {
+                rows: Some(r),
+                cols,
+            } => format!("[{r}, {cols}]"),
+            Self::Matrix { rows: None, cols } => format!("[_, {cols}]"),
+        }
+    }
+
+    fn check(&self, tensor: &str, shape: &[usize]) -> Result<(), CheckpointError> {
+        let ok = match self {
+            Self::Vector(n) => shape == [*n],
+            Self::Matrix { rows, cols } => {
+                shape.len() == 2
+                    && shape[1] == *cols
+                    && rows.is_none_or(|expected| shape[0] == expected)
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(CheckpointError::TensorAxes {
+                tensor: tensor.to_owned(),
+                expected: self.describe(),
+                actual: shape.to_vec(),
+            })
+        }
+    }
 }
 
 pub(crate) fn widen_exact(
@@ -462,7 +536,7 @@ pub struct HotElision {
 ///
 /// The first error wins and is returned after every worker has stopped.
 fn widen_many(
-    names: &[(String, bool)],
+    names: &[(String, bool, ShapeSpec)],
     widen_tensor: &(dyn Fn(&str) -> Result<Vec<f32>, CheckpointError> + Sync),
 ) -> Result<Vec<Vec<f32>>, CheckpointError> {
     use std::sync::Mutex;
@@ -486,7 +560,7 @@ fn widen_many(
     if workers == 1 {
         return names
             .iter()
-            .map(|(name, elided)| {
+            .map(|(name, elided, _)| {
                 if *elided {
                     Ok(Vec::new())
                 } else {
@@ -507,7 +581,7 @@ fn widen_many(
                     if index >= names.len() || first_error.lock().expect("error slot").is_some() {
                         return;
                     }
-                    let (name, elided) = &names[index];
+                    let (name, elided, _) = &names[index];
                     let outcome = if *elided {
                         Ok(Vec::new())
                     } else {
@@ -844,6 +918,7 @@ impl TalkerCheckpoint {
             TextEmbeddingSource::Safetensors,
             |name| widen(&file, path, name),
             |_| false,
+            |name| file.view(name).map(|view| view.shape().to_vec()),
         )
     }
 
@@ -930,11 +1005,21 @@ impl TalkerCheckpoint {
                     .all(|suffix| q8_present(&format!("{layer_prefix}{suffix}")))
             }
         };
+        let shape_artifact = Arc::clone(&artifact);
         Self::load_with(
             path,
             source,
             |name| widen_fttsq(&artifact, path, name),
             elide,
+            move |name| {
+                shape_artifact.reader().tensor(name).map(|entry| {
+                    entry
+                        .shape
+                        .iter()
+                        .map(|&extent| usize::try_from(extent).unwrap_or(usize::MAX))
+                        .collect()
+                })
+            },
         )
     }
 
@@ -943,51 +1028,169 @@ impl TalkerCheckpoint {
         text_embedding_source: TextEmbeddingSource,
         widen_tensor: impl Fn(&str) -> Result<Vec<f32>, CheckpointError> + Sync,
         elide_tensor: impl Fn(&str) -> bool,
+        tensor_shape: impl Fn(&str) -> Option<Vec<usize>>,
     ) -> Result<Self, CheckpointError> {
         let hidden = TALKER_HIDDEN;
-        let micro_layer_count = MicrodecoderConfig::default().num_layers;
+        let micro_config = MicrodecoderConfig::default();
+        let micro_layer_count = micro_config.num_layers;
+        let talker_config = crate::talker::TalkerConfig::default();
+
+        // Declared-axis expectations for one attention layer, in ATTENTION_LAYER_SUFFIXES
+        // order. This is the silent-transpose defense: q/o and gate-up/down are rectangular,
+        // so a `[in, out]` export has the same element count and passes every runtime length
+        // assert while multiplying garbage.
+        let layer_specs = |hidden: usize, q: usize, kv: usize, head: usize, inter: usize| {
+            [
+                ShapeSpec::Vector(hidden), // input_layernorm
+                ShapeSpec::Matrix {
+                    rows: Some(q),
+                    cols: hidden,
+                }, // q_proj
+                ShapeSpec::Matrix {
+                    rows: Some(kv),
+                    cols: hidden,
+                }, // k_proj
+                ShapeSpec::Matrix {
+                    rows: Some(kv),
+                    cols: hidden,
+                }, // v_proj
+                ShapeSpec::Vector(head),   // q_norm
+                ShapeSpec::Vector(head),   // k_norm
+                ShapeSpec::Matrix {
+                    rows: Some(hidden),
+                    cols: q,
+                }, // o_proj
+                ShapeSpec::Vector(hidden), // post_attention_layernorm
+                ShapeSpec::Matrix {
+                    rows: Some(inter),
+                    cols: hidden,
+                }, // gate_proj
+                ShapeSpec::Matrix {
+                    rows: Some(inter),
+                    cols: hidden,
+                }, // up_proj
+                ShapeSpec::Matrix {
+                    rows: Some(hidden),
+                    cols: inter,
+                }, // down_proj
+            ]
+        };
+        let talker_specs = layer_specs(
+            talker_config.hidden_size,
+            talker_config.num_attention_heads * talker_config.head_dim,
+            talker_config.num_key_value_heads * talker_config.head_dim,
+            talker_config.head_dim,
+            talker_config.intermediate_size,
+        );
+        let micro_specs = layer_specs(
+            micro_config.hidden_size,
+            micro_config.num_q_heads * micro_config.head_dim,
+            micro_config.num_kv_heads * micro_config.head_dim,
+            micro_config.head_dim,
+            micro_config.intermediate_size,
+        );
 
         // One flat, canonically ordered name list, hydrated in one concurrent pass; the struct is
         // then assembled by walking the results in the same order. Field-order changes here must
         // keep the two walks in lockstep -- the assertions at each seam catch a drift.
-        let mut names: Vec<(String, bool)> = Vec::new();
-        let mut push = |name: String| {
+        let mut names: Vec<(String, bool, ShapeSpec)> = Vec::new();
+        let mut push = |name: String, spec: ShapeSpec| {
             let elided = elide_tensor(&name);
-            names.push((name, elided));
+            names.push((name, elided, spec));
         };
         for layer in 0..TALKER_LAYER_COUNT {
-            for suffix in ATTENTION_LAYER_SUFFIXES {
-                push(format!("talker.model.layers.{layer}.{suffix}"));
+            for (suffix, spec) in ATTENTION_LAYER_SUFFIXES.iter().zip(&talker_specs) {
+                push(
+                    format!("talker.model.layers.{layer}.{suffix}"),
+                    spec.clone(),
+                );
             }
         }
         for layer in 0..micro_layer_count {
-            for suffix in ATTENTION_LAYER_SUFFIXES {
-                push(format!(
-                    "talker.code_predictor.model.layers.{layer}.{suffix}"
-                ));
+            for (suffix, spec) in ATTENTION_LAYER_SUFFIXES.iter().zip(&micro_specs) {
+                push(
+                    format!("talker.code_predictor.model.layers.{layer}.{suffix}"),
+                    spec.clone(),
+                );
             }
         }
         for table in 0..CODE_GROUP_COUNT - 1 {
-            push(format!(
-                "talker.code_predictor.model.codec_embedding.{table}.weight"
-            ));
+            push(
+                format!("talker.code_predictor.model.codec_embedding.{table}.weight"),
+                ShapeSpec::Matrix {
+                    rows: None,
+                    cols: hidden,
+                },
+            );
         }
         for head in 0..RESIDUAL_DEPTHS {
-            push(format!("talker.code_predictor.lm_head.{head}.weight"));
+            push(
+                format!("talker.code_predictor.lm_head.{head}.weight"),
+                ShapeSpec::Matrix {
+                    rows: None,
+                    cols: hidden,
+                },
+            );
         }
-        for single in [
-            "talker.model.norm.weight",
-            "talker.codec_head.weight",
-            "talker.model.codec_embedding.weight",
-            "talker.code_predictor.model.norm.weight",
-            "talker.text_projection.linear_fc1.weight",
-            "talker.text_projection.linear_fc1.bias",
-            "talker.text_projection.linear_fc2.weight",
-            "talker.text_projection.linear_fc2.bias",
+        for (single, spec) in [
+            ("talker.model.norm.weight", ShapeSpec::Vector(hidden)),
+            (
+                "talker.codec_head.weight",
+                ShapeSpec::Matrix {
+                    rows: None,
+                    cols: hidden,
+                },
+            ),
+            (
+                "talker.model.codec_embedding.weight",
+                ShapeSpec::Matrix {
+                    rows: None,
+                    cols: hidden,
+                },
+            ),
+            (
+                "talker.code_predictor.model.norm.weight",
+                ShapeSpec::Vector(hidden),
+            ),
+            (
+                "talker.text_projection.linear_fc1.weight",
+                ShapeSpec::Matrix {
+                    rows: Some(TEXT_EMBED_WIDTH),
+                    cols: TEXT_EMBED_WIDTH,
+                },
+            ),
+            (
+                "talker.text_projection.linear_fc1.bias",
+                ShapeSpec::Vector(TEXT_EMBED_WIDTH),
+            ),
+            (
+                "talker.text_projection.linear_fc2.weight",
+                ShapeSpec::Matrix {
+                    rows: Some(hidden),
+                    cols: TEXT_EMBED_WIDTH,
+                },
+            ),
+            (
+                "talker.text_projection.linear_fc2.bias",
+                ShapeSpec::Vector(hidden),
+            ),
         ] {
-            push(single.to_owned());
+            push(single.to_owned(), spec);
         }
         // NLL releases `push`'s borrow of `names` here; the closure needs no explicit drop.
+
+        // Axis validation happens BEFORE the (expensive, concurrent) widening pass: a
+        // transposed export should refuse in milliseconds, not after gigabytes of hydration.
+        // A source that exposes no shape metadata for a tensor skips the check and falls back
+        // to the element-count asserts downstream.
+        for (name, elided, spec) in &names {
+            if *elided {
+                continue;
+            }
+            if let Some(shape) = tensor_shape(name) {
+                spec.check(name, &shape)?;
+            }
+        }
 
         let mut widened = widen_many(&names, &widen_tensor)?.into_iter();
 
@@ -1852,6 +2055,35 @@ mod tests {
         for special in [TTS_PAD_TOKEN_ID, TTS_BOS_TOKEN_ID, TTS_EOS_TOKEN_ID] {
             assert!(ids.contains(&special), "special {special} must be gathered");
         }
+    }
+
+    #[test]
+    fn a_transposed_projection_is_refused_by_its_declared_axes() {
+        // The q_proj geometry: [2048, 1024]. Its transpose has the identical element count,
+        // which is exactly why element-count checks alone shipped this hole.
+        let q_proj = ShapeSpec::Matrix {
+            rows: Some(2048),
+            cols: 1024,
+        };
+        assert!(q_proj.check("q", &[2048, 1024]).is_ok());
+        let error = q_proj
+            .check("q", &[1024, 2048])
+            .expect_err("a transposed store must refuse");
+        assert!(error.to_string().contains("transposed"), "{error}");
+
+        // Vocabulary-open matrices (unknown row count) still catch the transpose through the
+        // input axis.
+        let head = ShapeSpec::Matrix {
+            rows: None,
+            cols: 1024,
+        };
+        assert!(head.check("head", &[2048, 1024]).is_ok());
+        assert!(head.check("head", &[1024, 2048]).is_err());
+
+        // Norm weights must be genuinely 1-D; a [1, n] reshape is refused.
+        let norm = ShapeSpec::Vector(1024);
+        assert!(norm.check("norm", &[1024]).is_ok());
+        assert!(norm.check("norm", &[1, 1024]).is_err());
     }
 
     #[test]
