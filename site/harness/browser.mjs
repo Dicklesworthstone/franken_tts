@@ -110,7 +110,10 @@ try {
     await page.waitForTimeout(1000);
   }
 
-  check("hydration advanced past staging", seen.length > 1, `stages: ${seen.join(" | ") || "(none)"}`);
+  const history = await page.evaluate(() => globalThis.__fttsStages ?? []);
+  console.log("\n--- stage history ---");
+  for (const entry of history) console.log(`      ${entry}`);
+  check("hydration advanced past staging", history.length > 1, `${history.length} stages`);
   check("no stall", !stalled, stalled ? `stuck ${180}s at "${stalled}"` : "");
 
   const ready = await page.evaluate(() => {

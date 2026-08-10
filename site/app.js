@@ -72,6 +72,10 @@ function recordStage(stage, detail) {
   // indistinguishable from a hung one — which is exactly the report this is here to answer.
   // Naming the live stage turns "it never finishes" into "it is stuck in widen-codec".
   stageStarted.set(stage, performance.now());
+  // Full history, not just the latest. Download progress rewrites the status line many times a
+  // second, so the init stages — the ones that say which build actually loaded — were erased
+  // before anyone could read them. The harness reads this array.
+  (globalThis.__fttsStages ??= []).push(detail ? `${stage} [${detail}]` : stage);
   const status = document.getElementById("dl-status");
   if (status) {
     status.textContent = detail ? `${stage} — ${detail}` : stage;

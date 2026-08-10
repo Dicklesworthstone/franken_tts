@@ -150,7 +150,31 @@ function reply(type, payload, transfer = []) {
   self.postMessage({ type, ...payload }, transfer);
 }
 
-self.onmessage = async ({ data }) => {
+/// Messages are handled STRICTLY ONE AT A TIME, in arrival order.
+///
+/// `self.onmessage` being `async` means the runtime happily starts a second handler while the
+/// first is still awaiting. app.js posts `load` as soon as it finds a complete cache, which races
+/// `init` — and hydration then runs against a module whose glue has not finished binding. The
+/// symptoms were maddening and platform-dependent: iOS threw
+/// `undefined is not an object (evaluating 'wasm.modelstaging_new')`, while Chrome simply hung
+/// forever inside `new ModelStaging(...)` with `wasmMemory` still null (reported as `mem 0.00 GB`,
+/// the clue that finally identified this).
+///
+/// Chaining onto the previous handler's promise makes the ordering guarantee explicit rather than
+/// depending on which message happens to win.
+let queue = Promise.resolve();
+self.onmessage = (event) => {
+  // `.catch` is not optional here: a rejected link poisons the chain, and every later `.then`
+  // would be skipped silently — turning one failed message into a worker that ignores all
+  // subsequent ones forever. handleMessage already reports its own errors, so swallowing here
+  // only keeps the chain alive.
+  queue = queue.then(() => handleMessage(event)).catch(() => {});
+};
+
+async function handleMessage({ data }) {
+  // Announced before anything is dispatched, so the page can see WHICH messages the worker
+  // actually received and in what order — the fact that no amount of reasoning could supply.
+  stage(`msg:${data.type}`);
   try {
     switch (data.type) {
       case "init": {
@@ -163,9 +187,20 @@ self.onmessage = async ({ data }) => {
         stage("create-memory", THREADED ? "shared/threaded" : "unshared/serial");
         const memory = createSharedMemory();
         wasmMemory = memory;
-        stage("instantiate");
+        stage(
+          "instantiate",
+          `threaded=${THREADED} pkg=${PKG_DIR} memory=${memory ? "made" : "null"} sab=${
+            typeof SharedArrayBuffer !== "undefined"
+          } isolated=${self.crossOriginIsolated}`,
+        );
         const exports = await init({ module_or_path: module, memory: memory ?? undefined });
         wasmMemory = exports?.memory ?? memory;
+        stage(
+          "instantiated",
+          `exports=${typeof exports} exportsMemory=${exports?.memory ? "yes" : "no"} bytes=${
+            wasmMemory?.buffer?.byteLength ?? -1
+          }`,
+        );
         // Arm ONLY if the memory the module actually instantiated against is shared. A build whose
         // memory is defined-and-exported rather than shared-and-imported silently ignores the
         // memory passed above, and every Worker would then get its own linear memory — the team's
@@ -283,4 +318,4 @@ self.onmessage = async ({ data }) => {
   } catch (error) {
     reply(data.type, { ok: false, error: String(error), requestId: data.requestId });
   }
-};
+}
