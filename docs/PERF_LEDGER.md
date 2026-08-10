@@ -30,6 +30,25 @@ tally_w_l_n: <wins/losses/neutrals for this lever>
 ## Local entries
 
 ```text
+PERF-005
+claim_id: wasm-packed-gemm-plus-codec-team
+evidence_id: site/harness/browser.mjs run 2026-08-10 (real Chromium 151 headless, real OPFS, real COOP/COEP, real 1.86 GB model over byte-Range); engine's own stage timing line, captured from the worker console
+status: PROVISIONAL_LOCAL_WIN (see cv_percent — single run, not an interleaved same-thermal-window pair)
+model_source_commit: 5d83992436eae1d760afd27aff78a71d676296fc
+fixture_sha256: not-applicable (end-to-end browser synthesis, not a fixture seam)
+artifact_sha256: qwen3-tts-12hz-0.6b-base.fttsq=597f7eb3314a2fe5be74fa10a6a3a28ace9e10e582c641deccd37348a0ccd824
+cpu_features: wasm32 simd128 (Int8Tier::WasmSimd128), 6-partition KernelTeam over SharedArrayBuffer, host Apple M4 Pro
+command_env: node site/harness/browser.mjs (site/pkg threaded build; text "The quick brown fox jumps over the lazy dog.")
+kill_switch: none single-lever — the packed kernel is the f32 fall-through itself; team dispatch is disarmed by a browser without crossOriginIsolated (which routes to site/pkg-serial), and the codec floor is `TEAM_FLOOR` in f32ref
+incumbent: the tree's own pre-lever wasm build, same model and route, measured with the same engine timing instrumentation (NOT a pinned external incumbent — this is a self-speedup and is labelled as maintenance-class per Doctrine #0.5, not a "faster than X" claim)
+before_after: codec 89,119 ms -> 6,773 ms (13.2x); talker+micro 7,641 ms -> 3,440 ms (2.2x); prefill 342 ms -> 137 ms; total 97.3 s -> 10.35 s (9.4x). Frame budget reshaped: codec 92% -> 65%, talker+micro 7.9% -> 33%
+cv_percent: NOT GATED — one run per side, different utterance lengths between the two measurements (5.12 s vs 3.20 s of audio). The per-stage ratios are like-for-like because both come from the same instrumented timing line, but no repeated interleaved pairs were taken. This row may NOT be quoted as a certified ratio until re-measured under the quiet-window protocol.
+equivalence: BIT-IDENTICAL to the scalar reference per element. `packed_matches_scalar_bit_for_bit` pins 11 shapes including k=0, k=1, tile-exact 4x8, NR/MR remainders and a multi-panel k=1024; `every_partition_count_reproduces_the_serial_bits` pins partitions 1/2/3/5/6/8 at real codec geometry (block_00 K=7168; transformer 512x512). Each output element accumulates ascending-k into its own slot, so blocking and partitioning change only WHICH element is computed WHEN. NOTE this TIGHTENS parity: the previous wasm fall-through used eight independent partial chains, a non-reference reduction order, so the browser now tracks the scalar reference more closely than before the lever.
+disposition: KEEP; context: ported from franken_numpy/crates/fnp-linalg (packed_gemm_serial_tiled), f64->f32, packing adapted to this project's [n,k] weight layout so no transpose is materialized. NE-004 ("register blocking is neutral, ~3%") does NOT apply — that was measured on int8 GEMV at m=1, where a packed panel has nothing to amortize over; the codec's im2col GEMMs have m>>1, which is the regime blocking exists for. All six codec GEMM sites funnel through f32ref::linear_with_accumulation, so one kernel upgraded every convolution, ConvNeXt pointwise pair and transformer projection at once.
+tally_w_l_n: 1/0/0
+```
+
+```text
 PERF-004
 claim_id: codec-dense-blas-form
 evidence_id: interleaved 3-round codec_time A/B 2026-08-09 + codec_decode_l2 ratchet re-pin; commit 9528cac

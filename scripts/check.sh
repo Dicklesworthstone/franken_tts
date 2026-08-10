@@ -186,6 +186,42 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 3c. The site actually loads and synthesizes IN A REAL BROWSER
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This gate exists because of a specific, expensive failure on 2026-08-10: a Node harness that
+# stubbed fetch, OPFS, Worker and navigator passed 8/8 of its cases while the deployed site hung on
+# every browser. The bug lived precisely in the gap between the stubs and reality — a `message`
+# posted before a module worker's top-level `await` completed was silently discarded, so the engine
+# never received `init`. Nothing that mocks the browser can find that.
+#
+# So this runs the real site in real Chromium: real OPFS, real Workers, real COOP/COEP served from
+# the shipped `site/_headers`, real byte-Range downloads of the real model. It asserts the page
+# becomes crossOriginIsolated, hydration walks its stages without stalling, the synthesize control
+# enables, and synthesis completes.
+#
+# Requirements are heavy (playwright + chromium + a populated ~/.cache/franken_tts/model), so a
+# missing prerequisite SKIPS loudly — never counted as a pass, per Doctrine #0.
+#
+# FTTS_SKIP_BROWSER_GATE=1 opts out for a quick iteration loop; the full run takes several minutes
+# because it downloads and hydrates 1.86 GB.
+stage_start "site loads + synthesizes in real Chromium"
+if [ "${FTTS_SKIP_BROWSER_GATE:-0}" = "1" ]; then
+    stage_skip "FTTS_SKIP_BROWSER_GATE=1; the browser end-to-end was NOT run"
+elif ! command -v node >/dev/null 2>&1; then
+    stage_skip "node not installed; browser end-to-end NOT run"
+elif [ ! -d "$HOME/.cache/franken_tts/model" ]; then
+    stage_skip "no local model cache; browser end-to-end NOT run"
+elif ! node -e "require.resolve('playwright')" >/dev/null 2>&1; then
+    stage_skip "playwright not installed (npm i playwright && npx playwright install chromium)"
+else
+    if ! node site/harness/browser.mjs; then
+        stage_fail "the site does not load or synthesize in a real browser"
+    fi
+    stage_pass
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 4. Formatting
 # ─────────────────────────────────────────────────────────────────────────────
 stage_start "cargo fmt --check"
