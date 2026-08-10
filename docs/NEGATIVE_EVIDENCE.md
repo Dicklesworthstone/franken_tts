@@ -37,6 +37,36 @@ what_exists: crates/ftts-kernels/src/int4.rs — symmetric per-output-channel W4
   extension. Four tests pass: bias cancellation exact vs a signed reference at k in
   {1,2,3,7,8,15,64,127,1024}; levels confined to [-7,7] with -8 never emitted; negation exact;
   packed storage exactly half of Q8.
+gate_a_RESULT: **FAILED, decisively.** Measured 2026-08-10 on M4 Pro (dispatched route
+  `neon-sdot`), release build, at the microdecoder's own shapes (hidden 1024, intermediate 3072,
+  16 Q / 8 KV heads x 128) at m = 1, 75 rounds = 15 depths x 5 layers, INTERLEAVED with 7 repeats
+  reporting the minimum per variant:
+
+    one layer, 75 rounds:  q8-scalar 18.9 ms | q4-scalar 418.8 ms | q8-route (SDOT) 18.8 ms
+    int4 vs scalar int8 .... 0.05x  (22x SLOWER)
+    int4 vs shipping int8 .. 0.04x  (25x SLOWER)
+    weight bytes per layer:  q8 15.7 MB -> q4 7.9 MB
+
+  A FIRST attempt timed the variants in sequential blocks and produced 98.60 ms for k_proj against
+  5.14 ms for v_proj — identical 1024x1024 shapes, 19x apart. That run is discarded as noise; only
+  the interleaved figures above are admissible, and under them k_proj/v_proj agree.
+
+why_it_lost (first principles): the unpack is not the halved traffic's junior partner, it is the
+  whole cost. Per weight the nibble path pays a mask, a shift, two i32 widenings and an
+  activation-sum update where Q8 pays one multiply-add — and, decisively, the byte-splitting loop
+  DEFEATS LLVM's autovectorizer. This is the same disease NE-001 recorded for the manual 8-lane
+  int8 loop (~15x slower than plain `Scalar`): the manual lane structure blocks the vectorizer
+  while the plain shape vectorizes to memory bandwidth. Corroborating datum from this same run:
+  q8-scalar (18.9 ms) and hand-written SDOT (18.8 ms) are indistinguishable at m = 1, which is
+  NE-INH-003 reproduced and says the int8 path is ALREADY at the bandwidth limit there. Halving the
+  bytes therefore cannot pay for a 22x compute penalty.
+
+do_not_retry_predicate: do NOT re-run the listening gate, and do NOT route int4, while the unpack
+  is scalar. The measurement above is the precondition; re-running it is only meaningful after an
+  in-register SIMD unpack exists (NEON: one 16-byte load, mask/shift into two i8 lanes, feed SDOT;
+  wasm: the v128 equivalent). That is NE-INH-004's documented escape clause and remains the ONLY
+  route by which this lever can come back.
+
 what_is_NOT_done: NOTHING ROUTES TO IT. Doctrine #2 requires BOTH gates before the microdecoder
   may select this path — (a) faster end-to-end on each target ISA INCLUDING unpack cost, measured
   not assumed, and (b) blind listeners cannot distinguish it under the equivalence-bound protocol
