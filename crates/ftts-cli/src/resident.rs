@@ -263,6 +263,14 @@ fn spawn_daemon(root: &Path) -> Option<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // Field diagnostics: the daemon's stderr is discarded by default; FTTS_RESIDENT_LOG
+    // routes it to a file instead, which is how a silent failure to serve gets a voice.
+    if let Ok(log) = std::env::var("FTTS_RESIDENT_LOG")
+        && let Ok(file) = fs::OpenOptions::new().create(true).append(true).open(&log)
+        && let Ok(err) = file.try_clone()
+    {
+        command.stdout(file).stderr(err);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -387,6 +395,10 @@ pub fn run_daemon(bundle_root: &Path) -> Result<(), FttsError> {
     listener
         .set_nonblocking(true)
         .map_err(|error| FttsError::Generic(format!("resident daemon socket mode: {error}")))?;
+    eprintln!(
+        "resident daemon serving {} on 127.0.0.1:{port}",
+        bundle.root.display()
+    );
 
     let idle = idle_period();
     let mut resident: Option<(LoadedModel, ftts_core::TtsEngine, (u64, u64))> = None;
@@ -401,6 +413,7 @@ pub fn run_daemon(bundle_root: &Path) -> Result<(), FttsError> {
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
+                    eprintln!("resident daemon idle exit");
                     let _ = fs::remove_file(&state_file);
                     return Ok(());
                 }
