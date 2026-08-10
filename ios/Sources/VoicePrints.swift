@@ -125,25 +125,49 @@ enum VoiceMath {
     }
 }
 
+/// How a glyph is drawn relative to its cohort. Absolute x-vectors are far more alike
+/// than they are different — every voice is "a human speaking" — so drawing them
+/// absolutely made every glyph look the same. What a viewer needs amplified is the
+/// DIFFERENCE from the average voice, and a color that mirrors the similarity map.
+struct GlyphContext {
+    /// Elementwise mean of every cohort member's pooled profile.
+    let meanProfile: [Double]
+    /// Typical per-bin deviation across the cohort, for normalizing amplitudes.
+    let deviationScale: Double
+    /// Hue from the voice's angle on the similarity map: neighbors share color.
+    let hue: Double
+    /// Saturation from distance to the map's center: outliers get vivid.
+    let saturation: Double
+}
+
 /// The glyph: a smoothed radial profile of the vector, with a palette from fixed
-/// projections. Pure function of the vector — identical input, identical picture.
+/// projections. Pure function of the vector (plus its cohort context, when the view
+/// shows many voices together) — identical input, identical picture.
 struct VoicePrintGlyph: View {
     let vector: [Float]
     var lineWidth: CGFloat = 1.6
+    var context: GlyphContext?
 
     private static let outerProjection = VoiceMath.projectionVector(dimension: 1024, seed: 0xF0A1)
     private static let innerProjection = VoiceMath.projectionVector(dimension: 1024, seed: 0xB007)
 
     var body: some View {
-        let profile = VoiceMath.pooledProfile(vector, bins: 72)
-        let hue = (atan2(
-            VoiceMath.project(vector, onto: Self.outerProjection),
-            VoiceMath.project(vector, onto: Self.innerProjection)
-        ) / (2 * .pi) + 0.5)
-        // The lab is emerald; voices claim the green-to-cyan-to-gold band around it so
-        // the constellation stays on-theme while distinct voices stay distinguishable.
-        let themedHue = 0.22 + hue * 0.28
-        let color = Color(hue: themedHue, saturation: 0.75, brightness: 0.95)
+        var profile = VoiceMath.pooledProfile(vector, bins: 72)
+        let color: Color
+        if let context {
+            // Cohort-relative: the silhouette is this voice's departure from the
+            // average voice, scaled so a typical departure reads clearly.
+            let scale = max(context.deviationScale, 1e-6)
+            profile = zip(profile, context.meanProfile).map { ($0 - $1) / scale }
+            color = Color(
+                hue: context.hue, saturation: context.saturation, brightness: 0.95)
+        } else {
+            let hue = (atan2(
+                VoiceMath.project(vector, onto: Self.outerProjection),
+                VoiceMath.project(vector, onto: Self.innerProjection)
+            ) / (2 * .pi) + 0.5)
+            color = Color(hue: 0.22 + hue * 0.28, saturation: 0.75, brightness: 0.95)
+        }
 
         return Canvas { context, size in
             let center = CGPoint(x: size.width / 2, y: size.height / 2)
