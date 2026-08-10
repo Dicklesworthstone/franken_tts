@@ -1,0 +1,15 @@
+# Paths the bug scanner must not judge, because we do not author them.
+#
+# `ubs --diff` is a gate on OUR changes. Generated artifacts land in the diff every time the wasm
+# is rebuilt, and scanning them produces findings nobody can act on: wasm-bindgen's glue uses
+# `__proto__: null` — the standard, SAFE null-prototype idiom — which the scanner reports as
+# prototype pollution. Suppressing a real finding would be dishonest; suppressing a scan of
+# machine-generated output whose source of truth is the Rust it came from is not.
+#
+# If the glue ever needs auditing, audit the generator or the Rust, not the emitted file.
+site/pkg/**
+site/pkg-serial/**
+
+# The vendored MP3 encoder is third-party, minified, and content-versioned; the same reasoning
+# applies — we can change which version we ship, never its contents.
+site/vendor/**
