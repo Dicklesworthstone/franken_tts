@@ -215,10 +215,19 @@ pub fn trailing_noise_samples_relative_to(
         return 0;
     }
 
-    // Trailing exact silence is model output, not artifact; keep it, and analyze what precedes it.
+    // Trailing silence is model output, not artifact; keep it, and analyze what precedes it.
+    //
+    // "Silence" is defined by AUDIBILITY, not by an exact zero bit pattern, and that distinction is
+    // load-bearing. This runs on the engine's raw f32, where the quiet tail is a run of tiny
+    // non-zero values that only become zeros when written as 16-bit PCM. Testing `!= 0.0` therefore
+    // found the last sample of the buffer, started the walk inside inaudible noise, and bailed
+    // immediately — the detector matched every WAV file it was validated against and did nothing at
+    // all in the live path. Half an i16 step is the honest threshold: below it, the sample rounds
+    // to zero in the file the listener actually gets.
+    const SILENCE_EPSILON: f32 = 0.5 / 32_767.0;
     let voiced_end = pcm
         .iter()
-        .rposition(|sample| *sample != 0.0)
+        .rposition(|sample| sample.abs() >= SILENCE_EPSILON)
         .map_or(0, |i| i + 1);
     if voiced_end < window * 4 {
         return 0;
@@ -742,6 +751,45 @@ mod holdback_tests {
         assert_eq!(
             u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]),
             0
+        );
+    }
+}
+
+#[cfg(test)]
+mod f32_silence_tests {
+    use super::*;
+
+    /// Trailing silence in the ENGINE's f32 output is not exact zeros: it is tiny values that only
+    /// become zeros when written as 16-bit PCM. A detector that tests `!= 0.0` matches every WAV
+    /// file it is validated against and then does nothing at all in the live path, which is exactly
+    /// what happened. This pins the audibility-based definition instead.
+    #[test]
+    fn inaudible_f32_tail_counts_as_silence() {
+        let sr = 24_000;
+        let mut pcm: Vec<f32> = (0..sr / 2)
+            .map(|i| 0.5 * (i as f32 * 2.0 * std::f32::consts::PI * 200.0 / sr as f32).sin())
+            .collect();
+        // The artifact: quiet, alternating-sign, high-frequency.
+        pcm.extend((0..2_400).map(|i| if i % 2 == 0 { 0.01 } else { -0.01 }));
+        // A tail that rounds to zero in i16 but is nowhere near 0.0 in f32.
+        pcm.extend((0..2_400).map(|i| if i % 2 == 0 { 1.0e-6 } else { -1.0e-6 }));
+
+        let trimmed = trailing_noise_samples(&pcm, sr as u32);
+        assert!(
+            trimmed > 0,
+            "an inaudible f32 tail must not hide the artifact behind it"
+        );
+
+        // And the same buffer rounded through i16 must agree, so the WAV-file validation and the
+        // live f32 path can never diverge again.
+        let rounded: Vec<f32> = pcm
+            .iter()
+            .map(|s| f32::from(sample_to_i16(*s)) / 32_767.0)
+            .collect();
+        let trimmed_rounded = trailing_noise_samples(&rounded, sr as u32);
+        assert_eq!(
+            trimmed, trimmed_rounded,
+            "f32 and i16-rounded views of the same audio must trim identically"
         );
     }
 }
