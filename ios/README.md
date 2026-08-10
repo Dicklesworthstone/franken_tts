@@ -34,3 +34,6 @@ Simulator builds are arm64-only (Apple Silicon hosts); an Intel host would need 
   device runs (delete the entitlement to run without it; synthesis then risks jetsam).
 - Real-time factor on A18-class hardware is unmeasured; the app shows the measured
   figure after each run and claims nothing else.
+- Shares export as M4A by default (AAC, an order of magnitude smaller than WAV) and as
+  a branded MP4 video rendered by the same Rust code behind `ftts make-video`, encoded
+  by the phone's hardware H.264/AAC encoders.

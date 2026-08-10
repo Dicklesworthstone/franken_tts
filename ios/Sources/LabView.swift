@@ -31,7 +31,12 @@ final class LabModel {
     var lastAudio: [Float]?
     var lastRealTimeFactor: Double?
     var player: AVAudioPlayer?
-    var shareUrl: URL?
+    /// The playback WAV (internal); shares go out as M4A and MP4.
+    var wavUrl: URL?
+    var m4aUrl: URL?
+    var videoUrl: URL?
+    var isExportingVideo = false
+    var videoProgress = 0.0
 
     var lowMemoryDevice: Bool {
         ProcessInfo.processInfo.physicalMemory < 6 * 1024 * 1024 * 1024
@@ -96,10 +101,43 @@ final class LabModel {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("franken_tts.wav")
         try wav.write(to: url)
-        shareUrl = url
+        wavUrl = url
+        m4aUrl = nil
+        videoUrl = nil
         try AVAudioSession.sharedInstance().setCategory(.playback)
         player = try AVAudioPlayer(contentsOf: url)
         player?.play()
+        // The share default is the small file; convert as soon as audio exists.
+        Task {
+            m4aUrl = try? await MediaExporter.exportM4A(fromWav: url)
+        }
+    }
+
+    /// The label stamped on the video's voice pill.
+    var currentVoiceLabel: String {
+        if let id = enrolledSelection(), let voice = library.voice(id: id) {
+            return voice.name
+        }
+        return selectedVoice.capitalized
+    }
+
+    func exportVideo() {
+        guard let wavUrl, let audio = lastAudio, !isExportingVideo else { return }
+        isExportingVideo = true
+        videoProgress = 0
+        let label = currentVoiceLabel
+        Task {
+            defer { isExportingVideo = false }
+            do {
+                videoUrl = try await MediaExporter.exportVideo(
+                    pcm: audio, voiceLabel: label, wavUrl: wavUrl
+                ) { [weak self] fraction in
+                    Task { @MainActor in self?.videoProgress = fraction }
+                }
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
     }
 
     var isEnrolling = false
@@ -480,11 +518,28 @@ struct LabView: View {
                         ) { _ in
                             playbackTick += 1
                         }
-                        if let url = model.shareUrl {
+                        if let url = model.m4aUrl ?? model.wavUrl {
+                            // M4A once the fast transcode lands; the WAV covers the gap.
                             ShareLink(item: url) {
-                                Text("Share WAV")
+                                Text(url.pathExtension == "m4a" ? "Share M4A" : "Share…")
                             }
                             .buttonStyle(GhostButtonStyle())
+                        }
+                        if let video = model.videoUrl {
+                            ShareLink(item: video) {
+                                Text("Share Video")
+                            }
+                            .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+                        } else if model.isExportingVideo {
+                            HStack(spacing: 6) {
+                                ProgressView().tint(Lab.emerald).controlSize(.small)
+                                Text("\(Int(model.videoProgress * 100))%")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(Lab.textSecondary)
+                            }
+                        } else {
+                            Button("Make video") { model.exportVideo() }
+                                .buttonStyle(GhostButtonStyle())
                         }
                         Spacer()
                         if let factor = model.lastRealTimeFactor {

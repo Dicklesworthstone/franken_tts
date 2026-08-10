@@ -627,3 +627,79 @@ mod tail_tests {
         assert_eq!(trailing_noise_samples(&tone(4096, 0.5), 0), 0);
     }
 }
+
+#[cfg(test)]
+mod holdback_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn tone(len: usize, amplitude: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| amplitude * (i as f32 * 2.0 * std::f32::consts::PI * 200.0 / 24_000.0).sin())
+            .collect()
+    }
+
+    fn write(pcm: &[f32], trimming: bool, chunk: usize) -> Vec<u8> {
+        let sink = Cursor::new(Vec::new());
+        let mut writer = if trimming {
+            WavWriter::new_trimming_tail(sink, SAMPLE_RATE_HZ).expect("header")
+        } else {
+            WavWriter::new(sink, SAMPLE_RATE_HZ).expect("header")
+        };
+        for packet in pcm.chunks(chunk) {
+            writer.write_samples(packet).expect("write");
+        }
+        writer.finish().expect("finish").into_inner()
+    }
+
+    /// Audio with no artifact must survive the hold-back path completely unchanged — same bytes,
+    /// same header — however it is packetized. The hold-back must be a delay, never a filter.
+    #[test]
+    fn clean_audio_is_byte_identical_through_the_holdback() {
+        let pcm = tone(24_000, 0.4);
+        let plain = write(&pcm, false, 1_920);
+        for chunk in [240, 1_920, 4_096, 24_000] {
+            assert_eq!(
+                write(&pcm, true, chunk),
+                plain,
+                "packet size {chunk} changed the bytes"
+            );
+        }
+    }
+
+    /// The header must describe what actually landed after a trim, or the file is corrupt in the
+    /// exact way this module exists to prevent.
+    #[test]
+    fn a_trimmed_file_has_a_header_matching_its_payload() {
+        let mut pcm = tone(24_000, 0.5);
+        let noise: Vec<f32> = (0..2_400)
+            .map(|i| if i % 2 == 0 { 0.01 } else { -0.01 })
+            .collect();
+        pcm.extend_from_slice(&noise);
+
+        let bytes = write(&pcm, true, 1_920);
+        let payload = bytes.len() - WAV_HEADER_BYTES;
+        let declared = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
+        assert_eq!(
+            declared, payload,
+            "data chunk size disagrees with the payload"
+        );
+        let riff = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        assert_eq!(riff, 36 + payload, "RIFF size disagrees with the payload");
+        assert!(
+            payload / 2 < pcm.len(),
+            "the artifact tail should have been removed"
+        );
+    }
+
+    /// An empty run must still produce a valid, playable, zero-length file.
+    #[test]
+    fn an_empty_run_still_finalizes() {
+        let bytes = write(&[], true, 1_920);
+        assert_eq!(bytes.len(), WAV_HEADER_BYTES);
+        assert_eq!(
+            u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]),
+            0
+        );
+    }
+}
