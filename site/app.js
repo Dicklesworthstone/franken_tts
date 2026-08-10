@@ -11,6 +11,7 @@ const ui = Object.fromEntries(
     "load-model",
     "dl-bar",
     "dl-status",
+    "memory-warning",
     "voice",
     "voice-character",
     "record",
@@ -274,22 +275,81 @@ let hydrateTotalBytes = 0;
 async function boot() {
   // Surface, don't just record: the breadcrumb only helps if somebody reads it back.
   const crash = reportPreviousCrash();
-  if (crash) {
-    ui.dlStatus.textContent = `Note: the previous visit ended during “${crash.stage}”.`;
-    clearStage();
-  }
+  clearStage();
+
   engineRoute = (await call("init"))?.route ?? "";
 
   // Persistence contract: the model downloads ONCE and stays in this browser's storage until
-  // "Clear model cache". When a complete cache exists, hydrate immediately on page open —
+  // "Clear model cache". When a complete cache exists the page normally hydrates on open —
   // consent is for the download, not for using what was already approved and downloaded.
+  //
+  // UNLESS the previous visit died during hydration. Auto-loading into a hydration that kills the
+  // tab makes the page unreachable: every visit re-crashes before anything can be clicked, so the
+  // user cannot even reach the button that clears the cache. That happened on an iPhone, and it is
+  // a trap of our own making — the cached model turns the site into a brick.
+  //
+  // A crash breadcrumb that names a hydration stage is therefore treated as a refusal to retry
+  // automatically. The user can still load deliberately, and is pointed at the standalone reset
+  // page, which loads no engine at all and so cannot crash for the same reason.
+  const crashedHydrating =
+    crash?.stage && !["compile-module", "create-memory", "instantiate"].includes(crash.stage);
   const cached = await cachedBytes();
+
+  if (crashedHydrating) {
+    ui.dlStatus.innerHTML =
+      `The previous visit stopped during <b>${crash.stage}</b>, so the model was not loaded ` +
+      `automatically this time. Press “Download &amp; load model…” to try again, or ` +
+      `<a href="reset.html">clear the cached model</a> if it keeps failing.`;
+    ui.loadModel.classList.remove("hidden");
+    ui.loadModel.disabled = false;
+    return;
+  }
+  if (crash) {
+    ui.dlStatus.textContent = `Note: the previous visit ended during “${crash.stage}”.`;
+  }
+
+  // Say the hard thing BEFORE the download, not after the tab dies.
+  //
+  // Hydration's resident set is ~2.45 GB, and that is not a tuning problem: 1.31 GB is the q8
+  // artifact (read in place, zero-copy), 0.70 GB the widened codec, and the remaining 0.34 GB is
+  // spread across 477 small f32 tensors with no dominant one. iOS Safari caps a tab well below
+  // that once its own overhead is counted, so on an iPhone this reliably kills the tab — after a
+  // 1.86 GB download the visitor has already paid for.
+  //
+  // The page still ALLOWS the attempt: it is the visitor's device, and the ceiling is a measured
+  // expectation rather than a certainty. It just refuses to spend someone's bandwidth on a likely
+  // crash without saying so first.
+  if (isMemoryConstrainedDevice()) {
+    ui.memoryWarning.innerHTML =
+      `<b>This device probably cannot run the playground.</b> Loading the model needs about ` +
+      `2.5 GB of memory at once, which is more than mobile Safari or Chrome allows one tab. ` +
+      `The download is 1.86 GB and the tab will most likely crash while loading. ` +
+      `A desktop browser will work.`;
+    ui.memoryWarning.classList.remove("hidden");
+  }
   if (cached >= TOTAL_BYTES) {
     ui.dlStatus.textContent = "Model cached. Verifying and loading…";
     await loadFromStore();
   } else if (cached > 0) {
     ui.dlStatus.textContent = `${gigabytes(cached)} GB of a partial download cached; click to resume.`;
   }
+}
+
+/// True on devices whose per-tab memory ceiling sits below what hydration needs.
+///
+/// Sniffs the platform rather than measuring, because there is no way to ASK a browser for its
+/// tab ceiling, and the one measurement available — allocating until it fails — IS the crash
+/// being avoided. iPadOS is caught by the touch test rather than the userAgent: it reports itself
+/// as "MacIntel", so a string check alone would miss every iPad.
+function isMemoryConstrainedDevice() {
+  const ua = navigator.userAgent;
+  const iOS =
+    /iPhone|iPad|iPod/.test(ua) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  if (iOS) return true;
+  // Android and small laptops. deviceMemory is coarse (rounded, capped at 8) and absent in
+  // Safari, so it can only ever ADD a warning here, never clear one.
+  return typeof navigator.deviceMemory === "number" && navigator.deviceMemory <= 4;
 }
 
 async function loadFromStore() {

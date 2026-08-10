@@ -20,6 +20,8 @@
 
 import { chromium, webkit } from "playwright";
 import path from "node:path";
+import fs from "node:fs/promises";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { serve } from "./serve.mjs";
 
@@ -50,8 +52,14 @@ console.log(`serving ${siteDir} on :${port}`);
 console.log(`  COOP=${headers["Cross-Origin-Opener-Policy"]} COEP=${headers["Cross-Origin-Embedder-Policy"]}`);
 
 console.log(`browser engine: ${ENGINE_NAME}`);
-const browser = await ENGINE.launch({ headless: !HEADED });
-const page = await browser.newPage();
+// PERSISTENT profile, and it is not optional. WebKit's OPFS needs a real storage directory: in an
+// ephemeral context the first `getFileHandle` fails with "operation failed for an unknown transient
+// reason", the download never starts, and the run looks like a site bug. Chromium tolerates the
+// ephemeral case, so testing only Chromium hides the difference — which is exactly how a WebKit
+// "stall" got mistaken for a real defect once already.
+const profile = await fs.mkdtemp(path.join(os.tmpdir(), `ftts-harness-${ENGINE_NAME}-`));
+const browser = await ENGINE.launchPersistentContext(profile, { headless: !HEADED });
+const page = browser.pages()[0] ?? (await browser.newPage());
 
 const transcript = [];
 page.on("console", (message) => {
@@ -69,7 +77,7 @@ page.on("worker", (worker) => {
   transcript.push(`[worker started] ${worker.url()}`);
   worker.on("close", () => transcript.push(`[worker CLOSED] ${worker.url()}`));
 });
-page.context().on("weberror", (error) => transcript.push(`[weberror] ${error.error().message}`));
+browser.on("weberror", (error) => transcript.push(`[weberror] ${error.error().message}`));
 page.on("requestfailed", (request) =>
   transcript.push(`[requestfailed] ${request.url()} ${request.failure()?.errorText}`),
 );

@@ -301,6 +301,14 @@
             </div>
             <div class="pg-progress mb-2"><div id="dl-bar"></div></div>
             <div class="pg-status mb-3" id="dl-status">Model not loaded.</div>
+            <!-- Shown only on devices measured to sit below hydration's ~2.5 GB resident set.
+                 Styled inline rather than with a new utility class: the site ships a COMPILED
+                 stylesheet, so a class invented here would silently render as nothing. -->
+            <div
+              class="pg-status mb-3 hidden"
+              id="memory-warning"
+              style="border: 1px solid currentColor; border-radius: 0.4rem; padding: 0.6rem 0.75rem"
+            ></div>
             <div class="flex flex-wrap gap-2">
               <button id="load-model" class="pg-btn primary">Download &amp; load model…</button>
               <button id="clear-cache" class="pg-btn danger" title="Remove the downloaded model from this browser's storage">Clear model cache</button>
