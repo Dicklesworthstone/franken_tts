@@ -60,11 +60,21 @@ function call(type, payload = {}, transfer = []) {
 // It lives here rather than in the Worker because Workers have no localStorage at all.
 const CRASH_KEY = "ftts-last-stage";
 
+const stageStarted = new Map();
+
 function recordStage(stage, detail) {
   try {
     localStorage.setItem(CRASH_KEY, JSON.stringify({ stage, detail, at: Date.now() }));
   } catch {
     /* private mode: diagnosis is best-effort, never a reason to fail the load */
+  }
+  // Show it too, not just record it. A page that says only "hydrating" for minutes is
+  // indistinguishable from a hung one — which is exactly the report this is here to answer.
+  // Naming the live stage turns "it never finishes" into "it is stuck in widen-codec".
+  stageStarted.set(stage, performance.now());
+  const status = document.getElementById("dl-status");
+  if (status) {
+    status.textContent = detail ? `${stage} — ${detail}` : stage;
   }
 }
 

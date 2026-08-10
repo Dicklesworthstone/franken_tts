@@ -27,7 +27,16 @@ function threadsAreSafeHere() {
 }
 
 const THREADED = threadsAreSafeHere();
-const PKG = THREADED ? "./pkg/ftts_wasm.js?v=@SITEV@" : "./pkg-serial/ftts_wasm.js?v=@SITEV@";
+
+/// The package directory for this engine, used for BOTH the glue and the binary.
+///
+/// One constant, deliberately: loading serial glue against the threaded binary instantiates a
+/// module that imports a shared memory without one being supplied. Instantiation fails, the glue's
+/// `wasm` binding is never assigned, and the first call surfaces as
+/// `undefined is not an object (evaluating 'wasm.modelstaging_new')` — a confusing error a long
+/// way from its cause. The two must never be able to disagree.
+const PKG_DIR = THREADED ? "./pkg" : "./pkg-serial";
+const PKG = `${PKG_DIR}/ftts_wasm.js?v=@SITEV@`;
 
 const {
   default: init,
@@ -91,6 +100,10 @@ function memoryBytes() {
 
 let wasmMemory = null;
 
+/// The module+memory captured at init, so the team can be armed AFTER hydration instead of before.
+/// See the note in the "init" case: arming first deadlocks shared-memory growth.
+let teamPending = null;
+
 /// Spawns the kernel Workers and arms the team with however many actually parked.
 ///
 /// The order matters and is the whole reason this is not one call: the control block is published
@@ -141,7 +154,7 @@ self.onmessage = async ({ data }) => {
   try {
     switch (data.type) {
       case "init": {
-        const wasmUrl = new URL("./pkg/ftts_wasm_bg.wasm?v=@SITEV@", import.meta.url);
+        const wasmUrl = new URL(`${PKG_DIR}/ftts_wasm_bg.wasm?v=@SITEV@`, import.meta.url);
         // Compile once and keep the module: kernel Workers must instantiate THE SAME module
         // against THE SAME memory, or they get their own linear memory and the team's shared
         // control block means nothing to them.
@@ -159,14 +172,25 @@ self.onmessage = async ({ data }) => {
         // control block would be a different object in each, the dispatcher would wait forever on
         // partitions that cannot report, and the page would hang instead of merely being slow.
         // Checking the instantiated buffer is the only honest test; the build flags are not.
-        const live = exports?.memory ?? memory;
-        const shared =
-          typeof SharedArrayBuffer !== "undefined" && live?.buffer instanceof SharedArrayBuffer;
-        const threads = shared ? await startTeam(module, live) : 1;
+        // The team is NOT armed here, and the ordering is the fix for a hard deadlock.
+        //
+        // Arming spawns kernel Workers that park inside Rust on `atomic.wait` for the life of the
+        // page. Hydration then asks dlmalloc for ~2 GB, which grows linear memory. Growing a
+        // SHARED memory has to coordinate every thread holding a view of it — and a thread parked
+        // in `atomic.wait` never reaches that point, so the grow never completes. The page hung
+        // forever inside `new ModelStaging(...)` with no error: reproduced in real Chromium, where
+        // `staging-detail` printed and `staging-ok` never did.
+        //
+        // It only ever bit threaded browsers, which is why the serial iOS build was unaffected and
+        // why every Node test missed it — those armed the team AFTER hydrating.
+        //
+        // So: all growth happens first, and the team is armed at the end of `load`, once the
+        // model is resident and linear memory has stopped moving.
+        teamPending = { module, memory: exports?.memory ?? memory };
         reply("init", {
           ok: true,
           presets: JSON.parse(presets()),
-          threads,
+          threads: 1,
           route: int8_route(),
         });
         break;
@@ -215,7 +239,20 @@ self.onmessage = async ({ data }) => {
           data.merges,
           data.tokenizerConfig,
         );
-        reply("load", { ok: true });
+        // Now that linear memory has finished growing, it is safe to park worker threads on it.
+        let threads = 1;
+        if (teamPending) {
+          const shared =
+            typeof SharedArrayBuffer !== "undefined" &&
+            teamPending.memory?.buffer instanceof SharedArrayBuffer;
+          if (shared) {
+            stage("arm-team");
+            threads = await startTeam(teamPending.module, teamPending.memory);
+          }
+          teamPending = null;
+        }
+        stage("ready", `threads=${threads}`);
+        reply("load", { ok: true, threads });
         break;
       }
       case "synthesize": {
