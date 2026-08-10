@@ -335,10 +335,7 @@ mod tests {
             "width {}",
             bitmap.width
         );
-        assert!(
-            bitmap.alpha.contains(&255),
-            "no fully-covered pixel"
-        );
+        assert!(bitmap.alpha.contains(&255), "no fully-covered pixel");
         let covered = bitmap.alpha.iter().filter(|&&a| a > 0).count();
         let total = bitmap.alpha.len();
         assert!(
