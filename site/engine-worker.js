@@ -38,6 +38,25 @@ const THREADED = threadsAreSafeHere();
 const PKG_DIR = THREADED ? "./pkg" : "./pkg-serial";
 const PKG = `${PKG_DIR}/ftts_wasm.js?v=@SITEV@`;
 
+// ── the inbox MUST be installed before the first `await` in this module ───────────────────────
+//
+// A module worker starts running its event loop while the module body is still evaluating. A
+// `message` event that arrives before `self.onmessage` exists is dispatched to nothing and is GONE
+// — it is not queued for a listener attached later. The dynamic `import` below is an await, so any
+// message posted during it lands in exactly that window.
+//
+// app.js posts `init` the instant it constructs the Worker, which is inside the window; `load`
+// arrives seconds later, after the handler exists, and survives. That asymmetry is the whole bug:
+// the engine only ever saw `load`, so the wasm glue was never bound, and `new ModelStaging(...)`
+// then hung on Chrome and threw `undefined is not an object (evaluating 'wasm.modelstaging_new')`
+// on iOS. One lost message, two unrecognizable symptoms, and a green Node test suite that never
+// loaded this file.
+//
+// So the handler goes in FIRST and buffers. Nothing here touches wasm; it only remembers.
+const inbox = [];
+let deliver = (event) => inbox.push(event);
+self.onmessage = (event) => deliver(event);
+
 const {
   default: init,
   WasmEngine,
@@ -162,14 +181,21 @@ function reply(type, payload, transfer = []) {
 ///
 /// Chaining onto the previous handler's promise makes the ordering guarantee explicit rather than
 /// depending on which message happens to win.
+// Real delivery, now that the glue is bound: strictly one message at a time, in arrival order.
+//
+// Serialization matters independently of the lost-message bug. `handleMessage` is async, so the
+// runtime would otherwise happily start `load` while `init` is still awaiting, and hydration would
+// run against a half-initialized module.
+//
+// `.catch` is not optional: a rejected link poisons the chain and every later `.then` is skipped
+// silently, turning one failed message into a worker that ignores all subsequent ones forever.
+// `handleMessage` reports its own errors, so swallowing here only keeps the chain alive.
 let queue = Promise.resolve();
-self.onmessage = (event) => {
-  // `.catch` is not optional here: a rejected link poisons the chain, and every later `.then`
-  // would be skipped silently — turning one failed message into a worker that ignores all
-  // subsequent ones forever. handleMessage already reports its own errors, so swallowing here
-  // only keeps the chain alive.
+deliver = (event) => {
   queue = queue.then(() => handleMessage(event)).catch(() => {});
 };
+// Drain whatever arrived while the module was still evaluating, in the order it arrived.
+for (const event of inbox.splice(0)) deliver(event);
 
 async function handleMessage({ data }) {
   // Announced before anything is dispatched, so the page can see WHICH messages the worker
