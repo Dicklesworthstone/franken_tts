@@ -233,7 +233,7 @@
       <span class="pg-chip">100% Rust</span>
       <span class="pg-chip">no Python, no PyTorch</span>
       <span class="pg-chip">1.4–1.6× real time native</span>
-      <span class="pg-chip">0.31× real time in the browser</span>
+      <span class="pg-chip">0.31–0.43× real time in the browser</span>
       <span class="pg-chip">28/28 layers verified</span>
       <span class="pg-chip">zero-shot voice cloning</span>
     </div>
@@ -360,9 +360,9 @@
           </p>
           <p id="error" class="pg-error hidden"></p>
           <p class="pg-note">
-            Speed, measured rather than estimated: this build synthesizes at about
-            <strong>0.31× real time</strong>, roughly 3.2 seconds of compute per second of speech,
-            so a sentence finishes in seconds and shows its progress while it works. The previous
+            Speed, measured rather than estimated: this build synthesizes at
+            <strong>0.31–0.43× real time</strong> across runs, so a sentence costs a few seconds
+            of compute per second of speech and shows its progress while it works. The previous
             single-threaded build managed 0.05×. The difference is a register-tiled packed GEMM
             and a six-partition kernel team, both bit-identical to the scalar reference. The
             native CLI runs the same engine faster than real time. Desktop browsers are the

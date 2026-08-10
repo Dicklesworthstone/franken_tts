@@ -34,3 +34,8 @@ docs/truth-pack/snapshots/gh/*
 __pycache__/
 *.pyc
 .oracle-venv/
+
+# Playwright and its browser downloads back the real-browser gate in site/harness/;
+# they are a developer dependency, never part of the shipped site.
+node_modules/
+package-lock.json

@@ -457,7 +457,7 @@ function buildLadder() {
   const rows = [
     { name: "f32 reference", value: 0.15, label: "≈0.15×", cls: "pg-lad-ref" },
     { name: "int8 + team", value: 1.5, label: "1.4–1.6×", cls: "" },
-    { name: "browser wasm", value: 0.31, label: "0.31×", cls: "pg-lad-ref" },
+    { name: "browser wasm", value: 0.31, label: "0.31–0.43×", cls: "pg-lad-ref" },
   ];
   for (const row of rows) {
     const line = document.createElement("div");
