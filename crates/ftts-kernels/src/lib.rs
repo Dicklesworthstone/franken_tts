@@ -24,6 +24,7 @@
 
 pub mod enhance;
 pub mod f32ref;
+pub mod int4;
 pub mod int8;
 pub mod mmap;
 pub mod packed_gemm;
