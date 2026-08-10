@@ -193,23 +193,30 @@ try {
         # that.
         $expected = $null
         $why = @()
-        try {
-            $sums = Get-RemoteText -Uri "$base/SHA256SUMS" -ProxyArgs $proxyArgs
-            foreach ($line in ($sums -split "`n")) {
-                if ($line -match '^\s*([0-9a-fA-F]{64})\s+[\* ]?(.+?)\s*$') {
-                    # sha256sum writes "hash  name", "hash *name" for binary mode, and manifests
-                    # generated from a directory walk often carry a "./" prefix. Compare on the
-                    # base name so a cosmetic difference in how the manifest was produced cannot
-                    # send us down the "no checksum published" path and refuse a good download.
-                    $listed = ($Matches[2] -replace '^\.[\\/]', '')
-                    if ((Split-Path -Leaf $listed) -eq $archive) {
-                        $expected = $Matches[1]
-                        break
+        $manifestNames = @('SHA256SUMS', 'SHA256SUMS.txt')
+        foreach ($manifestName in $manifestNames) {
+            if ($expected) { break }
+            try {
+                $sums = Get-RemoteText -Uri "$base/$manifestName" -ProxyArgs $proxyArgs
+                foreach ($line in ($sums -split "`n")) {
+                    if ($line -match '^\s*([0-9a-fA-F]{64})\s+[\* ]?(.+?)\s*$') {
+                        # sha256sum writes "hash  name", "hash *name" for binary mode, and manifests
+                        # generated from a directory walk often carry a "./" prefix. Compare on the
+                        # base name so a cosmetic difference in how the manifest was produced cannot
+                        # send us down the "no checksum published" path and refuse a good download.
+                        $listed = ($Matches[2] -replace '^\.[\\/]', '')
+                        if ((Split-Path -Leaf $listed) -eq $archive) {
+                            $expected = $Matches[1]
+                            break
+                        }
                     }
                 }
+                if (-not $expected) {
+                    $why += "${manifestName}: fetched but archive not listed"
+                }
+            } catch {
+                $why += "${manifestName}: $($_.Exception.Message)"
             }
-        } catch {
-            $why += "SHA256SUMS: $($_.Exception.Message)"
         }
         if (-not $expected) {
             try {
@@ -221,7 +228,7 @@ try {
         }
         if (-not $expected) {
             $detail = if ($why) { " Reason: " + ($why -join '; ') } else { ' Both were fetched but neither listed this file.' }
-            throw "No checksum published for $archive (neither SHA256SUMS nor $archive.sha256).$detail Refusing to install unverified binaries; pass -NoVerify to override."
+            throw "No checksum published for $archive (neither SHA256SUMS, SHA256SUMS.txt, nor $archive.sha256).$detail Refusing to install unverified binaries; pass -NoVerify to override."
         }
         Assert-Checksum -File $archivePath -Expected $expected
     }
