@@ -67,6 +67,15 @@ pub struct FrameRenderer {
     total_frames: usize,
 }
 
+// Frames are pure functions of (frame index, immutable renderer state), so hosts may
+// render several frames concurrently over one renderer. This assertion keeps that
+// property load-bearing: a future field with interior mutability must break the build,
+// not the iOS exporter that renders chunks in parallel.
+const _: fn() = || {
+    fn requires_sync<T: Sync>() {}
+    requires_sync::<FrameRenderer>();
+};
+
 impl FrameRenderer {
     /// Build a renderer over finished speech PCM (mono, any positive sample rate).
     ///
@@ -226,10 +235,11 @@ fn composite_overlay(rgb: &mut [u8], overlay: &raster::Surface) {
         .iter_mut()
         .zip(overlay.rgba.as_chunks::<4>().0.iter())
     {
-        let alpha = f32::from(source[3]) / 255.0;
-        if alpha <= 0.0 {
+        // Almost every overlay pixel is fully transparent; skip before any float work.
+        if source[3] == 0 {
             continue;
         }
+        let alpha = f32::from(source[3]) / 255.0;
         for c in 0..3 {
             let dst = f32::from(pixel[c]);
             let src = f32::from(source[c]);

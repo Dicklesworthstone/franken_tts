@@ -305,7 +305,22 @@ fn armed_native() -> Option<&'static Team> {
         for worker in 1..partitions {
             std::thread::Builder::new()
                 .name(format!("ftts-int8-{worker}"))
-                .spawn(move || worker_loop(shared, worker))
+                .spawn(move || {
+                    // On Apple platforms a thread without an elevated QoS class is fair
+                    // game for the efficiency cores. The team barrier waits for its
+                    // slowest member, so one demoted worker sets the pace of every
+                    // dispatch; ask for the same class the caller's UI work runs at.
+                    #[cfg(target_vendor = "apple")]
+                    // SAFETY: setting this thread's own QoS class; no memory contract.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        libc::pthread_set_qos_class_self_np(
+                            libc::qos_class_t::QOS_CLASS_USER_INITIATED,
+                            0,
+                        );
+                    }
+                    worker_loop(shared, worker)
+                })
                 .expect("spawn int8 worker");
         }
         Some(Team {
