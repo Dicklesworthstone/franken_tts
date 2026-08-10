@@ -297,7 +297,8 @@ function updateCharCount() {
 }
 ui.text.addEventListener("input", updateCharCount);
 
-// One-click sample texts; short on purpose, since a wasm sentence costs minutes.
+// One-click sample texts, kept short so a first try returns quickly. At 0.31x real time a
+// sentence is seconds of compute rather than the minutes the single-threaded build cost.
 const SAMPLE_TEXTS = [
   "Now is the time for all good men to come to the aid of the agents.",
   "When sunlight strikes raindrops in the air, they act as a prism and form a rainbow.",

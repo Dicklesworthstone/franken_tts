@@ -26,6 +26,34 @@ tally_local_w_l_n: <wins/losses/neutrals>
 
 ## Local entries
 
+```text
+NE-005
+claim_id: int4-microdecoder-arithmetic-landed-routing-not-decided
+status: OPEN OBLIGATION (not a rejection — recorded here so the gates are not quietly skipped)
+date: 2026-08-10
+what_exists: crates/ftts-kernels/src/int4.rs — symmetric per-output-channel W4A8, two biased
+  nibbles per byte, exact i32 accumulation with the +8 bias cancelled by ONE correction term
+  (`sum(x*nibble) - 8*sum(x)`) so the inner loop is mask/shift/MAC with no per-element sign
+  extension. Four tests pass: bias cancellation exact vs a signed reference at k in
+  {1,2,3,7,8,15,64,127,1024}; levels confined to [-7,7] with -8 never emitted; negation exact;
+  packed storage exactly half of Q8.
+what_is_NOT_done: NOTHING ROUTES TO IT. Doctrine #2 requires BOTH gates before the microdecoder
+  may select this path — (a) faster end-to-end on each target ISA INCLUDING unpack cost, measured
+  not assumed, and (b) blind listeners cannot distinguish it under the equivalence-bound protocol
+  (identity, naturalness, sibilance, breath, pitch stability, long-form prosody). Neither has been
+  run. A smaller file that runs slower or subtly damages speaker identity is a FAILED artifact.
+why_it_is_worth_gating_now: W11 measured the frame at codec 65% / talker+micro 33% after the
+  packed GEMM and kernel team took the codec down 13x. The microdecoder body is re-read 15x per
+  frame, so Q4 (~79 MB -> ~40 MB) is the one place cache residency is plausibly winnable. Before
+  2026-08-10 this lever targeted 7.9% of the frame; it now targets a third of it.
+honest_risk: 15 levels against 255 is ~17x the quantization step. `quantization_error_is_bounded_
+  by_the_level_step` asserts only that the quantizer is not BROKEN; it makes no claim that the
+  error is inaudible, and that distinction is the entire point of gate (b).
+do_not_retry_predicate: seq-16 speculative batching remains DEAD (NE-002, drafter ~1% acceptance).
+  Do not revive it as a way to amortize int4 unpack.
+```
+
+
 ### NE-003 wasm-simd128-is-a-1.8x-lever-not-a-4x-one
 
 `claim_id: wasm-int8-simd128-ceiling`; `evidence_id: scratchpad/bench.mjs — node 25, in-process interleaved ABBA, 7 pairs per shape, 40 rounds per timing, both routes same process/allocator/cache state`; `status: NEGATIVE (against the predicted magnitude; the tier itself is a KEEP)`; `model_source_commit: 5d83992436eae1d760afd27aff78a71d676296fc (weights not consumed; synthetic operands at pinned census shapes)`; `fixture_sha256: not-applicable`; `cpu_features: Apple M4 Pro, wasm32 + simd128 under V8`; `command_env: wasm-pack build --target nodejs --release with RUSTFLAGS=-C target-feature=+simd128; node bench.mjs`; `kill_switch: Int8Tier::Scalar remains dispatchable`; `before_after: scalar -> wasm-simd128, per-dot: k=1024/n=1024 299.9 -> 205.4 ns (1.49x); k=3072/n=1024 1026.6 -> 599.8 ns (1.71x); k=1024/n=3072 300.4 -> 204.2 ns (1.47x)`; `equivalence: exact i32 equality with Scalar by construction (every i8xi8 product fits i16, every pairwise sum fits i32, integer addition is associative)`; `killing_metric: per-dot wall time at real census shapes`; `disposition: KEEP the tier, REJECT the 4-8x estimate that motivated it`; `do_not_retry: do not budget more than ~2x for any SIMD128 int8 kernel on this instruction set — wasm has no int8 dot product, so the best available shape is 4 widenings + 2 i32x4.dot_i16x8_s + 2 adds per 16 bytes = 2.0 MACs/op against NEON SDOT's 16 MACs/instruction; the arithmetic ceiling with the activation widening hoisted is 2.67 MACs/op`; `tally_local_w_l_n: 0/1/0`.

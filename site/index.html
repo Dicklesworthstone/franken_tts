@@ -324,7 +324,7 @@
             </div>
             <p class="pg-note">
               Cloning first runs your recording through the built-in neural denoiser (the same
-              FastEnhancer port the CLI uses, described below), then the speaker encoder — so
+              FastEnhancer port the CLI uses, described below), then the speaker encoder, so
               laptop-mic hiss and room rumble never make it into the voice. The audio is discarded
               once the 4 KB voice vector exists. Clone only voices you have the right to use.
             </p>
@@ -360,13 +360,13 @@
           </p>
           <p id="error" class="pg-error hidden"></p>
           <p class="pg-note">
-            Speed honesty, measured: this multi-threaded WASM build synthesizes at roughly
-            <strong>0.31× real time</strong> — about 3.2 seconds of compute per second of speech,
-            so a sentence lands in seconds rather than minutes, with live progress. That is a
-            ~6× improvement over the previous single-threaded build's 0.05×, from a
-            register-tiled packed GEMM plus a six-partition kernel team, both bit-identical to
-            the scalar reference. The native CLI runs the same engine faster than real time.
-            Desktop browsers only: the engine needs several GB of memory.
+            Speed, measured rather than estimated: this build synthesizes at about
+            <strong>0.31× real time</strong>, roughly 3.2 seconds of compute per second of speech,
+            so a sentence finishes in seconds and shows its progress while it works. The previous
+            single-threaded build managed 0.05×. The difference is a register-tiled packed GEMM
+            and a six-partition kernel team, both bit-identical to the scalar reference. The
+            native CLI runs the same engine faster than real time. Desktop browsers are the
+            tested path; the engine needs several GB of memory either way.
           </p>
         </div>
       </div>
@@ -602,9 +602,9 @@
       </div>
       <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">What It Took to Run in a <span class="text-emerald-400">Tab</span>.</h2>
       <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        WebAssembly hands the engine one thread, no memory mapping, no BLAS, no clock in the
-        standard library, and a hard 4 GB ceiling. Getting a 2 GB model to speak under those
-        rules took four separate fixes, each found the hard way. Step through them.
+        WebAssembly offers no memory mapping, no BLAS, no clock in the standard library, threads
+        only behind cross-origin isolation, and a hard 4 GB ceiling. Getting a 2 GB model to speak
+        under those rules took six separate fixes, every one of them found the hard way.
       </p>
     </div>
 
@@ -631,9 +631,9 @@
         <p class="pg-note">The cross-origin isolation headers this page serves unlock
         SharedArrayBuffer, and the engine's kernel team now runs on it: six persistent worker
         partitions over disjoint output columns, so the parallel result is bit-identical to the
-        serial one per element. Apple devices get an unshared-memory serial build instead —
+        serial one per element. Apple devices get an unshared-memory serial build instead, because
         growing a shared wasm memory reclaims the tab on iOS. Relaxed SIMD and an int4
-        microdecoder are the remaining tracked path toward real time in the tab.</p>
+        microdecoder are what still stand between this and real time in the tab.</p>
       </div>
     </div>
   </section>
@@ -742,10 +742,9 @@
         A cloned voice inherits the recording it came from, noise and all: enroll next to a fan
         and every sentence the clone ever speaks carries the fan. So enrollment now cleans the
         reference automatically, in the CLI and in this playground, using a pure-Rust port of
-        FastEnhancer&#8209;S, a 207&#8239;K&#8209;parameter speech-enhancement network. The practical effect is
-        hard to overstate: an ordinary iPhone voice memo enrolls sounding like it was recorded in
-        a treated studio, with no audible noise floor, and every future utterance in that voice
-        keeps that cleanliness.
+        FastEnhancer&#8209;S, a 207&#8239;K&#8209;parameter speech-enhancement network. In practice an ordinary
+        iPhone voice memo enrolls sounding like it was recorded in a treated studio, with no
+        audible noise floor, and every later utterance in that voice keeps that cleanliness.
       </p>
     </div>
 

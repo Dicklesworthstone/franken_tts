@@ -66,6 +66,11 @@ export class ModelStaging {
      *
      * Throws when the staged bytes are short of what was reserved, or when the checkpoint does
      * not parse.
+     *
+     * Gated off unix for the same reason as the constructors below: `SafetensorsFile::from_bytes`
+     * is the byte-oriented loader that exists only where there is no filesystem. Native hosts go
+     * through the CLI's path-based loader instead, so this arm simply does not exist there — and
+     * the workspace's `--all-targets` check compiles this crate natively, which is what caught it.
      */
     finish_codec(): void;
     /**

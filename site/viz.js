@@ -457,7 +457,7 @@ function buildLadder() {
   const rows = [
     { name: "f32 reference", value: 0.15, label: "≈0.15×", cls: "pg-lad-ref" },
     { name: "int8 + team", value: 1.5, label: "1.4–1.6×", cls: "" },
-    { name: "browser wasm", value: 0.04, label: "0.03–0.05×", cls: "pg-lad-ref" },
+    { name: "browser wasm", value: 0.31, label: "0.31×", cls: "pg-lad-ref" },
   ];
   for (const row of rows) {
     const line = document.createElement("div");
@@ -485,7 +485,7 @@ function buildLadder() {
   key.className = "pg-note";
   key.style.marginTop = "0.6rem";
   key.innerHTML = 'The <span style="color:#fbbf24">amber line</span> is 1× real time: audio produced exactly as fast as it plays. ' +
-    'The f32 route is 6–7× slower than real time by design; the wasm figure is single-threaded.';
+    'The f32 route is 6–7× slower by design. The browser figure is a six-partition wasm build with a packed GEMM.';
   ladder.appendChild(key);
 
   onceVisible(ladder, () => {
@@ -546,8 +546,35 @@ function buildStepper() {
         "a single running sum compiles to a scalar chain no SIMD unit can help.",
       fix: "Restructure the sum into eight independent partial lanes the compiler can " +
         "vectorize, and route the codec through an int8 arm whose integer sums reorder freely. " +
-        "Codec decode fell from 119.9 s to 9.5 s, and the page now measures 0.03–0.05× real " +
-        "time on one thread.",
+        "Codec decode fell from 119.9 s to 9.5 s.",
+    },
+    {
+      title: "The codec was 92% of the frame",
+      stat: "codec 89.1 s → 6.8 s",
+      symptom: "Threads landed and nothing got faster. The kernel team covered the talker and " +
+        "microdecoder, which together account for 8% of the time.",
+      diagnosis: "Per-stage timing in a real browser put 89.1 s of a 97.3 s frame in the codec. " +
+        "Off macOS there is no BLAS, so every convolution and projection fell through to a " +
+        "dot product per output element: the activation row re-read once per column, no weight " +
+        "reused, five worker threads parked throughout.",
+      fix: "A register-tiled GEMM with packed weight panels, holding an MR×NR output tile in " +
+        "registers while one k-panel streams past, then partitioned across six threads by " +
+        "output column. Every codec matmul reaches one function, so both changes landed " +
+        "everywhere at once. Each element still sums in ascending k, so the result is " +
+        "bit-identical to the scalar reference.",
+    },
+    {
+      title: "One message, silently dropped",
+      stat: "every browser, no error",
+      symptom: "The page downloaded 1.86 GB, printed one hydration stage, and sat there. " +
+        "Safari threw a null-property error instead. Neither had a stack trace worth reading.",
+      diagnosis: "A module worker starts its event loop while the module is still evaluating. " +
+        "Splitting the build for iOS added a top-level await, and the init message posted at " +
+        "construction landed in that window, dispatched to no listener and gone. Messages " +
+        "sent later arrived normally, so the engine only ever saw the second one.",
+      fix: "Install the handler before the first await and buffer until the glue is bound. " +
+        "Found by printing every message type on arrival, after five wrong theories: the log " +
+        "read msg:load and nothing else.",
     },
   ];
 
