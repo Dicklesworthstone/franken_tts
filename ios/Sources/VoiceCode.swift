@@ -41,6 +41,7 @@ enum VoiceCode {
 
     private static let finderSpan = 7 // finder pattern cells, plus a 1-cell separator
     private static let calibrationRow = 8
+    private static let calibrationColumn = 8
 
     // ------------------------------------------------------------------ layout
 
@@ -53,13 +54,22 @@ enum VoiceCode {
         return false
     }
 
-    private static func isReserved(row: Int, column: Int) -> Bool {
-        row == calibrationRow || inFinderZone(row: row, column: column)
+    /// The calibration column pins the VERTICAL scale the way the row pins the
+    /// horizontal one; it runs between the top-left and bottom-left zones.
+    private static func inCalibrationColumn(row: Int, column: Int) -> Bool {
+        column == calibrationColumn && row > calibrationRow
+            && row < gridN - finderSpan - 1
     }
 
-    /// Level for a reserved cell: finder rings or the known calibration pattern.
+    private static func isReserved(row: Int, column: Int) -> Bool {
+        row == calibrationRow || inCalibrationColumn(row: row, column: column)
+            || inFinderZone(row: row, column: column)
+    }
+
+    /// Level for a reserved cell: finder rings or the known calibration patterns.
     private static func reservedLevel(row: Int, column: Int) -> Int {
         if row == calibrationRow { return column % 4 }
+        if inCalibrationColumn(row: row, column: column) { return row % 4 }
         // Local coordinates within whichever finder square this is.
         var r = row
         var c = column
@@ -104,6 +114,7 @@ enum VoiceCode {
                 coded.append(blocksOut[block][position])
             }
         }
+        whiten(&coded)
 
         var pixels = [UInt8](repeating: 0, count: cardSize * cardSize * 3)
         let background = levels[0]
@@ -125,12 +136,30 @@ enum VoiceCode {
                     level = (byte >> shift) & 0b11
                     bitCursor += 2
                 } else {
-                    level = (row &+ column) % 4 // deterministic filler
+                    // Deterministic filler, hashed so it blends with the data field.
+                    var hash = UInt64(row * gridN + column) &* 0x9E37_79B9_7F4A_7C15
+                    hash ^= hash >> 29
+                    hash = hash &* 0xBF58_476D_1CE4_E5B9
+                    level = Int(hash >> 62)
                 }
                 paintCell(&pixels, row: row, column: column, level: level)
             }
         }
         return pixels
+    }
+
+    /// XOR the coded stream with a fixed pseudo-random mask. The floats in the
+    /// payload repeat byte patterns that would otherwise show as visible stripes,
+    /// and a pathological payload could produce large flat regions that starve the
+    /// decoder's threshold estimate — masking keeps the field uniformly mixed.
+    private static func whiten(_ bytes: inout [UInt8]) {
+        var state: UInt64 = 0x5DEE_CE66_D1CE_F001
+        for index in bytes.indices {
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            bytes[index] ^= UInt8(truncatingIfNeeded: state >> 32)
+        }
     }
 
     private static func paintCell(_ pixels: inout [UInt8], row: Int, column: Int, level: Int) {
@@ -156,14 +185,14 @@ enum VoiceCode {
         guard width >= gridN, height >= gridN, pixels.count >= width * height * 3 else {
             return nil
         }
-        var luma = [Double](repeating: 0, count: width * height)
+        var luma = [Float](repeating: 0, count: width * height)
         var minLuma = 255.0
         var maxLuma = 0.0
         for index in 0..<(width * height) {
             let at = index * 3
             let value = 0.299 * Double(pixels[at]) + 0.587 * Double(pixels[at + 1])
                 + 0.114 * Double(pixels[at + 2])
-            luma[index] = value
+            luma[index] = Float(value)
             minLuma = min(minLuma, value)
             maxLuma = max(maxLuma, value)
         }
@@ -172,66 +201,166 @@ enum VoiceCode {
 
         let finders = findFinderPatterns(
             luma: luma, width: width, height: height, threshold: threshold)
-        guard let (topLeft, topRight, bottomLeft) = pickFinderTriple(finders) else {
-            return nil
+        // Data cells can imitate a finder by chance, so several plausible triples may
+        // exist; try them best-first — the calibration fit and the CRC reject impostor
+        // grids, so the first one that decodes is the real one.
+        for triple in rankFinderTriples(finders) {
+            if let decoded = decodeGrid(
+                triple: triple, luma: luma, width: width, height: height,
+                threshold: threshold) {
+                return decoded
+            }
+        }
+        return nil
+    }
+
+    private static func decodeGrid(
+        triple: (FinderCandidate, FinderCandidate, FinderCandidate),
+        luma: [Float], width: Int, height: Int, threshold: Double
+    ) -> (String, [Float])? {
+        func bilinear(_ x: Double, _ y: Double) -> Double {
+            let cx = min(max(x, 0), Double(width - 1))
+            let cy = min(max(y, 0), Double(height - 1))
+            let x0 = min(Int(cx), width - 2)
+            let y0 = min(Int(cy), height - 2)
+            let fx = cx - Double(x0)
+            let fy = cy - Double(y0)
+            let a = Double(luma[y0 * width + x0])
+            let b = Double(luma[y0 * width + x0 + 1])
+            let c = Double(luma[(y0 + 1) * width + x0])
+            let d = Double(luma[(y0 + 1) * width + x0 + 1])
+            return a * (1 - fx) * (1 - fy) + b * fx * (1 - fy)
+                + c * (1 - fx) * fy + d * fx * fy
         }
 
-        // Grid geometry from the finder centers: cell k's center sits at (k + 0.5)
-        // cell-units; the finder centers sit at 3.5 and gridN − 3.5.
+        /// Sub-pixel refinement of a finder center: brightness-weighted centroid over
+        /// a symmetric window that covers the finder but stops inside its separator.
+        func refined(_ finder: FinderCandidate) -> (x: Double, y: Double) {
+            let reach = finder.module * 3.4
+            let x0 = max(Int((finder.x - reach).rounded()), 0)
+            let x1 = min(Int((finder.x + reach).rounded()), width - 1)
+            let y0 = max(Int((finder.y - reach).rounded()), 0)
+            let y1 = min(Int((finder.y + reach).rounded()), height - 1)
+            guard x1 > x0, y1 > y0 else { return (finder.x, finder.y) }
+            var weightSum = 0.0
+            var sumX = 0.0
+            var sumY = 0.0
+            for y in y0...y1 {
+                for x in x0...x1 {
+                    let weight = max(Double(luma[y * width + x]) - threshold, 0)
+                    weightSum += weight
+                    sumX += weight * Double(x)
+                    sumY += weight * Double(y)
+                }
+            }
+            guard weightSum > 0 else { return (finder.x, finder.y) }
+            return (sumX / weightSum, sumY / weightSum)
+        }
+
+        let topLeft = refined(triple.0)
+        let topRight = refined(triple.1)
+        let bottomLeft = refined(triple.2)
+
+        // Grid geometry: cell k's center sits at (k + 0.5) cell-units from the region
+        // edge; the finder centers sit at cell coordinate 3.5 and gridN − 3.5.
         let centerSpan = Double(gridN - finderSpan)
         let cellW = (topRight.x - topLeft.x) / centerSpan
         let cellH = (bottomLeft.y - topLeft.y) / centerSpan
-        guard cellW > 0.8, cellH > 0.8 else { return nil } // below ~1 px/cell is gone
-        let originX = topLeft.x - 3.5 * cellW
-        let originY = topLeft.y - 3.5 * cellH
+        guard cellW > 1.2, cellH > 1.2 else { return nil } // near 1 px/cell is gone
 
-        func sample(row: Double, column: Double, dx: Double, dy: Double) -> Double {
-            let x = originX + (column + 0.5) * cellW + dx
-            let y = originY + (row + 0.5) * cellH + dy
-            let xi = min(max(Int(x.rounded()), 0), width - 1)
-            let yi = min(max(Int(y.rounded()), 0), height - 1)
-            var sum = 0.0
-            var count = 0.0
-            let reach = cellW >= 3 ? 1 : 0
-            for oy in -reach...reach {
-                for ox in -reach...reach {
-                    let sx = min(max(xi + ox, 0), width - 1)
-                    let sy = min(max(yi + oy, 0), height - 1)
-                    sum += luma[sy * width + sx]
-                    count += 1
-                }
-            }
-            return sum / count
-        }
-
-        // Calibration row: learn the four levels as they survived compression, and
-        // refine registration with a small offset search (units of the cell size).
-        var best: (score: Double, dx: Double, dy: Double, means: [Double])?
-        for dyStep in -3...3 {
-            for dxStep in -3...3 {
-                let dx = Double(dxStep) * cellW * 0.12
-                let dy = Double(dyStep) * cellH * 0.12
-                var sums = [Double](repeating: 0, count: 4)
-                var counts = [Double](repeating: 0, count: 4)
-                for column in 0..<gridN {
-                    let value = sample(
-                        row: Double(calibrationRow), column: Double(column), dx: dx, dy: dy)
-                    sums[column % 4] += value
-                    counts[column % 4] += 1
-                }
-                let means = zip(sums, counts).map { $0 / max($1, 1) }
-                let gaps = [means[1] - means[0], means[2] - means[1], means[3] - means[2]]
-                let score = gaps.min() ?? -1
-                if score > (best?.score ?? -.infinity) {
-                    best = (score, dx, dy, means)
-                }
+        // Cells much bigger than the resampling blur average well over a small
+        // footprint; cells near 3 px are only trustworthy at their very center. Try
+        // the footprint suited to this scale first, the other as a fallback.
+        let footprints = cellW < 4.5 ? [0.0, 0.22] : [0.22, 0.0]
+        for footprint in footprints {
+            if let decoded = attempt(footprint: footprint) {
+                return decoded
             }
         }
-        guard let fit = best, fit.score > 4 else { return nil }
+        return nil
+
+        /// One full fit + sample + error-correct pass with a fixed sample footprint.
+        func attempt(footprint: Double) -> (String, [Float])? {
+
+        /// Matched box sample of one cell, anchored at the top-left finder so a scale
+        /// tweak grows outward from a fixed point.
+        func sample(
+            row: Double, column: Double,
+            scaleX: Double, scaleY: Double, dx: Double, dy: Double
+        ) -> Double {
+            let x = topLeft.x + (column - 3.0) * cellW * scaleX + dx
+            let y = topLeft.y + (row - 3.0) * cellH * scaleY + dy
+            guard footprint > 0 else { return bilinear(x, y) }
+            let rx = cellW * footprint
+            let ry = cellH * footprint
+            return (bilinear(x, y)
+                + bilinear(x - rx, y - ry) + bilinear(x + rx, y - ry)
+                + bilinear(x - rx, y + ry) + bilinear(x + rx, y + ry)) / 5
+        }
+
+        /// Fit one axis against its known calibration strip: search a small offset and
+        /// scale range. The score is separation between adjacent levels MINUS the
+        /// spread within each level — a misaligned grid still averages to clean means
+        /// (the strip repeats every four flat cells) but bleeds neighboring cells into
+        /// individual samples, and the variance term is what catches that.
+        func fitAxis(
+            horizontal: Bool
+        ) -> (score: Double, scale: Double, offset: Double, means: [Double])? {
+            var best: (score: Double, scale: Double, offset: Double, means: [Double])?
+            for scaleStep in -3...3 {
+                let scale = 1.0 + Double(scaleStep) * 0.0018
+                for offsetStep in -4...4 {
+                    let offset = Double(offsetStep) * (horizontal ? cellW : cellH) * 0.1
+                    var sums = [Double](repeating: 0, count: 4)
+                    var squares = [Double](repeating: 0, count: 4)
+                    var counts = [Double](repeating: 0, count: 4)
+                    if horizontal {
+                        for column in 0..<gridN {
+                            let value = sample(
+                                row: Double(calibrationRow), column: Double(column),
+                                scaleX: scale, scaleY: 1, dx: offset, dy: 0)
+                            sums[column % 4] += value
+                            squares[column % 4] += value * value
+                            counts[column % 4] += 1
+                        }
+                    } else {
+                        for row in (calibrationRow + 1)..<(gridN - finderSpan - 1) {
+                            let value = sample(
+                                row: Double(row), column: Double(calibrationColumn),
+                                scaleX: 1, scaleY: scale, dx: 0, dy: offset)
+                            sums[row % 4] += value
+                            squares[row % 4] += value * value
+                            counts[row % 4] += 1
+                        }
+                    }
+                    let means = zip(sums, counts).map { $0 / max($1, 1) }
+                    var spread = 0.0
+                    for level in 0..<4 {
+                        let count = max(counts[level], 1)
+                        let variance = max(
+                            squares[level] / count - means[level] * means[level], 0)
+                        spread += variance.squareRoot() / 4
+                    }
+                    let gaps = [
+                        means[1] - means[0], means[2] - means[1], means[3] - means[2],
+                    ]
+                    let score = (gaps.min() ?? -1) - 2 * spread
+                    if score > (best?.score ?? -.infinity) {
+                        best = (score, scale, offset, means)
+                    }
+                }
+            }
+            return best
+        }
+
+        guard let fitX = fitAxis(horizontal: true), fitX.score > 4,
+            let fitY = fitAxis(horizontal: false), fitY.score > 4
+        else { return nil }
+        let means = zip(fitX.means, fitY.means).map { ($0 + $1) / 2 }
         let thresholds = [
-            (fit.means[0] + fit.means[1]) / 2,
-            (fit.means[1] + fit.means[2]) / 2,
-            (fit.means[2] + fit.means[3]) / 2,
+            (means[0] + means[1]) / 2,
+            (means[1] + means[2]) / 2,
+            (means[2] + means[3]) / 2,
         ]
 
         // Sample every data cell in layout order.
@@ -244,7 +373,8 @@ enum VoiceCode {
                 if isReserved(row: row, column: column) { continue }
                 if bitCursor + 2 > totalBits { break outer }
                 let value = sample(
-                    row: Double(row), column: Double(column), dx: fit.dx, dy: fit.dy)
+                    row: Double(row), column: Double(column),
+                    scaleX: fitX.scale, scaleY: fitY.scale, dx: fitX.offset, dy: fitY.offset)
                 var level = 0
                 for threshold in thresholds where value > threshold {
                     level += 1
@@ -255,7 +385,8 @@ enum VoiceCode {
             }
         }
 
-        // De-interleave and correct each block.
+        // Unmask, then de-interleave and correct each block.
+        whiten(&coded)
         var plaintext = [UInt8]()
         for block in 0..<blocks {
             var received = [UInt8]()
@@ -266,6 +397,7 @@ enum VoiceCode {
             plaintext += corrected.prefix(dataBytesPerBlock)
         }
         return parse(plaintext)
+        }
     }
 
     // ------------------------------------------------------------------ finder search
@@ -280,7 +412,7 @@ enum VoiceCode {
     /// Scan rows for the bright-dark-bright(3)-dark-bright 1:1:3:1:1 run signature,
     /// verify each hit vertically, and cluster the survivors.
     private static func findFinderPatterns(
-        luma: [Double], width: Int, height: Int, threshold: Double
+        luma: [Float], width: Int, height: Int, threshold: Double
     ) -> [FinderCandidate] {
         var candidates = [FinderCandidate]()
         let rowStep = max(1, height / 700)
@@ -297,7 +429,7 @@ enum VoiceCode {
         /// Vertical confirmation at a candidate x: bright core of ~3 modules with a
         /// dark ring then a bright ring above and below. Returns center y and module.
         func verticalCheck(x: Int, y: Int, module: Double) -> (Double, Double)? {
-            func bright(_ yy: Int) -> Bool { luma[yy * width + x] > threshold }
+            func bright(_ yy: Int) -> Bool { Double(luma[yy * width + x]) > threshold }
             guard bright(y) else { return nil }
             let limit = Int(module * 6) + 2
             var top = y
@@ -336,10 +468,10 @@ enum VoiceCode {
             let rowBase = y * width
             var runs = [Double]()
             var runIsBright = [Bool]()
-            var current = luma[rowBase] > threshold
+            var current = Double(luma[rowBase]) > threshold
             var length = 1.0
             for x in 1..<width {
-                let bright = luma[rowBase + x] > threshold
+                let bright = Double(luma[rowBase + x]) > threshold
                 if bright == current {
                     length += 1
                 } else {
@@ -388,13 +520,21 @@ enum VoiceCode {
         return candidates.filter { $0.votes >= 2 }
     }
 
-    /// Choose the (topLeft, topRight, bottomLeft) triple: axis-aligned arms of similar
-    /// length meeting at the corner, with consistent module sizes.
-    private static func pickFinderTriple(
+    /// Rank plausible (topLeft, topRight, bottomLeft) triples, best first. The layout
+    /// itself is the constraint: arms are axis-aligned, near-equal (shared images keep
+    /// their aspect), and exactly gridN − finderSpan cells long, so each arm must be
+    /// about 137× the finder's own module size.
+    private static func rankFinderTriples(
         _ candidates: [FinderCandidate]
-    ) -> (FinderCandidate, FinderCandidate, FinderCandidate)? {
-        guard candidates.count >= 3 else { return nil }
-        var best: (score: Double, triple: (FinderCandidate, FinderCandidate, FinderCandidate))?
+    ) -> [(FinderCandidate, FinderCandidate, FinderCandidate)] {
+        guard candidates.count >= 3 else { return [] }
+        // The search below is cubic; a busy photo can spawn hundreds of accidental
+        // candidates, so rank only the most-voted few dozen.
+        let candidates = Array(
+            candidates.sorted { $0.votes > $1.votes }.prefix(48))
+        let armCells = Double(gridN - finderSpan)
+        var ranked =
+            [(score: Double, triple: (FinderCandidate, FinderCandidate, FinderCandidate))]()
         for i in 0..<candidates.count {
             for j in 0..<candidates.count where j != i {
                 for k in 0..<candidates.count where k != i && k != j {
@@ -407,21 +547,24 @@ enum VoiceCode {
                     let lengthX = (armX.0 * armX.0 + armX.1 * armX.1).squareRoot()
                     let lengthY = (armY.0 * armY.0 + armY.1 * armY.1).squareRoot()
                     guard lengthX > 10, lengthY > 10 else { continue }
-                    guard abs(armX.1) < lengthX * 0.15, abs(armY.0) < lengthY * 0.15,
-                        lengthX / lengthY > 0.6, lengthX / lengthY < 1.7
+                    guard abs(armX.1) < lengthX * 0.1, abs(armY.0) < lengthY * 0.1,
+                        lengthX / lengthY > 0.9, lengthX / lengthY < 1.11
                     else { continue }
                     let modules = [corner.module, right.module, down.module]
                     let moduleSpread = (modules.max() ?? 1) / max(modules.min() ?? 1, 0.1)
-                    guard moduleSpread < 2 else { continue }
+                    guard moduleSpread < 1.5 else { continue }
+                    let meanModule = modules.reduce(0, +) / 3
+                    let armError = max(
+                        abs(lengthX / (meanModule * armCells) - 1),
+                        abs(lengthY / (meanModule * armCells) - 1))
+                    guard armError < 0.25 else { continue }
                     let score = Double(corner.votes + right.votes + down.votes)
-                        - moduleSpread
-                    if score > (best?.score ?? -.infinity) {
-                        best = (score, (corner, right, down))
-                    }
+                        - moduleSpread - armError * 10
+                    ranked.append((score, (corner, right, down)))
                 }
             }
         }
-        return best?.triple
+        return ranked.sorted { $0.score > $1.score }.prefix(8).map(\.triple)
     }
 
     // ------------------------------------------------------------------ payload

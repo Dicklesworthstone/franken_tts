@@ -28,7 +28,8 @@ enum VoicePrintCard {
         let mosaic = mosaicImage(name: name, vector: vector)
         let renderer = ImageRenderer(content: CardView(name: name, mosaic: mosaic))
         renderer.scale = 1
-        renderer.proposedSize = .init(width: cardWidth, height: cardHeight)
+        renderer.proposedSize = .init(
+            width: CGFloat(cardWidth), height: CGFloat(cardHeight))
         guard let image = renderer.uiImage, let png = image.pngData() else {
             throw EngineError.native("cannot render the voice card")
         }

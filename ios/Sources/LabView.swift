@@ -1,6 +1,7 @@
 // The laboratory: one scrolling screen mirroring the site's playground.
 
 import AVFoundation
+import PhotosUI
 import SwiftUI
 import UIKit
 
@@ -225,6 +226,10 @@ struct LabView: View {
     @State private var showGalaxy = false
     @State private var renameTarget: EnrolledVoice?
     @State private var renameText = ""
+    @State private var cardVoice: EnrolledVoice?
+    @State private var importItem: PhotosPickerItem?
+    @State private var importFailed = false
+    @State private var importedName: String?
     /// Bumped to refresh the play/pause icon, which tracks external playback state.
     @State private var playbackTick = 0
     @Environment(\.scenePhase) private var scenePhase
@@ -255,6 +260,45 @@ struct LabView: View {
         }
         .sheet(isPresented: $showGalaxy) {
             VoiceGalaxyView(presets: model.presets, enrolled: model.library.voices)
+        }
+        .sheet(item: $cardVoice) { voice in
+            VoiceCardSheet(voice: voice)
+        }
+        .alert(
+            "No voice in that picture", isPresented: $importFailed
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(
+                "This works with voice cards made in FrankenTTS. Ask for the card picture itself, uncropped, and try again."
+            )
+        }
+        .onChange(of: importItem) { _, item in
+            guard let item else { return }
+            importItem = nil
+            Task {
+                let data = try? await item.loadTransferable(type: Data.self)
+                let decoded = await Task.detached(priority: .userInitiated) {
+                    data.flatMap { VoicePrintCard.decode($0) }
+                }.value
+                if let (name, vector) = decoded {
+                    // Importing the same card twice selects the existing voice
+                    // instead of duplicating it.
+                    if let existing = model.library.voices.first(
+                        where: { $0.vector == vector }) {
+                        model.selectedVoice = "voice:\(existing.id.uuidString)"
+                        importedName = existing.name
+                    } else if let voice = try? model.library.add(
+                        name: name, vector: vector) {
+                        model.selectedVoice = "voice:\(voice.id.uuidString)"
+                        importedName = voice.name
+                    } else {
+                        importFailed = true
+                    }
+                } else {
+                    importFailed = true
+                }
+            }
         }
         .alert(
             "Rename voice", isPresented: Binding(
@@ -288,6 +332,8 @@ struct LabView: View {
         .sensoryFeedback(.selection, trigger: model.selectedVoice)
         .sensoryFeedback(.success, trigger: model.lastAudio?.count)
         .sensoryFeedback(.success, trigger: model.enrollmentSaved) { _, saved in saved }
+        .sensoryFeedback(.success, trigger: importedName) { _, name in name != nil }
+        .onAppear(perform: debugCardHook)
         .scrollDismissesKeyboard(.interactively)
     }
 
@@ -409,6 +455,7 @@ struct LabView: View {
                                 model.enrollmentTarget = voice.id
                                 showEnrollment = true
                             },
+                            share: { cardVoice = voice },
                             delete: {
                                 model.library.delete(id: voice.id)
                                 if model.enrolledSelection() == voice.id {
@@ -429,8 +476,27 @@ struct LabView: View {
                     }
                 }
                 .animation(.snappy, value: model.library.voices)
+                PhotosPicker(
+                    selection: $importItem, matching: .images, photoLibrary: .shared()
+                ) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "photo.badge.plus")
+                        Text("Add a voice from a picture")
+                        Spacer()
+                    }
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Lab.emerald)
+                    .padding(.vertical, 8)
+                    .padding(.horizontal, 10)
+                    .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Lab.emerald.opacity(0.35), lineWidth: 1))
+                }
+                .accessibilityHint(
+                    "Pick a voice card someone sent you; the voice joins your library")
                 Text(
-                    "Cloning runs the speaker encoder on this phone; the recording is discarded once the 4 KB voice vector exists. Clone only voices you have the right to use."
+                    "Cloning runs the speaker encoder on this phone; the recording is discarded once the 4 KB voice vector exists. A voice card someone sends you works the same way: the picture holds their voiceprint, and importing it never touches the internet. Clone or import only voices you have the right to use."
                 )
                 .font(.system(size: 12))
                 .foregroundStyle(Lab.textSecondary)
@@ -590,6 +656,24 @@ struct LabView: View {
         .padding(.top, 6)
     }
 
+    /// Screenshot harness: FTTS_DEBUG_CARD=1 opens the card sheet with a synthetic
+    /// voice so the layout is checkable on a model-less simulator. Debug builds only.
+    private func debugCardHook() {
+        #if DEBUG
+            guard ProcessInfo.processInfo.environment["FTTS_DEBUG_CARD"] != nil else {
+                return
+            }
+            var state: UInt64 = 0x0DDB_A11
+            let vector: [Float] = (0..<Engine.speakerWidth).map { _ in
+                state ^= state << 13
+                state ^= state >> 7
+                state ^= state << 17
+                return Float(Double(state >> 40) / Double(1 << 24) - 0.5) * 3
+            }
+            cardVoice = EnrolledVoice(id: UUID(), name: "Jeff", vector: vector)
+        #endif
+    }
+
     private static func gigabytes(_ bytes: Int64) -> String {
         String(format: "%.2f", Double(bytes) / 1_073_741_824.0)
     }
@@ -636,6 +720,7 @@ struct EnrolledVoiceTile: View {
     let select: () -> Void
     let rename: () -> Void
     let reRecord: () -> Void
+    let share: () -> Void
     let delete: () -> Void
     @State private var confirmDelete = false
 
@@ -662,6 +747,10 @@ struct EnrolledVoiceTile: View {
                     Image(systemName: "arrow.clockwise").frame(width: 34, height: 30)
                 }
                 .accessibilityLabel("Re-record \(voice.name)")
+                Button(action: share) {
+                    Image(systemName: "square.and.arrow.up").frame(width: 34, height: 30)
+                }
+                .accessibilityLabel("Share \(voice.name) as a voice card")
                 Spacer()
                 Button { confirmDelete = true } label: {
                     Image(systemName: "trash").frame(width: 34, height: 30)
