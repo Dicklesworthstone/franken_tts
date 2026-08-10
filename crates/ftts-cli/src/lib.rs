@@ -164,10 +164,18 @@ pub fn cli_main() -> ExitCode {
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
+    // `say` reports its own failures as a `run_error` NDJSON event on stderr — that IS the
+    // machine contract, and under `--stream raw` stderr carries nothing but events. The
+    // plain-text duplicate below would be a non-JSON line in that same stream, so for `say`
+    // it only appears when a human (a terminal) is reading stderr.
+    let already_on_contract = matches!(cli.command, Command::Say(_));
     match dispatch(cli, environment(), &mut stdin, &mut stdout, &mut stderr) {
         Ok(()) => FttsExitCode::Success.as_exit_code(),
         Err(error) => {
-            let _ = writeln!(stderr, "error: {error}");
+            use std::io::IsTerminal as _;
+            if !already_on_contract || io::stderr().is_terminal() {
+                let _ = writeln!(stderr, "error: {error}");
+            }
             error.exit_code().as_exit_code()
         }
     }

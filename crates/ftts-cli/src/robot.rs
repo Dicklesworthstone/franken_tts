@@ -881,7 +881,20 @@ impl RunContext {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.subsec_nanos());
-        Self::with_id(format!("r{:x}{:08x}", std::process::id(), nanos))
+        // OS-seeded entropy joins pid + subsecond-nanos: two runs on different hosts (or a
+        // pid reuse after reboot) could otherwise mint the same id inside aggregated logs.
+        let entropy = {
+            use std::hash::{BuildHasher as _, Hasher as _};
+            let mut hasher = std::hash::RandomState::new().build_hasher();
+            hasher.write_u32(nanos);
+            hasher.finish() as u32
+        };
+        Self::with_id(format!(
+            "r{:x}{:08x}{:08x}",
+            std::process::id(),
+            nanos,
+            entropy
+        ))
     }
 
     /// The id every event in this run repeats.

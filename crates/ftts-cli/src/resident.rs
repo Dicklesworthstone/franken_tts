@@ -214,11 +214,16 @@ fn artifact_stamp(bundle: &ModelBundle) -> (u64, u64) {
     let Ok(meta) = fs::metadata(path) else {
         return (0, 0);
     };
+    // Full nanosecond mtime, not whole seconds: a re-convert landing within the same second
+    // at the same byte length used to stamp identical and be served stale. Filesystems with
+    // coarse timestamps degrade gracefully (the nanos are just zero there). The `(0, 0)`
+    // stat-failed sentinel remains distinguishable in practice because a real artifact is
+    // never zero-length.
     let mtime = meta
         .modified()
         .ok()
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs());
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
     (mtime, meta.len())
 }
 
@@ -606,8 +611,21 @@ fn handle_connection(
         let _ = stream.write_all(format!("{reply}\n").as_bytes());
     };
 
-    // Token first: an unauthenticated peer learns nothing but "no".
-    if request.get("token").and_then(Value::as_str) != Some(token) {
+    // Token first: an unauthenticated peer learns nothing but "no". Compared in constant
+    // time (XOR-fold over the full length) so a loopback peer cannot walk the token byte by
+    // byte off an early-exit comparison — theoretical against 128 bits, free to close.
+    let token_matches = |candidate: &str| {
+        let (a, b) = (candidate.as_bytes(), token.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        a.iter().zip(b).fold(0_u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    };
+    if !request
+        .get("token")
+        .and_then(Value::as_str)
+        .is_some_and(token_matches)
+    {
         refuse(&mut stream, "auth", "bad token");
         return;
     }
