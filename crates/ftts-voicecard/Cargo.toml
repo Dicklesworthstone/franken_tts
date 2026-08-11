@@ -1,0 +1,21 @@
+# ftts-voicecard — the voice-card codec shared with the iOS app.
+#
+# A voice card is a picture that IS the voice: the full 1,024-float x-vector
+# written as a self-locating field of emerald cells, plus a lossless private
+# PNG chunk as a byte-exact fast path. This crate is the Rust twin of the
+# app's Sources/VoiceCode.swift and MUST stay bit-identical on encode: a card
+# made on a phone imports here, a card made here imports on a phone, through
+# either layer. Pure pixel buffers in and out; image file I/O lives in callers.
+[package]
+name = "ftts-voicecard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "franken_tts voice-card codec: a 1,024-float voiceprint as a self-locating mosaic"
+
+[dependencies]
+
+[lints]
+workspace = true

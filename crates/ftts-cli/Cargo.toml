@@ -17,6 +17,10 @@ ftts-core = { path = "../ftts-core", version = "0.1.5" }
 ftts-kernels = { path = "../ftts-kernels", version = "0.1.5" }
 ftts-model-qwen = { path = "../ftts-model-qwen", version = "0.1.5" }
 ftts-video = { path = "../ftts-video", version = "0.1.5" }
+ftts-voicecard = { path = "../ftts-voicecard", version = "0.1.5" }
+fmd-font = { version = "0.1.0", features = ["bundled-faces"] }
+png = "0.18"
+zune-jpeg = "0.5"
 rustfft = "6.2"
 serde_json = "1.0"
 symphonia = { version = "0.5.4", default-features = false, features = ["flac", "pcm", "wav"] }

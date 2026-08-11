@@ -2,6 +2,7 @@
 
 //! Shared, stateless command-line dispatch for both FrankenTTS binaries.
 
+mod card;
 mod error;
 pub mod resident;
 pub mod robot;
@@ -234,6 +235,9 @@ enum Command {
     Enroll(EnrollArgs),
     /// Inspect a portable voice pack.
     Voice(VoiceArgs),
+    /// Export or import a voice card: a picture that carries the voice itself,
+    /// interchangeable with the iOS app.
+    Card(CardArgs),
     /// Convert pinned source weights into a portable .fttsq artifact.
     Convert(ConvertArgs),
     /// Download and verify the pinned model files into the model directory.
@@ -749,6 +753,7 @@ fn dispatch(
         Command::Voice(VoiceArgs {
             command: VoiceCommand::Inspect { path },
         }) => run_voice_inspect(path, stdout),
+        Command::Card(args) => run_card(args, stdout),
         Command::Convert(args) => run_convert(&cli, args, environment, stdout, stderr),
         Command::Pull(args) => run_pull(args, environment, stdout),
         Command::Robot(args) => run_robot(args.command.clone(), environment, stdout),
@@ -2821,6 +2826,108 @@ fn admission_plan(text: &str, settings: &EffectiveSettings) -> Result<Value, Ftt
     }
 }
 
+#[derive(Debug, clap::Args)]
+struct CardArgs {
+    #[command(subcommand)]
+    command: CardCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CardCommand {
+    /// Render a voice as a shareable card PNG (mosaic + lossless chunk).
+    Export {
+        /// Voice source: a .spk vector file or a built-in voice name
+        /// (matt, james, leo, robert, judy, aria, ember).
+        #[arg(value_name = "PATH|NAME")]
+        voice: String,
+        /// Name written INTO the card (shown on phones at import).
+        /// Default: the preset name or the .spk file stem.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Output PNG path. Default: <name>-voice-card.png beside the source.
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+    /// Read a voice card image (PNG or JPEG) back into a .spk vector.
+    Import {
+        /// The card image: an original PNG, a screenshot, or a re-compressed JPEG.
+        #[arg(value_name = "IMAGE")]
+        image: PathBuf,
+        /// Output .spk path. Default: <embedded name>.spk beside the image.
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+}
+
+fn run_card(args: &CardArgs, stdout: &mut dyn Write) -> Result<(), FttsError> {
+    match &args.command {
+        CardCommand::Export {
+            voice,
+            name,
+            output,
+        } => {
+            let (vector, default_name, base_dir) = if let Some((preset_name, _, bytes)) =
+                PRESET_VOICES.iter().find(|(n, _, _)| n == voice)
+            {
+                let vector: Vec<f32> = bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| f32::from_le_bytes(*chunk))
+                    .collect();
+                ((vector), (*preset_name).to_owned(), PathBuf::from("."))
+            } else {
+                let path = PathBuf::from(voice);
+                let vector = card::read_spk(&path)?;
+                let stem = path
+                    .file_stem()
+                    .map_or_else(|| "voice".to_owned(), |s| s.to_string_lossy().into_owned());
+                let dir = path
+                    .parent()
+                    .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+                (vector, stem, dir)
+            };
+            let card_name = name.clone().unwrap_or(default_name);
+            let png = card::render_card_png(&card_name, &vector)?;
+            let destination = output.clone().unwrap_or_else(|| {
+                base_dir.join(format!(
+                    "{}-voice-card.png",
+                    card::safe_file_stem(&card_name)
+                ))
+            });
+            std::fs::write(&destination, &png).map_err(|error| {
+                FttsError::Generic(format!("cannot write {}: {error}", destination.display()))
+            })?;
+            writeln!(
+                stdout,
+                "wrote {} ({} KB) — the mosaic is the voice; phones import it from Photos",
+                destination.display(),
+                png.len() / 1024
+            )
+            .map_err(|error| FttsError::Generic(error.to_string()))?;
+            Ok(())
+        }
+        CardCommand::Import { image, output } => {
+            let bytes = std::fs::read(image).map_err(|error| {
+                FttsError::Input(format!("cannot read {}: {error}", image.display()))
+            })?;
+            let (voice_name, vector) = card::decode_card(&bytes)?;
+            let destination = output
+                .clone()
+                .unwrap_or_else(|| card::default_import_path(image, &voice_name));
+            card::write_spk(&destination, &vector)?;
+            writeln!(
+                stdout,
+                "imported \"{voice_name}\" -> {} — use it with: ftts say --voice {}",
+                destination.display(),
+                destination.display()
+            )
+            .map_err(|error| FttsError::Generic(error.to_string()))?;
+            Ok(())
+        }
+    }
+}
+
 fn run_voice_inspect(path: &Path, stdout: &mut dyn Write) -> Result<(), FttsError> {
     let path = resolve_existing_file(path, "voice pack")?;
     write_json_line(
@@ -3123,7 +3230,7 @@ mod tests {
     // Updated 2026-08-10 for the `make-video` subcommand, which landed without re-baselining this
     // snapshot. The snapshot exists to make CLI-surface changes deliberate rather than accidental,
     // so it is re-baselined only alongside a real, intended command — never widened to stop failing.
-    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,make-video,enroll,voice,convert,pull,robot,doctor,resident-daemon\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check,robot,no-resident\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
+    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,make-video,enroll,voice,card,convert,pull,robot,doctor,resident-daemon\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check,robot,no-resident\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
 
     #[test]
     fn clap_surface_matches_snapshot() {

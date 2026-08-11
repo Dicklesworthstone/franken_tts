@@ -1,5 +1,9 @@
 // The voice mosaic: 4 KB of x-vector as a self-locating field of emerald cells.
 //
+// TWIN: crates/ftts-voicecard (Rust) is this codec for the CLI, bit-identical on
+// encode and pinned by its `the_mosaic_matches_the_swift_encoder_bit_for_bit` test.
+// Change the format only with both implementations in hand.
+//
 // Design, and why:
 // - 144×144 cells, 2 bits per cell as one of FOUR brightness levels on a constant-hue
 //   emerald ramp. JPEG keeps luminance at full resolution and halves chroma, so the

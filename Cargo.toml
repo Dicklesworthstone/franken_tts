@@ -6,6 +6,7 @@ members = [
     "crates/ftts-kernels",
     "crates/ftts-cli",
     "crates/ftts-video",
+    "crates/ftts-voicecard",
     "crates/ftts-conformance",
     "crates/ftts-wasm",
     "crates/ftts-ffi",

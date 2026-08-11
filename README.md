@@ -79,6 +79,19 @@ ftts make-video --audio existing.wav --label "My Voice" clip.mp4   # render audi
 
 Every frame is drawn by memory-safe Rust inside the binary — the embedded illustration (QOI), the waveform, and the text (IBM Plex via `fmd-font`, rasterized in-process). Only the final H.264+AAC encode uses a system encoder, under the same contract as `.m4a` output: `.mp4` needs `ffmpeg`, while a `.y4m` output path renders natively with a `.wav` beside it and needs no encoder at all. Custom voices work exactly as in `say`, so a clip of your own cloned voice carries the project's look when you share it.
 
+### Voice cards: `ftts card`
+
+A voice card is a picture that carries the voice itself. The green mosaic in the image IS the 1,024-float speaker embedding, written at two bits per cell across a 144×144 grid with QR-style finder patterns and interleaved Reed-Solomon error correction, so the card survives screenshots and messaging-app recompression; a lossless PNG chunk in the same file is used first when the bytes arrive intact. The format is shared with the iOS app — a card exported here imports on a phone from Photos, and a card shared from a phone imports here:
+
+```bash
+ftts card export aria -o aria-card.png          # any preset, or a .spk file
+ftts card export my_voice.spk --name "Jeff"     # name is written into the card
+ftts card import aria-card.png                  # writes aria.spk next to the image
+ftts say "Hello from a picture." --voice aria.spk
+```
+
+The two encoders are bit-identical by pinned test (`crates/ftts-voicecard`), and import decodes PNG and JPEG. Cards hold only the small voiceprint, never a recording; share only voices that are yours to share.
+
 ### Warm starts: the resident engine
 
 The first `ftts say` of a session pays the model load; when it finishes, the loaded model stays behind in a small helper process, and the next `say` starts synthesizing at once instead of spending seconds reloading weights. The helper is spawned from the same binary, listens only on a loopback port recorded in a file that only your user can read, keeps no record of what it spoke, and exits on its own after ten minutes without a request (`FTTS_RESIDENT_IDLE_SECS` adjusts the window). Output is byte-identical with and without it, which the e2e suite asserts; a re-pulled model or an upgraded binary retires the old helper automatically. Opt out per run with `--no-resident`, or globally with `FTTS_NO_RESIDENT=1`.
