@@ -129,7 +129,7 @@ export class ModelStaging {
      *
      * As [`ModelStaging::reserve_fttsq`].
      */
-    reserve_fttsq_hot_prefix(hot_bytes: number): void;
+    reserve_fttsq_hot_prefix(hot_bytes: number, full_bytes: bigint): void;
 }
 
 /**
@@ -332,7 +332,7 @@ export interface InitOutput {
     readonly modelstaging_push_codec: (a: number, b: number, c: number) => [number, number];
     readonly modelstaging_push_fttsq: (a: number, b: number, c: number) => [number, number];
     readonly modelstaging_reserve_fttsq: (a: number, b: number) => [number, number];
-    readonly modelstaging_reserve_fttsq_hot_prefix: (a: number, b: number) => [number, number];
+    readonly modelstaging_reserve_fttsq_hot_prefix: (a: number, b: number, c: bigint) => [number, number];
     readonly preset_vector: (a: number, b: number) => [number, number, number, number];
     readonly presets: () => [number, number];
     readonly wasmengine_enroll: (a: number, b: number, c: number) => [number, number, number, number];

@@ -176,9 +176,10 @@ export class ModelStaging {
      *
      * As [`ModelStaging::reserve_fttsq`].
      * @param {number} hot_bytes
+     * @param {bigint} full_bytes
      */
-    reserve_fttsq_hot_prefix(hot_bytes) {
-        const ret = wasm.modelstaging_reserve_fttsq_hot_prefix(this.__wbg_ptr, hot_bytes);
+    reserve_fttsq_hot_prefix(hot_bytes, full_bytes) {
+        const ret = wasm.modelstaging_reserve_fttsq_hot_prefix(this.__wbg_ptr, hot_bytes, full_bytes);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
