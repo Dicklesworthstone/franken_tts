@@ -99,14 +99,10 @@ export class ModelStaging {
      *
      * Throws when linear memory cannot be reserved, naming the byte count that failed — the
      * honest signal on a device that simply does not have the memory.
-     * @param {number} codec_bytes
      */
-    constructor(codec_bytes) {
-        const ret = wasm.modelstaging_new(codec_bytes);
-        if (ret[2]) {
-            throw takeFromExternrefTable0(ret[1]);
-        }
-        this.__wbg_ptr = ret[0];
+    constructor() {
+        const ret = wasm.modelstaging_new();
+        this.__wbg_ptr = ret;
         ModelStagingFinalization.register(this, this.__wbg_ptr, this);
         return this;
     }
@@ -145,12 +141,48 @@ export class ModelStaging {
         }
     }
     /**
-     * Reserve exact room for the artifact, once the codec no longer needs its source bytes.
+     * Reserve exact room for the codec's staged bytes.
+     *
+     * Separate from construction so it can be claimed AFTER the artifact — see
+     * [`ModelStaging::reserve_fttsq`] for why that ordering is worth ~0.45 GB.
      *
      * # Errors
      *
-     * Throws if called before [`ModelStaging::finish_codec`] — which would silently restore the
-     * 3.35 GB peak this type exists to avoid — or when the reservation fails.
+     * When the reservation fails, naming the byte count — the honest signal on a device that
+     * simply does not have the memory.
+     * @param {number} codec_bytes
+     */
+    reserve_codec(codec_bytes) {
+        const ret = wasm.modelstaging_reserve_codec(this.__wbg_ptr, codec_bytes);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Reserve exact room for the artifact.
+     *
+     * # Why this no longer insists the codec goes first
+     *
+     * It used to, because the codec's source was the whole 0.68 GB file and holding it beside the
+     * artifact restored a ~3.35 GB peak. Both halves of that changed. The caller now stages only
+     * the codec's DECODER (~0.46 GB, since every tensor `CodecCheckpoint` reads is `decoder.*`),
+     * and the artifact is now a hot prefix rather than the whole file — so holding both is
+     * ~1.15 GB, below the peak the old ordering reached anyway.
+     *
+     * Ordering now matters for a different reason, and it points the other way. wasm memory can
+     * only grow, so a freed buffer is not returned; it is a hole, and a hole is only worth having
+     * where something later can land in it. The codec's source is freed the moment the checkpoint
+     * is built, and the checkpoint is ~0.04 GB — so that 0.46 GB hole wants to be the LAST large
+     * allocation, where the talker's 0.34 GB of widened tensors can reuse it. Reserving the
+     * artifact first puts it there. Codec-first instead committed the hole before the artifact
+     * ever grew, and the artifact could not fit in it, so the page paid for both.
+     *
+     * Measured: 1.64 GB committed codec-first, and the artifact streamed while already carrying
+     * ~1.19 GB — which is the phase an iPhone died in.
+     *
+     * # Errors
+     *
+     * When the reservation fails.
      * @param {number} fttsq_bytes
      */
     reserve_fttsq(fttsq_bytes) {
@@ -586,7 +618,7 @@ function __wbg_get_imports(memory) {
         __wbg___wbindgen_throw_344f42d3211c4765: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
-        __wbg_error_6d29952fd74a0b78: function(arg0, arg1) {
+        __wbg_error_a939a14617c8f86a: function(arg0, arg1) {
             console.error(getStringFromWasm0(arg0, arg1));
         },
         __wbg_now_86c0d4ba3fa605b8: function() {

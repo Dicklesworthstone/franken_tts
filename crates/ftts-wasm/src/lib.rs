@@ -320,18 +320,33 @@ impl ModelStaging {
     /// Throws when linear memory cannot be reserved, naming the byte count that failed — the
     /// honest signal on a device that simply does not have the memory.
     #[wasm_bindgen(constructor)]
-    pub fn new(codec_bytes: usize) -> Result<ModelStaging, JsValue> {
-        let mut codec_source = Vec::new();
-        codec_source
-            .try_reserve_exact(codec_bytes)
-            .map_err(|_| js_error("cannot reserve codec memory (bytes)", codec_bytes))?;
-        Ok(ModelStaging {
-            codec_source,
+    pub fn new() -> ModelStaging {
+        // Reserves NOTHING. Both buffers are claimed explicitly, by the caller, in the order the
+        // caller wants them laid out — which is the whole lever now that wasm memory can only
+        // grow. Reserving the codec here would pin it below the artifact permanently, and the
+        // codec's buffer is the one that becomes a hole.
+        ModelStaging {
+            codec_source: Vec::new(),
             codec: None,
             fttsq: Vec::new(),
             cold_elided: None,
             codec_retired: 0,
-        })
+        }
+    }
+
+    /// Reserve exact room for the codec's staged bytes.
+    ///
+    /// Separate from construction so it can be claimed AFTER the artifact — see
+    /// [`ModelStaging::reserve_fttsq`] for why that ordering is worth ~0.45 GB.
+    ///
+    /// # Errors
+    ///
+    /// When the reservation fails, naming the byte count — the honest signal on a device that
+    /// simply does not have the memory.
+    pub fn reserve_codec(&mut self, codec_bytes: usize) -> Result<(), JsValue> {
+        self.codec_source
+            .try_reserve_exact(codec_bytes)
+            .map_err(|_| js_error("cannot reserve codec memory (bytes)", codec_bytes))
     }
 
     /// Append one slice of the codec checkpoint, in order.
@@ -395,19 +410,31 @@ impl ModelStaging {
         Ok(())
     }
 
-    /// Reserve exact room for the artifact, once the codec no longer needs its source bytes.
+    /// Reserve exact room for the artifact.
+    ///
+    /// # Why this no longer insists the codec goes first
+    ///
+    /// It used to, because the codec's source was the whole 0.68 GB file and holding it beside the
+    /// artifact restored a ~3.35 GB peak. Both halves of that changed. The caller now stages only
+    /// the codec's DECODER (~0.46 GB, since every tensor `CodecCheckpoint` reads is `decoder.*`),
+    /// and the artifact is now a hot prefix rather than the whole file — so holding both is
+    /// ~1.15 GB, below the peak the old ordering reached anyway.
+    ///
+    /// Ordering now matters for a different reason, and it points the other way. wasm memory can
+    /// only grow, so a freed buffer is not returned; it is a hole, and a hole is only worth having
+    /// where something later can land in it. The codec's source is freed the moment the checkpoint
+    /// is built, and the checkpoint is ~0.04 GB — so that 0.46 GB hole wants to be the LAST large
+    /// allocation, where the talker's 0.34 GB of widened tensors can reuse it. Reserving the
+    /// artifact first puts it there. Codec-first instead committed the hole before the artifact
+    /// ever grew, and the artifact could not fit in it, so the page paid for both.
+    ///
+    /// Measured: 1.64 GB committed codec-first, and the artifact streamed while already carrying
+    /// ~1.19 GB — which is the phase an iPhone died in.
     ///
     /// # Errors
     ///
-    /// Throws if called before [`ModelStaging::finish_codec`] — which would silently restore the
-    /// 3.35 GB peak this type exists to avoid — or when the reservation fails.
+    /// When the reservation fails.
     pub fn reserve_fttsq(&mut self, fttsq_bytes: usize) -> Result<(), JsValue> {
-        if self.codec.is_none() {
-            return Err(js_error(
-                "codec must be hydrated first",
-                "reserve_fttsq before finish_codec",
-            ));
-        }
         self.fttsq
             .try_reserve_exact(fttsq_bytes)
             .map_err(|_| js_error("cannot reserve model memory (bytes)", fttsq_bytes))

@@ -84,7 +84,7 @@ export class ModelStaging {
      * Throws when linear memory cannot be reserved, naming the byte count that failed — the
      * honest signal on a device that simply does not have the memory.
      */
-    constructor(codec_bytes: number);
+    constructor();
     /**
      * Append one slice of the codec checkpoint, in order.
      *
@@ -104,12 +104,42 @@ export class ModelStaging {
      */
     push_fttsq(chunk: Uint8Array): void;
     /**
-     * Reserve exact room for the artifact, once the codec no longer needs its source bytes.
+     * Reserve exact room for the codec's staged bytes.
+     *
+     * Separate from construction so it can be claimed AFTER the artifact — see
+     * [`ModelStaging::reserve_fttsq`] for why that ordering is worth ~0.45 GB.
      *
      * # Errors
      *
-     * Throws if called before [`ModelStaging::finish_codec`] — which would silently restore the
-     * 3.35 GB peak this type exists to avoid — or when the reservation fails.
+     * When the reservation fails, naming the byte count — the honest signal on a device that
+     * simply does not have the memory.
+     */
+    reserve_codec(codec_bytes: number): void;
+    /**
+     * Reserve exact room for the artifact.
+     *
+     * # Why this no longer insists the codec goes first
+     *
+     * It used to, because the codec's source was the whole 0.68 GB file and holding it beside the
+     * artifact restored a ~3.35 GB peak. Both halves of that changed. The caller now stages only
+     * the codec's DECODER (~0.46 GB, since every tensor `CodecCheckpoint` reads is `decoder.*`),
+     * and the artifact is now a hot prefix rather than the whole file — so holding both is
+     * ~1.15 GB, below the peak the old ordering reached anyway.
+     *
+     * Ordering now matters for a different reason, and it points the other way. wasm memory can
+     * only grow, so a freed buffer is not returned; it is a hole, and a hole is only worth having
+     * where something later can land in it. The codec's source is freed the moment the checkpoint
+     * is built, and the checkpoint is ~0.04 GB — so that 0.46 GB hole wants to be the LAST large
+     * allocation, where the talker's 0.34 GB of widened tensors can reuse it. Reserving the
+     * artifact first puts it there. Codec-first instead committed the hole before the artifact
+     * ever grew, and the artifact could not fit in it, so the page paid for both.
+     *
+     * Measured: 1.64 GB committed codec-first, and the artifact streamed while already carrying
+     * ~1.19 GB — which is the phase an iPhone died in.
+     *
+     * # Errors
+     *
+     * When the reservation fails.
      */
     reserve_fttsq(fttsq_bytes: number): void;
     /**
@@ -327,9 +357,10 @@ export interface InitOutput {
     readonly int8_route: () => [number, number];
     readonly modelstaging_filled: (a: number) => number;
     readonly modelstaging_finish_codec: (a: number) => [number, number];
-    readonly modelstaging_new: (a: number) => [number, number, number];
+    readonly modelstaging_new: () => number;
     readonly modelstaging_push_codec: (a: number, b: number, c: number) => [number, number];
     readonly modelstaging_push_fttsq: (a: number, b: number, c: number) => [number, number];
+    readonly modelstaging_reserve_codec: (a: number, b: number) => [number, number];
     readonly modelstaging_reserve_fttsq: (a: number, b: number) => [number, number];
     readonly modelstaging_reserve_fttsq_hot_prefix: (a: number, b: number, c: bigint) => [number, number];
     readonly preset_vector: (a: number, b: number) => [number, number, number, number];

@@ -513,10 +513,8 @@ async function handleMessage({ data }) {
         // staging buffers, and leaving it to the FinalizationRegistry means the retry the
         // error message invites allocates a second 2 GB alongside the orphan → tab death.
         // (`from_staging` consumes the handle on success, making the later free a no-op.)
-        // Planned BEFORE the staging buffer is reserved, because the plan is what decides its
-        // size: only the decoder is staged, so the reservation is a fraction of the file.
         const codecPlan = await planCodecDecoderOnly(root, data.codec.asset);
-        const staging = new ModelStaging(codecPlan.totalBytes);
+        const staging = new ModelStaging();
         loadStaging = staging;
         // What will actually be ingested: the decoder-only codec, plus the artifact's hot prefix
         // once the layout is known. Before that it is the codec alone, which is all that streamed.
@@ -610,36 +608,46 @@ async function handleMessage({ data }) {
           }
         };
 
+        // ARTIFACT FIRST, codec second — the reverse of the original order, and worth ~0.45 GB.
+        //
+        // wasm memory only ever grows, so a freed buffer is not returned to anyone; it is a hole,
+        // and a hole is only useful if a later allocation can land in it. The codec's staged bytes
+        // are freed the instant the checkpoint is built, and that checkpoint is ~0.04 GB against
+        // ~0.46 GB of source — so the codec's buffer is the hole, and it wants to be the LAST big
+        // claim, where the talker's 0.34 GB of widened tensors can reuse it.
+        //
+        // Codec-first committed that hole before the artifact ever grew, and the artifact (0.69 GB)
+        // could not fit in it, so the page paid for both and streamed the artifact while already
+        // carrying ~1.19 GB. That is the phase an iPhone died in, which is the whole reason the
+        // order changed.
+        //
+        // The prefix leaves the cold text embedding on disk: 622 MB, 47% of the artifact, read a
+        // few hundred 4 KB rows at a time. A native host pays only for the rows it touches because
+        // it maps the file; wasm cannot map and its heap is grow-only, so every staged byte is
+        // resident for the life of the page.
+        //
+        // Both of these run on EVERY browser rather than only the small ones. A path that runs
+        // exclusively on phones is a path nothing tests, and this session already paid for that
+        // lesson when a Chromium-only harness hid a WebKit-only failure (NE-007).
+        coldLayout = await readColdLayout(root, data.fttsq.asset);
+        stage("reserve-artifact", `${(coldLayout.hotBytes / 1e9).toFixed(2)} GB hot prefix`);
+        // The full length rides along with the prefix length: the directory's declared ranges are
+        // validated against the REAL artifact, since the section left behind necessarily runs past
+        // what is staged. Passing the prefix as if it were the whole file is what made the first
+        // attempt reject its own artifact.
+        staging.reserve_fttsq_hot_prefix(coldLayout.hotBytes, BigInt(data.fttsq.bytes));
+        stage("stream-artifact");
+        await drain(data.fttsq, (chunk) => staging.push_fttsq(chunk), coldLayout.hotBytes);
+
         stage(
           "stream-codec",
           `${(codecPlan.totalBytes / 1e9).toFixed(2)} GB decoder of ${(data.codec.bytes / 1e9).toFixed(2)} GB`,
         );
+        staging.reserve_codec(codecPlan.totalBytes);
         staging.push_codec(codecPlan.prefix);
         await drainRanges(data.codec.asset, codecPlan.ranges, (chunk) => staging.push_codec(chunk));
         stage("widen-codec", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
         staging.finish_codec();
-
-        // Stage the artifact's HOT PREFIX and leave the cold text embedding on disk.
-        //
-        // That section is 622 MB — 47% of the artifact — and an utterance reads a few hundred of
-        // its 4 KB rows. A native host pays only for the rows it touches because it maps the file;
-        // wasm cannot map, and its heap is grow-only, so every staged byte stays resident for the
-        // life of the page. Holding it costs ~0.62 GB of a ~2 GB iOS tab budget to serve ~2 MB of
-        // actual reads.
-        //
-        // Done on EVERY browser rather than only the small ones, deliberately. A path that runs
-        // exclusively on phones is a path nothing tests, and this session already paid for that
-        // lesson once when a Chromium-only harness hid a WebKit-only failure (NE-007). One path,
-        // exercised by every harness run.
-        coldLayout = await readColdLayout(root, data.fttsq.asset);
-        stage("reserve-artifact", `${(coldLayout.hotBytes / 1e9).toFixed(2)} GB hot prefix`);
-        // The full length goes along with the prefix length: the directory's declared ranges are
-        // validated against the REAL artifact, since the section being left behind necessarily
-        // runs past what is staged. Passing the prefix as if it were the whole file is what made
-        // the first attempt reject its own artifact.
-        staging.reserve_fttsq_hot_prefix(coldLayout.hotBytes, BigInt(data.fttsq.bytes));
-        stage("stream-artifact");
-        await drain(data.fttsq, (chunk) => staging.push_fttsq(chunk), coldLayout.hotBytes);
 
         stage("hydrate-talker", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
         engine = WasmEngine.from_staging(
