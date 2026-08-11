@@ -1085,9 +1085,7 @@ impl FttsqReader {
     pub fn verify_digests(&self, bytes: &[u8]) -> Result<(), FttsqError> {
         for section in &self.sections {
             let payload = self.section_bytes(section, bytes)?;
-            let mut hasher = Sha256::new();
-            hasher.update(payload);
-            let actual = to_hex(&hasher.finish());
+            let actual = to_hex(&crate::sha256::digest(payload));
             if actual != section.sha256 {
                 return Err(FttsqError::DigestMismatch {
                     section: section.name.clone(),
@@ -1115,9 +1113,7 @@ impl FttsqReader {
                 continue;
             }
             let payload = self.section_bytes(section, bytes)?;
-            let mut hasher = Sha256::new();
-            hasher.update(payload);
-            let actual = to_hex(&hasher.finish());
+            let actual = to_hex(&crate::sha256::digest(payload));
             if actual != section.sha256 {
                 return Err(FttsqError::DigestMismatch {
                     section: section.name.clone(),

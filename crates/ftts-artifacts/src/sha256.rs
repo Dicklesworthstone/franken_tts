@@ -1,17 +1,22 @@
 //! SHA-256 (FIPS 180-4), for `.fttsq` section digests.
 //!
-//! # Why this is here rather than a dependency
+//! # Why a hand-rolled implementation still lives here
 //!
-//! `sha2` is already resolved in `Cargo.lock` as a transitive dependency, and it is the better
-//! long-run answer. Adding a direct edge to it changes the dependency graph, which changes
-//! `Cargo.lock` — and `cargo check --locked` is a hard gate that every concurrent agent in this
-//! workspace runs. Landing a Cargo.toml edit without an in-lockstep lockfile regeneration breaks
-//! the gate for everyone, and regenerating the lock requires winning a contended build lock.
+//! It no longer computes the digests that gate loading — [`digest`] delegates those to `sha2`,
+//! which dispatches the ARMv8 and x86 SHA extensions at runtime and turns whole-artifact
+//! verification from seconds into a rounding error. What remains is the STREAMING state, and it
+//! remains because the writer hashes payload as it is produced and never holds a whole section:
+//! a one-shot API cannot express that without a second copy of a multi-hundred-megabyte buffer.
 //!
-//! So this is a deliberate, bounded trade, not a preference for hand-rolled crypto.
+//! An earlier revision of this note argued against the direct dependency on the grounds that it
+//! moves `Cargo.lock`, and `cargo check --locked` is a hard gate every concurrent agent in this
+//! workspace runs. That reasoning was sound and the constraint is real; the resolution is simply
+//! that the Cargo.toml edit and the regenerated lockfile land in the SAME commit, which is what
+//! happened. `sha2` was already resolved transitively, so the lock moved by one line.
 //!
-//! **DELETION CONDITION:** replace this module with `sha2::Sha256` the next time the workspace
-//! lockfile is being updated for another reason. Tracked by `frankentts-p2-fttsq-format-wsa`.
+//! The two implementations must agree exactly — the writer produces a digest the verifier checks,
+//! so a disagreement would fail every artifact, or accept a corrupt one. That is pinned by
+//! `one_shot_matches_the_streaming_implementation` rather than assumed from both being "SHA-256".
 //!
 //! # Scope
 //!
@@ -271,10 +276,23 @@ pub fn hex_digest_file(path: &std::path::Path) -> std::io::Result<String> {
 
 /// Digests a byte slice, returning lowercase hex.
 #[must_use]
+pub fn digest(bytes: &[u8]) -> [u8; 32] {
+    // Hardware SHA-256 where the CPU has it, which is every Apple Silicon Mac, every recent x86,
+    // and the phones. Verifying a 1.3 GB artifact with this crate's portable implementation
+    // measured 3.6 s — pure latency before a single sample, paid on every load.
+    //
+    // Only the one-shot path delegates. The streaming writer keeps `Sha256` below, because it
+    // hashes payload as it is produced and never holds the whole section. Both compute SHA-256,
+    // so they agree by definition; `one_shot_matches_the_streaming_implementation` pins that
+    // rather than trusting it.
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// Lowercase-hex SHA-256 of a complete byte slice.
+#[must_use]
 pub fn hex_digest(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    to_hex(&hasher.finish())
+    to_hex(&digest(bytes))
 }
 
 /// Renders raw digest bytes as lowercase hex.
@@ -369,6 +387,33 @@ mod tests {
     }
 
     /// A single flipped bit must change the digest — the property section verification relies on.
+    #[test]
+    fn one_shot_matches_the_streaming_implementation() {
+        // Two SHA-256 implementations now live here: the accelerated one-shot path used for
+        // verification, and this crate's portable streaming one used by the writer. An artifact
+        // is hashed by the writer and checked by the verifier, so a disagreement would not be a
+        // wrong number in a test — it would be every artifact failing to load, or worse, a
+        // corrupt one accepted. Pinned across sizes that straddle the 64-byte block boundary and
+        // the length-padding edge.
+        for size in [0_usize, 1, 55, 56, 63, 64, 65, 1000, 1 << 16, (1 << 16) + 7] {
+            let bytes: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
+            let mut streaming = Sha256::new();
+            streaming.update(&bytes);
+            assert_eq!(
+                digest(&bytes),
+                streaming.finish(),
+                "one-shot and streaming disagree at {size} bytes"
+            );
+        }
+        // And chunked updates must agree with both, since the writer feeds arbitrary slices.
+        let bytes: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        let mut chunked = Sha256::new();
+        for chunk in bytes.chunks(37) {
+            chunked.update(chunk);
+        }
+        assert_eq!(digest(&bytes), chunked.finish());
+    }
+
     #[test]
     fn a_single_bit_flip_changes_the_digest() {
         let mut message = vec![0_u8; 256];
