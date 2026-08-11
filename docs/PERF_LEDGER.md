@@ -30,6 +30,25 @@ tally_w_l_n: <wins/losses/neutrals for this lever>
 ## Local entries
 
 ```text
+PERF-007
+claim_id: checkpoint-owned-transposed-convolution-weights
+evidence_id: three-round interleaved 24-frame direct-CLI A/B, 2026-08-11
+status: PROVISIONAL_LOCAL_WIN
+model_source_commit: e742085e1ff490b25e9506b5f297927647d328c6
+fixture_sha256: not-applicable (same seeded end-to-end synthesis)
+artifact_sha256: 597f7eb3314a2fe5be74fa10a6a3a28ace9e10e582c641deccd37348a0ccd824
+cpu_features: AMD Ryzen AI 9 HX 370, native release build
+command_env: FTTS_NO_RESIDENT=1 FTTS_MAX_FRAMES=24; seed 42; 24 generated frames; three interleaved rounds
+kill_switch: FTTS_TCONV_WEIGHT_CACHE=0 restores per-call transposition
+incumbent: current tree's per-call ConvTranspose1d weight transposition; self-speedup only, NO ADMISSIBLE EXTERNAL RATIO
+before_after: synthesis with per-call transposition 10272/9971/10284 ms (mean 10175.7 ms) versus checkpoint-owned transposition 9371/9294/9429 ms (mean 9364.7 ms), 8.0% lower; including the one-time load cost, mean load+synthesis fell 10907.7 -> 10132.0 ms (7.1%)
+cv_percent: per-call synthesis 1.7%; checkpoint-owned synthesis 0.7%; load+synthesis 1.6%/0.9%
+equivalence: all six WAVs were byte-identical; streaming-versus-offline parity remains exact
+disposition: KEEP; immutable transposed matrices are created with and owned by each checkpoint, eliminating stale global-cache entries and allocator-address reuse
+tally_w_l_n: 1/0/0
+```
+
+```text
 PERF-006
 claim_id: x86-sha-ni-artifact-verification
 evidence_id: three-round interleaved direct-CLI load-stage A/B, 2026-08-11

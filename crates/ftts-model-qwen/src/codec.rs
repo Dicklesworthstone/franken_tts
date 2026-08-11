@@ -1019,8 +1019,29 @@ pub fn causal_transpose_conv1d(
     //
     // The reference's weight is `[in_channel, out_channel, tap]`, which is `[k, n]`; the GEMM
     // helper wants `[n, k]`, so the columns' operand is transposed once up front.
-    let column_width = output_channels * kernel;
-    let mut column_weight = vec![0.0f32; column_width * input_channels];
+    let column_weight = transpose_conv_weight(weight, input_channels, output_channels, kernel);
+    causal_transpose_conv1d_pretransposed(
+        input,
+        frames,
+        input_channels,
+        &column_weight,
+        bias,
+        output_channels,
+        kernel,
+        stride,
+        output,
+    );
+}
+
+/// Transpose a ConvTranspose1d weight once for repeated GEMM-backed inference.
+#[must_use]
+pub fn transpose_conv_weight(
+    weight: &[f32],
+    input_channels: usize,
+    output_channels: usize,
+    kernel: usize,
+) -> Vec<f32> {
+    let mut column_weight = vec![0.0f32; output_channels * kernel * input_channels];
     for input_channel in 0..input_channels {
         for output_channel in 0..output_channels {
             for tap in 0..kernel {
@@ -1030,6 +1051,38 @@ pub fn causal_transpose_conv1d(
             }
         }
     }
+    column_weight
+}
+
+/// `FTTS_TCONV_WEIGHT_CACHE=0` restores per-call transposition for A/B measurements.
+pub(crate) fn cached_transpose_weights_armed() -> bool {
+    static ARMED: OnceLock<bool> = OnceLock::new();
+    *ARMED.get_or_init(|| {
+        !matches!(
+            std::env::var("FTTS_TCONV_WEIGHT_CACHE").as_deref(),
+            Ok("0" | "off" | "false")
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn causal_transpose_conv1d_pretransposed(
+    input: &[f32],
+    frames: usize,
+    input_channels: usize,
+    column_weight: &[f32],
+    bias: Option<&[f32]>,
+    output_channels: usize,
+    kernel: usize,
+    stride: usize,
+    output: &mut [f32],
+) {
+    let column_width = output_channels * kernel;
+    assert_eq!(
+        column_weight.len(),
+        column_width * input_channels,
+        "causal tconv column-weight shape"
+    );
     let mut columns = vec![0.0f32; frames * column_width];
     f32ref::linear_with_accumulation(
         input,
@@ -1196,47 +1249,111 @@ impl CausalTransposeConvStream {
         bias: Option<&[f32]>,
         output: &mut Vec<f32>,
     ) {
+        Self::push_impl(
+            self.input_channels,
+            self.output_channels,
+            self.kernel,
+            self.stride,
+            &mut self.history,
+            input,
+            frames,
+            weight,
+            bias,
+            None,
+            output,
+        );
+    }
+
+    fn push_pretransposed(
+        &mut self,
+        input: &[f32],
+        frames: usize,
+        weights: CausalTransposeConvWeights<'_>,
+        output: &mut Vec<f32>,
+    ) {
+        assert_eq!(weights.input_channels, self.input_channels);
+        assert_eq!(weights.output_channels, self.output_channels);
+        assert_eq!(weights.kernel, self.kernel);
+        assert_eq!(weights.stride, self.stride);
+        Self::push_impl(
+            self.input_channels,
+            self.output_channels,
+            self.kernel,
+            self.stride,
+            &mut self.history,
+            input,
+            frames,
+            weights.weight,
+            Some(weights.bias),
+            cached_transpose_weights_armed().then_some(weights.column_weight),
+            output,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_impl(
+        input_channels: usize,
+        output_channels: usize,
+        kernel: usize,
+        stride: usize,
+        history: &mut Vec<f32>,
+        input: &[f32],
+        frames: usize,
+        weight: &[f32],
+        bias: Option<&[f32]>,
+        column_weight: Option<&[f32]>,
+        output: &mut Vec<f32>,
+    ) {
         assert_eq!(
             input.len(),
-            frames * self.input_channels,
+            frames * input_channels,
             "causal transposed stream input shape"
         );
         assert_eq!(
             weight.len(),
-            self.input_channels * self.output_channels * self.kernel,
+            input_channels * output_channels * kernel,
             "causal transposed stream weight shape"
         );
         if let Some(bias) = bias {
-            assert_eq!(
-                bias.len(),
-                self.output_channels,
-                "causal transposed stream bias shape"
-            );
+            assert_eq!(bias.len(), output_channels);
         }
 
-        let history_frames = self.history.len() / self.input_channels;
-        let mut joined = Vec::with_capacity(self.history.len() + input.len());
-        joined.extend_from_slice(&self.history);
+        let history_frames = history.len() / input_channels;
+        let mut joined = Vec::with_capacity(history.len() + input.len());
+        joined.extend_from_slice(history);
         joined.extend_from_slice(input);
         let joined_frames = history_frames + frames;
-        let mut all = vec![0.0f32; joined_frames * self.stride * self.output_channels];
-        causal_transpose_conv1d(
-            &joined,
-            joined_frames,
-            self.input_channels,
-            weight,
-            bias,
-            self.output_channels,
-            self.kernel,
-            self.stride,
-            &mut all,
-        );
+        let mut all = vec![0.0f32; joined_frames * stride * output_channels];
+        if let Some(column_weight) = column_weight {
+            causal_transpose_conv1d_pretransposed(
+                &joined,
+                joined_frames,
+                input_channels,
+                column_weight,
+                bias,
+                output_channels,
+                kernel,
+                stride,
+                &mut all,
+            );
+        } else {
+            causal_transpose_conv1d(
+                &joined,
+                joined_frames,
+                input_channels,
+                weight,
+                bias,
+                output_channels,
+                kernel,
+                stride,
+                &mut all,
+            );
+        }
         output.clear();
-        output.extend_from_slice(&all[history_frames * self.stride * self.output_channels..]);
-        let retain = ((self.kernel - 1) / self.stride).min(joined_frames);
-        self.history.clear();
-        self.history
-            .extend_from_slice(&joined[(joined_frames - retain) * self.input_channels..]);
+        output.extend_from_slice(&all[history_frames * stride * output_channels..]);
+        let retain = ((kernel - 1) / stride).min(joined_frames);
+        history.clear();
+        history.extend_from_slice(&joined[(joined_frames - retain) * input_channels..]);
     }
 }
 
@@ -1344,6 +1461,8 @@ impl CausalConvWeights<'_> {
 pub struct CausalTransposeConvWeights<'a> {
     /// `[in_channel, out_channel, kernel]`.
     pub weight: &'a [f32],
+    /// The same weights transposed once to `[out_channel * kernel, in_channel]`.
+    pub column_weight: &'a [f32],
     /// ConvTranspose1d bias, `[out_channel]`.
     pub bias: &'a [f32],
     pub input_channels: usize,
@@ -1355,17 +1474,31 @@ pub struct CausalTransposeConvWeights<'a> {
 impl CausalTransposeConvWeights<'_> {
     fn forward(&self, input: &[f32], frames: usize) -> Vec<f32> {
         let mut output = vec![0.0f32; frames * self.stride * self.output_channels];
-        causal_transpose_conv1d(
-            input,
-            frames,
-            self.input_channels,
-            self.weight,
-            Some(self.bias),
-            self.output_channels,
-            self.kernel,
-            self.stride,
-            &mut output,
-        );
+        if cached_transpose_weights_armed() {
+            causal_transpose_conv1d_pretransposed(
+                input,
+                frames,
+                self.input_channels,
+                self.column_weight,
+                Some(self.bias),
+                self.output_channels,
+                self.kernel,
+                self.stride,
+                &mut output,
+            );
+        } else {
+            causal_transpose_conv1d(
+                input,
+                frames,
+                self.input_channels,
+                self.weight,
+                Some(self.bias),
+                self.output_channels,
+                self.kernel,
+                self.stride,
+                &mut output,
+            );
+        }
         output
     }
 }
@@ -1797,13 +1930,8 @@ impl CodecDecoderBlockStream {
     ) -> usize {
         let mut hidden = input.to_vec();
         snake_beta_in_place(&mut hidden, frames, weights.alpha_log, weights.beta_log);
-        self.transposed.push(
-            &hidden,
-            frames,
-            weights.transposed.weight,
-            Some(weights.transposed.bias),
-            output,
-        );
+        self.transposed
+            .push_pretransposed(&hidden, frames, weights.transposed, output);
         let output_frames = frames * weights.transposed.stride;
         for (unit_state, unit_weights) in self.residual_units.iter_mut().zip(weights.residual_units)
         {
@@ -1848,13 +1976,8 @@ impl CodecUpsampleStageStream {
         output: &mut Vec<f32>,
     ) -> usize {
         let mut hidden = Vec::new();
-        self.transposed.push(
-            input,
-            frames,
-            weights.transposed.weight,
-            Some(weights.transposed.bias),
-            &mut hidden,
-        );
+        self.transposed
+            .push_pretransposed(input, frames, weights.transposed, &mut hidden);
         let output_frames = frames * weights.transposed.stride;
         self.convnext
             .push(&hidden, output_frames, weights.convnext, output);
@@ -2340,8 +2463,11 @@ mod tests {
             output_proj_bias: &two_channels,
         };
         let latent_transposed_weight = [0.1f32, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let latent_transposed_column_weight =
+            transpose_conv_weight(&latent_transposed_weight, 2, 2, 2);
         let latent_transposed = CausalTransposeConvWeights {
             weight: &latent_transposed_weight,
+            column_weight: &latent_transposed_column_weight,
             bias: &two_channels,
             input_channels: 2,
             output_channels: 2,
@@ -2414,12 +2540,17 @@ mod tests {
         let block_5_weight = [0.1f32, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0];
         let block_4_weight = [0.1f32, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0];
         let block_3_weight = [0.1f32, 0.0, 0.0, 0.1, 0.0, 0.0];
+        let block_8_column_weight = transpose_conv_weight(&block_8_weight, 1, 1, 16);
+        let block_5_column_weight = transpose_conv_weight(&block_5_weight, 1, 1, 10);
+        let block_4_column_weight = transpose_conv_weight(&block_4_weight, 1, 1, 8);
+        let block_3_column_weight = transpose_conv_weight(&block_3_weight, 1, 1, 6);
         let decoder_blocks = [
             CodecDecoderBlockWeights {
                 alpha_log: &one_channel,
                 beta_log: &one_channel,
                 transposed: CausalTransposeConvWeights {
                     weight: &block_8_weight,
+                    column_weight: &block_8_column_weight,
                     bias: &one_channel,
                     input_channels: 1,
                     output_channels: 1,
@@ -2433,6 +2564,7 @@ mod tests {
                 beta_log: &one_channel,
                 transposed: CausalTransposeConvWeights {
                     weight: &block_5_weight,
+                    column_weight: &block_5_column_weight,
                     bias: &one_channel,
                     input_channels: 1,
                     output_channels: 1,
@@ -2446,6 +2578,7 @@ mod tests {
                 beta_log: &one_channel,
                 transposed: CausalTransposeConvWeights {
                     weight: &block_4_weight,
+                    column_weight: &block_4_column_weight,
                     bias: &one_channel,
                     input_channels: 1,
                     output_channels: 1,
@@ -2459,6 +2592,7 @@ mod tests {
                 beta_log: &one_channel,
                 transposed: CausalTransposeConvWeights {
                     weight: &block_3_weight,
+                    column_weight: &block_3_column_weight,
                     bias: &one_channel,
                     input_channels: 1,
                     output_channels: 1,

@@ -34,7 +34,7 @@ use ftts_model_qwen::codec::{
     CodecResidualUnitWeights, CodecStreamingState, CodecTransformerLayerWeights,
     CodecUpsampleStageWeights, MaterializedCodebook, SplitResidualVectorQuantizer, causal_conv1d,
     causal_transpose_conv1d, codec_rope_rows, decode_codec_offline, forward_codec_transformer_step,
-    forward_convnext, forward_decoder_block, snake_beta_in_place,
+    forward_convnext, forward_decoder_block, snake_beta_in_place, transpose_conv_weight,
 };
 use std::path::{Path, PathBuf};
 
@@ -408,6 +408,7 @@ struct OwnedBlock {
     alpha: Vec<f32>,
     beta: Vec<f32>,
     transposed: OwnedConv,
+    transposed_column_weight: Vec<f32>,
     units: [OwnedResidualUnit; 3],
     input_channels: usize,
     output_channels: usize,
@@ -425,10 +426,14 @@ impl OwnedBlock {
         stride: usize,
     ) -> Self {
         let prefix = format!("decoder.decoder.{block}");
+        let transposed = OwnedConv::load(file, &format!("{prefix}.block.1.conv"));
+        let transposed_column_weight =
+            transpose_conv_weight(&transposed.weight, input_channels, output_channels, kernel);
         Self {
             alpha: widen(file, &format!("{prefix}.block.0.alpha")),
             beta: widen(file, &format!("{prefix}.block.0.beta")),
-            transposed: OwnedConv::load(file, &format!("{prefix}.block.1.conv")),
+            transposed,
+            transposed_column_weight,
             units: [
                 OwnedResidualUnit::load(file, block, 2),
                 OwnedResidualUnit::load(file, block, 3),
@@ -447,6 +452,7 @@ impl OwnedBlock {
             beta_log: &self.beta,
             transposed: CausalTransposeConvWeights {
                 weight: &self.transposed.weight,
+                column_weight: &self.transposed_column_weight,
                 bias: &self.transposed.bias,
                 input_channels: self.input_channels,
                 output_channels: self.output_channels,
@@ -464,6 +470,7 @@ impl OwnedBlock {
 
 struct OwnedUpsampleStage {
     transposed: OwnedConv,
+    transposed_column_weight: Vec<f32>,
     dwconv: OwnedConv,
     norm_weight: Vec<f32>,
     norm_bias: Vec<f32>,
@@ -475,8 +482,11 @@ struct OwnedUpsampleStage {
 impl OwnedUpsampleStage {
     fn load(file: &SafetensorsFile, stage: usize) -> Self {
         let prefix = format!("decoder.upsample.{stage}");
+        let transposed = OwnedConv::load(file, &format!("{prefix}.0.conv"));
+        let transposed_column_weight = transpose_conv_weight(&transposed.weight, 1024, 1024, 2);
         Self {
-            transposed: OwnedConv::load(file, &format!("{prefix}.0.conv")),
+            transposed,
+            transposed_column_weight,
             dwconv: OwnedConv::load(file, &format!("{prefix}.1.dwconv.conv")),
             norm_weight: widen(file, &format!("{prefix}.1.norm.weight")),
             norm_bias: widen(file, &format!("{prefix}.1.norm.bias")),
@@ -489,6 +499,7 @@ impl OwnedUpsampleStage {
     fn borrow_transposed(&self) -> CausalTransposeConvWeights<'_> {
         CausalTransposeConvWeights {
             weight: &self.transposed.weight,
+            column_weight: &self.transposed_column_weight,
             bias: &self.transposed.bias,
             input_channels: 1024,
             output_channels: 1024,
