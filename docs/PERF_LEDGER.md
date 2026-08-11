@@ -30,6 +30,23 @@ tally_w_l_n: <wins/losses/neutrals for this lever>
 ## Local entries
 
 ```text
+PERF-006
+claim_id: wasm-browser-resident-set-reduction
+evidence_id: site/harness/browser.mjs (real Chromium and real WebKit, persistent profiles, real 1.86 GB model over byte-Range); the engine's own per-stage `memoryBytes()` readouts and the in-wasm `linear_memory_bytes()` milestones
+status: WIN (memory, not throughput — a ceiling claim, gated on the crash it removes rather than on a ratio)
+model_source_commit: 2a1ea07 (session head); artifact qwen3-tts-12hz-0.6b-base.fttsq
+fixture_sha256: not-applicable (end-to-end browser hydration, not a fixture seam)
+artifact_sha256: qwen3-tts-12hz-0.6b-base.fttsq=597f7eb3314a2fe5be74fa10a6a3a28ace9e10e582c641deccd37348a0ccd824
+cpu_features: wasm32 simd128; Chromium threaded (6-partition team), WebKit serial (the iOS path)
+command_env: node site/harness/browser.mjs [--webkit] (text "The quick brown fox jumps over the lazy dog.", voice matt, seed 0)
+kill_switch: none — these are structural, not routed levers
+incumbent: the tree's own earlier wasm builds, same model, same harness, same instrumentation. Self-improvement, maintenance-class per Doctrine #0.5; NOT a "faster than X" claim.
+before_after: peak resident 2.45 GB -> 1.64 GB Chromium / 1.61 GB WebKit, and synthesis growth +0.56 GB per press -> +0.00 GB. Four independent levers: (a) COLD_TEXT_EMBEDDING left in OPFS and read row-wise, -0.62 GB; (b) codec staged decoder-only, dropping the 0.225 GB encoder; (c) fused int8 tables built once at hydration and the artifact released, which removed a 0.46 GB per-utterance rebuild that never came back; (d) codec built from tensors moved in one at a time instead of a 0.46 GB staged file, -0.19 GB. Ordering is itself a lever here: wasm memory only grows, so a freed buffer is a hole and a hole is worth only what lands in it — artifact-first vs codec-first was 1.64 GB vs 2.10 GB for identical work.
+cv_percent: NOT GATED as a throughput row. The memory figures are exact byte counts from `WebAssembly.Memory.buffer.byteLength` and `memory_size(0)`, not timings, so run-to-run variance does not apply to the claim being made. Any WALL-TIME number quoted alongside these runs is NOT admissible: another agent held 8 concurrent cargo processes on this machine throughout, violating the same-thermal-window rule.
+equivalence: LOSSLESS for (a), (b) and (d) — the cold rows are the same bf16 widened by the same bit pattern (`provided_rows_reconstruct_exactly_what_the_mapped_table_would_have_gathered`), the encoder is never read by CodecCheckpoint (every tensor it loads is `decoder.*`), and the tensor-map path moves the same buffers the file path would have widened. (c) is a lifetime change, not an arithmetic one. Browser-vs-CLI frame 0 stayed 1919/1920 samples identical across the whole sequence, which is the standing check that none of this moved the audio.
+disposition: KEEP. Context: the target was an iPhone tab that died during hydration; peak is now below the 1.61 GB that device was observed to survive, though the device itself remains unverified against this build. The remaining resident set is load-bearing — 0.69 GB hot q8 prefix, 0.457 GB codec f32, 0.34 GB talker f32 — and further reduction needs a format or numerics change, both of which are out of scope here.
+tally_w_l_n: 1/0/0
+
 PERF-005
 claim_id: wasm-packed-gemm-plus-codec-team
 evidence_id: site/harness/browser.mjs run 2026-08-10 (real Chromium 151 headless, real OPFS, real COOP/COEP, real 1.86 GB model over byte-Range); engine's own stage timing line, captured from the worker console
