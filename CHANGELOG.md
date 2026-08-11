@@ -15,7 +15,8 @@ individual commits are intentionally not cited.
 
 | Version | Date | Status | Summary |
 |---------|------|--------|---------|
-| 0.1.5 | 2026-08-10 | current | browser engine 9.4× faster; iOS survives; enrollment denoises itself; Windows installer |
+| 0.1.6 | 2026-08-10 | current | voice cards (a picture that IS the voice), phone↔CLI interop; iOS video export unstuck; output denoising |
+| 0.1.5 | 2026-08-10 | superseded | browser engine 9.4× faster; iOS survives; enrollment denoises itself; Windows installer |
 | 0.1.4 | 2026-08-09 | superseded | faster than real time: worker team, pipelined codec, 2.5× faster startup |
 | 0.1.3 | 2026-08-09 | superseded | optimized route becomes the library-wide default; 48 kHz enrollment fix |
 | 0.1.2 | 2026-08-08 | superseded | `ftts convert` works on the real checkpoint; `ftts pull` ships the quantized `.fttsq` |
@@ -23,6 +24,13 @@ individual commits are intentionally not cited.
 | 0.1.0 | 2026-08-08 | first release | f32 reference engine, CLI, conformance ladder, artifact groundwork |
 
 ## [Unreleased]
+
+## [0.1.6] - 2026-08-10
+
+Voices become pictures: a card exported anywhere imports everywhere, phone and
+CLI alike. The iOS video exporter stops deadlocking, synthesis output gets the
+same denoiser enrollment uses, and the end-of-utterance trim removes the noise
+it was built to remove.
 
 ### Added
 
