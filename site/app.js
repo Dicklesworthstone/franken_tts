@@ -686,6 +686,11 @@ ui.speak.addEventListener("click", async () => {
     setWavBlob(pcmToWavBlob(samples, sampleRate));
     lastSamples = samples;
     lastSampleRate = sampleRate;
+    // Expose the raw PCM for the conformance harness, which compares these exact samples against
+    // the CLI's for the same text/voice/seed. Reading the <audio> element instead would measure
+    // the WAV encoder and the browser's decoder rather than the engine.
+    globalThis.__fttsLastPcm = samples;
+    globalThis.__fttsLastSampleRate = sampleRate;
     lastMp3Blob = null;
     drawWaveform(samples);
     ui.player.src = wavObjectUrl();

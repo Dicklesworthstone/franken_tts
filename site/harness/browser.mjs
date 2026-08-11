@@ -38,6 +38,17 @@ const HEADED = process.argv.includes("--headed");
 const ENGINE = process.argv.includes("--webkit") ? webkit : chromium;
 const ENGINE_NAME = process.argv.includes("--webkit") ? "webkit" : "chromium";
 const KEEP = process.argv.includes("--keep");
+// Conformance mode: compare the browser's own PCM against a WAV the CLI produced for the SAME
+// text, voice and seed. This is the only comparison that means anything — the browser and the CLI
+// share every line of the engine, so any divergence is a wasm-vs-native fork, not a model
+// difference, and there are known forks (codec int8 arm, f32 accumulation order).
+const argValue = (flag) => {
+  const at = process.argv.indexOf(flag);
+  return at >= 0 ? process.argv[at + 1] : null;
+};
+const CLI_GOLDEN = argValue("--cli-golden");
+const PCM_OUT = argValue("--pcm-out");
+const CONFORMANCE_TEXT = "The quick brown fox jumps over the lazy dog.";
 
 const modelFiles = {
   "qwen3-tts-12hz-0.6b-base.fttsq": path.join(modelDir, "qwen3-tts-12hz-0.6b-base.fttsq"),
@@ -81,6 +92,46 @@ browser.on("weberror", (error) => transcript.push(`[weberror] ${error.error().me
 page.on("requestfailed", (request) =>
   transcript.push(`[requestfailed] ${request.url()} ${request.failure()?.errorText}`),
 );
+
+
+/// Minimal 16-bit mono WAV writer/reader, so a parity run needs no audio dependency.
+function wav16(samples, rate) {
+  const data = Buffer.alloc(samples.length * 2);
+  for (let i = 0; i < samples.length; i += 1) {
+    data.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32767))), i * 2);
+  }
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + data.length, 4);
+  header.write("WAVEfmt ", 8);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(rate, 24);
+  header.writeUInt32LE(rate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(data.length, 40);
+  return Buffer.concat([header, data]);
+}
+
+/// Walk the chunk list rather than assuming a 44-byte header: the CLI's writer is free to emit
+/// LIST/fact chunks, and a fixed offset would silently read metadata as audio.
+function readWav16(buffer) {
+  let offset = 12;
+  while (offset + 8 <= buffer.length) {
+    const id = buffer.toString("ascii", offset, offset + 4);
+    const size = buffer.readUInt32LE(offset + 4);
+    if (id === "data") {
+      const out = new Array(size / 2);
+      for (let i = 0; i < out.length; i += 1) out[i] = buffer.readInt16LE(offset + 8 + i * 2);
+      return out;
+    }
+    offset += 8 + size + (size % 2);
+  }
+  throw new Error("no data chunk in WAV");
+}
 
 let failures = 0;
 const check = (label, ok, detail = "") => {
@@ -166,7 +217,11 @@ try {
   // The number that actually matters. Everything above only proves the page loads; this measures
   // whether the kernel work bought anything, in the browser, on the real model.
   if (ready) {
-    await page.fill("#text, textarea", "The quick brown fox jumps over the lazy dog.").catch(() => {});
+    await page.fill("#text, textarea", CONFORMANCE_TEXT).catch(() => {});
+    // Pinned so the CLI golden is reproducible: the sampler is seeded, and an unpinned seed would
+    // make every comparison a fresh coin flip rather than a parity test.
+    await page.fill("#seed", "0").catch(() => {});
+    await page.selectOption("#voice", "matt").catch(() => {});
     const started = Date.now();
     await page.click("#speak");
     // Wait for the control to go DOWN before waiting for it to come back up. Checking only for
@@ -192,6 +247,47 @@ try {
       () => document.getElementById("error")?.textContent?.trim() ?? "",
     );
     if (synthError) console.log(`SYNTH ERROR: ${synthError}`);
+
+    // ── conformance: the browser's samples against the CLI's ────────────────────────────────
+    const pcm = await page.evaluate(() =>
+      globalThis.__fttsLastPcm ? Array.from(globalThis.__fttsLastPcm) : null,
+    );
+    const rate = await page.evaluate(() => globalThis.__fttsLastSampleRate ?? 24000);
+    if (pcm && (PCM_OUT || CLI_GOLDEN)) {
+      if (PCM_OUT) {
+        await fs.writeFile(PCM_OUT, wav16(pcm, rate));
+        console.log(`wrote ${PCM_OUT} (${pcm.length} samples @ ${rate} Hz)`);
+      }
+      if (CLI_GOLDEN) {
+        const golden = readWav16(await fs.readFile(CLI_GOLDEN));
+        const n = Math.min(golden.length, pcm.length);
+        // The browser holds f32 in [-1,1]; the CLI's WAV is i16. Quantize ours the same way
+        // before comparing, so the comparison measures the ENGINE and not the WAV encoder.
+        const ours = pcm.slice(0, n).map((v) => Math.max(-32768, Math.min(32767, Math.round(v * 32767))));
+        const theirs = golden.slice(0, n);
+        let identical = 0;
+        let maxDiff = 0;
+        let sumSq = 0;
+        let refSq = 0;
+        for (let i = 0; i < n; i += 1) {
+          const d = ours[i] - theirs[i];
+          if (d === 0) identical += 1;
+          maxDiff = Math.max(maxDiff, Math.abs(d));
+          sumSq += d * d;
+          refSq += theirs[i] * theirs[i];
+        }
+        const snr = 10 * Math.log10((refSq || 1) / (sumSq || 1e-20));
+        console.log(`\n--- CLI PARITY (${CONFORMANCE_TEXT.slice(0, 32)}…, voice matt, seed 0) ---`);
+        console.log(`      lengths: browser ${pcm.length}, cli ${golden.length}, compared ${n}`);
+        console.log(`      identical samples: ${identical}/${n} (${((100 * identical) / n).toFixed(2)}%)`);
+        console.log(`      max |diff|: ${maxDiff} LSB of 32767`);
+        console.log(`      SNR of the difference: ${snr.toFixed(1)} dB`);
+        check("browser output matches the CLI sample-for-sample", identical === n,
+          identical === n ? "" : `${n - identical} samples differ, max ${maxDiff} LSB, SNR ${snr.toFixed(1)} dB`);
+      }
+    } else if (CLI_GOLDEN) {
+      check("browser produced PCM to compare", false, "no __fttsLastPcm (synthesis failed?)");
+    }
     // Stages recorded DURING synthesis. The history dump above happens at "ready", so anything
     // synthesis reports — including how much linear memory it claims, which is now the number
     // that decides whether a phone survives pressing the button — was never printed.
