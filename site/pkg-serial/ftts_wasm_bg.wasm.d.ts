@@ -8,9 +8,10 @@ export const bench_int8_gemv: (a: number, b: number, c: number, d: number, e: nu
 export const int8_route: () => [number, number];
 export const modelstaging_filled: (a: number) => number;
 export const modelstaging_finish_codec: (a: number) => [number, number];
-export const modelstaging_new: (a: number) => [number, number, number];
+export const modelstaging_new: () => number;
 export const modelstaging_push_codec: (a: number, b: number, c: number) => [number, number];
 export const modelstaging_push_fttsq: (a: number, b: number, c: number) => [number, number];
+export const modelstaging_reserve_codec: (a: number, b: number) => [number, number];
 export const modelstaging_reserve_fttsq: (a: number, b: number) => [number, number];
 export const modelstaging_reserve_fttsq_hot_prefix: (a: number, b: number, c: bigint) => [number, number];
 export const preset_vector: (a: number, b: number) => [number, number, number, number];
