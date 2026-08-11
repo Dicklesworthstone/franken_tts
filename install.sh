@@ -64,7 +64,10 @@ OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-franken_tts}"
 BINARY_NAME="franken_tts"
 ALIAS_NAME="ftts"
-CHECKSUMS_ASSET="SHA256SUMS"
+# Every name a release has used for the combined manifest, most current first. Releases ship
+# `SHA256SUMS.txt`; older tooling produced `SHA256SUMS`. Both are accepted, because verification
+# must not hinge on one spelling.
+CHECKSUMS_ASSETS="SHA256SUMS.txt SHA256SUMS"
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
 DEST_EXPLICIT=0
@@ -862,8 +865,19 @@ validate_archive_members() {
             "README.md") readme_count=$((readme_count + 1)) ;;
             "LICENSE") license_count=$((license_count + 1)) ;;
             "CHANGELOG.md") changelog_count=$((changelog_count + 1)) ;;
+            # AppleDouble sidecars: inert resource-fork metadata that macOS `tar` writes next to
+            # each real member unless COPYFILE_DISABLE is set. The v0.1.5 Linux archives carry
+            # five of them (`._franken_tts`, `._ftts`, `._README.md`, `._LICENSE`,
+            # `._CHANGELOG.md`) because they were packed on a Mac, and rejecting them made the
+            # archive uninstallable even after checksum verification passed.
+            #
+            # Skipped rather than allowlisted-and-counted: they are never installed, never
+            # executed, and carry no content this script reads. Note they are INVISIBLE to macOS
+            # `tar -tzf`, which absorbs them as xattrs — so a Mac cannot see the problem it causes,
+            # which is exactly why this shipped.
+            "._"*) ;;
             *)
-                log_error "Archive contains an unexpected member"
+                log_error "Archive contains an unexpected member: $normalized"
                 return 1
                 ;;
         esac
@@ -1069,17 +1083,26 @@ download_release() {
         if [ -n "$CHECKSUM" ]; then
             expected="${CHECKSUM%% *}"
         else
-            local checksums_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${CHECKSUMS_ASSET}"
-            if download_file "$checksums_url" "$TMP/$CHECKSUMS_ASSET"; then
-                # Match a line whose filename field equals the exact asset name
-                # (tolerating the `*name` binary-mode marker) so an unrelated
-                # entry can never shadow the real checksum. `|| true` keeps a
-                # no-match from killing the script under `set -euo pipefail`;
-                # we fall through to the sidecar, then the honest error.
-                expected=$(awk -v name="$archive_name" \
-                    '$2 == name || $2 == "*" name { print $1; exit }' \
-                    "$TMP/$CHECKSUMS_ASSET" 2>/dev/null || true)
-            fi
+            # Try every name a release has actually used for the combined manifest.
+            #
+            # v0.1.5 ships SHA256SUMS.txt and nothing else, while this asked only for SHA256SUMS:
+            # the 404 left `expected` empty, the sidecar 404'd too, and a perfectly good download
+            # was refused at the last step. Every Linux install failed that way.
+            local manifest_name
+            for manifest_name in $CHECKSUMS_ASSETS; do
+                local checksums_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${manifest_name}"
+                if download_file "$checksums_url" "$TMP/$manifest_name"; then
+                    # Match a line whose filename field equals the exact asset name
+                    # (tolerating the `*name` binary-mode marker) so an unrelated
+                    # entry can never shadow the real checksum. `|| true` keeps a
+                    # no-match from killing the script under `set -euo pipefail`;
+                    # we fall through to the next candidate, then the sidecar.
+                    expected=$(awk -v name="$archive_name" \
+                        '$2 == name || $2 == "*" name { print $1; exit }' \
+                        "$TMP/$manifest_name" 2>/dev/null || true)
+                    [ -n "$expected" ] && break
+                fi
+            done
             if [ -z "$expected" ]; then
                 local sidecar_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}.sha256"
                 log_step "Combined manifest unavailable; trying ${archive_name}.sha256 sidecar..."
@@ -1110,7 +1133,7 @@ download_release() {
                 log_success "Checksum verified: ${actual:0:16}..."
             fi
         else
-            log_error "Checksum not available for $archive_name (not in $CHECKSUMS_ASSET and no ${archive_name}.sha256 sidecar)"
+            log_error "Checksum not available for $archive_name (not in any of: $CHECKSUMS_ASSETS, and no ${archive_name}.sha256 sidecar)"
             return 1
         fi
     fi

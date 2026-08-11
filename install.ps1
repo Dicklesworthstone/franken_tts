@@ -193,8 +193,13 @@ try {
         # that.
         $expected = $null
         $why = @()
+        # Every name a release has used for the combined manifest, most current first. v0.1.5
+        # ships SHA256SUMS.txt and no SHA256SUMS, so asking for a single spelling refused a
+        # perfectly good download. Same failure the shell installer had.
+        foreach ($manifest in @("SHA256SUMS.txt", "SHA256SUMS")) {
+        if ($expected) { break }
         try {
-            $sums = Get-RemoteText -Uri "$base/SHA256SUMS" -ProxyArgs $proxyArgs
+            $sums = Get-RemoteText -Uri "$base/$manifest" -ProxyArgs $proxyArgs
             foreach ($line in ($sums -split "`n")) {
                 if ($line -match '^\s*([0-9a-fA-F]{64})\s+[\* ]?(.+?)\s*$') {
                     # sha256sum writes "hash  name", "hash *name" for binary mode, and manifests
@@ -209,7 +214,8 @@ try {
                 }
             }
         } catch {
-            $why += "SHA256SUMS: $($_.Exception.Message)"
+            $why += "${manifest}: $($_.Exception.Message)"
+        }
         }
         if (-not $expected) {
             try {
@@ -221,7 +227,7 @@ try {
         }
         if (-not $expected) {
             $detail = if ($why) { " Reason: " + ($why -join '; ') } else { ' Both were fetched but neither listed this file.' }
-            throw "No checksum published for $archive (neither SHA256SUMS nor $archive.sha256).$detail Refusing to install unverified binaries; pass -NoVerify to override."
+            throw "No checksum published for $archive (neither SHA256SUMS.txt/SHA256SUMS nor $archive.sha256).$detail Refusing to install unverified binaries; pass -NoVerify to override."
         }
         Assert-Checksum -File $archivePath -Expected $expected
     }
