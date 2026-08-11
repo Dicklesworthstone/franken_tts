@@ -282,22 +282,22 @@ async function planCodecDecoderOnly(root, asset) {
 
     // Reassign offsets contiguously in the order the bytes will be pushed, so the rewritten
     // header describes exactly the stream the engine is about to receive.
-    const rebuilt = {};
-    const ranges = [];
+    // Just where each tensor lives. Nothing is rewritten into a new container: the engine takes
+    // tensors by name now, so the header this used to synthesize was a step that existed only to
+    // be parsed straight back apart.
+    const tensors = [];
     let cursor = 0;
     for (const [name, entry] of kept) {
       const [start, end] = entry.data_offsets;
       const length = end - start;
-      rebuilt[name] = { dtype: entry.dtype, shape: entry.shape, data_offsets: [cursor, cursor + length] };
-      ranges.push({ at: payloadBase + start, length });
+      if (entry.dtype !== "F32") {
+        throw new Error(`codec tensor ${name} is ${entry.dtype}; the engine widens f32 only`);
+      }
+      tensors.push({ name, at: payloadBase + start, length });
       cursor += length;
     }
 
-    const headerJson = new TextEncoder().encode(JSON.stringify(rebuilt));
-    const prefix = new Uint8Array(8 + headerJson.length);
-    new DataView(prefix.buffer).setBigUint64(0, BigInt(headerJson.length), true);
-    prefix.set(headerJson, 8);
-    return { prefix, ranges, totalBytes: prefix.length + cursor, asset };
+    return { tensors, totalBytes: cursor, asset };
   } finally {
     sync?.close();
   }
@@ -572,31 +572,32 @@ async function handleMessage({ data }) {
           }
         };
 
-        // Stream an explicit list of source ranges, in order, through the same reused buffer.
-        // The codec is no longer a contiguous prefix of its file — it is the decoder tensors
-        // gathered out of it — so `drain`'s single-range walk cannot express it.
-        const drainRanges = async (asset, ranges, push) => {
+        // Hand the codec over one tensor at a time, widening each on arrival.
+        //
+        // A tensor is read whole because the engine widens whole tensors; the largest is ~75 MB,
+        // so the transient is that rather than the 0.46 GB the staged file used to cost. Nothing
+        // accumulates on this side: each buffer is dropped as soon as wasm has copied it.
+        const pushCodecTensors = async (asset, tensors, staging) => {
           const handle = await root.getFileHandle(asset);
           const sync = handle.createSyncAccessHandle
             ? await handle.createSyncAccessHandle()
             : null;
           try {
-            for (const range of ranges) {
-              for (let done = 0; done < range.length; done += INGEST_SLICE) {
-                const want = Math.min(INGEST_SLICE, range.length - done);
-                if (sync) {
-                  const view = scratch.subarray(0, want);
-                  const read = sync.read(view, { at: range.at + done });
-                  if (read !== want) {
-                    throw new Error(`short codec read at ${range.at + done}: ${read}/${want}`);
-                  }
-                  push(view);
-                } else {
-                  const file = await handle.getFile();
-                  const from = range.at + done;
-                  push(new Uint8Array(await file.slice(from, from + want).arrayBuffer()));
+            for (const tensor of tensors) {
+              let bytes;
+              if (sync) {
+                bytes = new Uint8Array(tensor.length);
+                const read = sync.read(bytes, { at: tensor.at });
+                if (read !== tensor.length) {
+                  throw new Error(`short codec tensor ${tensor.name}: ${read}/${tensor.length}`);
                 }
+              } else {
+                const file = await handle.getFile();
+                bytes = new Uint8Array(
+                  await file.slice(tensor.at, tensor.at + tensor.length).arrayBuffer(),
+                );
               }
+              staging.push_codec_tensor(tensor.name, bytes);
               reply("loadProgress", {
                 bytesDone: staging.filled(),
                 bytesTotal: stagedTotal(),
@@ -653,9 +654,7 @@ async function handleMessage({ data }) {
           "stream-codec",
           `${(codecPlan.totalBytes / 1e9).toFixed(2)} GB decoder of ${(data.codec.bytes / 1e9).toFixed(2)} GB`,
         );
-        staging.reserve_codec(codecPlan.totalBytes);
-        staging.push_codec(codecPlan.prefix);
-        await drainRanges(data.codec.asset, codecPlan.ranges, (chunk) => staging.push_codec(chunk));
+        await pushCodecTensors(data.codec.asset, codecPlan.tensors, staging);
         stage("widen-codec", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
         staging.finish_codec();
 
