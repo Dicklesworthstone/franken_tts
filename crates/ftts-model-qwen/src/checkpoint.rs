@@ -2182,8 +2182,10 @@ mod tests {
         for (slot, id) in distinct.iter().enumerate() {
             let row = table.row(*id).expect("every supplied id resolves");
             let expected: Vec<f32> = cold[slot * row_bytes..(slot + 1) * row_bytes]
-                .chunks_exact(2)
-                .map(|p| f32::from_bits(u32::from(u16::from_le_bytes([p[0], p[1]])) << 16))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| f32::from_bits(u32::from(u16::from_le_bytes(*p)) << 16))
                 .collect();
             assert_eq!(
                 row.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),

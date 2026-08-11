@@ -451,7 +451,11 @@ async function handleMessage({ data }) {
         // exercised by every harness run.
         coldLayout = await readColdLayout(root, data.fttsq.asset);
         stage("reserve-artifact", `${(coldLayout.hotBytes / 1e9).toFixed(2)} GB hot prefix`);
-        staging.reserve_fttsq_hot_prefix(coldLayout.hotBytes);
+        // The full length goes along with the prefix length: the directory's declared ranges are
+        // validated against the REAL artifact, since the section being left behind necessarily
+        // runs past what is staged. Passing the prefix as if it were the whole file is what made
+        // the first attempt reject its own artifact.
+        staging.reserve_fttsq_hot_prefix(coldLayout.hotBytes, BigInt(data.fttsq.bytes));
         stage("stream-artifact");
         await drain(data.fttsq, (chunk) => staging.push_fttsq(chunk), coldLayout.hotBytes);
 

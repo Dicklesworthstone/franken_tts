@@ -798,9 +798,11 @@ impl MappedFttsq {
     /// directory itself, or when it splits a section rather than stopping cleanly before one — a
     /// partial section cannot be verified, so it is rejected rather than silently trusted.
     #[cfg(not(unix))] // same owned-bytes backing as `from_bytes`; a mapping never needs this
-    pub fn from_prefix_bytes(bytes: Vec<u8>) -> Result<Self, FttsqError> {
+    pub fn from_prefix_bytes(bytes: Vec<u8>, file_len: u64) -> Result<Self, FttsqError> {
         let mapping = MappedFile::from_bytes(bytes);
-        let reader = FttsqReader::parse_directory(mapping.as_slice())?;
+        // Against the artifact's REAL length, not the bytes in hand: the elided section runs past
+        // the prefix by construction, so bounding by what is present rejects every prefix outright.
+        let reader = FttsqReader::parse_directory_of_prefix(mapping.as_slice(), file_len)?;
         let available = mapping.as_slice().len() as u64;
 
         let absent_sections = reader.absent_sections_in_prefix(available)?;
@@ -943,6 +945,24 @@ impl FttsqReader {
     /// Returns a named [`FttsqError`] for any structural or range violation.
     pub fn parse_directory(bytes: &[u8]) -> Result<Self, FttsqError> {
         Self::parse_directory_for_file_len(bytes, bytes.len() as u64)
+    }
+
+    /// Parses the directory of a PREFIX, validating ranges against the artifact's full length.
+    ///
+    /// [`FttsqReader::parse_directory`] bounds every declared range by the bytes in hand, which is
+    /// right for a whole file and wrong for a deliberate prefix: the section being left behind
+    /// necessarily runs past the end, so parsing refuses before absence can even be considered.
+    /// Here the structural check keeps its full strength against `file_len` — the artifact's real
+    /// size, known independently — while only the header and directory need to be present.
+    ///
+    /// This proves structure, never integrity. Digests still decide what may be read, via
+    /// [`FttsqReader::verify_digests_of_present`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a named [`FttsqError`] for any structural or range violation.
+    pub fn parse_directory_of_prefix(bytes: &[u8], file_len: u64) -> Result<Self, FttsqError> {
+        Self::parse_directory_for_file_len(bytes, file_len)
     }
 
     /// Parses a present header and directory against a declared final file length.

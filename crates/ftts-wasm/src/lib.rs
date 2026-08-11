@@ -298,8 +298,11 @@ pub struct ModelStaging {
     fttsq: Vec<u8>,
     /// Set when the caller reserved only the artifact's hot prefix, holding the 622 MB cold text
     /// embedding out of linear memory. Checked against the artifact's own directory at hydration,
-    /// so a caller that truncates at the wrong offset is refused rather than trusted.
-    cold_elided: bool,
+    /// so a caller that truncates at the wrong offset is refused rather than trusted. Carries the
+    /// artifact's FULL declared length, because the directory's ranges must be validated against
+    /// the real artifact rather than the bytes in hand — the elided section runs past the prefix
+    /// by construction, so bounding by what is present rejects every prefix outright.
+    cold_elided: Option<u64>,
     /// Bytes freed by `finish_codec`, so `filled` can keep reporting monotonic download progress
     /// after the source it was counting has gone away.
     codec_retired: usize,
@@ -326,7 +329,7 @@ impl ModelStaging {
             codec_source,
             codec: None,
             fttsq: Vec::new(),
-            cold_elided: false,
+            cold_elided: None,
             codec_retired: 0,
         })
     }
@@ -425,8 +428,12 @@ impl ModelStaging {
     /// # Errors
     ///
     /// As [`ModelStaging::reserve_fttsq`].
-    pub fn reserve_fttsq_hot_prefix(&mut self, hot_bytes: usize) -> Result<(), JsValue> {
-        self.cold_elided = true;
+    pub fn reserve_fttsq_hot_prefix(
+        &mut self,
+        hot_bytes: usize,
+        full_bytes: u64,
+    ) -> Result<(), JsValue> {
+        self.cold_elided = Some(full_bytes);
         self.reserve_fttsq(hot_bytes)
     }
 
@@ -568,7 +575,7 @@ impl WasmEngine {
         Self::hydrate_with_codec(
             fttsq,
             codec,
-            false,
+            None,
             vocab_json,
             merges_txt,
             tokenizer_config_json,
@@ -583,24 +590,20 @@ impl WasmEngine {
     fn hydrate_with_codec(
         fttsq: Vec<u8>,
         codec: CodecCheckpoint,
-        cold_elided: bool,
+        cold_elided: Option<u64>,
         vocab_json: &str,
         merges_txt: &str,
         tokenizer_config_json: &str,
     ) -> Result<WasmEngine, JsValue> {
         let staged_bytes = fttsq.len() as u64;
-        console_error(&format!(
-            "ftts-wasm hydrate: verifying artifact ({staged_bytes} bytes, cold_elided={cold_elided})"
-        ));
-        let artifact = Arc::new(if cold_elided {
-            ftts_artifacts::fttsq::MappedFttsq::from_prefix_bytes(fttsq)
-                .map_err(|error| js_error("artifact prefix rejected", error))?
-        } else {
-            ftts_artifacts::fttsq::MappedFttsq::from_bytes(fttsq)
-                .map_err(|error| js_error("artifact rejected", error))?
+        let artifact = Arc::new(match cold_elided {
+            Some(full_bytes) => {
+                ftts_artifacts::fttsq::MappedFttsq::from_prefix_bytes(fttsq, full_bytes)
+                    .map_err(|error| js_error("artifact prefix rejected", error))?
+            }
+            None => ftts_artifacts::fttsq::MappedFttsq::from_bytes(fttsq)
+                .map_err(|error| js_error("artifact rejected", error))?,
         });
-
-        console_error("ftts-wasm hydrate: artifact verified, checking layout");
 
         // Re-derive the truncation point from the directory the artifact itself declares, and
         // insist the caller stopped exactly there. Without this the JS side's byte offset is an
@@ -609,7 +612,7 @@ impl WasmEngine {
         // than a loader bug. `prefix_len_omitting` also returns None if a future layout puts a
         // retained section after the cold one, which turns a silent 622 MB regression into a
         // refusal to load.
-        if cold_elided {
+        if cold_elided.is_some() {
             let expected = artifact
                 .reader()
                 .prefix_len_omitting(&[ftts_artifacts::fttsq::AccessClass::ColdTextEmbedding]);
@@ -650,7 +653,6 @@ impl WasmEngine {
             }
         }
 
-        console_error("ftts-wasm hydrate: layout checks passed, loading talker");
         let label = Path::new("browser://model.fttsq");
         let talker = TalkerCheckpoint::load_fttsq_mapped(
             Arc::clone(&artifact),
@@ -658,7 +660,6 @@ impl WasmEngine {
             ftts_model_qwen::generate::hot_elision_from_environment(),
         )
         .map_err(|error| js_error("talker hydration failed", error))?;
-        console_error("ftts-wasm hydrate: talker loaded, building tokenizer");
 
         let tokenizer = QwenTokenizer::from_files_using_environment(TokenizerFiles {
             vocab_json,

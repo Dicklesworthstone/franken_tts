@@ -332,10 +332,11 @@ async function boot() {
   // crash without saying so first.
   if (isMemoryConstrainedDevice()) {
     ui.memoryWarning.innerHTML =
-      `<b>This device probably cannot run the playground.</b> Loading the model needs about ` +
-      `2.5 GB of memory at once, which is more than mobile Safari or Chrome allows one tab. ` +
-      `The download is 1.86 GB and the tab will most likely crash while loading. ` +
-      `A desktop browser will work.`;
+      `<b>This may not work on a phone.</b> Loading the model needs about 1.9 GB of memory at ` +
+      `once, and mobile Safari allows a tab roughly 2 GB — so it is close, and it depends on the ` +
+      `device. The download is 1.86 GB. If the tab crashes while loading, that is why, and a ` +
+      `desktop browser will work. You can also <a href="reset.html">clear the cached model</a> ` +
+      `afterwards.`;
     ui.memoryWarning.classList.remove("hidden");
   }
   if (cached >= TOTAL_BYTES) {
