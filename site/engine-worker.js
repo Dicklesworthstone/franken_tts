@@ -235,6 +235,74 @@ function reply(type, payload, transfer = []) {
 /// `init` — and hydration then runs against a module whose glue has not finished binding. The
 /// symptoms were maddening and platform-dependent: iOS threw
 /// `undefined is not an object (evaluating 'wasm.modelstaging_new')`, while Chrome simply hung
+/// A plan for streaming ONLY the codec's decoder into wasm, rebuilt as a valid safetensors file.
+///
+/// # Why the whole file is the wrong thing to stage
+///
+/// `CodecCheckpoint` is decoder-only — every tensor it reads is named `decoder.*`, with no
+/// exceptions — but the file is 0.68 GB of which 0.225 GB is the encoder, used only during voice
+/// enrollment. Staging all of it allocated 0.68 GB of wasm linear memory to build an object that
+/// measured ~38 MB (committed memory right after widening was 0.72 GB, and wasm memory can only
+/// grow, so source + widened peaked there).
+///
+/// That buffer is then freed — and wasm can never return memory to the OS, so it becomes a
+/// permanent 0.68 GB hole. Worse, it lands 7 MB short of the 0.69 GB artifact reservation, so the
+/// artifact cannot reuse it and grows on top instead. Roughly two thirds of the page's committed
+/// memory was dead space, which is why an iPhone died during streaming while carrying far less
+/// live data than a desktop that survived.
+///
+/// So the header is rewritten here to describe the decoder alone, and only those payload bytes are
+/// streamed. Nothing is dropped that synthesis reads, nothing is reordered within a tensor, and
+/// the engine parses an ordinary safetensors file that happens to be smaller.
+async function planCodecDecoderOnly(root, asset) {
+  const handle = await root.getFileHandle(asset);
+  const sync = handle.createSyncAccessHandle ? await handle.createSyncAccessHandle() : null;
+  const at = async (offset, length) => {
+    const buffer = new Uint8Array(length);
+    if (sync) {
+      sync.read(buffer, { at: offset });
+      return buffer;
+    }
+    const file = await handle.getFile();
+    return new Uint8Array(await file.slice(offset, offset + length).arrayBuffer());
+  };
+  try {
+    const lengthBytes = await at(0, 8);
+    const headerLength = Number(
+      new DataView(lengthBytes.buffer, lengthBytes.byteOffset, 8).getBigUint64(0, true),
+    );
+    const header = JSON.parse(new TextDecoder().decode(await at(8, headerLength)));
+    const payloadBase = 8 + headerLength;
+
+    // Sorted by source offset so the reads stay sequential across a 0.68 GB file.
+    const kept = Object.entries(header)
+      .filter(([name, entry]) => name.startsWith("decoder.") && entry?.data_offsets)
+      .sort((a, b) => a[1].data_offsets[0] - b[1].data_offsets[0]);
+    if (kept.length === 0) throw new Error("codec file declares no decoder tensors");
+
+    // Reassign offsets contiguously in the order the bytes will be pushed, so the rewritten
+    // header describes exactly the stream the engine is about to receive.
+    const rebuilt = {};
+    const ranges = [];
+    let cursor = 0;
+    for (const [name, entry] of kept) {
+      const [start, end] = entry.data_offsets;
+      const length = end - start;
+      rebuilt[name] = { dtype: entry.dtype, shape: entry.shape, data_offsets: [cursor, cursor + length] };
+      ranges.push({ at: payloadBase + start, length });
+      cursor += length;
+    }
+
+    const headerJson = new TextEncoder().encode(JSON.stringify(rebuilt));
+    const prefix = new Uint8Array(8 + headerJson.length);
+    new DataView(prefix.buffer).setBigUint64(0, BigInt(headerJson.length), true);
+    prefix.set(headerJson, 8);
+    return { prefix, ranges, totalBytes: prefix.length + cursor, asset };
+  } finally {
+    sync?.close();
+  }
+}
+
 /// Where the cold text embedding lives inside the artifact, read from the artifact itself.
 ///
 /// The `.fttsq` header is `magic(8) | version(4) | directoryLength(8) | directoryJSON`, all at the
@@ -445,11 +513,14 @@ async function handleMessage({ data }) {
         // staging buffers, and leaving it to the FinalizationRegistry means the retry the
         // error message invites allocates a second 2 GB alongside the orphan → tab death.
         // (`from_staging` consumes the handle on success, making the later free a no-op.)
-        const staging = new ModelStaging(data.codec.bytes);
+        // Planned BEFORE the staging buffer is reserved, because the plan is what decides its
+        // size: only the decoder is staged, so the reservation is a fraction of the file.
+        const codecPlan = await planCodecDecoderOnly(root, data.codec.asset);
+        const staging = new ModelStaging(codecPlan.totalBytes);
         loadStaging = staging;
-        // What will actually be ingested: the whole codec, plus the artifact's hot prefix once
-        // the layout is known. Before that it is the codec alone, which is all that has streamed.
-        const stagedTotal = () => data.codec.bytes + (coldLayout?.hotBytes ?? 0);
+        // What will actually be ingested: the decoder-only codec, plus the artifact's hot prefix
+        // once the layout is known. Before that it is the codec alone, which is all that streamed.
+        const stagedTotal = () => codecPlan.totalBytes + (coldLayout?.hotBytes ?? 0);
         // Read through ONE reused buffer, never through Blob.
         //
         // The previous shape — `getFileHandle().getFile()` then `blob.slice(a, b).arrayBuffer()`
@@ -503,8 +574,48 @@ async function handleMessage({ data }) {
           }
         };
 
-        stage("stream-codec", `${(data.codec.bytes / 1e9).toFixed(2)} GB`);
-        await drain(data.codec, (chunk) => staging.push_codec(chunk));
+        // Stream an explicit list of source ranges, in order, through the same reused buffer.
+        // The codec is no longer a contiguous prefix of its file — it is the decoder tensors
+        // gathered out of it — so `drain`'s single-range walk cannot express it.
+        const drainRanges = async (asset, ranges, push) => {
+          const handle = await root.getFileHandle(asset);
+          const sync = handle.createSyncAccessHandle
+            ? await handle.createSyncAccessHandle()
+            : null;
+          try {
+            for (const range of ranges) {
+              for (let done = 0; done < range.length; done += INGEST_SLICE) {
+                const want = Math.min(INGEST_SLICE, range.length - done);
+                if (sync) {
+                  const view = scratch.subarray(0, want);
+                  const read = sync.read(view, { at: range.at + done });
+                  if (read !== want) {
+                    throw new Error(`short codec read at ${range.at + done}: ${read}/${want}`);
+                  }
+                  push(view);
+                } else {
+                  const file = await handle.getFile();
+                  const from = range.at + done;
+                  push(new Uint8Array(await file.slice(from, from + want).arrayBuffer()));
+                }
+              }
+              reply("loadProgress", {
+                bytesDone: staging.filled(),
+                bytesTotal: stagedTotal(),
+                wasmBytes: memoryBytes(),
+              });
+            }
+          } finally {
+            sync?.close();
+          }
+        };
+
+        stage(
+          "stream-codec",
+          `${(codecPlan.totalBytes / 1e9).toFixed(2)} GB decoder of ${(data.codec.bytes / 1e9).toFixed(2)} GB`,
+        );
+        staging.push_codec(codecPlan.prefix);
+        await drainRanges(data.codec.asset, codecPlan.ranges, (chunk) => staging.push_codec(chunk));
         stage("widen-codec", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
         staging.finish_codec();
 

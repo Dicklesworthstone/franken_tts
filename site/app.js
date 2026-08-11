@@ -331,8 +331,13 @@ async function boot() {
   const cached = await cachedBytes();
 
   if (crashedHydrating) {
+    // The detail is the whole point on a device that was killed by the OS. It carries how far
+    // staging got and how large linear memory was at that instant, and a tab reclaimed by iOS
+    // reports nothing else at all — no error, no unload, no callback. Showing only the stage name
+    // threw away the one measurement that says whether the ceiling was hit and where.
     ui.dlStatus.innerHTML =
-      `The previous visit stopped during <b>${crash.stage}</b>, so the model was not loaded ` +
+      `The previous visit stopped during <b>${crash.stage}</b>` +
+      `${crash.detail ? ` — <code>${crash.detail}</code>` : ""}, so the model was not loaded ` +
       `automatically this time. Press “Download &amp; load model…” to try again, or ` +
       `<a href="reset.html">clear the cached model</a> if it keeps failing.`;
     ui.loadModel.classList.remove("hidden");
