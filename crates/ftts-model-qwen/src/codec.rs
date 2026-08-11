@@ -1085,7 +1085,7 @@ pub fn causal_transpose_conv1d_columns(
     let mut columns = vec![0.0f32; frames * column_width];
     f32ref::linear_with_accumulation(
         input,
-        &column_weight,
+        column_weight,
         None,
         frames,
         input_channels,
