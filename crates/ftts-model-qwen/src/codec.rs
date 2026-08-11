@@ -977,6 +977,33 @@ pub fn causal_conv1d(
     );
 }
 
+/// Rearrange `[in_channel, out_channel, tap]` into the `[n, k]` the column GEMM wants.
+///
+/// A pure permutation — every value survives unchanged, so any caller that supplies the result
+/// instead of re-deriving it gets bit-identical output by construction, not by tolerance.
+///
+/// Worth hoisting because the operand is INVARIANT: the same upsample weights were permuted once
+/// per packet, roughly a dozen times per utterance, purely to be consumed identically each time.
+#[must_use]
+pub fn column_layout(
+    weight: &[f32],
+    input_channels: usize,
+    output_channels: usize,
+    kernel: usize,
+) -> Vec<f32> {
+    let mut column_weight = vec![0.0f32; output_channels * kernel * input_channels];
+    for input_channel in 0..input_channels {
+        for output_channel in 0..output_channels {
+            for tap in 0..kernel {
+                let source = (input_channel * output_channels + output_channel) * kernel + tap;
+                let target = (output_channel * kernel + tap) * input_channels + input_channel;
+                column_weight[target] = weight[source];
+            }
+        }
+    }
+    column_weight
+}
+
 /// Reference causal ConvTranspose1d for time-major data.
 ///
 /// PyTorch stores transposed-convolution weights `[in_channel, out_channel, kernel]`. The Qwen
@@ -1024,17 +1051,37 @@ pub fn causal_transpose_conv1d(
     //
     // The reference's weight is `[in_channel, out_channel, tap]`, which is `[k, n]`; the GEMM
     // helper wants `[n, k]`, so the columns' operand is transposed once up front.
+    let column_weight = column_layout(weight, input_channels, output_channels, kernel);
+    causal_transpose_conv1d_columns(
+        input,
+        frames,
+        input_channels,
+        &column_weight,
+        bias,
+        output_channels,
+        kernel,
+        stride,
+        output,
+    );
+}
+
+/// [`causal_transpose_conv1d`] for a caller that already holds the column layout.
+///
+/// Identical arithmetic; the only difference is who owns the permutation. Streaming decode reuses
+/// one layout for the whole utterance instead of rebuilding it per packet.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_transpose_conv1d_columns(
+    input: &[f32],
+    frames: usize,
+    input_channels: usize,
+    column_weight: &[f32],
+    bias: Option<&[f32]>,
+    output_channels: usize,
+    kernel: usize,
+    stride: usize,
+    output: &mut [f32],
+) {
     let column_width = output_channels * kernel;
-    let mut column_weight = vec![0.0f32; column_width * input_channels];
-    for input_channel in 0..input_channels {
-        for output_channel in 0..output_channels {
-            for tap in 0..kernel {
-                let source = (input_channel * output_channels + output_channel) * kernel + tap;
-                let target = (output_channel * kernel + tap) * input_channels + input_channel;
-                column_weight[target] = weight[source];
-            }
-        }
-    }
     let mut columns = vec![0.0f32; frames * column_width];
     f32ref::linear_with_accumulation(
         input,
@@ -1159,6 +1206,14 @@ pub struct CausalTransposeConvStream {
     stride: usize,
     /// The retained input frames, time-major `[retained, input_channels]`.
     history: Vec<f32>,
+    /// The GEMM-ready weight permutation, derived once on first use and reused for the utterance.
+    ///
+    /// The weight is invariant, so rebuilding this per packet was pure repetition: roughly a
+    /// dozen permutations of the same 8.4 MB upsample weight for one utterance, each feeding an
+    /// identical GEMM. Cached here rather than in the checkpoint so the layout lives exactly as
+    /// long as the decode that needs it, which keeps hydration's high-water mark untouched — the
+    /// browser has no room to spare there.
+    columns: Vec<f32>,
 }
 
 impl CausalTransposeConvStream {
@@ -1180,12 +1235,18 @@ impl CausalTransposeConvStream {
             kernel,
             stride,
             history: Vec::with_capacity(((kernel - 1) / stride) * input_channels),
+            columns: Vec::new(),
         }
     }
 
     /// Discard retained left context without releasing its allocation.
+    ///
+    /// The cached column layout goes too. A cleared stream may legitimately be re-driven with a
+    /// different weight, and a layout that outlived its weight would decode the next utterance
+    /// with the previous one — silently, and with perfectly plausible audio.
     pub fn clear(&mut self) {
         self.history.clear();
+        self.columns.clear();
     }
 
     /// Process a packet and write its finalized output frames to `output`.
@@ -1225,11 +1286,24 @@ impl CausalTransposeConvStream {
         joined.extend_from_slice(input);
         let joined_frames = history_frames + frames;
         let mut all = vec![0.0f32; joined_frames * self.stride * self.output_channels];
-        causal_transpose_conv1d(
+        // Derive the column layout once per stream. `is_empty` is the whole guard: a stream is
+        // built for one utterance and driven with one weight, so the first packet fills this and
+        // every later packet reuses it. The values are a permutation of the same weight either
+        // way, so the GEMM sees identical operands and the output stays bit-identical to the
+        // offline path — the streaming==batch gate still holds.
+        if self.columns.is_empty() {
+            self.columns = column_layout(
+                weight,
+                self.input_channels,
+                self.output_channels,
+                self.kernel,
+            );
+        }
+        causal_transpose_conv1d_columns(
             &joined,
             joined_frames,
             self.input_channels,
-            weight,
+            &self.columns,
             bias,
             self.output_channels,
             self.kernel,
