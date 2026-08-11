@@ -96,6 +96,20 @@ const CRASH_KEY = "ftts-last-stage";
 
 const stageStarted = new Map();
 
+/// Update ONLY the crash breadcrumb, without touching the stage history.
+///
+/// Streaming reports progress many times a second. Routing those through `recordStage` pushed a
+/// history entry per tick — 179 of them in one run — burying the init stages that say which build
+/// loaded, which is the history's whole reason for existing. The breadcrumb is a single
+/// last-known-position that wants overwriting; the history is a log that does not.
+function markPosition(stage, detail) {
+  try {
+    localStorage.setItem(CRASH_KEY, JSON.stringify({ stage, detail, at: Date.now() }));
+  } catch {
+    /* private mode: diagnosis is best-effort, never a reason to fail the load */
+  }
+}
+
 function recordStage(stage, detail) {
   try {
     localStorage.setItem(CRASH_KEY, JSON.stringify({ stage, detail, at: Date.now() }));
@@ -170,7 +184,10 @@ worker.onmessage = ({ data }) => {
       // the moment of death is to have written it down beforehand. Streaming is where a phone
       // died, and "it crashed somewhere in streaming" is not a number anyone can act on.
       if (Number.isFinite(data.wasmBytes)) {
-        recordStage("stream-artifact", `${gigabytes(data.bytesDone)} GB in, wasm ${gigabytes(data.wasmBytes)} GB`);
+        markPosition(
+          "stream-artifact",
+          `${gigabytes(data.bytesDone)} GB in, wasm ${gigabytes(data.wasmBytes)} GB`,
+        );
       }
     }
     return;
