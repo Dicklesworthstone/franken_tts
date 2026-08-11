@@ -1646,6 +1646,7 @@ pub fn synthesize(
             let mut tee = TeeGenerator {
                 inner: &mut generator,
                 frames: frame_tx,
+                emitted: 0,
             };
             let result = engine
                 .synthesize(
@@ -1692,6 +1693,8 @@ pub fn synthesize(
 struct TeeGenerator<'a> {
     inner: &'a mut dyn FrameGenerator,
     frames: std::sync::mpsc::SyncSender<ftts_core::CodeFrame>,
+    /// Frames emitted so far, for the FTTS_DEBUG_CODES forensics tap only.
+    emitted: usize,
 }
 
 impl FrameGenerator for TeeGenerator<'_> {
@@ -1701,6 +1704,18 @@ impl FrameGenerator for TeeGenerator<'_> {
 
     fn next_frame(&mut self) -> Result<Option<ftts_core::CodeFrame>, GenerationError> {
         let frame = self.inner.next_frame()?;
+        // Mirror of the wasm build's `ftts-wasm codes[n]` line, so the two targets can be compared
+        // at the token level rather than only through audio. Env-gated: this is a forensics tap,
+        // not output, and it must never appear in a normal run.
+        if let Some(frame) = &frame
+            && std::env::var("FTTS_DEBUG_CODES").is_ok()
+            && self.emitted < 3
+        {
+            eprintln!("ftts-cli codes[{}]: {:?}", self.emitted, frame.codes);
+        }
+        if frame.is_some() {
+            self.emitted += 1;
+        }
         if let Some(frame) = &frame
             && self.frames.send(frame.clone()).is_err()
         {

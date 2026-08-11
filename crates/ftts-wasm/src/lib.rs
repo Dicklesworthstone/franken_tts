@@ -1044,6 +1044,7 @@ impl WasmEngine {
             Ok(())
         };
 
+        let mut emitted = 0usize;
         for _ in 0..cap {
             let frame_started = clock();
             let step = generator
@@ -1052,6 +1053,14 @@ impl WasmEngine {
             frames_ms += clock() - frame_started;
             match step {
                 Some(frame) => {
+                    // The first frames' codes, for cross-target comparison. Audio can only say
+                    // THAT two builds diverge; codes say whether the divergence is upstream of the
+                    // codec (token generation) or inside it, which is the difference between
+                    // hunting the talker and hunting the vocoder.
+                    if emitted < 3 {
+                        console_error(&format!("ftts-wasm codes[{emitted}]: {:?}", frame.codes));
+                    }
+                    emitted += 1;
                     for code in &frame.codes {
                         packet.push(i32::try_from(*code).map_err(|error| {
                             js_error("generated code does not fit the codec's i32", error)
