@@ -110,6 +110,9 @@ try {
   let status = "";
   const deadline = Date.now() + 15 * 60 * 1000;
   let stalled = null;
+  // One constant, used by both the detector and the report: they disagreed once, and a report
+  // that says "180s" after waiting 420 sends the next reader down the wrong path entirely.
+  const STALL_MS = 420_000;
 
   while (Date.now() < deadline) {
     const next = await page.evaluate(() => {
@@ -127,7 +130,11 @@ try {
       return button ? !button.disabled : false;
     });
     if (enabled) break;
-    if (Date.now() - lastChange > 180_000) {
+    // Hydration is one synchronous wasm call that posts no progress while it runs, so the stage
+    // text is legitimately frozen for its whole duration. The window has to exceed the slowest
+    // real hydration or the harness invents a stall — which it did, at "hydrate-talker", for a
+    // build that was merely working.
+    if (Date.now() - lastChange > STALL_MS) {
       stalled = status;
       break;
     }
@@ -138,13 +145,23 @@ try {
   console.log("\n--- stage history ---");
   for (const entry of history) console.log(`      ${entry}`);
   check("hydration advanced past staging", history.length > 1, `${history.length} stages`);
-  check("no stall", !stalled, stalled ? `stuck ${180}s at "${stalled}"` : "");
+  check("no stall", !stalled, stalled ? `stuck ${STALL_MS / 1000}s at "${stalled}"` : "");
 
   const ready = await page.evaluate(() => {
     const button = document.getElementById("speak");
     return button ? !button.disabled : null;
   });
   check("synthesize control is enabled", ready === true, `enabled=${ready}`);
+
+  // Read the page's own error banner. The wasm build sets `panic = "abort"`, which means
+  // `set_hook` never runs and a Rust panic is a SILENT trap — the only surviving evidence is the
+  // RuntimeError the worker forwards here. Watching only the stage text reported that as a
+  // "stall", which sent the diagnosis after a phantom performance problem instead of a real
+  // error that the page had been displaying the whole time.
+  const pageError = await page.evaluate(
+    () => document.getElementById("error")?.textContent?.trim() ?? "",
+  );
+  if (pageError) console.log(`\nPAGE ERROR: ${pageError}`);
 
   // The number that actually matters. Everything above only proves the page loads; this measures
   // whether the kernel work bought anything, in the browser, on the real model.

@@ -734,6 +734,59 @@ impl TextEmbeddingTable {
         Ok(Self { rows, gathered })
     }
 
+    /// Build the same table from rows the CALLER read, for hosts that do not hold the cold
+    /// section at all.
+    ///
+    /// The browser stages only the artifact's hot prefix and leaves the 622 MB cold table in
+    /// OPFS, then reads back the handful of 4 KB rows an utterance needs and hands them here.
+    /// The result is indistinguishable from [`TextEmbeddingTable::gather`]: same widening, same
+    /// compact layout, same binary-search addressing.
+    ///
+    /// `rows_bf16` must hold one row per DISTINCT id, ordered by ascending id — the same order
+    /// this function derives from `ids` by sorting and deduplicating. That ordering is the whole
+    /// contract between the two sides, so it is checked by length here and, more usefully, made
+    /// unfalsifiable by having the caller obtain its ids from
+    /// [`TalkerCheckpoint::utterance_text_ids`] rather than assembling its own set.
+    ///
+    /// # Errors
+    ///
+    /// If any id is outside the vocabulary, or `rows_bf16` is not exactly one bf16 row per
+    /// distinct id. A short buffer is refused rather than zero-filled: a zero row is a legitimate
+    /// embedding downstream and would yield confident wrong audio instead of an error.
+    pub fn from_provided_rows(ids: &[u32], rows_bf16: &[u8]) -> Result<Self, CheckpointError> {
+        let name = "talker.model.text_embedding.weight";
+        let mut gathered: Vec<u32> = ids.to_vec();
+        gathered.sort_unstable();
+        gathered.dedup();
+
+        if let Some(over) = gathered.iter().find(|id| **id as usize >= TEXT_VOCAB) {
+            return Err(CheckpointError::TensorShape {
+                tensor: name.to_owned(),
+                expected: TEXT_VOCAB,
+                actual: *over as usize + 1,
+            });
+        }
+        let expected_bytes = gathered.len() * TEXT_EMBED_WIDTH * 2;
+        if rows_bf16.len() != expected_bytes {
+            return Err(CheckpointError::TensorShape {
+                tensor: name.to_owned(),
+                expected: expected_bytes,
+                actual: rows_bf16.len(),
+            });
+        }
+
+        // bf16 -> f32 is an exact widening: the formats share sign and exponent, so the value is
+        // the bf16 bit pattern in the high half of the f32. This is the same conversion the
+        // mapped path performs, which is why a provided row is bit-identical to a gathered one.
+        let rows = rows_bf16
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16))
+            .collect();
+        Ok(Self { rows, gathered })
+    }
+
     fn gather_fttsq(
         artifact: &MappedFttsq,
         path: &Path,
@@ -1993,6 +2046,167 @@ mod tests {
     use super::*;
     use ftts_artifacts::fttsq::{AccessClass, FttsqWriter, TensorEntry};
     use std::io::Write as _;
+
+    /// A synthetic artifact shaped like the real one: a hot section, then a cold bf16 table LAST.
+    ///
+    /// Deliberately narrow in rows and full-width in columns. Row width has to be
+    /// `TEXT_EMBED_WIDTH` because that is the stride both readers assume, but the row COUNT is
+    /// free — a real-vocabulary table would be 622 MB, which is exactly the thing under test and
+    /// not something to allocate to test it.
+    fn artifact_with_cold_table(rows: usize) -> (Vec<u8>, Vec<u8>, u64) {
+        let cold: Vec<u8> = (0..rows * TEXT_EMBED_WIDTH)
+            .flat_map(|i| {
+                // Distinct, non-zero, and different in both bytes, so a stride error or a
+                // byte-order slip cannot coincidentally still compare equal.
+                u16::try_from((i * 7 + 1) % 30_000).unwrap_or(1).to_le_bytes()
+            })
+            .collect();
+        let hot = vec![1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let artifact = FttsqWriter::new("cold-elision-test", "b".repeat(64))
+            .license_notice("Apache-2.0")
+            .section("hot", AccessClass::HotRecurrentTalker, hot)
+            .section("cold", AccessClass::ColdTextEmbedding, cold.clone())
+            .tensor(TensorEntry {
+                name: "talker.model.text_embedding.weight".to_owned(),
+                section: "cold".to_owned(),
+                dtype: StoredDtype::Bf16,
+                shape: vec![rows as u64, TEXT_EMBED_WIDTH as u64],
+                offset: 0,
+                length: (rows * TEXT_EMBED_WIDTH * 2) as u64,
+                scales: None,
+            })
+            .finish()
+            .expect("a valid artifact");
+        let cold_offset = {
+            let reader =
+                ftts_artifacts::fttsq::FttsqReader::parse_directory(&artifact).expect("directory");
+            reader
+                .prefix_len_omitting(&[AccessClass::ColdTextEmbedding])
+                .expect("the cold section is last, so a hot prefix exists")
+        };
+        (artifact, cold, cold_offset)
+    }
+
+    #[test]
+    fn a_hot_prefix_verifies_what_it_holds_and_names_what_it_does_not() {
+        let (artifact, cold, cold_offset) = artifact_with_cold_table(4);
+        assert_eq!(
+            cold_offset as usize,
+            artifact.len() - cold.len(),
+            "the cold section must be the file's tail, or truncating it would drop hot bytes too"
+        );
+
+        let reader =
+            ftts_artifacts::fttsq::FttsqReader::parse_directory(&artifact).expect("directory");
+        assert_eq!(
+            reader
+                .absent_sections_in_prefix(cold_offset)
+                .expect("a clean cut classifies"),
+            ["cold"]
+        );
+        // Every retained section verifies in full against its own digest, exactly as it would in
+        // a whole-file load — a prefix weakens coverage, never the strength of what it covers.
+        reader
+            .verify_digests_of_present(&artifact[..cold_offset as usize])
+            .expect("the hot section's digest still holds in the prefix");
+        // While the whole-file check must NOT pass, or truncation would go unnoticed.
+        assert!(
+            reader
+                .verify_digests(&artifact[..cold_offset as usize])
+                .is_err(),
+            "the full digest pass must still notice the missing section"
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_splits_a_section_is_refused_rather_than_half_trusted() {
+        let (artifact, _cold, cold_offset) = artifact_with_cold_table(4);
+        let reader =
+            ftts_artifacts::fttsq::FttsqReader::parse_directory(&artifact).expect("directory");
+        // One byte into the cold section: verifiable as neither present nor absent.
+        assert!(
+            reader.absent_sections_in_prefix(cold_offset + 1).is_err(),
+            "a partial section cannot be digest-checked, so it must not load"
+        );
+        // And a cut inside the HOT section is equally refused.
+        assert!(
+            reader.absent_sections_in_prefix(cold_offset - 1).is_err(),
+            "truncating a retained section must not be mistaken for eliding it"
+        );
+    }
+
+    #[test]
+    fn the_hot_prefix_length_is_derived_from_the_layout_not_assumed() {
+        let (artifact, cold, cold_offset) = artifact_with_cold_table(4);
+        assert_eq!(cold_offset as usize, artifact.len() - cold.len());
+
+        // A layout with a retained section AFTER the cold one has no hot prefix at all, and must
+        // say so rather than silently truncating the retained section away.
+        let awkward = FttsqWriter::new("cold-not-last", "c".repeat(64))
+            .license_notice("Apache-2.0")
+            .section("cold", AccessClass::ColdTextEmbedding, vec![0_u8; 16])
+            .section("hot", AccessClass::HotRecurrentTalker, vec![1_u8; 16])
+            .finish()
+            .expect("a valid artifact");
+        let reader =
+            ftts_artifacts::fttsq::FttsqReader::parse_directory(&awkward).expect("directory");
+        assert!(
+            reader
+                .prefix_len_omitting(&[AccessClass::ColdTextEmbedding])
+                .is_none(),
+            "eliding a section that is not last would drop a retained one"
+        );
+    }
+
+    #[test]
+    fn provided_rows_reconstruct_exactly_what_the_mapped_table_would_have_gathered() {
+        let (_artifact, cold, _) = artifact_with_cold_table(4);
+
+        // Ids are deliberately unsorted, duplicated, and far apart, because the wire contract is
+        // "ascending distinct" and the caller is not asked to know that. Rows are supplied in the
+        // order the ids sort into, which is what `text_row_ids` hands the browser.
+        let ids = [900_u32, 12, 900, 4, 77];
+        let mut distinct = ids.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct, [4, 12, 77, 900]);
+
+        let row_bytes = TEXT_EMBED_WIDTH * 2;
+        let provided: Vec<u8> = (0..distinct.len())
+            .flat_map(|slot| cold[slot * row_bytes..(slot + 1) * row_bytes].to_vec())
+            .collect();
+        let table =
+            TextEmbeddingTable::from_provided_rows(&ids, &provided).expect("well-formed rows");
+
+        assert_eq!(table.gathered_ids(), distinct.as_slice());
+        for (slot, id) in distinct.iter().enumerate() {
+            let row = table.row(*id).expect("every supplied id resolves");
+            let expected: Vec<f32> = cold[slot * row_bytes..(slot + 1) * row_bytes]
+                .chunks_exact(2)
+                .map(|p| f32::from_bits(u32::from(u16::from_le_bytes([p[0], p[1]])) << 16))
+                .collect();
+            assert_eq!(
+                row.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "row for id {id} must widen bit-for-bit"
+            );
+        }
+    }
+
+    #[test]
+    fn provided_rows_refuse_a_buffer_that_does_not_match_the_ids() {
+        let width = TEXT_EMBED_WIDTH * 2;
+        let two_rows = vec![0_u8; width * 2];
+        // Three distinct ids, two rows: silently zero-filling the third would be a legitimate-
+        // looking embedding and confident wrong audio.
+        assert!(TextEmbeddingTable::from_provided_rows(&[1, 2, 3], &two_rows).is_err());
+        // Exactly right is accepted, so the check above is about the mismatch and not the shape.
+        assert!(TextEmbeddingTable::from_provided_rows(&[1, 2], &two_rows).is_ok());
+        // An out-of-vocabulary id is refused before any indexing happens.
+        assert!(
+            TextEmbeddingTable::from_provided_rows(&[1, TEXT_VOCAB as u32], &two_rows).is_err()
+        );
+    }
 
     #[test]
     fn runtime_and_converter_q8_quantizers_are_byte_identical_by_construction() {

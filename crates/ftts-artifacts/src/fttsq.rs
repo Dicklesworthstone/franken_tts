@@ -699,6 +699,14 @@ pub struct MappedFttsq {
     mapping: MappedFile,
     reader: FttsqReader,
     page_advice: Vec<PageAdviceApplication>,
+    /// Sections the backing bytes stop short of, in declaration order.
+    ///
+    /// Empty for every whole-file load, which is every native load. Non-empty only via
+    /// [`MappedFttsq::from_prefix_bytes`], where a caller has deliberately declined to hold a
+    /// trailing section. Reads into an absent section are already refused by the range checks in
+    /// [`FttsqReader::tensor_bytes`]; this list exists so callers can ask BEFORE reading, and so
+    /// the refusal can name the cause rather than looking like a corrupt artifact.
+    absent_sections: Vec<String>,
 }
 
 impl MappedFttsq {
@@ -729,6 +737,7 @@ impl MappedFttsq {
             mapping,
             reader,
             page_advice,
+            absent_sections: Vec::new(),
         })
     }
 
@@ -751,7 +760,70 @@ impl MappedFttsq {
             mapping,
             reader,
             page_advice,
+            absent_sections: Vec::new(),
         })
+    }
+
+    /// Load a PREFIX of an artifact: every section it fully contains is verified, the rest are
+    /// recorded as absent.
+    ///
+    /// # Why a partial artifact is a legitimate thing to want
+    ///
+    /// [`AccessClass::ColdTextEmbedding`] is 622 MB — 47% of the artifact — and the format already
+    /// says what it is for: lazy, row-granular, never paged in wholesale. A native host gets that
+    /// for free, because the mapping only faults in the rows an utterance actually touches.
+    /// wasm has no mapping. Every byte staged into linear memory is a byte permanently resident,
+    /// and the wasm heap is grow-only — a tab can never hand memory back — so on a phone the cold
+    /// table is 622 MB of ballast held for the lifetime of the page to serve a few hundred 4 KB
+    /// rows per utterance.
+    ///
+    /// So the browser stops the buffer where the cold section starts and reads those rows from
+    /// OPFS instead. That works ONLY because the cold section is last in the file: every other
+    /// section keeps its true offset, so nothing needs remapping and no offset arithmetic changes.
+    /// A future layout that put a hot section after a cold one would break this, which is why the
+    /// prefix length is derived from the directory rather than assumed
+    /// ([`FttsqReader::prefix_len_omitting`]).
+    ///
+    /// # Integrity
+    ///
+    /// Undiminished for what is present. The v1 format carries a digest per section, so a prefix
+    /// verifies exactly the sections it holds, in full, with the same SHA-256 comparison as a
+    /// whole-file load. What is NOT present is not vouched for here — the caller holding the rest
+    /// out of band is responsible for it (the browser verifies the whole file on download, before
+    /// it ever reaches this path).
+    ///
+    /// # Errors
+    ///
+    /// As [`MappedFttsq::from_bytes`], plus a refusal when the prefix is too short to contain the
+    /// directory itself, or when it splits a section rather than stopping cleanly before one — a
+    /// partial section cannot be verified, so it is rejected rather than silently trusted.
+    #[cfg(not(unix))] // same owned-bytes backing as `from_bytes`; a mapping never needs this
+    pub fn from_prefix_bytes(bytes: Vec<u8>) -> Result<Self, FttsqError> {
+        let mapping = MappedFile::from_bytes(bytes);
+        let reader = FttsqReader::parse_directory(mapping.as_slice())?;
+        let available = mapping.as_slice().len() as u64;
+
+        let absent_sections = reader.absent_sections_in_prefix(available)?;
+        let page_advice = apply_page_in_plan(&mapping, &reader);
+        reader.verify_digests_of_present(mapping.as_slice())?;
+        Ok(Self {
+            mapping,
+            reader,
+            page_advice,
+            absent_sections,
+        })
+    }
+
+    /// Sections this artifact's bytes stop short of; empty for a whole-file load.
+    #[must_use]
+    pub fn absent_sections(&self) -> &[String] {
+        &self.absent_sections
+    }
+
+    /// Whether a named section's bytes are actually held.
+    #[must_use]
+    pub fn has_section(&self, name: &str) -> bool {
+        self.reader.section(name).is_some() && !self.absent_sections.iter().any(|s| s == name)
     }
 
     /// The fully validated directory over this artifact.
@@ -1005,6 +1077,100 @@ impl FttsqReader {
             }
         }
         Ok(())
+    }
+
+    /// Verify every section the bytes fully contain, skipping those they stop short of.
+    ///
+    /// The skip is deliberately silent because the caller has already classified what is absent
+    /// and refused any section that was merely truncated — see [`MappedFttsq::from_prefix_bytes`].
+    /// What this verifies, it verifies exactly as [`FttsqReader::verify_digests`] does.
+    ///
+    /// # Errors
+    ///
+    /// On any present section whose payload does not match its declared digest.
+    pub fn verify_digests_of_present(&self, bytes: &[u8]) -> Result<(), FttsqError> {
+        for section in &self.sections {
+            let Some(end) = section.end() else { continue };
+            if end > bytes.len() as u64 {
+                continue;
+            }
+            let payload = self.section_bytes(section, bytes)?;
+            let mut hasher = Sha256::new();
+            hasher.update(payload);
+            let actual = to_hex(&hasher.finish());
+            if actual != section.sha256 {
+                return Err(FttsqError::DigestMismatch {
+                    section: section.name.clone(),
+                    expected: section.sha256.clone(),
+                    actual,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Which sections a prefix of `available` bytes stops short of entirely.
+    ///
+    /// A section is absent when it starts at or after the cut, and present when it ends at or
+    /// before it. A section straddling the cut is neither: it cannot be digest-checked and must
+    /// not be read, so it is an error rather than a third category. That distinction is what
+    /// separates "the caller deliberately declined a trailing section" from "the download stopped
+    /// early", which would otherwise both arrive here looking identical.
+    ///
+    /// # Errors
+    ///
+    /// When the prefix splits a section, or a declared section's range overflows.
+    pub fn absent_sections_in_prefix(&self, available: u64) -> Result<Vec<String>, FttsqError> {
+        let mut absent = Vec::new();
+        for section in &self.sections {
+            let end = section
+                .end()
+                .ok_or_else(|| FttsqError::RangeOutOfBounds {
+                    what: format!("section `{}`", section.name),
+                    offset: section.offset,
+                    length: section.length,
+                    bound: available,
+                })?;
+            if end <= available {
+                continue;
+            }
+            if section.offset < available {
+                return Err(FttsqError::RangeOutOfBounds {
+                    what: format!("prefix splits section `{}`", section.name),
+                    offset: section.offset,
+                    length: section.length,
+                    bound: available,
+                });
+            }
+            absent.push(section.name.clone());
+        }
+        Ok(absent)
+    }
+
+    /// The shortest prefix that holds every section EXCEPT those in `omit`.
+    ///
+    /// Returns `None` when omitting those classes would not leave a contiguous prefix — i.e. when
+    /// a retained section sits after an omitted one. That is the guard that keeps the browser's
+    /// truncation honest against a future layout change: the saving depends on the omitted
+    /// sections being last, and this is what refuses to assume it.
+    #[must_use]
+    pub fn prefix_len_omitting(&self, omit: &[AccessClass]) -> Option<u64> {
+        let omitted = |section: &SectionEntry| omit.contains(&section.access_class);
+        let first_omitted = self
+            .sections
+            .iter()
+            .filter(|section| omitted(section))
+            .map(|section| section.offset)
+            .min()?;
+        // Nothing retained may live at or beyond that point, or the prefix would drop it too.
+        if self
+            .sections
+            .iter()
+            .any(|section| !omitted(section) && section.offset >= first_omitted)
+        {
+            return None;
+        }
+        Some(first_omitted)
     }
 
     fn section_bytes<'a>(

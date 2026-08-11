@@ -159,6 +159,30 @@ export class ModelStaging {
             throw takeFromExternrefTable0(ret[0]);
         }
     }
+    /**
+     * Reserve room for the artifact's HOT PREFIX only, leaving the cold text embedding on disk.
+     *
+     * The cold section is 622 MB — 47% of the artifact — and an utterance touches a few hundred
+     * of its 4 KB rows. A native host pays for only those rows because it maps the file; wasm has
+     * no mapping, and its heap is grow-only, so every staged byte is resident for the life of the
+     * page. On a device with a ~2 GB per-tab ceiling that ballast is the difference between
+     * running and being killed.
+     *
+     * `hot_bytes` must be exactly the artifact's cold-section offset. It is not taken on trust:
+     * hydration re-derives it from the staged directory and refuses a mismatch, so a caller that
+     * truncates at the wrong place gets a named error instead of silently wrong tensors.
+     *
+     * # Errors
+     *
+     * As [`ModelStaging::reserve_fttsq`].
+     * @param {number} hot_bytes
+     */
+    reserve_fttsq_hot_prefix(hot_bytes) {
+        const ret = wasm.modelstaging_reserve_fttsq_hot_prefix(this.__wbg_ptr, hot_bytes);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
 }
 if (Symbol.dispose) ModelStaging.prototype[Symbol.dispose] = ModelStaging.prototype.free;
 
@@ -325,6 +349,63 @@ export class WasmEngine {
         var v3 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
         wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
         return v3;
+    }
+    /**
+     * [`WasmEngine::synthesize`] for an engine whose artifact omits the cold text embedding.
+     *
+     * `rows_bf16` is one bf16 row per id from [`WasmEngine::text_row_ids`], in that order,
+     * concatenated. Roughly 4 KB per distinct token, so a long utterance costs a couple of MB of
+     * reads against 622 MB of permanently resident linear memory saved.
+     *
+     * # Errors
+     *
+     * As [`WasmEngine::synthesize`], plus a refusal when the rows do not match the ids.
+     * @param {string} text
+     * @param {Float32Array} speaker
+     * @param {bigint} seed
+     * @param {number} max_frames
+     * @param {Uint8Array} rows_bf16
+     * @returns {Float32Array}
+     */
+    synthesize_with_text_rows(text, speaker, seed, max_frames, rows_bf16) {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArrayF32ToWasm0(speaker, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(rows_bf16, wasm.__wbindgen_malloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmengine_synthesize_with_text_rows(this.__wbg_ptr, ptr0, len0, ptr1, len1, seed, max_frames, ptr2, len2);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v4 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v4;
+    }
+    /**
+     * The cold-text-embedding ids this exact text will need, in the order the rows must arrive.
+     *
+     * The caller reads these rows out of the artifact itself (in the browser: out of OPFS) and
+     * hands them to [`WasmEngine::synthesize_with_text_rows`]. Ids come from the engine rather
+     * than from the caller's own tokenization on purpose — the two must agree exactly, and the
+     * only way to guarantee that is to ask the tokenizer that will actually run.
+     *
+     * # Errors
+     *
+     * Throws when text preparation fails.
+     * @param {string} text
+     * @returns {Uint32Array}
+     */
+    text_row_ids(text) {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmengine_text_row_ids(this.__wbg_ptr, ptr0, len0);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v2 = getArrayU32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v2;
     }
 }
 if (Symbol.dispose) WasmEngine.prototype[Symbol.dispose] = WasmEngine.prototype.free;
@@ -550,6 +631,11 @@ function getArrayF32FromWasm0(ptr, len) {
     return getFloat32ArrayMemory0().subarray(ptr / 4, ptr / 4 + len);
 }
 
+function getArrayU32FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint32ArrayMemory0().subarray(ptr / 4, ptr / 4 + len);
+}
+
 let cachedFloat32ArrayMemory0 = null;
 function getFloat32ArrayMemory0() {
     if (cachedFloat32ArrayMemory0 === null || cachedFloat32ArrayMemory0.byteLength === 0) {
@@ -560,6 +646,14 @@ function getFloat32ArrayMemory0() {
 
 function getStringFromWasm0(ptr, len) {
     return decodeText(ptr >>> 0, len);
+}
+
+let cachedUint32ArrayMemory0 = null;
+function getUint32ArrayMemory0() {
+    if (cachedUint32ArrayMemory0 === null || cachedUint32ArrayMemory0.byteLength === 0) {
+        cachedUint32ArrayMemory0 = new Uint32Array(wasm.memory.buffer);
+    }
+    return cachedUint32ArrayMemory0;
 }
 
 let cachedUint8ArrayMemory0 = null;
@@ -662,6 +756,7 @@ function __wbg_finalize_init(instance, module) {
     wasm = instance.exports;
     wasmModule = module;
     cachedFloat32ArrayMemory0 = null;
+    cachedUint32ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
     wasm.__wbindgen_start();
     return wasm;

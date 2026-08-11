@@ -209,6 +209,25 @@ function reply(type, payload, transfer = []) {
   self.postMessage({ type, ...payload }, transfer);
 }
 
+// Mirror this worker's console.error to the page.
+//
+// A Worker's console is not the page's console, and Playwright exposes no way to subscribe to it,
+// so ANYTHING logged in here — including the Rust panic hook, which is the one thing that explains
+// a dead engine — is invisible to the harness. That blindness has now cost two separate
+// diagnoses: a fatal worker error read as an innocent stall, and a wasm trap that produced no
+// output at all. Forwarding costs one postMessage per error and makes the panic hook worth having.
+{
+  const passthrough = console.error.bind(console);
+  console.error = (...args) => {
+    passthrough(...args);
+    try {
+      self.postMessage({ type: "workerLog", text: args.map(String).join(" ") });
+    } catch {
+      /* an unpostable argument must never mask the error being reported */
+    }
+  };
+}
+
 /// Messages are handled STRICTLY ONE AT A TIME, in arrival order.
 ///
 /// `self.onmessage` being `async` means the runtime happily starts a second handler while the
@@ -216,6 +235,71 @@ function reply(type, payload, transfer = []) {
 /// `init` — and hydration then runs against a module whose glue has not finished binding. The
 /// symptoms were maddening and platform-dependent: iOS threw
 /// `undefined is not an object (evaluating 'wasm.modelstaging_new')`, while Chrome simply hung
+/// Where the cold text embedding lives inside the artifact, read from the artifact itself.
+///
+/// The `.fttsq` header is `magic(8) | version(4) | directoryLength(8) | directoryJSON`, all at the
+/// head of the file, so this costs one small read regardless of how large the artifact is.
+///
+/// Nothing here is hardcoded on purpose. The byte offset where staging stops and the offset each
+/// embedding row is read from both come from the directory the artifact declares about itself, so
+/// a re-exported model with a different layout cannot silently desynchronize the two sides — and
+/// the engine independently re-derives the same prefix length at hydration and refuses a mismatch.
+let coldLayout = null;
+
+async function readColdLayout(root, asset) {
+  const blob = await (await root.getFileHandle(asset)).getFile();
+  const prefix = new DataView(await blob.slice(0, 20).arrayBuffer());
+  const magic = new TextDecoder().decode(new Uint8Array(await blob.slice(0, 5).arrayBuffer()));
+  if (magic !== "FTTSQ") throw new Error(`not a .fttsq artifact (magic ${JSON.stringify(magic)})`);
+  // getBigUint64 because the directory length is a u64; Number() is safe afterwards because a
+  // directory that exceeded 2^53 bytes would not fit in the file it describes.
+  const directoryLength = Number(prefix.getBigUint64(12, true));
+  const directory = JSON.parse(
+    new TextDecoder().decode(await blob.slice(20, 20 + directoryLength).arrayBuffer()),
+  );
+
+  const cold = directory.sections.find((s) => s.access_class === "COLD_TEXT_EMBEDDING");
+  if (!cold) throw new Error("artifact declares no COLD_TEXT_EMBEDDING section");
+  // The saving depends on the cold section being last: everything before it keeps its true file
+  // offset, so truncating needs no remapping at all. Refuse rather than assume.
+  const later = directory.sections.find(
+    (s) => s.access_class !== "COLD_TEXT_EMBEDDING" && s.offset >= cold.offset,
+  );
+  if (later) throw new Error(`section ${later.name} sits after the cold section; cannot elide`);
+
+  const tensor = directory.tensors.find((t) => t.name === "talker.model.text_embedding.weight");
+  if (!tensor || tensor.dtype !== "bf16") {
+    throw new Error(`cold text embedding must be bf16, found ${tensor?.dtype}`);
+  }
+  const width = tensor.shape[1];
+  return {
+    hotBytes: cold.offset,
+    // Rows are read straight out of the file, so the offset is the section's plus the tensor's
+    // offset within it plus the row stride.
+    rowBase: cold.offset + tensor.offset,
+    rowBytes: width * 2,
+    asset,
+  };
+}
+
+/// Read one bf16 embedding row per id, concatenated in the order given.
+///
+/// `ids` arrives from `engine.text_row_ids`, which returns them ascending and distinct — the exact
+/// order the Rust side reconstructs independently when it rebuilds the table.
+async function readColdRows(root, layout, ids) {
+  const blob = await (await root.getFileHandle(layout.asset)).getFile();
+  const out = new Uint8Array(ids.length * layout.rowBytes);
+  for (let i = 0; i < ids.length; i += 1) {
+    const start = layout.rowBase + ids[i] * layout.rowBytes;
+    const row = await blob.slice(start, start + layout.rowBytes).arrayBuffer();
+    if (row.byteLength !== layout.rowBytes) {
+      throw new Error(`short cold row for id ${ids[i]}: ${row.byteLength}/${layout.rowBytes}`);
+    }
+    out.set(new Uint8Array(row), i * layout.rowBytes);
+  }
+  return out;
+}
+
 /// forever inside `new ModelStaging(...)` with `wasmMemory` still null (reported as `mem 0.00 GB`,
 /// the clue that finally identified this).
 ///
@@ -331,13 +415,20 @@ async function handleMessage({ data }) {
         // (`from_staging` consumes the handle on success, making the later free a no-op.)
         const staging = new ModelStaging(data.codec.bytes);
         loadStaging = staging;
-        const drain = async (meta, push) => {
+        // What will actually be ingested: the whole codec, plus the artifact's hot prefix once
+        // the layout is known. Before that it is the codec alone, which is all that has streamed.
+        const stagedTotal = () => data.codec.bytes + (coldLayout?.hotBytes ?? 0);
+        const drain = async (meta, push, limit) => {
           const blob = await (await root.getFileHandle(meta.asset)).getFile();
-          for (let offset = 0; offset < blob.size; offset += INGEST_SLICE) {
-            const end = Math.min(offset + INGEST_SLICE, blob.size);
+          const stop = Math.min(limit ?? blob.size, blob.size);
+          for (let offset = 0; offset < stop; offset += INGEST_SLICE) {
+            const end = Math.min(offset + INGEST_SLICE, stop);
             // One slice live at a time; the previous is collectable before the next is read.
             push(new Uint8Array(await blob.slice(offset, end).arrayBuffer()));
-            reply("loadProgress", { bytesDone: staging.filled() });
+            // The total is reported alongside, because staging no longer ingests the whole
+            // artifact: the elided cold section would otherwise leave the bar stalled at ~85%
+            // with nothing wrong.
+            reply("loadProgress", { bytesDone: staging.filled(), bytesTotal: stagedTotal() });
           }
         };
 
@@ -346,10 +437,23 @@ async function handleMessage({ data }) {
         stage("widen-codec", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
         staging.finish_codec();
 
-        stage("reserve-artifact", `${(data.fttsq.bytes / 1e9).toFixed(2)} GB`);
-        staging.reserve_fttsq(data.fttsq.bytes);
+        // Stage the artifact's HOT PREFIX and leave the cold text embedding on disk.
+        //
+        // That section is 622 MB — 47% of the artifact — and an utterance reads a few hundred of
+        // its 4 KB rows. A native host pays only for the rows it touches because it maps the file;
+        // wasm cannot map, and its heap is grow-only, so every staged byte stays resident for the
+        // life of the page. Holding it costs ~0.62 GB of a ~2 GB iOS tab budget to serve ~2 MB of
+        // actual reads.
+        //
+        // Done on EVERY browser rather than only the small ones, deliberately. A path that runs
+        // exclusively on phones is a path nothing tests, and this session already paid for that
+        // lesson once when a Chromium-only harness hid a WebKit-only failure (NE-007). One path,
+        // exercised by every harness run.
+        coldLayout = await readColdLayout(root, data.fttsq.asset);
+        stage("reserve-artifact", `${(coldLayout.hotBytes / 1e9).toFixed(2)} GB hot prefix`);
+        staging.reserve_fttsq_hot_prefix(coldLayout.hotBytes);
         stage("stream-artifact");
-        await drain(data.fttsq, (chunk) => staging.push_fttsq(chunk));
+        await drain(data.fttsq, (chunk) => staging.push_fttsq(chunk), coldLayout.hotBytes);
 
         stage("hydrate-talker", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
         engine = WasmEngine.from_staging(
@@ -382,8 +486,23 @@ async function handleMessage({ data }) {
         }
         const voice =
           data.voiceVector ?? Float32Array.from(preset_vector(data.voiceName ?? "matt"));
+        // The cold embedding rows this utterance needs, read on demand from OPFS. The ids come
+        // from the engine's own tokenizer rather than from anything here: the two sides must agree
+        // exactly, and asking the tokenizer that will actually run is the only way to be sure.
+        const rowIds = engine.text_row_ids(data.text);
+        const rows = await readColdRows(
+          await navigator.storage.getDirectory(),
+          coldLayout,
+          rowIds,
+        );
         const started = performance.now();
-        const pcm = engine.synthesize(data.text, voice, BigInt(data.seed ?? 0), 0);
+        const pcm = engine.synthesize_with_text_rows(
+          data.text,
+          voice,
+          BigInt(data.seed ?? 0),
+          0,
+          rows,
+        );
         const elapsedMs = performance.now() - started;
         reply(
           "synthesize",

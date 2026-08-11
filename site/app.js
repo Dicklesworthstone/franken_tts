@@ -149,11 +149,22 @@ worker.onmessage = ({ data }) => {
   // Streaming-into-wasm progress: also telemetry. The worker emits one of these per slice
   // precisely so the bar keeps moving during the multi-ten-second hydration phase; they
   // were silently discarded before, freezing the bar at 100%-downloaded.
+  // Re-emit the worker's errors on the page console, which is the only one anything outside the
+  // browser can observe. See the mirror in engine-worker.js for why this exists.
+  if (data.type === "workerLog") {
+    console.error(`[engine-worker] ${data.text}`);
+    return;
+  }
   if (data.type === "loadProgress") {
-    if (hydrateTotalBytes > 0 && Number.isFinite(data.bytesDone)) {
-      const percent = Math.min(100, (data.bytesDone / hydrateTotalBytes) * 100);
+    // The worker's own total wins when it sends one: it stages the artifact's hot prefix rather
+    // than the whole file, so the download total would leave the bar short of 100% forever.
+    const total = Number.isFinite(data.bytesTotal) && data.bytesTotal > 0
+      ? data.bytesTotal
+      : hydrateTotalBytes;
+    if (total > 0 && Number.isFinite(data.bytesDone)) {
+      const percent = Math.min(100, (data.bytesDone / total) * 100);
       ui.dlBar.style.width = `${percent.toFixed(1)}%`;
-      ui.dlStatus.textContent = `Streaming into the engine: ${gigabytes(data.bytesDone)} / ${gigabytes(hydrateTotalBytes)} GB`;
+      ui.dlStatus.textContent = `Streaming into the engine: ${gigabytes(data.bytesDone)} / ${gigabytes(total)} GB`;
     }
     return;
   }

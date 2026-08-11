@@ -14,6 +14,7 @@
 use ftts_core::{FrameGenerator, NormalizationOptions, PreparedText, TextPreparer};
 use ftts_model_qwen::checkpoint::{
     CODEC_LANGUAGE_ENGLISH_ID, CodecCheckpoint, TALKER_HIDDEN, TalkerCheckpoint,
+    TextEmbeddingTable,
 };
 use ftts_model_qwen::generate::{QwenGenerator, QwenGeneratorConfig};
 use ftts_model_qwen::microdecoder::MicrodecoderConfig;
@@ -295,6 +296,10 @@ pub struct ModelStaging {
     codec: Option<CodecCheckpoint>,
     /// Reserved by `reserve_fttsq`, which refuses to run before the codec is hydrated.
     fttsq: Vec<u8>,
+    /// Set when the caller reserved only the artifact's hot prefix, holding the 622 MB cold text
+    /// embedding out of linear memory. Checked against the artifact's own directory at hydration,
+    /// so a caller that truncates at the wrong offset is refused rather than trusted.
+    cold_elided: bool,
     /// Bytes freed by `finish_codec`, so `filled` can keep reporting monotonic download progress
     /// after the source it was counting has gone away.
     codec_retired: usize,
@@ -321,6 +326,7 @@ impl ModelStaging {
             codec_source,
             codec: None,
             fttsq: Vec::new(),
+            cold_elided: false,
             codec_retired: 0,
         })
     }
@@ -404,6 +410,26 @@ impl ModelStaging {
             .map_err(|_| js_error("cannot reserve model memory (bytes)", fttsq_bytes))
     }
 
+    /// Reserve room for the artifact's HOT PREFIX only, leaving the cold text embedding on disk.
+    ///
+    /// The cold section is 622 MB — 47% of the artifact — and an utterance touches a few hundred
+    /// of its 4 KB rows. A native host pays for only those rows because it maps the file; wasm has
+    /// no mapping, and its heap is grow-only, so every staged byte is resident for the life of the
+    /// page. On a device with a ~2 GB per-tab ceiling that ballast is the difference between
+    /// running and being killed.
+    ///
+    /// `hot_bytes` must be exactly the artifact's cold-section offset. It is not taken on trust:
+    /// hydration re-derives it from the staged directory and refuses a mismatch, so a caller that
+    /// truncates at the wrong place gets a named error instead of silently wrong tensors.
+    ///
+    /// # Errors
+    ///
+    /// As [`ModelStaging::reserve_fttsq`].
+    pub fn reserve_fttsq_hot_prefix(&mut self, hot_bytes: usize) -> Result<(), JsValue> {
+        self.cold_elided = true;
+        self.reserve_fttsq(hot_bytes)
+    }
+
     /// Append one slice of the artifact, in order.
     ///
     /// # Errors
@@ -468,7 +494,12 @@ impl WasmEngine {
                 ),
             ));
         }
-        let ModelStaging { fttsq, codec, .. } = staging;
+        let ModelStaging {
+            fttsq,
+            codec,
+            cold_elided,
+            ..
+        } = staging;
         let codec = codec.ok_or_else(|| {
             js_error(
                 "codec was never hydrated",
@@ -478,6 +509,7 @@ impl WasmEngine {
         Self::hydrate_with_codec(
             fttsq,
             codec,
+            cold_elided,
             &vocab_json,
             &merges_txt,
             &tokenizer_config_json,
@@ -533,7 +565,14 @@ impl WasmEngine {
             CodecCheckpoint::load_from_file(&codec_file, Path::new("browser://codec.safetensors"))
                 .map_err(|error| js_error("codec hydration failed", error))?;
         drop(codec_file);
-        Self::hydrate_with_codec(fttsq, codec, vocab_json, merges_txt, tokenizer_config_json)
+        Self::hydrate_with_codec(
+            fttsq,
+            codec,
+            false,
+            vocab_json,
+            merges_txt,
+            tokenizer_config_json,
+        )
     }
 
     /// Hydration from an artifact buffer plus an ALREADY-widened codec.
@@ -544,15 +583,74 @@ impl WasmEngine {
     fn hydrate_with_codec(
         fttsq: Vec<u8>,
         codec: CodecCheckpoint,
+        cold_elided: bool,
         vocab_json: &str,
         merges_txt: &str,
         tokenizer_config_json: &str,
     ) -> Result<WasmEngine, JsValue> {
-        let artifact = Arc::new(
+        let staged_bytes = fttsq.len() as u64;
+        console_error(&format!(
+            "ftts-wasm hydrate: verifying artifact ({staged_bytes} bytes, cold_elided={cold_elided})"
+        ));
+        let artifact = Arc::new(if cold_elided {
+            ftts_artifacts::fttsq::MappedFttsq::from_prefix_bytes(fttsq)
+                .map_err(|error| js_error("artifact prefix rejected", error))?
+        } else {
             ftts_artifacts::fttsq::MappedFttsq::from_bytes(fttsq)
-                .map_err(|error| js_error("artifact rejected", error))?,
-        );
+                .map_err(|error| js_error("artifact rejected", error))?
+        });
 
+        console_error("ftts-wasm hydrate: artifact verified, checking layout");
+
+        // Re-derive the truncation point from the directory the artifact itself declares, and
+        // insist the caller stopped exactly there. Without this the JS side's byte offset is an
+        // unchecked assumption about the file layout, and the failure it would produce — hot
+        // tensors silently missing their tails — is the kind that reads as a model bug rather
+        // than a loader bug. `prefix_len_omitting` also returns None if a future layout puts a
+        // retained section after the cold one, which turns a silent 622 MB regression into a
+        // refusal to load.
+        if cold_elided {
+            let expected = artifact
+                .reader()
+                .prefix_len_omitting(&[ftts_artifacts::fttsq::AccessClass::ColdTextEmbedding]);
+            match expected {
+                Some(len) if len == staged_bytes => {}
+                Some(len) => {
+                    return Err(js_error(
+                        "hot-prefix length does not match the artifact layout (expected/staged)",
+                        format!("{len}/{staged_bytes}"),
+                    ));
+                }
+                None => {
+                    return Err(js_error(
+                        "artifact layout does not permit eliding the cold text embedding",
+                        "a retained section starts after the cold section",
+                    ));
+                }
+            }
+
+            // The provided-row path widens bf16, while the mapped path also accepts f32 and q8
+            // cold tables. The directory survives truncation (it sits at the head of the file), so
+            // the stored dtype can be checked here rather than assumed — an f32 or q8 cold table
+            // would otherwise be read at the wrong stride and produce fluent wrong audio.
+            let cold = artifact
+                .reader()
+                .tensor("talker.model.text_embedding.weight")
+                .ok_or_else(|| {
+                    js_error(
+                        "artifact declares no cold text embedding",
+                        "cannot elide what is not there",
+                    )
+                })?;
+            if cold.dtype != ftts_artifacts::fttsq::StoredDtype::Bf16 {
+                return Err(js_error(
+                    "cold text embedding must be bf16 to be supplied row-wise",
+                    format!("{:?}", cold.dtype),
+                ));
+            }
+        }
+
+        console_error("ftts-wasm hydrate: layout checks passed, loading talker");
         let label = Path::new("browser://model.fttsq");
         let talker = TalkerCheckpoint::load_fttsq_mapped(
             Arc::clone(&artifact),
@@ -560,6 +658,7 @@ impl WasmEngine {
             ftts_model_qwen::generate::hot_elision_from_environment(),
         )
         .map_err(|error| js_error("talker hydration failed", error))?;
+        console_error("ftts-wasm hydrate: talker loaded, building tokenizer");
 
         let tokenizer = QwenTokenizer::from_files_using_environment(TokenizerFiles {
             vocab_json,
@@ -618,6 +717,62 @@ impl WasmEngine {
         seed: u64,
         max_frames: u32,
     ) -> Result<Vec<f32>, JsValue> {
+        self.synthesize_inner(text, speaker, seed, max_frames, None)
+    }
+
+    /// The cold-text-embedding ids this exact text will need, in the order the rows must arrive.
+    ///
+    /// The caller reads these rows out of the artifact itself (in the browser: out of OPFS) and
+    /// hands them to [`WasmEngine::synthesize_with_text_rows`]. Ids come from the engine rather
+    /// than from the caller's own tokenization on purpose — the two must agree exactly, and the
+    /// only way to guarantee that is to ask the tokenizer that will actually run.
+    ///
+    /// # Errors
+    ///
+    /// Throws when text preparation fails.
+    pub fn text_row_ids(&self, text: &str) -> Result<Vec<u32>, JsValue> {
+        let prepared_raw = self
+            .tokenizer
+            .prepare(text, &NormalizationOptions::default())
+            .map_err(|error| js_error("text preparation failed", error))?;
+        let wrapped = TalkerCheckpoint::wrap_target_ids(&prepared_raw.token_ids);
+        let mut ids = TalkerCheckpoint::utterance_text_ids(&wrapped);
+        // Ascending-and-distinct is the wire contract: the caller reads rows in this order and
+        // `from_provided_rows` rebuilds the same order independently. Sorting here means the
+        // caller never has to know that rule, only to preserve the order it was given.
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// [`WasmEngine::synthesize`] for an engine whose artifact omits the cold text embedding.
+    ///
+    /// `rows_bf16` is one bf16 row per id from [`WasmEngine::text_row_ids`], in that order,
+    /// concatenated. Roughly 4 KB per distinct token, so a long utterance costs a couple of MB of
+    /// reads against 622 MB of permanently resident linear memory saved.
+    ///
+    /// # Errors
+    ///
+    /// As [`WasmEngine::synthesize`], plus a refusal when the rows do not match the ids.
+    pub fn synthesize_with_text_rows(
+        &self,
+        text: &str,
+        speaker: &[f32],
+        seed: u64,
+        max_frames: u32,
+        rows_bf16: &[u8],
+    ) -> Result<Vec<f32>, JsValue> {
+        self.synthesize_inner(text, speaker, seed, max_frames, Some(rows_bf16))
+    }
+
+    fn synthesize_inner(
+        &self,
+        text: &str,
+        speaker: &[f32],
+        seed: u64,
+        max_frames: u32,
+        provided_rows: Option<&[u8]>,
+    ) -> Result<Vec<f32>, JsValue> {
         if speaker.len() != TALKER_HIDDEN {
             return Err(js_error(
                 "speaker vector must be exactly 1,024 floats",
@@ -632,10 +787,14 @@ impl WasmEngine {
         let prepared = PreparedText::new(wrapped.clone(), prepared_raw.normalization_trace);
 
         let ids = TalkerCheckpoint::utterance_text_ids(&wrapped);
-        let table = self
-            .talker
-            .gather_text_rows(&ids)
-            .map_err(|error| js_error("text embedding gather failed", error))?;
+        let table = match provided_rows {
+            Some(rows) => TextEmbeddingTable::from_provided_rows(&ids, rows)
+                .map_err(|error| js_error("provided text rows rejected", error))?,
+            None => self
+                .talker
+                .gather_text_rows(&ids)
+                .map_err(|error| js_error("text embedding gather failed", error))?,
+        };
         let header = self
             .talker
             .xvector_header(&table, speaker, CODEC_LANGUAGE_ENGLISH_ID)

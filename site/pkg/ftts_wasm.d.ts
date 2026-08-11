@@ -112,6 +112,24 @@ export class ModelStaging {
      * 3.35 GB peak this type exists to avoid — or when the reservation fails.
      */
     reserve_fttsq(fttsq_bytes: number): void;
+    /**
+     * Reserve room for the artifact's HOT PREFIX only, leaving the cold text embedding on disk.
+     *
+     * The cold section is 622 MB — 47% of the artifact — and an utterance touches a few hundred
+     * of its 4 KB rows. A native host pays for only those rows because it maps the file; wasm has
+     * no mapping, and its heap is grow-only, so every staged byte is resident for the life of the
+     * page. On a device with a ~2 GB per-tab ceiling that ballast is the difference between
+     * running and being killed.
+     *
+     * `hot_bytes` must be exactly the artifact's cold-section offset. It is not taken on trust:
+     * hydration re-derives it from the staged directory and refuses a mismatch, so a caller that
+     * truncates at the wrong place gets a named error instead of silently wrong tensors.
+     *
+     * # Errors
+     *
+     * As [`ModelStaging::reserve_fttsq`].
+     */
+    reserve_fttsq_hot_prefix(hot_bytes: number): void;
 }
 
 /**
@@ -181,6 +199,31 @@ export class WasmEngine {
      * Throws on an ill-shaped speaker vector, text preparation failure, or a decode error.
      */
     synthesize(text: string, speaker: Float32Array, seed: bigint, max_frames: number): Float32Array;
+    /**
+     * [`WasmEngine::synthesize`] for an engine whose artifact omits the cold text embedding.
+     *
+     * `rows_bf16` is one bf16 row per id from [`WasmEngine::text_row_ids`], in that order,
+     * concatenated. Roughly 4 KB per distinct token, so a long utterance costs a couple of MB of
+     * reads against 622 MB of permanently resident linear memory saved.
+     *
+     * # Errors
+     *
+     * As [`WasmEngine::synthesize`], plus a refusal when the rows do not match the ids.
+     */
+    synthesize_with_text_rows(text: string, speaker: Float32Array, seed: bigint, max_frames: number, rows_bf16: Uint8Array): Float32Array;
+    /**
+     * The cold-text-embedding ids this exact text will need, in the order the rows must arrive.
+     *
+     * The caller reads these rows out of the artifact itself (in the browser: out of OPFS) and
+     * hands them to [`WasmEngine::synthesize_with_text_rows`]. Ids come from the engine rather
+     * than from the caller's own tokenization on purpose — the two must agree exactly, and the
+     * only way to guarantee that is to ask the tokenizer that will actually run.
+     *
+     * # Errors
+     *
+     * Throws when text preparation fails.
+     */
+    text_row_ids(text: string): Uint32Array;
 }
 
 /**
@@ -288,6 +331,7 @@ export interface InitOutput {
     readonly modelstaging_push_codec: (a: number, b: number, c: number) => [number, number];
     readonly modelstaging_push_fttsq: (a: number, b: number, c: number) => [number, number];
     readonly modelstaging_reserve_fttsq: (a: number, b: number) => [number, number];
+    readonly modelstaging_reserve_fttsq_hot_prefix: (a: number, b: number) => [number, number];
     readonly preset_vector: (a: number, b: number) => [number, number, number, number];
     readonly presets: () => [number, number];
     readonly wasmengine_enroll: (a: number, b: number, c: number) => [number, number, number, number];
@@ -295,6 +339,8 @@ export interface InitOutput {
     readonly wasmengine_from_staging: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly wasmengine_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
     readonly wasmengine_synthesize: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => [number, number, number, number];
+    readonly wasmengine_synthesize_with_text_rows: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number) => [number, number, number, number];
+    readonly wasmengine_text_row_ids: (a: number, b: number, c: number) => [number, number, number, number];
     readonly worker_loop_entry: (a: number) => [number, number];
     readonly arm_worker_team: (a: number) => void;
     readonly install_panic_hook: () => void;
