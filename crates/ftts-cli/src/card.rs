@@ -131,13 +131,40 @@ pub fn decode_card(bytes: &[u8]) -> Result<(String, Vec<f32>), FttsError> {
         return Ok(found);
     }
     let (rgb, width, height) = decode_image_rgb(bytes)?;
-    ftts_voicecard::decode(&rgb, width, height).ok_or_else(|| {
-        FttsError::Input(
-            "no voice found in that picture; voice cards must arrive uncropped (screenshots \
-             and messaging-app recompression are fine)"
-                .to_owned(),
-        )
-    })
+    if let Some(found) = ftts_voicecard::decode(&rgb, width, height) {
+        return Ok(found);
+    }
+    // Rotation retry: the phone bakes EXIF orientation into pixels before decoding,
+    // but zune-jpeg does not apply the EXIF flag, so a card that traveled through a
+    // rotation-tagging pipeline arrives sideways here. Three quarter-turns cover
+    // every axis-aligned case; each retry costs one decode pass, failure path only.
+    let mut turned = rgb;
+    let (mut turned_width, mut turned_height) = (width, height);
+    for _ in 0..3 {
+        (turned, turned_width, turned_height) =
+            rotate_quarter_turn(&turned, turned_width, turned_height);
+        if let Some(found) = ftts_voicecard::decode(&turned, turned_width, turned_height) {
+            return Ok(found);
+        }
+    }
+    Err(FttsError::Input(
+        "no voice found in that picture; voice cards must arrive uncropped (screenshots \
+         and messaging-app recompression are fine)"
+            .to_owned(),
+    ))
+}
+
+/// Rotate an RGB24 image 90° clockwise.
+fn rotate_quarter_turn(rgb: &[u8], width: usize, height: usize) -> (Vec<u8>, usize, usize) {
+    let mut out = vec![0_u8; rgb.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let source = (y * width + x) * 3;
+            let target = (x * height + (height - 1 - y)) * 3;
+            out[target..target + 3].copy_from_slice(&rgb[source..source + 3]);
+        }
+    }
+    (out, height, width)
 }
 
 /// Read a `.spk` speaker vector file.
@@ -240,11 +267,27 @@ fn decode_image_rgb(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), FttsError> 
     ))
 }
 
+/// Bound the work BEFORE pixel buffers are allocated: the mosaic is unreadable below
+/// ~2 px/cell anyway, and an arbitrary 100-megapixel input would otherwise cost
+/// hundreds of MB. The phone applies the same kind of cap (24 MP, downscaling);
+/// here refusal with a named reason beats a silent giant allocation.
+fn refuse_oversized(width: usize, height: usize) -> Result<(), FttsError> {
+    if width.saturating_mul(height) > 40_000_000 {
+        return Err(FttsError::Input(format!(
+            "{width}x{height} is larger than any voice card; export or screenshot the \
+             card itself rather than a scan"
+        )));
+    }
+    Ok(())
+}
+
 fn decode_png_rgb(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), FttsError> {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder
         .read_info()
         .map_err(|error| FttsError::Input(format!("unreadable PNG: {error}")))?;
+    let header = reader.info();
+    refuse_oversized(header.width as usize, header.height as usize)?;
     let mut buffer = vec![0_u8; reader.output_buffer_size().unwrap_or_default()];
     let info = reader
         .next_frame(&mut buffer)
@@ -293,12 +336,16 @@ fn decode_jpeg_rgb(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), FttsError> {
         zune_jpeg::zune_core::bytestream::ZCursor::new(bytes),
         options,
     );
-    let rgb = decoder
-        .decode()
+    decoder
+        .decode_headers()
         .map_err(|error| FttsError::Input(format!("unreadable JPEG: {error}")))?;
     let (width, height) = decoder
         .dimensions()
         .ok_or_else(|| FttsError::Input("JPEG carries no dimensions".to_owned()))?;
+    refuse_oversized(width, height)?;
+    let rgb = decoder
+        .decode()
+        .map_err(|error| FttsError::Input(format!("unreadable JPEG: {error}")))?;
     Ok((rgb, width, height))
 }
 
@@ -335,6 +382,36 @@ mod tests {
         let (name, decoded) = decode_card(&stripped).expect("pixel import");
         assert_eq!(name, "Round Trip");
         assert_eq!(decoded, vector);
+    }
+
+    #[test]
+    fn a_sideways_card_still_imports() {
+        // zune-jpeg ignores the EXIF orientation flag, so a card that traveled
+        // through a rotation-tagging pipeline arrives with its pixels turned;
+        // the retry must recover all three quarter-turn cases.
+        let vector = test_vector();
+        let png = render_card_png("Turned", &vector).expect("render");
+        let (rgb, width, height) = decode_image_rgb(&png).expect("decode");
+        let mut turned = rgb;
+        let (mut turned_width, mut turned_height) = (width, height);
+        for turn in 1..=3 {
+            (turned, turned_width, turned_height) =
+                rotate_quarter_turn(&turned, turned_width, turned_height);
+            let stripped = encode_png(&turned, turned_width, turned_height).expect("re-encode");
+            let (name, decoded) = decode_card(&stripped)
+                .unwrap_or_else(|error| panic!("turn {turn} failed: {error}"));
+            assert_eq!(name, "Turned");
+            assert_eq!(decoded, vector);
+        }
+    }
+
+    #[test]
+    fn an_oversized_image_is_refused_before_decoding() {
+        // A 41-megapixel PNG header must be refused by dimensions alone; encoding
+        // a real one would be slow, so build a tiny header-only lie via the
+        // encoder path with small data — instead, verify the guard directly.
+        assert!(refuse_oversized(6_500, 6_500).is_err());
+        assert!(refuse_oversized(1_024, 1_180).is_ok());
     }
 
     #[test]
