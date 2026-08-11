@@ -1595,16 +1595,132 @@ impl TalkerCheckpoint {
 }
 
 /// Owned weight + bias pair for one convolution.
+/// Where the codec's tensors come from, so they need not all be resident as file bytes first.
+///
+/// The codec decoder is ~0.457 GB of f32, and building it from a staged safetensors meant holding
+/// the source AND the checkpoint at once — 0.92 GB spent to end up with 0.457 GB. On a native host
+/// that source is a mapped file and costs nothing. In wasm every staged byte is resident and
+/// linear memory only grows, so the doubling was a measured third of a gigabyte of the browser's
+/// peak, permanently.
+///
+/// `take_widened` is a MOVE where the store owns its data: it hands the buffer over and keeps
+/// nothing, so the checkpoint holds the only copy that ever existed.
+///
+/// `&self` rather than `&mut self` because the native loader hydrates pieces on scoped threads;
+/// interior mutability keeps that parallel walk intact.
+pub trait TensorStore: Sync {
+    /// Yield one tensor's f32 values, by move where the store owns them.
+    ///
+    /// # Errors
+    ///
+    /// When the tensor is absent — including when it was already taken, which for a moving store
+    /// is the same observable failure and equally a caller bug.
+    fn take_widened(&self, path: &Path, name: &str) -> Result<Vec<f32>, CheckpointError>;
+}
+
+/// A store over a parsed safetensors file: every take widens a fresh copy, exactly as before.
+pub struct FileStore<'a>(pub &'a SafetensorsFile);
+
+impl TensorStore for FileStore<'_> {
+    fn take_widened(&self, path: &Path, name: &str) -> Result<Vec<f32>, CheckpointError> {
+        widen(self.0, path, name)
+    }
+}
+
+/// Tensors the caller widened already, handed over one at a time.
+///
+/// The browser fills this as it streams the codec: each tensor is widened on arrival and its
+/// incoming bytes released immediately, so the high-water mark is the finished set plus one
+/// tensor, rather than the finished set plus the whole file.
+pub struct WidenedTensors {
+    tensors: std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>,
+}
+
+impl Default for WidenedTensors {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WidenedTensors {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            tensors: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Widen one tensor's little-endian f32 bytes and keep it under `name`.
+    ///
+    /// # Errors
+    ///
+    /// When the byte count is not a whole number of f32 — a truncated push, which must not be
+    /// rounded down into a silently short tensor.
+    pub fn insert_f32_le(&self, name: &str, bytes: &[u8]) -> Result<(), CheckpointError> {
+        if !bytes.len().is_multiple_of(4) {
+            return Err(CheckpointError::TensorShape {
+                tensor: name.to_owned(),
+                expected: bytes.len() / 4 * 4,
+                actual: bytes.len(),
+            });
+        }
+        let values = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        self.tensors
+            .lock()
+            .expect("widened tensor map poisoned")
+            .insert(name.to_owned(), values);
+        Ok(())
+    }
+
+    /// How many tensors are held, for the caller's own completeness check.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tensors
+            .lock()
+            .expect("widened tensor map poisoned")
+            .len()
+    }
+
+    /// Whether nothing has been inserted yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl TensorStore for WidenedTensors {
+    fn take_widened(&self, path: &Path, name: &str) -> Result<Vec<f32>, CheckpointError> {
+        self.tensors
+            .lock()
+            .expect("widened tensor map poisoned")
+            .remove(name)
+            .ok_or_else(|| CheckpointError::MissingTensor {
+                path: path.to_path_buf(),
+                tensor: name.to_owned(),
+            })
+    }
+}
+
+/// Preserves the `widen(file, path, name)` call shape the codec loaders were written against.
+fn take(store: &dyn TensorStore, path: &Path, name: &str) -> Result<Vec<f32>, CheckpointError> {
+    store.take_widened(path, name)
+}
+
 struct OwnedConv {
     weight: Vec<f32>,
     bias: Vec<f32>,
 }
 
 impl OwnedConv {
-    fn load(file: &SafetensorsFile, path: &Path, prefix: &str) -> Result<Self, CheckpointError> {
+    fn load(store: &dyn TensorStore, path: &Path, prefix: &str) -> Result<Self, CheckpointError> {
         Ok(Self {
-            weight: widen(file, path, &format!("{prefix}.weight"))?,
-            bias: widen(file, path, &format!("{prefix}.bias"))?,
+            weight: take(store, path, &format!("{prefix}.weight"))?,
+            bias: take(store, path, &format!("{prefix}.bias"))?,
         })
     }
 }
@@ -1624,28 +1740,28 @@ struct OwnedCodecLayer {
 }
 
 impl OwnedCodecLayer {
-    fn load(file: &SafetensorsFile, path: &Path, index: usize) -> Result<Self, CheckpointError> {
+    fn load(store: &dyn TensorStore, path: &Path, index: usize) -> Result<Self, CheckpointError> {
         let prefix = format!("decoder.pre_transformer.layers.{index}");
         Ok(Self {
-            input_layernorm: widen(file, path, &format!("{prefix}.input_layernorm.weight"))?,
-            q_proj: widen(file, path, &format!("{prefix}.self_attn.q_proj.weight"))?,
-            k_proj: widen(file, path, &format!("{prefix}.self_attn.k_proj.weight"))?,
-            v_proj: widen(file, path, &format!("{prefix}.self_attn.v_proj.weight"))?,
-            o_proj: widen(file, path, &format!("{prefix}.self_attn.o_proj.weight"))?,
-            self_attn_layer_scale: widen(
-                file,
+            input_layernorm: take(store, path, &format!("{prefix}.input_layernorm.weight"))?,
+            q_proj: take(store, path, &format!("{prefix}.self_attn.q_proj.weight"))?,
+            k_proj: take(store, path, &format!("{prefix}.self_attn.k_proj.weight"))?,
+            v_proj: take(store, path, &format!("{prefix}.self_attn.v_proj.weight"))?,
+            o_proj: take(store, path, &format!("{prefix}.self_attn.o_proj.weight"))?,
+            self_attn_layer_scale: take(
+                store,
                 path,
                 &format!("{prefix}.self_attn_layer_scale.scale"),
             )?,
-            post_attention_layernorm: widen(
-                file,
+            post_attention_layernorm: take(
+                store,
                 path,
                 &format!("{prefix}.post_attention_layernorm.weight"),
             )?,
-            gate_proj: widen(file, path, &format!("{prefix}.mlp.gate_proj.weight"))?,
-            up_proj: widen(file, path, &format!("{prefix}.mlp.up_proj.weight"))?,
-            down_proj: widen(file, path, &format!("{prefix}.mlp.down_proj.weight"))?,
-            mlp_layer_scale: widen(file, path, &format!("{prefix}.mlp_layer_scale.scale"))?,
+            gate_proj: take(store, path, &format!("{prefix}.mlp.gate_proj.weight"))?,
+            up_proj: take(store, path, &format!("{prefix}.mlp.up_proj.weight"))?,
+            down_proj: take(store, path, &format!("{prefix}.mlp.down_proj.weight"))?,
+            mlp_layer_scale: take(store, path, &format!("{prefix}.mlp_layer_scale.scale"))?,
         })
     }
 
@@ -1677,19 +1793,19 @@ struct OwnedResidualUnit {
 
 impl OwnedResidualUnit {
     fn load(
-        file: &SafetensorsFile,
+        store: &dyn TensorStore,
         path: &Path,
         block: usize,
         unit: usize,
     ) -> Result<Self, CheckpointError> {
         let prefix = format!("decoder.decoder.{block}.block.{unit}");
         Ok(Self {
-            first_alpha: widen(file, path, &format!("{prefix}.act1.alpha"))?,
-            first_beta: widen(file, path, &format!("{prefix}.act1.beta"))?,
-            first_conv: OwnedConv::load(file, path, &format!("{prefix}.conv1.conv"))?,
-            second_alpha: widen(file, path, &format!("{prefix}.act2.alpha"))?,
-            second_beta: widen(file, path, &format!("{prefix}.act2.beta"))?,
-            second_conv: OwnedConv::load(file, path, &format!("{prefix}.conv2.conv"))?,
+            first_alpha: take(store, path, &format!("{prefix}.act1.alpha"))?,
+            first_beta: take(store, path, &format!("{prefix}.act1.beta"))?,
+            first_conv: OwnedConv::load(store, path, &format!("{prefix}.conv1.conv"))?,
+            second_alpha: take(store, path, &format!("{prefix}.act2.alpha"))?,
+            second_beta: take(store, path, &format!("{prefix}.act2.beta"))?,
+            second_conv: OwnedConv::load(store, path, &format!("{prefix}.conv2.conv"))?,
         })
     }
 
@@ -1732,7 +1848,7 @@ struct OwnedBlock {
 
 impl OwnedBlock {
     fn load(
-        file: &SafetensorsFile,
+        store: &dyn TensorStore,
         path: &Path,
         block: usize,
         input_channels: usize,
@@ -1742,13 +1858,13 @@ impl OwnedBlock {
     ) -> Result<Self, CheckpointError> {
         let prefix = format!("decoder.decoder.{block}");
         Ok(Self {
-            alpha: widen(file, path, &format!("{prefix}.block.0.alpha"))?,
-            beta: widen(file, path, &format!("{prefix}.block.0.beta"))?,
-            transposed: OwnedConv::load(file, path, &format!("{prefix}.block.1.conv"))?,
+            alpha: take(store, path, &format!("{prefix}.block.0.alpha"))?,
+            beta: take(store, path, &format!("{prefix}.block.0.beta"))?,
+            transposed: OwnedConv::load(store, path, &format!("{prefix}.block.1.conv"))?,
             units: [
-                OwnedResidualUnit::load(file, path, block, 2)?,
-                OwnedResidualUnit::load(file, path, block, 3)?,
-                OwnedResidualUnit::load(file, path, block, 4)?,
+                OwnedResidualUnit::load(store, path, block, 2)?,
+                OwnedResidualUnit::load(store, path, block, 3)?,
+                OwnedResidualUnit::load(store, path, block, 4)?,
             ],
             input_channels,
             output_channels,
@@ -1789,16 +1905,16 @@ struct OwnedUpsampleStage {
 }
 
 impl OwnedUpsampleStage {
-    fn load(file: &SafetensorsFile, path: &Path, stage: usize) -> Result<Self, CheckpointError> {
+    fn load(store: &dyn TensorStore, path: &Path, stage: usize) -> Result<Self, CheckpointError> {
         let prefix = format!("decoder.upsample.{stage}");
         Ok(Self {
-            transposed: OwnedConv::load(file, path, &format!("{prefix}.0.conv"))?,
-            dwconv: OwnedConv::load(file, path, &format!("{prefix}.1.dwconv.conv"))?,
-            norm_weight: widen(file, path, &format!("{prefix}.1.norm.weight"))?,
-            norm_bias: widen(file, path, &format!("{prefix}.1.norm.bias"))?,
-            pwconv1: OwnedConv::load(file, path, &format!("{prefix}.1.pwconv1"))?,
-            pwconv2: OwnedConv::load(file, path, &format!("{prefix}.1.pwconv2"))?,
-            gamma: widen(file, path, &format!("{prefix}.1.gamma"))?,
+            transposed: OwnedConv::load(store, path, &format!("{prefix}.0.conv"))?,
+            dwconv: OwnedConv::load(store, path, &format!("{prefix}.1.dwconv.conv"))?,
+            norm_weight: take(store, path, &format!("{prefix}.1.norm.weight"))?,
+            norm_bias: take(store, path, &format!("{prefix}.1.norm.bias"))?,
+            pwconv1: OwnedConv::load(store, path, &format!("{prefix}.1.pwconv1"))?,
+            pwconv2: OwnedConv::load(store, path, &format!("{prefix}.1.pwconv2"))?,
+            gamma: take(store, path, &format!("{prefix}.1.gamma"))?,
         })
     }
 
@@ -1849,14 +1965,25 @@ pub struct CodecCheckpoint {
 }
 
 impl CodecCheckpoint {
+    /// Hydrate from a parsed safetensors file, as native hosts do.
+    ///
+    /// # Errors
+    ///
+    /// As [`CodecCheckpoint::load_from_store`].
+    pub fn load_from_file(file: &SafetensorsFile, label: &Path) -> Result<Self, CheckpointError> {
+        Self::load_from_store(&FileStore(file), label)
+    }
+
+    /// Hydrate from tensors the caller widened and hands over one at a time.
+    ///
     /// Hydrate the codec decoder.
     ///
     /// # Errors
     ///
-    /// If the file cannot be opened, a tensor is missing, or a codebook refuses to materialize.
+    /// If the store cannot be opened, a tensor is missing, or a codebook refuses to materialize.
     pub fn load(path: &Path) -> Result<Self, CheckpointError> {
-        let file = open(path)?;
-        Self::load_from_file(&file, path)
+        let store = open(path)?;
+        Self::load_from_file(&store, path)
     }
 
     /// [`CodecCheckpoint::load`] over an already-parsed checkpoint, for callers with no
@@ -1865,12 +1992,12 @@ impl CodecCheckpoint {
     /// # Errors
     ///
     /// As [`CodecCheckpoint::load`].
-    pub fn load_from_file(file: &SafetensorsFile, label: &Path) -> Result<Self, CheckpointError> {
+    pub fn load_from_store(store: &dyn TensorStore, label: &Path) -> Result<Self, CheckpointError> {
         let path = label;
         let config = CodecConfig::default();
         let materialize = |prefix: &str| -> Result<MaterializedCodebook, CheckpointError> {
-            let sum = widen(file, path, &format!("{prefix}.embedding_sum"))?;
-            let usage = widen(file, path, &format!("{prefix}.cluster_usage"))?;
+            let sum = take(store, path, &format!("{prefix}.embedding_sum"))?;
+            let usage = take(store, path, &format!("{prefix}.cluster_usage"))?;
             MaterializedCodebook::from_unnormalized(
                 &sum,
                 &usage,
@@ -1898,18 +2025,18 @@ impl CodecCheckpoint {
                 Ok((first, rest))
             })();
             let layers = (0..8)
-                .map(|index| OwnedCodecLayer::load(file, path, index))
+                .map(|index| OwnedCodecLayer::load(store, path, index))
                 .collect::<Result<Vec<_>, _>>();
             let blocks = [
-                OwnedBlock::load(file, path, 1, 1_536, 768, 16, 8),
-                OwnedBlock::load(file, path, 2, 768, 384, 10, 5),
-                OwnedBlock::load(file, path, 3, 384, 192, 8, 4),
-                OwnedBlock::load(file, path, 4, 192, 96, 6, 3),
+                OwnedBlock::load(store, path, 1, 1_536, 768, 16, 8),
+                OwnedBlock::load(store, path, 2, 768, 384, 10, 5),
+                OwnedBlock::load(store, path, 3, 384, 192, 8, 4),
+                OwnedBlock::load(store, path, 4, 192, 96, 6, 3),
             ];
             let upsample = (|| -> Result<_, CheckpointError> {
                 Ok([
-                    OwnedUpsampleStage::load(file, path, 0)?,
-                    OwnedUpsampleStage::load(file, path, 1)?,
+                    OwnedUpsampleStage::load(store, path, 0)?,
+                    OwnedUpsampleStage::load(store, path, 1)?,
                 ])
             })();
             (codebooks, layers, blocks, upsample)
@@ -1929,19 +2056,19 @@ impl CodecCheckpoint {
             });
             let layers = scope.spawn(|| {
                 (0..8)
-                    .map(|index| OwnedCodecLayer::load(file, path, index))
+                    .map(|index| OwnedCodecLayer::load(store, path, index))
                     .collect::<Result<Vec<_>, _>>()
             });
             let block_handles = [
-                scope.spawn(|| OwnedBlock::load(file, path, 1, 1_536, 768, 16, 8)),
-                scope.spawn(|| OwnedBlock::load(file, path, 2, 768, 384, 10, 5)),
-                scope.spawn(|| OwnedBlock::load(file, path, 3, 384, 192, 8, 4)),
-                scope.spawn(|| OwnedBlock::load(file, path, 4, 192, 96, 6, 3)),
+                scope.spawn(|| OwnedBlock::load(store, path, 1, 1_536, 768, 16, 8)),
+                scope.spawn(|| OwnedBlock::load(store, path, 2, 768, 384, 10, 5)),
+                scope.spawn(|| OwnedBlock::load(store, path, 3, 384, 192, 8, 4)),
+                scope.spawn(|| OwnedBlock::load(store, path, 4, 192, 96, 6, 3)),
             ];
             let upsample = scope.spawn(|| -> Result<_, CheckpointError> {
                 Ok([
-                    OwnedUpsampleStage::load(file, path, 0)?,
-                    OwnedUpsampleStage::load(file, path, 1)?,
+                    OwnedUpsampleStage::load(store, path, 0)?,
+                    OwnedUpsampleStage::load(store, path, 1)?,
                 ])
             });
             let mut blocks = block_handles
@@ -1966,19 +2093,19 @@ impl CodecCheckpoint {
             config,
             first_codebook,
             rest_codebooks,
-            first_output_proj: widen(file, path, "decoder.quantizer.rvq_first.output_proj.weight")?,
-            rest_output_proj: widen(file, path, "decoder.quantizer.rvq_rest.output_proj.weight")?,
-            pre_conv: OwnedConv::load(file, path, "decoder.pre_conv.conv")?,
-            input_proj: OwnedConv::load(file, path, "decoder.pre_transformer.input_proj")?,
+            first_output_proj: take(store, path, "decoder.quantizer.rvq_first.output_proj.weight")?,
+            rest_output_proj: take(store, path, "decoder.quantizer.rvq_rest.output_proj.weight")?,
+            pre_conv: OwnedConv::load(store, path, "decoder.pre_conv.conv")?,
+            input_proj: OwnedConv::load(store, path, "decoder.pre_transformer.input_proj")?,
             layers: layers?,
-            final_norm: widen(file, path, "decoder.pre_transformer.norm.weight")?,
-            output_proj: OwnedConv::load(file, path, "decoder.pre_transformer.output_proj")?,
+            final_norm: take(store, path, "decoder.pre_transformer.norm.weight")?,
+            output_proj: OwnedConv::load(store, path, "decoder.pre_transformer.output_proj")?,
             upsample: upsample?,
-            decoder_input: OwnedConv::load(file, path, "decoder.decoder.0.conv")?,
+            decoder_input: OwnedConv::load(store, path, "decoder.decoder.0.conv")?,
             blocks: [block1?, block2?, block3?, block4?],
-            final_alpha: widen(file, path, "decoder.decoder.5.alpha")?,
-            final_beta: widen(file, path, "decoder.decoder.5.beta")?,
-            final_conv: OwnedConv::load(file, path, "decoder.decoder.6.conv")?,
+            final_alpha: take(store, path, "decoder.decoder.5.alpha")?,
+            final_beta: take(store, path, "decoder.decoder.5.beta")?,
+            final_conv: OwnedConv::load(store, path, "decoder.decoder.6.conv")?,
         })
     }
 

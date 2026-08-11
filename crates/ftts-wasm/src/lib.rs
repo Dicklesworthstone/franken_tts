@@ -312,8 +312,15 @@ const DENOISER_SAFETENSORS: &[u8] =
 /// `push_fttsq` xN -> `WasmEngine::from_staging`. Each step refuses to run out of order.
 #[wasm_bindgen]
 pub struct ModelStaging {
-    /// The codec's raw bytes; emptied and freed by `finish_codec`.
-    codec_source: Vec<u8>,
+    /// Codec tensors, widened as they arrive and moved into the checkpoint by `finish_codec`.
+    ///
+    /// Never a staged file. Holding the codec's 0.46 GB of source bytes to build a 0.457 GB
+    /// checkpoint out of them meant paying for it twice, and wasm cannot hand the first copy
+    /// back — linear memory only grows. Each tensor is widened on arrival and its incoming bytes
+    /// released immediately, so the high-water mark is the finished set plus one tensor.
+    codec_tensors: ftts_model_qwen::checkpoint::WidenedTensors,
+    /// Bytes accepted into `codec_tensors`, for progress only.
+    codec_filled: usize,
     /// Present only after `finish_codec`. Its presence IS the phase marker.
     codec: Option<CodecCheckpoint>,
     /// Reserved by `reserve_fttsq`, which refuses to run before the codec is hydrated.
@@ -350,7 +357,8 @@ impl ModelStaging {
         // grow. Reserving the codec here would pin it below the artifact permanently, and the
         // codec's buffer is the one that becomes a hole.
         ModelStaging {
-            codec_source: Vec::new(),
+            codec_tensors: ftts_model_qwen::checkpoint::WidenedTensors::new(),
+            codec_filled: 0,
             codec: None,
             fttsq: Vec::new(),
             hydrated: None,
@@ -389,36 +397,29 @@ impl ModelStaging {
         Ok(())
     }
 
-    /// Reserve exact room for the codec's staged bytes.
+    /// Hand over one codec tensor's little-endian f32 bytes, widened on arrival.
     ///
-    /// Separate from construction so it can be claimed AFTER the artifact — see
-    /// [`ModelStaging::reserve_fttsq`] for why that ordering is worth ~0.45 GB.
-    ///
-    /// # Errors
-    ///
-    /// When the reservation fails, naming the byte count — the honest signal on a device that
-    /// simply does not have the memory.
-    pub fn reserve_codec(&mut self, codec_bytes: usize) -> Result<(), JsValue> {
-        self.codec_source
-            .try_reserve_exact(codec_bytes)
-            .map_err(|_| js_error("cannot reserve codec memory (bytes)", codec_bytes))
-    }
-
-    /// Append one slice of the codec checkpoint, in order.
+    /// There is no staged file and no reservation. The codec used to arrive as a 0.46 GB
+    /// safetensors buffer that a 0.457 GB checkpoint was then built out of — paying for the same
+    /// weights twice, in a heap that can never shrink. Tensor by tensor, the caller's chunk is
+    /// widened and released immediately, so the peak is the finished set plus one tensor.
     ///
     /// # Errors
     ///
-    /// Throws if the slice would exceed the reserved capacity, which means the caller's manifest
-    /// and its download disagree — better caught here than as a corrupt tensor later. Also throws
-    /// once the codec has been hydrated, when there is nothing left to append to.
-    pub fn push_codec(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
+    /// Throws once the codec is hydrated, or when the byte count is not a whole number of f32 —
+    /// a truncated push, which must not be rounded down into a silently short tensor.
+    pub fn push_codec_tensor(&mut self, name: &str, bytes: &[u8]) -> Result<(), JsValue> {
         if self.codec.is_some() {
             return Err(js_error(
                 "codec already hydrated",
-                "push_codec after finish",
+                "push_codec_tensor after finish",
             ));
         }
-        append_exact(&mut self.codec_source, chunk, "codec")
+        self.codec_tensors
+            .insert_f32_le(name, bytes)
+            .map_err(|error| js_error("codec tensor rejected", error))?;
+        self.codec_filled += bytes.len();
+        Ok(())
     }
 
     /// Parse and widen the codec, then free its source bytes.
@@ -440,27 +441,22 @@ impl ModelStaging {
         if self.codec.is_some() {
             return Err(js_error("codec already hydrated", "finish_codec twice"));
         }
-        if self.codec_source.len() != self.codec_source.capacity() {
+        if self.codec_tensors.is_empty() {
             return Err(js_error(
-                "codec staging is incomplete",
-                format!(
-                    "{}/{}",
-                    self.codec_source.len(),
-                    self.codec_source.capacity()
-                ),
+                "no codec tensors were staged",
+                "push_codec_tensor before finish_codec",
             ));
         }
-        // `take` moves the bytes into the parser and leaves an empty Vec behind, so the source is
-        // owned by exactly one place and is released the moment `codec_file` goes out of scope —
-        // which happens inside this function, before the artifact has been reserved at all.
-        let bytes = std::mem::take(&mut self.codec_source);
-        self.codec_retired = bytes.len();
-        let codec_file = ftts_artifacts::safetensors::SafetensorsFile::from_bytes(bytes)
-            .map_err(|error| js_error("codec checkpoint rejected", error))?;
-        let codec =
-            CodecCheckpoint::load_from_file(&codec_file, Path::new("browser://codec.safetensors"))
-                .map_err(|error| js_error("codec hydration failed", error))?;
-        drop(codec_file);
+        self.codec_retired = self.codec_filled;
+        // Each tensor is MOVED out of the store as the checkpoint claims it, so the two never
+        // hold the same weights at once. A name the checkpoint asks for and the caller never
+        // pushed surfaces here as a missing-tensor error naming it, which is the honest failure
+        // for an incomplete stream — never a zero-filled stand-in.
+        let codec = CodecCheckpoint::load_from_store(
+            &self.codec_tensors,
+            Path::new("browser://codec.safetensors"),
+        )
+        .map_err(|error| js_error("codec hydration failed", error))?;
         self.codec = Some(codec);
         Ok(())
     }
@@ -534,7 +530,7 @@ impl ModelStaging {
     /// across the phase boundary instead of collapsing when the source is freed.
     #[must_use]
     pub fn filled(&self) -> usize {
-        self.codec_retired + self.codec_source.len() + self.fttsq.len()
+        self.codec_retired + self.codec_filled + self.fttsq.len()
     }
 }
 
