@@ -399,6 +399,12 @@
     </div>
 
     <div class="pg-panel rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
+      <!-- Revealed only when the diagrams are torn down to make room for a resident engine on a
+           small device. Sections vanishing with no explanation reads as a broken page. -->
+      <p id="viz-note" class="pg-note hidden">
+        The animated diagrams on this page are paused while the model is loaded, so the engine has
+        this device's memory to itself. Reload without loading the model to see them.
+      </p>
       <div id="anatomy-viz" aria-label="Animated anatomy of one synthesis frame"></div>
       <p class="pg-note mt-3 text-center">
         The microdecoder is small, but rereading its body fifteen times per frame makes it the

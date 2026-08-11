@@ -393,7 +393,42 @@ function isMemoryConstrainedDevice() {
   return typeof navigator.deviceMemory === "number" && navigator.deviceMemory <= 4;
 }
 
+/// The visualization containers, by id. Kept here rather than imported from viz.js because this
+/// must work even if viz.js failed to load at all.
+const VIZ_CONTAINERS = [
+  "anatomy-viz",
+  "rvq-viz",
+  "seams-viz",
+  "speed-ladder",
+  "wasm-stepper",
+  "rms-bars",
+];
+
+/// Stop the page's decorative DOM from competing with the engine for a small device's memory.
+///
+/// Two things, and the teardown is not redundant with the flag. viz.js builds lazily on scroll but
+/// ALSO on a 3.5-second timeout, so on a phone the visualizations are already built and animating
+/// long before anyone presses load — the flag only prevents future builds. An iPhone that reached
+/// "ready to speak" died on the very next scroll, with the engine resident at 1.61 GB; these
+/// scenes are live SVG with their own animation loops, and they are what scrolling was touching.
+///
+/// Only on devices that need it, and only for this page view: a reload brings the whole page back.
+function releasePageMemoryForEngine() {
+  globalThis.__fttsEngineResident = true;
+  if (!isMemoryConstrainedDevice()) return;
+  for (const id of VIZ_CONTAINERS) {
+    const node = document.getElementById(id);
+    if (!node) continue;
+    // replaceChildren() drops the subtree, its animation loops, and its compositor layers.
+    node.replaceChildren();
+    node.classList.add("hidden");
+  }
+  const note = document.getElementById("viz-note");
+  if (note) note.classList.remove("hidden");
+}
+
 async function loadFromStore() {
+  releasePageMemoryForEngine();
   ui.loadModel.disabled = true;
   ui.loadModel.classList.add("hidden");
   try {

@@ -689,6 +689,12 @@ async function handleMessage({ data }) {
           coldLayout,
           rowIds,
         );
+        // Synthesis has its own high-water mark, separate from hydration's, and it is now the one
+        // that matters: a phone that reaches "ready to speak" and dies on the first press is being
+        // killed by what THIS allocates, not by the model. Recorded before and after so a crash
+        // leaves the before-number behind, and the pair says how much synthesis costs.
+        const memBefore = memoryBytes();
+        stage("synthesize", `mem ${(memBefore / 1e9).toFixed(2)} GB`);
         const started = performance.now();
         const pcm = engine.synthesize_with_text_rows(
           data.text,
@@ -698,6 +704,10 @@ async function handleMessage({ data }) {
           rows,
         );
         const elapsedMs = performance.now() - started;
+        stage(
+          "synthesized",
+          `mem ${(memoryBytes() / 1e9).toFixed(2)} GB (+${((memoryBytes() - memBefore) / 1e9).toFixed(2)} GB)`,
+        );
         reply(
           "synthesize",
           { ok: true, pcm: pcm.buffer, sampleRate: 24000, elapsedMs, requestId: data.requestId },

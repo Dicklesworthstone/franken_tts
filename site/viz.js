@@ -17,10 +17,33 @@ const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matc
 // timeout fallback guarantees every visualization exists within a few seconds.
 // Same guarantee for one-shot entrance animations (count-ups, bar fills): run when
 // the element becomes visible, or after a timeout if an instant jump skipped it.
+/// True when building decorative DOM would compete with a resident engine for a tab's memory.
+///
+/// The visualizations are pedagogy, not the playground, and they are not free: each one is a live
+/// SVG scene with its own animation loop and compositor layers. That is nothing on a laptop and
+/// decisive on a phone whose tab is already holding ~1.6 GB of model — an iPhone reached
+/// "ready to speak" and then died on the next scroll, which is precisely when these build.
+///
+/// Note the AND: a phone that has not loaded the model has memory to spare and keeps the full
+/// page. Only the combination is refused, and only until reload.
+///
+/// The device test is duplicated from app.js rather than imported on purpose — importing it would
+/// pull app.js's module side effects (it constructs the engine Worker on load) into whatever
+/// happens to load viz.js first, and load order here is decided by index.html.
+function tooExpensiveToBuild() {
+  if (!globalThis.__fttsEngineResident) return false;
+  const ua = navigator.userAgent;
+  const iOS =
+    /iPhone|iPad|iPod/.test(ua) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  return iOS || (typeof navigator.deviceMemory === "number" && navigator.deviceMemory <= 4);
+}
+
 function onceVisible(el, run, threshold = 0.4, timeout = 3500) {
   let done = false;
   const fire = () => {
     if (done) return;
+    if (tooExpensiveToBuild()) return; // re-checked at BUILD time, not at wiring time
     done = true;
     run();
   };
@@ -38,6 +61,7 @@ function lazyBuild(el, build) {
   let built = false;
   const once = () => {
     if (built) return;
+    if (tooExpensiveToBuild()) return;
     built = true;
     build();
   };
