@@ -24,6 +24,65 @@ individual commits are intentionally not cited.
 
 ## [Unreleased]
 
+### Added
+
+- **Voice cards**: a picture that carries the voice itself, interchangeable
+  between the CLI and the iOS app. The green mosaic in the image is the full
+  1,024-float speaker embedding, written at two bits per cell across a 144×144
+  grid with QR-style finder patterns, calibration strips, and interleaved
+  Reed-Solomon (255,223) error correction, so the card survives screenshots
+  and messaging-app recompression; a lossless private PNG chunk in the same
+  file is used first when the bytes arrive intact. The codec lives in the new
+  `ftts-voicecard` crate, and the CLI and Swift encoders are bit-identical —
+  proven byte-for-byte against real artifacts and pinned by a CRC test so the
+  implementations cannot drift apart silently.
+- `ftts card export <preset|.spk>` renders a voice as a shareable card PNG;
+  `ftts card import <image>` reads a card (PNG or JPEG) back into a `.spk`
+  file, printing the name written into it.
+- `ftts say --voice card.png` (and `make-video --voice`) accept a voice-card
+  image directly; no import step needed.
+- iOS: enrolled voices export as voice cards (share sheet or straight to
+  Photos, with the exact bytes preserved so the lossless layer survives), and
+  "Add a voice from a picture" imports one from the photo library. Importing
+  the same card twice selects the existing voice instead of duplicating it.
+- iOS: the voice constellation draws every voice as a glyph whose shape
+  amplifies its difference from the average voice, positioned by
+  multidimensional scaling over pairwise similarity, colored from the map
+  itself — neighbors share a hue, outliers go vivid.
+- iOS: synthesis shows a progress percentage estimated from the text length
+  and the last measured speed on the device, plus a "waking the model" state
+  for the first run.
+
+### Fixed
+
+- iOS video export no longer sticks partway. Two stacked bugs: feeding all
+  video frames before any audio deadlocked `AVAssetWriter`'s interleaving at
+  its buffer depth, and behind that, mono AAC at 24 kHz rejects a 96 kbps
+  bitrate outright, killing the export the moment the deadlock was cured.
+  Audio and video now feed concurrently and the encoder picks its own
+  bitrate. Export is also much faster: fixed-point Ken Burns resampling,
+  frames rendered in parallel chunks, and the BGRA conversion moved into
+  Rust — a 20-second clip that previously never finished exports in about
+  15 seconds.
+- The end-of-utterance tail trim removed the wrong samples whenever the noise
+  burst was followed by inaudible silence: it kept the audible artifact and
+  deleted the harmless silence. The detector now reports where the noise run
+  sits and the writer removes exactly that window; a content-asserting test
+  pins the behavior (sample counts alone cannot distinguish right from wrong
+  here). The holdback window also derives from the writer's own sample rate
+  instead of a hardcoded 24 kHz.
+- iOS kernel worker threads request an elevated QoS class so the scheduler
+  stops parking them on efficiency cores; the barrier waits for its slowest
+  member, so one demoted worker set the pace of every dispatch.
+
+### Changed
+
+- The FastEnhancer denoiser is now a required model file on iOS: enrollment
+  refuses to run without it (a profile built from un-denoised audio carries
+  the recording's noise into every synthesis), synthesis output is denoised
+  with the same network, and installs that predate the file complete the
+  missing 0.8 MB silently at launch.
+
 ## [0.1.5] - 2026-08-10
 
 The browser engine gets 9.4x faster, Apple devices stop crashing, and enrollment

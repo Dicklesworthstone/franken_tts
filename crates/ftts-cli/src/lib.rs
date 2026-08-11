@@ -2,7 +2,7 @@
 
 //! Shared, stateless command-line dispatch for both FrankenTTS binaries.
 
-mod card;
+pub(crate) mod card;
 mod error;
 pub mod resident;
 pub mod robot;
@@ -278,7 +278,8 @@ struct SayArgs {
     #[arg(long, value_name = "PATH")]
     model: Option<PathBuf>,
 
-    /// Voice source: a .spk vector, reference audio, or a built-in voice name
+    /// Voice source: a .spk vector, a voice-card image (PNG/JPEG), reference
+    /// audio, or a built-in voice name
     /// (matt, james, leo, robert, judy, aria, ember).
     /// Default: MODEL_DIR/default.spk when enrolled, else the built-in "matt".
     #[arg(long, value_name = "PATH|NAME")]
@@ -332,7 +333,8 @@ struct MakeVideoArgs {
     #[arg(long, value_name = "PATH")]
     model: Option<PathBuf>,
 
-    /// Voice source: a .spk vector, reference audio, or a built-in voice name
+    /// Voice source: a .spk vector, a voice-card image (PNG/JPEG), reference
+    /// audio, or a built-in voice name
     /// (matt, james, leo, robert, judy, aria, ember).
     #[arg(long, value_name = "PATH|NAME")]
     voice: Option<PathBuf>,

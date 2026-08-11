@@ -252,6 +252,13 @@ fn decode_png_rgb(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), FttsError> {
     buffer.truncate(info.buffer_size());
     let width = info.width as usize;
     let height = info.height as usize;
+    // Depth first: the channel unpacking below assumes one byte per sample, and
+    // 16-bit input must be refused before it can be misread as two 8-bit samples.
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(FttsError::Input(
+            "only 8-bit images are supported; re-save the card as a normal screenshot".to_owned(),
+        ));
+    }
     let rgb = match info.color_type {
         png::ColorType::Rgb => buffer,
         png::ColorType::Rgba => buffer
@@ -273,11 +280,6 @@ fn decode_png_rgb(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), FttsError> {
             ));
         }
     };
-    if info.bit_depth != png::BitDepth::Eight {
-        return Err(FttsError::Input(
-            "only 8-bit images are supported; re-save the card as a normal screenshot".to_owned(),
-        ));
-    }
     Ok((rgb, width, height))
 }
 

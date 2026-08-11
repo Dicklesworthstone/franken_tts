@@ -87,7 +87,7 @@ A voice card is a picture that carries the voice itself. The green mosaic in the
 ftts card export aria -o aria-card.png          # any preset, or a .spk file
 ftts card export my_voice.spk --name "Jeff"     # name is written into the card
 ftts card import aria-card.png                  # writes aria.spk next to the image
-ftts say "Hello from a picture." --voice aria.spk
+ftts say "Hello from a picture." --voice aria-card.png   # or skip the import entirely
 ```
 
 The two encoders are bit-identical by pinned test (`crates/ftts-voicecard`), and import decodes PNG and JPEG. Cards hold only the small voiceprint, never a recording; share only voices that are yours to share.

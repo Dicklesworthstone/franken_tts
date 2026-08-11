@@ -311,6 +311,14 @@ pub fn speaker_from_voice(
     if bytes.len() == SPEAKER_VECTOR_BYTES && !looks_like_audio {
         return decode_speaker_vector(path, &bytes);
     }
+    // A voice-card image (PNG or JPEG) IS a voice: decode it directly, no explicit
+    // `ftts card import` step needed. Card decoding never touches the model bundle.
+    let looks_like_image = bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        || bytes.starts_with(&[0xFF, 0xD8]);
+    if looks_like_image {
+        let (_, vector) = crate::card::decode_card(&bytes)?;
+        return Ok(vector);
+    }
     let pcm = decode_reference_audio_any(path)?;
     speaker_from_reference_pcm(bundle, pcm, cleanup)
 }
