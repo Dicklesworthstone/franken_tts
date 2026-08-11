@@ -77,7 +77,7 @@ const {
 
 // Slice size for streaming OPFS into wasm. Big enough that per-call overhead is noise, small
 // enough that the JS heap never holds a meaningful fraction of the model.
-const INGEST_SLICE = 16 * 1024 * 1024;
+const INGEST_SLICE = 8 * 1024 * 1024;
 
 let engine = null;
 // The in-flight load's staging handle, held here so the error path can free its wasm-side
@@ -247,16 +247,33 @@ function reply(type, payload, transfer = []) {
 let coldLayout = null;
 
 async function readColdLayout(root, asset) {
-  const blob = await (await root.getFileHandle(asset)).getFile();
-  const prefix = new DataView(await blob.slice(0, 20).arrayBuffer());
-  const magic = new TextDecoder().decode(new Uint8Array(await blob.slice(0, 5).arrayBuffer()));
-  if (magic !== "FTTSQ") throw new Error(`not a .fttsq artifact (magic ${JSON.stringify(magic)})`);
-  // getBigUint64 because the directory length is a u64; Number() is safe afterwards because a
-  // directory that exceeded 2^53 bytes would not fit in the file it describes.
-  const directoryLength = Number(prefix.getBigUint64(12, true));
-  const directory = JSON.parse(
-    new TextDecoder().decode(await blob.slice(20, 20 + directoryLength).arrayBuffer()),
-  );
+  const handle = await root.getFileHandle(asset);
+  const sync = handle.createSyncAccessHandle ? await handle.createSyncAccessHandle() : null;
+  const at = async (offset, length) => {
+    const buffer = new Uint8Array(length);
+    if (sync) {
+      sync.read(buffer, { at: offset });
+      return buffer;
+    }
+    const file = await handle.getFile();
+    return new Uint8Array(await file.slice(offset, offset + length).arrayBuffer());
+  };
+  let head;
+  let directory;
+  try {
+    head = await at(0, 20);
+    if (new TextDecoder().decode(head.subarray(0, 5)) !== "FTTSQ") {
+      throw new Error("not a .fttsq artifact");
+    }
+    // getBigUint64 because the directory length is a u64; Number() is safe afterwards because a
+    // directory that exceeded 2^53 bytes would not fit in the file it describes.
+    const directoryLength = Number(
+      new DataView(head.buffer, head.byteOffset, head.byteLength).getBigUint64(12, true),
+    );
+    directory = JSON.parse(new TextDecoder().decode(await at(20, directoryLength)));
+  } finally {
+    sync?.close();
+  }
 
   const cold = directory.sections.find((s) => s.access_class === "COLD_TEXT_EMBEDDING");
   if (!cold) throw new Error("artifact declares no COLD_TEXT_EMBEDDING section");
@@ -287,15 +304,30 @@ async function readColdLayout(root, asset) {
 /// `ids` arrives from `engine.text_row_ids`, which returns them ascending and distinct — the exact
 /// order the Rust side reconstructs independently when it rebuilds the table.
 async function readColdRows(root, layout, ids) {
-  const blob = await (await root.getFileHandle(layout.asset)).getFile();
+  const handle = await root.getFileHandle(layout.asset);
   const out = new Uint8Array(ids.length * layout.rowBytes);
-  for (let i = 0; i < ids.length; i += 1) {
-    const start = layout.rowBase + ids[i] * layout.rowBytes;
-    const row = await blob.slice(start, start + layout.rowBytes).arrayBuffer();
-    if (row.byteLength !== layout.rowBytes) {
-      throw new Error(`short cold row for id ${ids[i]}: ${row.byteLength}/${layout.rowBytes}`);
+  // Sync access handle for the same reason as staging: this runs once per utterance and would
+  // otherwise re-materialize a File over a 1.3 GB entry every time somebody presses speak.
+  const sync = handle.createSyncAccessHandle ? await handle.createSyncAccessHandle() : null;
+  try {
+    for (let i = 0; i < ids.length; i += 1) {
+      const at = layout.rowBase + ids[i] * layout.rowBytes;
+      // Read straight into the destination slice; no intermediate buffer, no copy.
+      const view = out.subarray(i * layout.rowBytes, (i + 1) * layout.rowBytes);
+      const read = sync
+        ? sync.read(view, { at })
+        : await (async () => {
+            const file = await handle.getFile();
+            const bytes = new Uint8Array(await file.slice(at, at + layout.rowBytes).arrayBuffer());
+            view.set(bytes);
+            return bytes.length;
+          })();
+      if (read !== layout.rowBytes) {
+        throw new Error(`short cold row for id ${ids[i]}: ${read}/${layout.rowBytes}`);
+      }
     }
-    out.set(new Uint8Array(row), i * layout.rowBytes);
+  } finally {
+    sync?.close();
   }
   return out;
 }
@@ -418,17 +450,56 @@ async function handleMessage({ data }) {
         // What will actually be ingested: the whole codec, plus the artifact's hot prefix once
         // the layout is known. Before that it is the codec alone, which is all that has streamed.
         const stagedTotal = () => data.codec.bytes + (coldLayout?.hotBytes ?? 0);
+        // Read through ONE reused buffer, never through Blob.
+        //
+        // The previous shape — `getFileHandle().getFile()` then `blob.slice(a, b).arrayBuffer()`
+        // per chunk — asks the browser for a fresh 16 MB ArrayBuffer on every iteration, on top of
+        // whatever the File object itself materializes for a 1.3 GB OPFS entry. On a phone that is
+        // allocation pressure layered directly on the largest allocation the page ever makes, and
+        // it is where an iPhone died: during streaming, at roughly 1.4 GB, comfortably BELOW the
+        // 1.86 GB peak the same build reaches on a desktop. Dying under your own high-water mark
+        // is the signature of the reader, not the totals.
+        //
+        // `createSyncAccessHandle` reads straight into a buffer we own and reuse, so the steady
+        // state is one 8 MB staging buffer regardless of file size and the GC has nothing to
+        // chase. It is worker-only, which is fine because this IS the worker — and it is what the
+        // browser-side LLM runtimes settled on for the same reason.
+        const scratch = new Uint8Array(INGEST_SLICE);
         const drain = async (meta, push, limit) => {
-          const blob = await (await root.getFileHandle(meta.asset)).getFile();
-          const stop = Math.min(limit ?? blob.size, blob.size);
-          for (let offset = 0; offset < stop; offset += INGEST_SLICE) {
-            const end = Math.min(offset + INGEST_SLICE, stop);
-            // One slice live at a time; the previous is collectable before the next is read.
-            push(new Uint8Array(await blob.slice(offset, end).arrayBuffer()));
-            // The total is reported alongside, because staging no longer ingests the whole
-            // artifact: the elided cold section would otherwise leave the bar stalled at ~85%
-            // with nothing wrong.
-            reply("loadProgress", { bytesDone: staging.filled(), bytesTotal: stagedTotal() });
+          const handle = await root.getFileHandle(meta.asset);
+          const sync = handle.createSyncAccessHandle
+            ? await handle.createSyncAccessHandle()
+            : null;
+          try {
+            const size = sync ? sync.getSize() : (await handle.getFile()).size;
+            const stop = Math.min(limit ?? size, size);
+            for (let offset = 0; offset < stop; offset += INGEST_SLICE) {
+              const want = Math.min(INGEST_SLICE, stop - offset);
+              if (sync) {
+                // subarray is a VIEW, not a copy: nothing is allocated per chunk.
+                const view = scratch.subarray(0, want);
+                const read = sync.read(view, { at: offset });
+                if (read !== want) throw new Error(`short read at ${offset}: ${read}/${want}`);
+                push(view);
+              } else {
+                // Fallback for engines without sync access handles. Same bytes, more garbage.
+                const file = await handle.getFile();
+                push(new Uint8Array(await file.slice(offset, offset + want).arrayBuffer()));
+              }
+              // The total is reported alongside, because staging no longer ingests the whole
+              // artifact: the elided cold section would otherwise leave the bar stalled at ~85%
+              // with nothing wrong. Memory rides along so a crash breadcrumb records the size the
+              // tab actually died at, which is the number that decides what to cut next.
+              reply("loadProgress", {
+                bytesDone: staging.filled(),
+                bytesTotal: stagedTotal(),
+                wasmBytes: memoryBytes(),
+              });
+            }
+          } finally {
+            // The handle holds an EXCLUSIVE lock on the file; leaving it open makes every later
+            // read — including the cold embedding rows — fail for the life of the page.
+            sync?.close();
           }
         };
 

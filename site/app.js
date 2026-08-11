@@ -165,6 +165,13 @@ worker.onmessage = ({ data }) => {
       const percent = Math.min(100, (data.bytesDone / total) * 100);
       ui.dlBar.style.width = `${percent.toFixed(1)}%`;
       ui.dlStatus.textContent = `Streaming into the engine: ${gigabytes(data.bytesDone)} / ${gigabytes(total)} GB`;
+      // Overwrite the breadcrumb with the live wasm size. A tab killed by the OS gets no
+      // callback, no error and no unload, so the ONLY way to learn how big linear memory was at
+      // the moment of death is to have written it down beforehand. Streaming is where a phone
+      // died, and "it crashed somewhere in streaming" is not a number anyone can act on.
+      if (Number.isFinite(data.wasmBytes)) {
+        recordStage("stream-artifact", `${gigabytes(data.bytesDone)} GB in, wasm ${gigabytes(data.wasmBytes)} GB`);
+      }
     }
     return;
   }
