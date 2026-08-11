@@ -92,7 +92,24 @@ do_not_retry_predicate: seq-16 speculative batching remains DEAD (NE-002, drafte
 
 `claim_id: wasm-int8-4column-register-blocking`; `evidence_id: same harness as NE-003, immediately before/after the blocked kernel landed`; `status: NEGATIVE (neutral)`; `cpu_features: Apple M4 Pro, wasm32 + simd128 under V8`; `kill_switch: the blocked path is behind cfg(target_arch = "wasm32") and matches only Int8Tier::WasmSimd128`; `before_after: 1.49 -> 1.53x, 1.71 -> 1.79x, 1.47 -> 1.53x — about 3%, against a predicted 23% from the op-count arithmetic (26 ops per 64 MACs instead of 32)`; `equivalence: exact i32 equality preserved; only the loop nest changed`; `killing_metric: per-dot wall time at real census shapes`; `disposition: KEEP (consistent across all three shapes, no numerics change, no measurable cost) but do NOT treat it as a lever`; `do_not_retry: the doctrine's "the instruction is not the lever; the blocking is" is an *instruction-bound* heuristic and does not apply here. Hoisting the shared activation widening bought nothing, which says the wasm GEMV is not instruction-issue-bound: measured ~0.2 ns per int8 element (~5 GB/s) where SIMD128 issue rates predict several times that. Further kernel micro-optimization is exhausted; the remaining levers are parallelism (threads) and *traffic reduction* (int4 weights, the seq-16 microdecoder batching that removes a 15x reread), not instruction selection`; `tally_local_w_l_n: 0/0/1`.
 
-### NE-006 the-ios-hydration-crash-is-not-reachable-by-memory-tuning
+### NE-006 the-ios-hydration-crash-is-not-reachable-by-memory-tuning — **RETRACTED**
+
+**This entry was wrong, and the way it was wrong is the useful part.** It concluded that 2.45 GB
+was irreducible because no single dominant allocation remained. The premise was true and the
+conclusion did not follow: 622 MB — 47% of the artifact — was the COLD_TEXT_EMBEDDING section,
+held resident to serve a few hundred 4 KB rows per utterance. It was invisible to the census below
+because that census only asked *what hydration widens*, and this section is not widened; it is
+staged as raw bytes and read in place. Measuring one axis and concluding about the total is how a
+0.6 GB allocation hid behind the sentence "there is no large allocation left to remove". Peak is
+now 1.86 GB — see the `perf(wasm)` commit that leaves the cold section in OPFS.
+
+The transferable rule: "no big allocation remains" is a claim about a *search*, not about a
+system, and it is only as good as the axis the search ran along. Before concluding that a resident
+set is irreducible, enumerate it by ACCESS FREQUENCY as well as by size — the thing to remove is
+not the biggest allocation, it is the biggest one that is barely read. The decomposition below is
+still accurate for what it measured, so it is kept rather than deleted.
+
+Original entry, retained for the record:
 
 `claim_id: ios-playground-hydration-peak`; `evidence_id: site/harness/browser.mjs against the real 1.86 GB assets, both engines, persistent profiles; per-stage wasm memory readouts; fttsq directory census over docs/truth-pack/snapshots/hf/qwen3-tts-12hz-0.6b-base.fttsq`; `status: NEGATIVE (the lever class, not the goal)`; `cpu_features: wasm32+simd128 under WebKit and V8, Apple M4 Pro host`; `kill_switch: not-applicable — this is a measurement, no code path was gated`; `before_after: peak resident 2.45 GB, decomposed as 1.31 GB q8 artifact (read in place through MappedFttsq, zero-copy, cannot be freed while the engine lives) + 0.70 GB widened codec (its safetensors source is already f32, so keeping it narrow saves nothing) + 0.34 GB of talker f32 spread across 477 tensors with no dominant member + ~0.10 GB gathered rows and scratch`; `equivalence: not-applicable`; `killing_metric: peak wasm linear memory at hydrate-talker`; `disposition: REJECT further memory tuning; SHIP an upfront device warning instead (site/app.js isMemoryConstrainedDevice)`; `do_not_retry: do not look for a big single allocation — there is not one. The cold text embedding is already gathered per-row rather than widened, the codec checkpoint is already decoder-only, and the streaming ModelStaging already keeps the codec source out of the artifact's window (2.67 GB against 3.35 GB). Arming FTTS_INT8_CODEC makes this WORSE, not better: that route memoizes the Q8 form ALONGSIDE the f32 weights it quantizes from. The only remaining levers both carry costs already ruled out of scope — a narrower artifact format (rejected: it would break every installed version) or storing the codec quantized and dropping its f32 (a wasm audio numerics change, ~0.5 GB, unevaluated)`; `tally_local_w_l_n: 0/1/0`.
 
