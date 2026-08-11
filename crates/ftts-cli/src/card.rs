@@ -232,7 +232,7 @@ fn decode_image_rgb(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), FttsError> 
     if bytes.len() >= 8 && bytes[..8] == PNG_SIGNATURE {
         return decode_png_rgb(bytes);
     }
-    if bytes.len() >= 2 && bytes[..2] == [0xFF, 0xD8] {
+    if bytes.len() >= 3 && bytes[..3] == [0xFF, 0xD8, 0xFF] {
         return decode_jpeg_rgb(bytes);
     }
     Err(FttsError::Input(

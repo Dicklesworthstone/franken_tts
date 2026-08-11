@@ -312,8 +312,11 @@ pub fn speaker_from_voice(
     // `ftts card import` step needed. Card decoding never touches the model bundle.
     // Checked BEFORE the raw-vector size branch for the same reason the audio sniff
     // exists: a 4,096-byte image would otherwise reinterpret as garbage floats.
+    // The JPEG sniff is three bytes (SOI plus the next marker's FF), not two: every
+    // real JPEG has it, and a bare FF D8 matches one legitimate .spk in 65,536 —
+    // which would then FAIL to load through the image path instead of speaking.
     let looks_like_image = bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
-        || bytes.starts_with(&[0xFF, 0xD8]);
+        || bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
     if looks_like_image {
         let (_, vector) = crate::card::decode_card(&bytes)?;
         return Ok(vector);
