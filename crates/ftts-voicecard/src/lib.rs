@@ -819,12 +819,15 @@ pub fn decode_chunk(data: &[u8]) -> Option<(String, Vec<f32>)> {
     if data.len() <= 16 || data[..8] != SIGNATURE {
         return None;
     }
-    let mut offset = 8;
+    let mut offset = 8_usize;
     while offset + 12 <= data.len() {
         let length = u32::from_be_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
         let kind = &data[offset + 4..offset + 8];
         let data_start = offset + 8;
-        if data_start + length + 4 > data.len() {
+        // Checked: `length` is attacker-controlled and usize is 32-bit on wasm, so
+        // unchecked addition could wrap and let a bounds check pass falsely.
+        let chunk_end = data_start.checked_add(length)?.checked_add(4)?;
+        if chunk_end > data.len() {
             return None;
         }
         if kind == CHUNK_TYPE {
@@ -841,7 +844,7 @@ pub fn decode_chunk(data: &[u8]) -> Option<(String, Vec<f32>)> {
             }
             return parse_chunk(payload);
         }
-        offset = data_start + length + 4;
+        offset = chunk_end;
     }
     None
 }

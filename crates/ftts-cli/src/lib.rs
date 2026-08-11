@@ -2880,6 +2880,19 @@ fn run_card(args: &CardArgs, stdout: &mut dyn Write) -> Result<(), FttsError> {
                 ((vector), (*preset_name).to_owned(), PathBuf::from("."))
             } else {
                 let path = PathBuf::from(voice);
+                // A bare word that is not a preset and not a file is almost always a
+                // typo'd preset name; a raw file-not-found error would hide that.
+                if !path.exists()
+                    && !voice.contains('.')
+                    && !voice.contains('/')
+                    && !voice.contains('\\')
+                {
+                    let names: Vec<&str> = PRESET_VOICES.iter().map(|(name, _, _)| *name).collect();
+                    return Err(FttsError::Input(format!(
+                        "`{voice}` is not a built-in voice (those are: {}) and no such file exists",
+                        names.join(", ")
+                    )));
+                }
                 let vector = card::read_spk(&path)?;
                 let stem = path
                     .file_stem()
