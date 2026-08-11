@@ -319,14 +319,15 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
                     // chains give the compiler independent accumulators. Both orders live in
                     // the same "correct, not exact" contract the denied-BLAS path already
                     // declares.
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        8
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        1
-                    }
+                    // PARITY EXPERIMENT: wasm takes the native reduction order.
+                    //
+                    // Eight partial chains autovectorize where one cannot, but f32 addition is
+                    // not associative, so the two orders give different sums — and these sums
+                    // feed the codec head's logits, where a one-ulp difference flips a sampled
+                    // token and the whole utterance diverges. Measured browser-vs-CLI on the same
+                    // text/voice/seed: 0.4% identical samples, -4.5 dB SNR at best alignment,
+                    // 40 frames against 41. Same words, different performance.
+                    1
                 }
                 F32LinearAccumulation::Scalar | F32LinearAccumulation::WidenedF64 => {
                     unreachable!("scalar and widened orders are handled above")
