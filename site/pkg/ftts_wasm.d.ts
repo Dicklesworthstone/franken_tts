@@ -102,15 +102,19 @@ export class ModelStaging {
      */
     constructor();
     /**
-     * Append one slice of the codec checkpoint, in order.
+     * Hand over one codec tensor's little-endian f32 bytes, widened on arrival.
+     *
+     * There is no staged file and no reservation. The codec used to arrive as a 0.46 GB
+     * safetensors buffer that a 0.457 GB checkpoint was then built out of — paying for the same
+     * weights twice, in a heap that can never shrink. Tensor by tensor, the caller's chunk is
+     * widened and released immediately, so the peak is the finished set plus one tensor.
      *
      * # Errors
      *
-     * Throws if the slice would exceed the reserved capacity, which means the caller's manifest
-     * and its download disagree — better caught here than as a corrupt tensor later. Also throws
-     * once the codec has been hydrated, when there is nothing left to append to.
+     * Throws once the codec is hydrated, or when the byte count is not a whole number of f32 —
+     * a truncated push, which must not be rounded down into a silently short tensor.
      */
-    push_codec(chunk: Uint8Array): void;
+    push_codec_tensor(name: string, bytes: Uint8Array): void;
     /**
      * Append one slice of the artifact, in order.
      *
@@ -119,18 +123,6 @@ export class ModelStaging {
      * Throws if the slice would exceed the reserved capacity, or if no reservation was made.
      */
     push_fttsq(chunk: Uint8Array): void;
-    /**
-     * Reserve exact room for the codec's staged bytes.
-     *
-     * Separate from construction so it can be claimed AFTER the artifact — see
-     * [`ModelStaging::reserve_fttsq`] for why that ordering is worth ~0.45 GB.
-     *
-     * # Errors
-     *
-     * When the reservation fails, naming the byte count — the honest signal on a device that
-     * simply does not have the memory.
-     */
-    reserve_codec(codec_bytes: number): void;
     /**
      * Reserve exact room for the artifact.
      *
@@ -375,9 +367,8 @@ export interface InitOutput {
     readonly modelstaging_finish_artifact: (a: number) => [number, number];
     readonly modelstaging_finish_codec: (a: number) => [number, number];
     readonly modelstaging_new: () => number;
-    readonly modelstaging_push_codec: (a: number, b: number, c: number) => [number, number];
+    readonly modelstaging_push_codec_tensor: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly modelstaging_push_fttsq: (a: number, b: number, c: number) => [number, number];
-    readonly modelstaging_reserve_codec: (a: number, b: number) => [number, number];
     readonly modelstaging_reserve_fttsq: (a: number, b: number) => [number, number];
     readonly modelstaging_reserve_fttsq_hot_prefix: (a: number, b: number, c: bigint) => [number, number];
     readonly preset_vector: (a: number, b: number) => [number, number, number, number];

@@ -128,19 +128,26 @@ export class ModelStaging {
         return this;
     }
     /**
-     * Append one slice of the codec checkpoint, in order.
+     * Hand over one codec tensor's little-endian f32 bytes, widened on arrival.
+     *
+     * There is no staged file and no reservation. The codec used to arrive as a 0.46 GB
+     * safetensors buffer that a 0.457 GB checkpoint was then built out of — paying for the same
+     * weights twice, in a heap that can never shrink. Tensor by tensor, the caller's chunk is
+     * widened and released immediately, so the peak is the finished set plus one tensor.
      *
      * # Errors
      *
-     * Throws if the slice would exceed the reserved capacity, which means the caller's manifest
-     * and its download disagree — better caught here than as a corrupt tensor later. Also throws
-     * once the codec has been hydrated, when there is nothing left to append to.
-     * @param {Uint8Array} chunk
+     * Throws once the codec is hydrated, or when the byte count is not a whole number of f32 —
+     * a truncated push, which must not be rounded down into a silently short tensor.
+     * @param {string} name
+     * @param {Uint8Array} bytes
      */
-    push_codec(chunk) {
-        const ptr0 = passArray8ToWasm0(chunk, wasm.__wbindgen_malloc);
+    push_codec_tensor(name, bytes) {
+        const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.modelstaging_push_codec(this.__wbg_ptr, ptr0, len0);
+        const ptr1 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.modelstaging_push_codec_tensor(this.__wbg_ptr, ptr0, len0, ptr1, len1);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
@@ -157,24 +164,6 @@ export class ModelStaging {
         const ptr0 = passArray8ToWasm0(chunk, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.modelstaging_push_fttsq(this.__wbg_ptr, ptr0, len0);
-        if (ret[1]) {
-            throw takeFromExternrefTable0(ret[0]);
-        }
-    }
-    /**
-     * Reserve exact room for the codec's staged bytes.
-     *
-     * Separate from construction so it can be claimed AFTER the artifact — see
-     * [`ModelStaging::reserve_fttsq`] for why that ordering is worth ~0.45 GB.
-     *
-     * # Errors
-     *
-     * When the reservation fails, naming the byte count — the honest signal on a device that
-     * simply does not have the memory.
-     * @param {number} codec_bytes
-     */
-    reserve_codec(codec_bytes) {
-        const ret = wasm.modelstaging_reserve_codec(this.__wbg_ptr, codec_bytes);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
