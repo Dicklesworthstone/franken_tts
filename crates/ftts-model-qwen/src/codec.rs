@@ -704,13 +704,18 @@ fn codec_int8_route() -> Option<&'static CodecInt8Route> {
                 Ok("1" | "all") => (true, true),
                 Ok("transformer") => (true, false),
                 Ok("convnext") => (false, true),
-                // wasm32 has no BLAS: its f32 dense fall-through is the slow path, so the
-                // spectral-gate-passed convnext int8 arm (0.65 dB LSD, transparent) arms by
-                // default there — integer accumulation is reassociable and autovectorizes.
-                // Native keeps the no-int8 default the codec_time A/B chose.
-                #[cfg(target_arch = "wasm32")]
-                _ => (false, true),
-                #[cfg(not(target_arch = "wasm32"))]
+                // ONE default on every target: no codec int8 unless asked for.
+                //
+                // wasm used to arm the convnext arm by default, on the reasoning that wasm has no
+                // BLAS so its f32 dense fall-through is the slow path. That premise expired when
+                // the packed SIMD128 GEMM landed, and the cost was never only speed: it made the
+                // browser's codec arithmetic differ from the CLI's, which is measurable as a
+                // 29.9 dB frame-0 SNR between the two for the same text, voice and seed.
+                //
+                // A small delta is not a small problem here. The talker SAMPLES (16 draws/frame),
+                // so any epsilon that reaches the logits flips a draw and the two renderings
+                // diverge completely from the next frame on — frame 1 measured 0.6 dB. "Transparent
+                // on a spectral gate" is the wrong bar when the output is a sampling process.
                 _ => return None,
             };
             Some(CodecInt8Route {

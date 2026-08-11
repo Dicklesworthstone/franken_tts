@@ -217,11 +217,26 @@ try {
   // The number that actually matters. Everything above only proves the page loads; this measures
   // whether the kernel work bought anything, in the browser, on the real model.
   if (ready) {
-    await page.fill("#text, textarea", CONFORMANCE_TEXT).catch(() => {});
+    // Set the inputs, then READ THEM BACK. Every one of these was previously set with the error
+    // swallowed, which means a selector that matched the wrong element — or nothing — produced a
+    // parity comparison against different text or a different voice, and reported it as a
+    // divergence in the engine. Three separate harness lies this session started exactly here.
+    await page.fill("#text", CONFORMANCE_TEXT);
     // Pinned so the CLI golden is reproducible: the sampler is seeded, and an unpinned seed would
     // make every comparison a fresh coin flip rather than a parity test.
-    await page.fill("#seed", "0").catch(() => {});
-    await page.selectOption("#voice", "matt").catch(() => {});
+    await page.fill("#seed", "0");
+    await page.selectOption("#voice", "matt");
+    const inputs = await page.evaluate(() => ({
+      text: document.getElementById("text")?.value ?? null,
+      seed: document.getElementById("seed")?.value ?? null,
+      voice: document.getElementById("voice")?.value ?? null,
+    }));
+    console.log(`      inputs: voice=${inputs.voice} seed=${inputs.seed} text=${JSON.stringify(inputs.text)}`);
+    check(
+      "conformance inputs are what the CLI golden was made with",
+      inputs.text === CONFORMANCE_TEXT && inputs.seed === "0" && inputs.voice === "matt",
+      `voice=${inputs.voice} seed=${inputs.seed}`,
+    );
     const started = Date.now();
     await page.click("#speak");
     // Wait for the control to go DOWN before waiting for it to come back up. Checking only for

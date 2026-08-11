@@ -943,6 +943,19 @@ impl WasmEngine {
         let prepared = PreparedText::new(wrapped.clone(), prepared_raw.normalization_trace);
 
         let ids = TalkerCheckpoint::utterance_text_ids(&wrapped);
+        // Directly comparable to the CLI's `prepared_token_count`. If these disagree the two are
+        // conditioning on different text, and every audio comparison downstream is meaningless.
+        console_error(&format!(
+            "ftts-wasm tokens: prepared {} wrapped {} distinct_rows {}",
+            prepared_raw.token_ids.len(),
+            wrapped.len(),
+            {
+                let mut d = ids.clone();
+                d.sort_unstable();
+                d.dedup();
+                d.len()
+            }
+        ));
         let table = match provided_rows {
             Some(rows) => TextEmbeddingTable::from_provided_rows(&ids, rows)
                 .map_err(|error| js_error("provided text rows rejected", error))?,
