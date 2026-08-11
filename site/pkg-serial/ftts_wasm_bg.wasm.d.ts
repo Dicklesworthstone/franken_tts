@@ -7,6 +7,7 @@ export const bench_frame_kernels: (a: number) => [number, number];
 export const bench_int8_gemv: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
 export const int8_route: () => [number, number];
 export const modelstaging_filled: (a: number) => number;
+export const modelstaging_finish_artifact: (a: number) => [number, number];
 export const modelstaging_finish_codec: (a: number) => [number, number];
 export const modelstaging_new: () => number;
 export const modelstaging_push_codec: (a: number, b: number, c: number) => [number, number];

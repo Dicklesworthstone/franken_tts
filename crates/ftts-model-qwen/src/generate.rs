@@ -309,13 +309,132 @@ struct UtteranceState {
 /// attention, per-depth heads/embeddings, the final norms, and the primary head remain f32 in
 /// both stacks per the fixed doctrine recipe.
 #[derive(Debug)]
-struct Int8Route {
+pub struct Int8Route {
     talker: Vec<TalkerLayerQuant>,
     micro: Vec<MicroLayerQuant>,
     /// Quantized per-depth heads for the int8+f32-refine scoring path (empty when the
     /// microdecoder stack is not armed).
     micro_heads: Vec<ftts_kernels::int8::QuantizedMatrix>,
     mode: QuantLinearMode,
+}
+
+
+/// Build the fused W8A8 tables ONCE, so they can outlive the artifact they were read from.
+///
+/// # Why this is separable, and why it matters on a phone
+///
+/// Fusing QKV and gate‖up into one matrix each is a copy by definition — the whole point is that
+/// the three projections end up contiguous. Read artifact-natively that copy is ~0.46 GB of Q8,
+/// duplicating bytes that are already resident in the staged artifact, and it was being rebuilt on
+/// every single synthesize call, landing on top of the existing high-water mark. Measured in
+/// WebKit: entry 1.61 GB, after the generator 2.07 GB, and the tab died there.
+///
+/// The route owns everything it returns — `Vec<TalkerLayerQuant>`, `Vec<MicroLayerQuant>`,
+/// `Vec<QuantizedMatrix>` — and borrows nothing from `artifact`. So a caller can build it during
+/// hydration, drop the artifact, and keep synthesizing: the fused tables are the only reader of
+/// those hot bytes once they exist.
+#[must_use]
+pub fn prepare_int8_route(
+    talker_config: &TalkerConfig,
+    talker_weights: &TalkerWeights<'_>,
+    microdecoder_config: &MicrodecoderConfig,
+    microdecoder_weights: &MicrodecoderWeights<'_>,
+    artifact: Option<&MappedFttsq>,
+) -> Option<Int8Route> {
+    ftts_kernels::route::optimized_default("FTTS_INT8").then(|| {
+        // FTTS_INT8_SCOPE narrows the lever for sensitivity attribution: `talker` or
+        // `micro` quantizes one stack and leaves the other on the f32 reference. An empty
+        // table below means "this stack stays f32" at the branch sites.
+        let scope = std::env::var("FTTS_INT8_SCOPE").unwrap_or_default();
+        let (arm_talker, arm_micro) = match scope.as_str() {
+            "talker" => (true, false),
+            "micro" => (false, true),
+            _ => (true, true),
+        };
+        let artifact = artifact.filter(|_| artifact_q8_enabled());
+        Int8Route {
+            talker: if arm_talker {
+                talker_weights
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, layer)| {
+                        artifact
+                            .and_then(|artifact| {
+                                let talker = &*talker_config;
+                                fused_layer_from_artifact(
+                                    artifact,
+                                    &format!("talker.model.layers.{index}"),
+                                    talker.hidden_size,
+                                    talker.query_width(),
+                                    talker.kv_width(),
+                                    talker.intermediate_size,
+                                )
+                            })
+                            .map(|(qkv, o_proj, gate_up, down_proj)| TalkerLayerQuant {
+                                qkv,
+                                o_proj,
+                                gate_up,
+                                down_proj,
+                            })
+                            .unwrap_or_else(|| {
+                                TalkerLayerQuant::quantize(&*talker_config, layer)
+                            })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            micro: if arm_micro {
+                microdecoder_weights
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, layer)| {
+                        artifact
+                            .and_then(|artifact| {
+                                let micro = &*microdecoder_config;
+                                fused_layer_from_artifact(
+                                    artifact,
+                                    &format!("talker.code_predictor.model.layers.{index}"),
+                                    micro.hidden_size,
+                                    micro.q_width(),
+                                    micro.kv_width(),
+                                    micro.intermediate_size,
+                                )
+                            })
+                            .map(|(qkv, o_proj, gate_up, down_proj)| MicroLayerQuant {
+                                qkv,
+                                o_proj,
+                                gate_up,
+                                down_proj,
+                            })
+                            .unwrap_or_else(|| {
+                                MicroLayerQuant::quantize(&*microdecoder_config, layer)
+                            })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            micro_heads: if arm_micro {
+                microdecoder_weights
+                    .heads
+                    .iter()
+                    .map(|head| {
+                        ftts_kernels::int8::QuantizedMatrix::quantize(
+                            head,
+                            RESIDUAL_VOCAB,
+                            microdecoder_config.hidden_size,
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            mode: ftts_kernels::int8::quant_mode_from_environment(),
+        }
+    })
 }
 
 /// The Qwen3-TTS Base implementation of [`FrameGenerator`].
@@ -337,7 +456,9 @@ pub struct QwenGenerator<'a> {
     kv: TalkerKvCache,
     frame_state: FrameState,
     utterance: Option<UtteranceState>,
-    int8: Option<Int8Route>,
+    /// Shared rather than owned: the engine builds these once during hydration and lends the
+    /// same tables to every utterance, which is what lets the artifact they came from be dropped.
+    int8: Option<std::sync::Arc<Int8Route>>,
 }
 
 impl<'a> QwenGenerator<'a> {
@@ -350,6 +471,22 @@ impl<'a> QwenGenerator<'a> {
     #[must_use]
     pub fn new(config: QwenGeneratorConfig<'a>) -> Self {
         Self::new_with_artifact(config, None)
+    }
+
+    /// [`QwenGenerator::new`] with the fused int8 tables supplied rather than built.
+    ///
+    /// The memory-frugal entry point, and the one the browser uses. Building the route costs a
+    /// ~0.46 GB Q8 copy of the hot weights; doing it per utterance rebuilt that copy on top of an
+    /// already-peaked heap, and wasm memory never shrinks, so every press ratcheted the tab
+    /// upward. A caller that prepared the route once with [`prepare_int8_route`] lends the same
+    /// tables here for free — and, because the route borrows nothing from the artifact, can have
+    /// dropped the artifact entirely by now.
+    #[must_use]
+    pub fn new_with_prepared_int8(
+        config: QwenGeneratorConfig<'a>,
+        int8: Option<std::sync::Arc<Int8Route>>,
+    ) -> Self {
+        Self::assemble(config, int8)
     }
 
     /// [`QwenGenerator::new`], additionally offered the mapped canonical artifact the checkpoint
@@ -365,6 +502,30 @@ impl<'a> QwenGenerator<'a> {
     pub fn new_with_artifact(
         config: QwenGeneratorConfig<'a>,
         artifact: Option<&MappedFttsq>,
+    ) -> Self {
+        let int8 = ftts_kernels::route::optimized_default("FTTS_INT8")
+            .then(|| {
+                prepare_int8_route(
+                    &config.talker_config,
+                    &config.talker_weights,
+                    &config.microdecoder_config,
+                    &config.microdecoder_weights,
+                    artifact,
+                )
+            })
+            .flatten()
+            .map(std::sync::Arc::new);
+        Self::assemble(config, int8)
+    }
+
+    /// Validate the config and build everything that is not the int8 route.
+    ///
+    /// Split out so the route can either be built here or handed in already built — the two
+    /// constructors differ in nothing else, and duplicating a dozen shape assertions between them
+    /// is how the two paths would quietly stop agreeing.
+    fn assemble(
+        config: QwenGeneratorConfig<'a>,
+        int8: Option<std::sync::Arc<Int8Route>>,
     ) -> Self {
         let hidden = config.talker_config.hidden_size;
         assert_eq!(
@@ -413,103 +574,6 @@ impl<'a> QwenGenerator<'a> {
         // path quantizes nothing and calls the untouched f32 reference functions.
         // The optimized route is the library default; `FTTS_INT8=0` or a conformance
         // reference-pin selects the f32 reference instead (ftts_kernels::route).
-        let int8 = ftts_kernels::route::optimized_default("FTTS_INT8").then(|| {
-            // FTTS_INT8_SCOPE narrows the lever for sensitivity attribution: `talker` or
-            // `micro` quantizes one stack and leaves the other on the f32 reference. An empty
-            // table below means "this stack stays f32" at the branch sites.
-            let scope = std::env::var("FTTS_INT8_SCOPE").unwrap_or_default();
-            let (arm_talker, arm_micro) = match scope.as_str() {
-                "talker" => (true, false),
-                "micro" => (false, true),
-                _ => (true, true),
-            };
-            let artifact = artifact.filter(|_| artifact_q8_enabled());
-            Int8Route {
-                talker: if arm_talker {
-                    config
-                        .talker_weights
-                        .layers
-                        .iter()
-                        .enumerate()
-                        .map(|(index, layer)| {
-                            artifact
-                                .and_then(|artifact| {
-                                    let talker = &config.talker_config;
-                                    fused_layer_from_artifact(
-                                        artifact,
-                                        &format!("talker.model.layers.{index}"),
-                                        talker.hidden_size,
-                                        talker.query_width(),
-                                        talker.kv_width(),
-                                        talker.intermediate_size,
-                                    )
-                                })
-                                .map(|(qkv, o_proj, gate_up, down_proj)| TalkerLayerQuant {
-                                    qkv,
-                                    o_proj,
-                                    gate_up,
-                                    down_proj,
-                                })
-                                .unwrap_or_else(|| {
-                                    TalkerLayerQuant::quantize(&config.talker_config, layer)
-                                })
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                },
-                micro: if arm_micro {
-                    config
-                        .microdecoder_weights
-                        .layers
-                        .iter()
-                        .enumerate()
-                        .map(|(index, layer)| {
-                            artifact
-                                .and_then(|artifact| {
-                                    let micro = &config.microdecoder_config;
-                                    fused_layer_from_artifact(
-                                        artifact,
-                                        &format!("talker.code_predictor.model.layers.{index}"),
-                                        micro.hidden_size,
-                                        micro.q_width(),
-                                        micro.kv_width(),
-                                        micro.intermediate_size,
-                                    )
-                                })
-                                .map(|(qkv, o_proj, gate_up, down_proj)| MicroLayerQuant {
-                                    qkv,
-                                    o_proj,
-                                    gate_up,
-                                    down_proj,
-                                })
-                                .unwrap_or_else(|| {
-                                    MicroLayerQuant::quantize(&config.microdecoder_config, layer)
-                                })
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                },
-                micro_heads: if arm_micro {
-                    config
-                        .microdecoder_weights
-                        .heads
-                        .iter()
-                        .map(|head| {
-                            ftts_kernels::int8::QuantizedMatrix::quantize(
-                                head,
-                                RESIDUAL_VOCAB,
-                                config.microdecoder_config.hidden_size,
-                            )
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                },
-                mode: ftts_kernels::int8::quant_mode_from_environment(),
-            }
-        });
 
         Self {
             talker_config: config.talker_config,

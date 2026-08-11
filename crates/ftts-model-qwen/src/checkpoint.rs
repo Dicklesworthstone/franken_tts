@@ -675,6 +675,14 @@ pub struct TextEmbeddingTable {
 enum TextEmbeddingSource {
     Safetensors,
     Fttsq(Arc<MappedFttsq>),
+    /// The artifact was deliberately released; cold rows must be supplied by the caller.
+    ///
+    /// Not an error state. It is the browser's steady state: once the fused int8 tables exist,
+    /// nothing reads the artifact's hot bytes again, and holding ~0.69 GB of them for the life of
+    /// the page is what put a phone over its limit. Gathering from here fails loudly rather than
+    /// returning zeros, because a zero embedding row is a legitimate-looking vector downstream and
+    /// would produce fluent wrong audio instead of an error.
+    Released,
 }
 
 impl TextEmbeddingTable {
@@ -1325,8 +1333,36 @@ impl TalkerCheckpoint {
     #[must_use]
     pub fn artifact(&self) -> Option<&Arc<MappedFttsq>> {
         match &self.text_embedding_source {
-            TextEmbeddingSource::Safetensors => None,
+            TextEmbeddingSource::Safetensors | TextEmbeddingSource::Released => None,
             TextEmbeddingSource::Fttsq(artifact) => Some(artifact),
+        }
+    }
+
+    /// Release the artifact this checkpoint was hydrated from.
+    ///
+    /// Only safe once every reader of the artifact's bytes has taken what it needs — in practice,
+    /// once the fused int8 tables are built ([`crate::generate::prepare_int8_route`]) and the cold
+    /// text embedding is being supplied externally ([`TextEmbeddingTable::from_provided_rows`]).
+    /// The widened f32 tensors this checkpoint owns were copied at hydration and are unaffected.
+    ///
+    /// Returns whether the artifact allocation actually went away. It does not when another
+    /// `Arc` handle is still outstanding, and that distinction is worth reporting rather than
+    /// assuming: a silent failure here looks exactly like the memory saving working, right up
+    /// until the device runs out anyway.
+    pub fn release_artifact(&mut self) -> bool {
+        let previous = std::mem::replace(&mut self.text_embedding_source, TextEmbeddingSource::Released);
+        match previous {
+            TextEmbeddingSource::Fttsq(artifact) => {
+                // One handle in hand means one handle total, so dropping it frees the payload.
+                let sole_owner = Arc::strong_count(&artifact) == 1;
+                drop(artifact);
+                sole_owner
+            }
+            TextEmbeddingSource::Safetensors => {
+                self.text_embedding_source = TextEmbeddingSource::Safetensors;
+                false
+            }
+            TextEmbeddingSource::Released => false,
         }
     }
 
@@ -1347,6 +1383,15 @@ impl TalkerCheckpoint {
             TextEmbeddingSource::Fttsq(artifact) => {
                 TextEmbeddingTable::gather_fttsq(artifact, &self.path, ids)
             }
+            // Refused, not zero-filled: the caller that released the artifact took on the job of
+            // supplying rows, and silently returning an empty table here would surface as fluent
+            // wrong audio rather than as the contract violation it is.
+            TextEmbeddingSource::Released => Err(CheckpointError::MissingTensor {
+                path: self.path.clone(),
+                tensor: "talker.model.text_embedding.weight (artifact released; supply rows via \
+                         TextEmbeddingTable::from_provided_rows)"
+                    .to_owned(),
+            }),
         }
     }
 

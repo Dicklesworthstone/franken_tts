@@ -83,6 +83,20 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// Wasm linear memory in bytes, read from the engine itself.
+///
+/// The JS side can only sample this between calls, so a spike that happens INSIDE one synchronous
+/// synthesize call is invisible there — and synthesis was measured to add 0.56 GB somewhere in
+/// that call. This reads the page count directly, which is exact and costs one instruction.
+#[cfg(target_arch = "wasm32")]
+fn linear_memory_bytes() -> f64 {
+    (core::arch::wasm32::memory_size(0) as f64) * 65_536.0
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn linear_memory_bytes() -> f64 {
+    0.0
+}
+
 fn js_error(context: &str, error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("{context}: {error}"))
 }
@@ -231,7 +245,15 @@ pub struct WasmEngine {
     talker: TalkerCheckpoint,
     codec: CodecCheckpoint,
     tokenizer: QwenTokenizer,
-    artifact: Arc<ftts_artifacts::fttsq::MappedFttsq>,
+    /// The fused W8A8 tables, built ONCE at hydration and lent to every utterance.
+    ///
+    /// This field is what replaced the artifact handle. Fusing QKV and gate‖up is a copy by
+    /// definition, ~0.46 GB of Q8 duplicating bytes already in the staged artifact — and it used
+    /// to happen on every synthesize call, landing on top of an already-peaked heap that wasm can
+    /// never shrink. Built here instead, the artifact becomes dead the moment it exists, so it is
+    /// released and the 0.69 GB hot prefix goes back to the allocator for the codec and the
+    /// talker's widened tensors to reuse.
+    int8: Option<Arc<ftts_model_qwen::generate::Int8Route>>,
     speaker_encoder: Option<SpeakerEncoder>,
     #[cfg(not(unix))]
     denoiser: Option<ftts_kernels::enhance::Enhancer>,
@@ -296,6 +318,8 @@ pub struct ModelStaging {
     codec: Option<CodecCheckpoint>,
     /// Reserved by `reserve_fttsq`, which refuses to run before the codec is hydrated.
     fttsq: Vec<u8>,
+    /// The talker side, complete and artifact-free, once `finish_artifact` has run.
+    hydrated: Option<HydratedArtifact>,
     /// Set when the caller reserved only the artifact's hot prefix, holding the 622 MB cold text
     /// embedding out of linear memory. Checked against the artifact's own directory at hydration,
     /// so a caller that truncates at the wrong offset is refused rather than trusted. Carries the
@@ -329,9 +353,40 @@ impl ModelStaging {
             codec_source: Vec::new(),
             codec: None,
             fttsq: Vec::new(),
+            hydrated: None,
             cold_elided: None,
             codec_retired: 0,
         }
+    }
+
+    /// Hydrate the talker from the staged artifact, then RELEASE the artifact.
+    ///
+    /// The ordering step, and the reason this is a separate call rather than part of the final
+    /// assembly. Building the fused int8 tables is what makes the artifact's 0.69 GB hot prefix
+    /// dead — and wasm memory only ever grows, so the hole that release leaves is worth exactly
+    /// whatever gets allocated after it. Running this BEFORE the codec is staged lets the codec's
+    /// 0.46 GB of source and 0.457 GB of checkpoint land INSIDE that hole rather than on top of
+    /// it. With the codec first, the same work peaked at 2.10 GB.
+    ///
+    /// # Errors
+    ///
+    /// Throws when staging is incomplete, the prefix does not match the artifact's own declared
+    /// layout, or hydration fails — each named.
+    pub fn finish_artifact(&mut self) -> Result<(), JsValue> {
+        if self.hydrated.is_some() {
+            return Err(js_error("artifact already hydrated", "finish_artifact twice"));
+        }
+        if self.fttsq.len() != self.fttsq.capacity() {
+            return Err(js_error(
+                "artifact staging is incomplete",
+                format!("{}/{}", self.fttsq.len(), self.fttsq.capacity()),
+            ));
+        }
+        // `take` moves the bytes out, so the staging buffer is not a second owner keeping the
+        // payload alive past the release this whole step exists to perform.
+        let fttsq = std::mem::take(&mut self.fttsq);
+        self.hydrated = Some(HydratedArtifact::build(fttsq, self.cold_elided)?);
+        Ok(())
     }
 
     /// Reserve exact room for the codec's staged bytes.
@@ -518,36 +573,36 @@ impl WasmEngine {
         merges_txt: String,
         tokenizer_config_json: String,
     ) -> Result<WasmEngine, JsValue> {
-        if staging.fttsq.len() != staging.fttsq.capacity() {
-            return Err(js_error(
-                "staging is incomplete",
-                format!(
-                    "artifact {}/{}",
-                    staging.fttsq.len(),
-                    staging.fttsq.capacity()
-                ),
-            ));
-        }
         let ModelStaging {
-            fttsq,
-            codec,
-            cold_elided,
-            ..
+            codec, hydrated, ..
         } = staging;
+        let mut hydrated = hydrated.ok_or_else(|| {
+            js_error(
+                "artifact was never hydrated",
+                "call finish_artifact() before from_staging",
+            )
+        })?;
         let codec = codec.ok_or_else(|| {
             js_error(
                 "codec was never hydrated",
                 "call finish_codec() before from_staging",
             )
         })?;
-        Self::hydrate_with_codec(
-            fttsq,
+        let tokenizer = QwenTokenizer::from_files_using_environment(TokenizerFiles {
+            vocab_json: &vocab_json,
+            merges_txt: &merges_txt,
+            tokenizer_config_json: &tokenizer_config_json,
+        })
+        .map_err(|error| js_error("tokenizer unusable", error))?;
+        Ok(WasmEngine {
+            talker: hydrated.talker.take().expect("built by finish_artifact"),
             codec,
-            cold_elided,
-            &vocab_json,
-            &merges_txt,
-            &tokenizer_config_json,
-        )
+            tokenizer,
+            int8: hydrated.int8.take(),
+            speaker_encoder: hydrated.speaker_encoder.take(),
+            #[cfg(not(unix))]
+            denoiser: None,
+        })
     }
 
     /// Hydrate the engine from in-memory buffers.
@@ -622,6 +677,45 @@ impl WasmEngine {
         merges_txt: &str,
         tokenizer_config_json: &str,
     ) -> Result<WasmEngine, JsValue> {
+        // The whole-buffer path: run the artifact phase and the codec phase back to back. It
+        // carries a higher peak than the streaming path by construction, because both raw files
+        // are already in hand; see `ModelStaging` for the ordering that a phone needs.
+        let mut hydrated = HydratedArtifact::build(fttsq, cold_elided)?;
+        let tokenizer = QwenTokenizer::from_files_using_environment(TokenizerFiles {
+            vocab_json,
+            merges_txt,
+            tokenizer_config_json,
+        })
+        .map_err(|error| js_error("tokenizer unusable", error))?;
+        Ok(WasmEngine {
+            talker: hydrated.talker.take().expect("built above"),
+            codec,
+            tokenizer,
+            int8: hydrated.int8.take(),
+            speaker_encoder: hydrated.speaker_encoder.take(),
+            #[cfg(not(unix))]
+            denoiser: None,
+        })
+    }
+}
+
+/// The talker side of hydration, complete and no longer holding the artifact.
+///
+/// Exists as its own step because ORDER is the lever. Building the fused int8 tables is what
+/// makes the artifact's 0.69 GB hot prefix dead, and wasm memory only grows — so the hole that
+/// release leaves is worth exactly as much as whatever gets allocated after it. Running this
+/// BEFORE the codec is staged lets the codec's 0.46 GB source and 0.457 GB checkpoint land inside
+/// that hole instead of on top of it. Measured the wrong way round, the peak was 2.10 GB.
+#[cfg(not(unix))]
+struct HydratedArtifact {
+    talker: Option<TalkerCheckpoint>,
+    int8: Option<Arc<ftts_model_qwen::generate::Int8Route>>,
+    speaker_encoder: Option<SpeakerEncoder>,
+}
+
+#[cfg(not(unix))]
+impl HydratedArtifact {
+    fn build(fttsq: Vec<u8>, cold_elided: Option<u64>) -> Result<Self, JsValue> {
         let staged_bytes = fttsq.len() as u64;
         let artifact = Arc::new(match cold_elided {
             Some(full_bytes) => {
@@ -688,24 +782,57 @@ impl WasmEngine {
         )
         .map_err(|error| js_error("talker hydration failed", error))?;
 
-        let tokenizer = QwenTokenizer::from_files_using_environment(TokenizerFiles {
-            vocab_json,
-            merges_txt,
-            tokenizer_config_json,
-        })
-        .map_err(|error| js_error("tokenizer unusable", error))?;
+        // ── everything the artifact is still needed for, done here, once ────────────────────
+        //
+        // Both readers of the artifact's hot bytes run now so the bytes can be released: the fused
+        // W8A8 tables (~0.46 GB of Q8, previously rebuilt on EVERY synthesize call and stacked on
+        // top of a heap wasm cannot shrink) and the speaker encoder (~18 MB, previously lazy on
+        // first enrollment — cheap enough to pay always, and paying it is what lets voice cloning
+        // keep working after the release).
+        let mut talker = talker;
+        let int8 = {
+            let talker_layers = talker.talker_layer_weights();
+            let micro_layers = talker.microdecoder_layer_weights();
+            let residual = talker.residual_embedding_slices();
+            let heads = talker.microdecoder_head_slices();
+            let micro_residual = &residual[..residual.len() - 1];
+            ftts_model_qwen::generate::prepare_int8_route(
+                &TalkerConfig::default(),
+                &talker.talker_weights(&talker_layers),
+                &MicrodecoderConfig::default(),
+                &talker.microdecoder_weights(&micro_layers, micro_residual, &heads),
+                Some(&artifact),
+            )
+            .map(Arc::new)
+        };
+        let speaker_encoder = SpeakerEncoder::load_fttsq_mapped(&artifact, label).ok();
 
-        Ok(WasmEngine {
-            talker,
-            codec,
-            tokenizer,
-            artifact,
-            speaker_encoder: None,
-            #[cfg(not(unix))]
-            denoiser: None,
+        // Drop this scope's handle first, then the checkpoint's, so the payload actually goes.
+        // `release_artifact` reports whether it was the last one; a handle left outstanding would
+        // look exactly like the saving working, right up until the device ran out anyway.
+        drop(artifact);
+        let released = talker.release_artifact();
+        console_error(&format!(
+            "ftts-wasm hydrate: artifact released={released}, int8 route {}, encoder {}",
+            if int8.is_some() { "built" } else { "absent" },
+            if speaker_encoder.is_some() { "built" } else { "absent" },
+        ));
+
+        Ok(Self {
+            talker: Some(talker),
+            int8,
+            speaker_encoder,
         })
     }
+}
 
+// `#[wasm_bindgen]` is not decoration here: without it every method below stops being exported to
+// JS while still compiling perfectly. Splitting the original impl block to make room for the
+// artifact phase silently dropped `text_row_ids` and `synthesize_with_text_rows` from the glue,
+// and the only symptom was "engine.text_row_ids is not a function" at the first press.
+#[wasm_bindgen]
+#[cfg(not(unix))]
+impl WasmEngine {
     /// The unix stub: byte-based construction is the wasm path; native hosts use the CLI.
     ///
     /// # Errors
@@ -807,6 +934,7 @@ impl WasmEngine {
                 speaker.len(),
             ));
         }
+        let mem_at_entry = linear_memory_bytes();
         let prepared_raw = self
             .tokenizer
             .prepare(text, &NormalizationOptions::default())
@@ -835,7 +963,7 @@ impl WasmEngine {
         let heads = self.talker.microdecoder_head_slices();
         let micro_residual = &residual[..residual.len() - 1];
 
-        let mut generator = QwenGenerator::new_with_artifact(
+        let mut generator = QwenGenerator::new_with_prepared_int8(
             QwenGeneratorConfig {
                 talker_config: TalkerConfig::default(),
                 talker_weights: self.talker.talker_weights(&talker_layers),
@@ -857,15 +985,17 @@ impl WasmEngine {
                 sampling_mode: SamplingMode::Production,
                 seed,
             },
-            Some(&self.artifact),
+            self.int8.clone(),
         );
 
         let clock = js_sys::Date::now;
+        let mem_after_generator = linear_memory_bytes();
         let prefill_started = clock();
         generator
             .begin_utterance(&prepared)
             .map_err(|error| js_error("prefill failed", error))?;
         let prefill_ms = clock() - prefill_started;
+        let mem_after_prefill = linear_memory_bytes();
         let mut frames_ms = 0.0f64;
         let mut codec_ms = 0.0f64;
 
@@ -928,6 +1058,14 @@ impl WasmEngine {
             "ftts-wasm timing: prefill {prefill_ms:.0}ms, talker+micro {frames_ms:.0}ms, codec {codec_ms:.0}ms, {} samples",
             pcm.len()
         ));
+        // Where synthesis's memory actually goes, measured inside the call that spends it.
+        console_error(&format!(
+            "ftts-wasm memory: entry {:.2} GB, after generator {:.2} GB, after prefill {:.2} GB, end {:.2} GB",
+            mem_at_entry / 1e9,
+            mem_after_generator / 1e9,
+            mem_after_prefill / 1e9,
+            linear_memory_bytes() / 1e9,
+        ));
         Ok(pcm)
     }
 
@@ -981,12 +1119,12 @@ impl WasmEngine {
     /// Throws when the PCM is too short for the mel front end or hydration fails.
     pub fn enroll_raw(&mut self, pcm: &[f32]) -> Result<Vec<f32>, JsValue> {
         if self.speaker_encoder.is_none() {
-            let encoder = SpeakerEncoder::load_fttsq_mapped(
-                &self.artifact,
-                Path::new("browser://model.fttsq"),
-            )
-            .map_err(|error| js_error("speaker encoder hydration failed", error))?;
-            self.speaker_encoder = Some(encoder);
+            // Hydration builds this eagerly precisely so the artifact can be released; reaching
+            // here means it did not, and the bytes it would need are gone.
+            return Err(js_error(
+                "speaker encoder unavailable",
+                "the artifact was released before the encoder was built",
+            ));
         }
         let mel = log_mel_from_24khz_pcm(pcm)
             .map_err(|error| js_error("cannot extract speaker features", error))?;

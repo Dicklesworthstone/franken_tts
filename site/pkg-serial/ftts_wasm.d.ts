@@ -57,6 +57,22 @@ export class ModelStaging {
      */
     filled(): number;
     /**
+     * Hydrate the talker from the staged artifact, then RELEASE the artifact.
+     *
+     * The ordering step, and the reason this is a separate call rather than part of the final
+     * assembly. Building the fused int8 tables is what makes the artifact's 0.69 GB hot prefix
+     * dead — and wasm memory only ever grows, so the hole that release leaves is worth exactly
+     * whatever gets allocated after it. Running this BEFORE the codec is staged lets the codec's
+     * 0.46 GB of source and 0.457 GB of checkpoint land INSIDE that hole rather than on top of
+     * it. With the codec first, the same work peaked at 2.10 GB.
+     *
+     * # Errors
+     *
+     * Throws when staging is incomplete, the prefix does not match the artifact's own declared
+     * layout, or hydration fails — each named.
+     */
+    finish_artifact(): void;
+    /**
      * Parse and widen the codec, then free its source bytes.
      *
      * This is the phase boundary. After it returns, the 0.68 GB of BF16 is gone and only the
@@ -357,6 +373,7 @@ export interface InitOutput {
     readonly bench_int8_gemv: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly int8_route: () => [number, number];
     readonly modelstaging_filled: (a: number) => number;
+    readonly modelstaging_finish_artifact: (a: number) => [number, number];
     readonly modelstaging_finish_codec: (a: number) => [number, number];
     readonly modelstaging_new: () => number;
     readonly modelstaging_push_codec: (a: number, b: number, c: number) => [number, number];

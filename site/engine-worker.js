@@ -639,6 +639,16 @@ async function handleMessage({ data }) {
         stage("stream-artifact");
         await drain(data.fttsq, (chunk) => staging.push_fttsq(chunk), coldLayout.hotBytes);
 
+        // Hydrate the talker and RELEASE the artifact before the codec is staged at all.
+        //
+        // This is the ordering the whole memory story turns on. Fusing the int8 tables makes the
+        // artifact's 0.69 GB hot prefix dead, and wasm memory only grows — so the hole that
+        // release leaves is worth whatever gets allocated next. Staging the codec after it means
+        // the codec's source and checkpoint land inside that hole. The other way round, they land
+        // on top and the peak was 2.10 GB.
+        stage("hydrate-talker", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
+        staging.finish_artifact();
+
         stage(
           "stream-codec",
           `${(codecPlan.totalBytes / 1e9).toFixed(2)} GB decoder of ${(data.codec.bytes / 1e9).toFixed(2)} GB`,
@@ -649,7 +659,7 @@ async function handleMessage({ data }) {
         stage("widen-codec", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
         staging.finish_codec();
 
-        stage("hydrate-talker", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
+        stage("assemble-engine", `mem ${(memoryBytes() / 1e9).toFixed(2)} GB`);
         engine = WasmEngine.from_staging(
           staging,
           data.vocab,

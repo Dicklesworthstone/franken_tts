@@ -169,7 +169,14 @@ try {
     await page.fill("#text, textarea", "The quick brown fox jumps over the lazy dog.").catch(() => {});
     const started = Date.now();
     await page.click("#speak");
-    // Synthesis is minutes at wasm speed; wait for the control to re-enable.
+    // Wait for the control to go DOWN before waiting for it to come back up. Checking only for
+    // "enabled" races the click handler: the button is still enabled for the instant between the
+    // click and the handler disabling it, so the wait returned immediately, reported 0.0 s, and
+    // the run exited while synthesis was still going — a pass that measured nothing.
+    await page
+      .waitForFunction(() => document.getElementById("speak").disabled, null, { timeout: 30_000 })
+      .catch(() => {});
+    // Synthesis is minutes at wasm speed; now wait for it to re-enable.
     await page
       .waitForFunction(() => !document.getElementById("speak").disabled, null, { timeout: 900_000 })
       .catch(() => {});
@@ -178,6 +185,18 @@ try {
       () => document.getElementById("synth-status")?.textContent?.trim() ?? "",
     );
     console.log(`\nSYNTHESIS: ${seconds.toFixed(1)} s wall — status: ${status}`);
+    // The error banner AFTER synthesis, not just before it. A synthesis that fails leaves the
+    // status line empty and the button enabled, which is indistinguishable from one that never
+    // started — and the only thing that tells them apart is this element.
+    const synthError = await page.evaluate(
+      () => document.getElementById("error")?.textContent?.trim() ?? "",
+    );
+    if (synthError) console.log(`SYNTH ERROR: ${synthError}`);
+    // Stages recorded DURING synthesis. The history dump above happens at "ready", so anything
+    // synthesis reports — including how much linear memory it claims, which is now the number
+    // that decides whether a phone survives pressing the button — was never printed.
+    const after = await page.evaluate(() => globalThis.__fttsStages ?? []);
+    for (const entry of after.slice(history.length)) console.log(`      ${entry}`);
   }
 } finally {
   console.log("\n--- browser transcript ---");
