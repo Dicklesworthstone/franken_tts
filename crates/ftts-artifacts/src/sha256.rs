@@ -1,17 +1,10 @@
 //! SHA-256 (FIPS 180-4), for `.fttsq` section digests.
 //!
-//! # Why this is here rather than a dependency
+//! # Why both implementations exist
 //!
-//! `sha2` is already resolved in `Cargo.lock` as a transitive dependency, and it is the better
-//! long-run answer. Adding a direct edge to it changes the dependency graph, which changes
-//! `Cargo.lock` — and `cargo check --locked` is a hard gate that every concurrent agent in this
-//! workspace runs. Landing a Cargo.toml edit without an in-lockstep lockfile regeneration breaks
-//! the gate for everyone, and regenerating the lock requires winning a contended build lock.
-//!
-//! So this is a deliberate, bounded trade, not a preference for hand-rolled crypto.
-//!
-//! **DELETION CONDITION:** replace this module with `sha2::Sha256` the next time the workspace
-//! lockfile is being updated for another reason. Tracked by `frankentts-p2-fttsq-format-wsa`.
+//! Streaming writers and file hashing retain the small stateful implementation below. Mapped
+//! artifact verification has the complete section in memory and uses RustCrypto's one-shot
+//! implementation, which runtime-dispatches to SHA-NI where available.
 //!
 //! # Scope
 //!
@@ -277,6 +270,13 @@ pub fn hex_digest(bytes: &[u8]) -> String {
     to_hex(&hasher.finish())
 }
 
+/// Digests an in-memory payload through RustCrypto's runtime-dispatched implementation.
+#[must_use]
+pub fn accelerated_digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
 /// Renders raw digest bytes as lowercase hex.
 #[must_use]
 pub fn to_hex(digest: &[u8; 32]) -> String {
@@ -349,6 +349,16 @@ mod tests {
                 expected,
                 "digest changed with chunk size {chunk_size}"
             );
+        }
+    }
+
+    #[test]
+    fn accelerated_digest_matches_the_portable_streaming_implementation() {
+        for length in [0_usize, 1, 63, 64, 65, 1_000, 1 << 20] {
+            let message: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+            let mut portable = Sha256::new();
+            portable.update(&message);
+            assert_eq!(accelerated_digest(&message), portable.finish());
         }
     }
 

@@ -52,7 +52,7 @@ use std::{collections::BTreeMap, fmt};
 use ftts_kernels::mmap::{MappedFile, MemoryAdvice, MemoryAdviceOutcome, MemoryResidency};
 use serde_json::{Value, json};
 
-use crate::sha256::{Sha256, hex_digest, to_hex};
+use crate::sha256::{Sha256, accelerated_digest, hex_digest, to_hex};
 
 /// File magic. Eight bytes so the directory length lands 8-byte aligned.
 pub const MAGIC: &[u8; 8] = b"FTTSQ\0\0\0";
@@ -1085,9 +1085,7 @@ impl FttsqReader {
     pub fn verify_digests(&self, bytes: &[u8]) -> Result<(), FttsqError> {
         for section in &self.sections {
             let payload = self.section_bytes(section, bytes)?;
-            let mut hasher = Sha256::new();
-            hasher.update(payload);
-            let actual = to_hex(&hasher.finish());
+            let actual = to_hex(&accelerated_digest(payload));
             if actual != section.sha256 {
                 return Err(FttsqError::DigestMismatch {
                     section: section.name.clone(),
@@ -1115,9 +1113,7 @@ impl FttsqReader {
                 continue;
             }
             let payload = self.section_bytes(section, bytes)?;
-            let mut hasher = Sha256::new();
-            hasher.update(payload);
-            let actual = to_hex(&hasher.finish());
+            let actual = to_hex(&accelerated_digest(payload));
             if actual != section.sha256 {
                 return Err(FttsqError::DigestMismatch {
                     section: section.name.clone(),

@@ -30,6 +30,25 @@ tally_w_l_n: <wins/losses/neutrals for this lever>
 ## Local entries
 
 ```text
+PERF-006
+claim_id: x86-sha-ni-artifact-verification
+evidence_id: three-round interleaved direct-CLI load-stage A/B, 2026-08-11
+status: PROVISIONAL_LOCAL_WIN
+model_source_commit: 5d83992436eae1d760afd27aff78a71d676296fc
+fixture_sha256: not-applicable (same mapped production artifact)
+artifact_sha256: 597f7eb3314a2fe5be74fa10a6a3a28ace9e10e582c641deccd37348a0ccd824
+cpu_features: AMD Ryzen AI 9 HX 370, SHA-NI through RustCrypto sha2 0.10
+command_env: RUSTFLAGS="-C target-cpu=native" release build; FTTS_NO_RESIDENT=1 FTTS_MAX_FRAMES=4; baseline/candidate ABBA/BABA
+kill_switch: not applicable; RustCrypto supplies a portable fallback when SHA-NI is absent
+incumbent: current tree's portable scalar section verifier; self-speedup only, NO ADMISSIBLE EXTERNAL RATIO
+before_after: scalar load stage 3536/3451/3482 ms (mean 3490 ms) versus RustCrypto 678/716/661 ms (mean 685 ms), 80.4% lower
+cv_percent: scalar 1.2%; RustCrypto 4.1%
+equivalence: RustCrypto is cross-checked against the portable implementation at boundary sizes; all six production WAVs were byte-identical
+disposition: KEEP for one-shot mapped-section verification; streaming writers and file hashing retain the stateful implementation
+tally_w_l_n: 1/0/0
+```
+
+```text
 PERF-005
 claim_id: wasm-packed-gemm-plus-codec-team
 evidence_id: site/harness/browser.mjs run 2026-08-10 (real Chromium 151 headless, real OPFS, real COOP/COEP, real 1.86 GB model over byte-Range); engine's own stage timing line, captured from the worker console
