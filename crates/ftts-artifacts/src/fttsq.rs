@@ -1139,14 +1139,12 @@ impl FttsqReader {
     pub fn absent_sections_in_prefix(&self, available: u64) -> Result<Vec<String>, FttsqError> {
         let mut absent = Vec::new();
         for section in &self.sections {
-            let end = section
-                .end()
-                .ok_or_else(|| FttsqError::RangeOutOfBounds {
-                    what: format!("section `{}`", section.name),
-                    offset: section.offset,
-                    length: section.length,
-                    bound: available,
-                })?;
+            let end = section.end().ok_or_else(|| FttsqError::RangeOutOfBounds {
+                what: format!("section `{}`", section.name),
+                offset: section.offset,
+                length: section.length,
+                bound: available,
+            })?;
             if end <= available {
                 continue;
             }

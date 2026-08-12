@@ -13,8 +13,7 @@
 
 use ftts_core::{FrameGenerator, NormalizationOptions, PreparedText, TextPreparer};
 use ftts_model_qwen::checkpoint::{
-    CODEC_LANGUAGE_ENGLISH_ID, CodecCheckpoint, TALKER_HIDDEN, TalkerCheckpoint,
-    TextEmbeddingTable,
+    CODEC_LANGUAGE_ENGLISH_ID, CodecCheckpoint, TALKER_HIDDEN, TalkerCheckpoint, TextEmbeddingTable,
 };
 use ftts_model_qwen::generate::{QwenGenerator, QwenGeneratorConfig};
 use ftts_model_qwen::microdecoder::MicrodecoderConfig;
@@ -382,7 +381,10 @@ impl ModelStaging {
     /// layout, or hydration fails — each named.
     pub fn finish_artifact(&mut self) -> Result<(), JsValue> {
         if self.hydrated.is_some() {
-            return Err(js_error("artifact already hydrated", "finish_artifact twice"));
+            return Err(js_error(
+                "artifact already hydrated",
+                "finish_artifact twice",
+            ));
         }
         if self.fttsq.len() != self.fttsq.capacity() {
             return Err(js_error(
@@ -811,7 +813,11 @@ impl HydratedArtifact {
         console_error(&format!(
             "ftts-wasm hydrate: artifact released={released}, int8 route {}, encoder {}",
             if int8.is_some() { "built" } else { "absent" },
-            if speaker_encoder.is_some() { "built" } else { "absent" },
+            if speaker_encoder.is_some() {
+                "built"
+            } else {
+                "absent"
+            },
         ));
 
         Ok(Self {
@@ -914,7 +920,14 @@ impl WasmEngine {
         rows_bf16: &[u8],
         packet_frames: u32,
     ) -> Result<Vec<f32>, JsValue> {
-        self.synthesize_inner(text, speaker, seed, max_frames, Some(rows_bf16), packet_frames)
+        self.synthesize_inner(
+            text,
+            speaker,
+            seed,
+            max_frames,
+            Some(rows_bf16),
+            packet_frames,
+        )
     }
 
     fn synthesize_inner(
