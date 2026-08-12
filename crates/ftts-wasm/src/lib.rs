@@ -868,7 +868,7 @@ impl WasmEngine {
         seed: u64,
         max_frames: u32,
     ) -> Result<Vec<f32>, JsValue> {
-        self.synthesize_inner(text, speaker, seed, max_frames, None)
+        self.synthesize_inner(text, speaker, seed, max_frames, None, 0)
     }
 
     /// The cold-text-embedding ids this exact text will need, in the order the rows must arrive.
@@ -912,8 +912,9 @@ impl WasmEngine {
         seed: u64,
         max_frames: u32,
         rows_bf16: &[u8],
+        packet_frames: u32,
     ) -> Result<Vec<f32>, JsValue> {
-        self.synthesize_inner(text, speaker, seed, max_frames, Some(rows_bf16))
+        self.synthesize_inner(text, speaker, seed, max_frames, Some(rows_bf16), packet_frames)
     }
 
     fn synthesize_inner(
@@ -923,6 +924,7 @@ impl WasmEngine {
         seed: u64,
         max_frames: u32,
         provided_rows: Option<&[u8]>,
+        packet_frames: u32,
     ) -> Result<Vec<f32>, JsValue> {
         if speaker.len() != TALKER_HIDDEN {
             return Err(js_error(
@@ -1015,12 +1017,21 @@ impl WasmEngine {
             max_frames as usize
         };
 
-        const PACKET_FRAMES: usize = 4;
+        // How many frames the codec decodes per call. Bigger packets mean a larger `m` in every
+        // codec GEMM, which is the regime blocking pays off in; the cost is that a packet's
+        // activations scale with it. Output does not change either way — the streaming==batch
+        // gate holds under every packet schedule — so this is purely a speed/memory dial, and
+        // `0` keeps the long-standing default rather than silently moving it.
+        let packet_target = if packet_frames == 0 {
+            4
+        } else {
+            packet_frames as usize
+        };
         let mut state = self.codec.stream_state();
         let mut pcm: Vec<f32> = Vec::new();
         let mut packet_pcm: Vec<f32> = Vec::new();
-        let mut packet: Vec<i32> = Vec::with_capacity(16 * PACKET_FRAMES);
-        let mut packet_frames = 0usize;
+        let mut packet: Vec<i32> = Vec::with_capacity(16 * packet_target);
+        let mut emitted_in_packet = 0usize;
         let mut flush = |state: &mut _,
                          packet: &mut Vec<i32>,
                          frames: &mut usize,
@@ -1062,15 +1073,15 @@ impl WasmEngine {
                             js_error("generated code does not fit the codec's i32", error)
                         })?);
                     }
-                    packet_frames += 1;
-                    if packet_frames == PACKET_FRAMES {
-                        flush(&mut state, &mut packet, &mut packet_frames, &mut pcm)?;
+                    emitted_in_packet += 1;
+                    if emitted_in_packet == packet_target {
+                        flush(&mut state, &mut packet, &mut emitted_in_packet, &mut pcm)?;
                     }
                 }
                 None => break,
             }
         }
-        flush(&mut state, &mut packet, &mut packet_frames, &mut pcm)?;
+        flush(&mut state, &mut packet, &mut emitted_in_packet, &mut pcm)?;
         // Stage split to the console: the number that says WHERE wasm time goes.
         console_error(&format!(
             "ftts-wasm timing: prefill {prefill_ms:.0}ms, talker+micro {frames_ms:.0}ms, codec {codec_ms:.0}ms, {} samples",

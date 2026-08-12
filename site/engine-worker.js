@@ -723,12 +723,16 @@ async function handleMessage({ data }) {
         const memBefore = memoryBytes();
         stage("synthesize", `mem ${(memBefore / 1e9).toFixed(2)} GB`);
         const started = performance.now();
+        // Packet size is a pure speed/memory dial: the streaming==batch gate makes output
+        // bit-identical under every schedule, so 0 (the engine's default of 4) and any override
+        // produce the same samples. Bigger packets mean a larger `m` in every codec GEMM.
         const pcm = engine.synthesize_with_text_rows(
           data.text,
           voice,
           BigInt(data.seed ?? 0),
           0,
           rows,
+          data.packetFrames ?? 0,
         );
         const elapsedMs = performance.now() - started;
         stage(

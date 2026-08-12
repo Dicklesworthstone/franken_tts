@@ -705,6 +705,10 @@ ui.speak.addEventListener("click", async () => {
     } else {
       payload.voiceName = ui.voice.value;
     }
+    // Sweepable without a rebuild, for the harness. Unset means the engine's own default.
+    if (Number.isFinite(globalThis.__fttsPacketFrames)) {
+      payload.packetFrames = globalThis.__fttsPacketFrames;
+    }
     const { pcm, sampleRate, elapsedMs } = await call("synthesize", payload);
     const samples = new Float32Array(pcm);
     setWavBlob(pcmToWavBlob(samples, sampleRate));

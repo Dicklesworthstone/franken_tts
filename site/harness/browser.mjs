@@ -49,6 +49,11 @@ const argValue = (flag) => {
 const CLI_GOLDEN = argValue("--cli-golden");
 const PCM_OUT = argValue("--pcm-out");
 const CONFORMANCE_TEXT = "The quick brown fox jumps over the lazy dog.";
+// `--packet-frames N` overrides the codec's packet size for this run. Output is bit-identical
+// under every schedule (the streaming==batch gate), so a sweep measures speed and memory only —
+// and the CLI-parity check still has to pass at each size, which is what proves that claim here
+// rather than assuming it.
+const PACKET_FRAMES = Number(argValue("--packet-frames") ?? 0);
 
 const modelFiles = {
   "qwen3-tts-12hz-0.6b-base.fttsq": path.join(modelDir, "qwen3-tts-12hz-0.6b-base.fttsq"),
@@ -226,6 +231,12 @@ try {
     // make every comparison a fresh coin flip rather than a parity test.
     await page.fill("#seed", "0");
     await page.selectOption("#voice", "matt");
+    if (PACKET_FRAMES > 0) {
+      await page.evaluate((n) => {
+        globalThis.__fttsPacketFrames = n;
+      }, PACKET_FRAMES);
+      console.log(`      packet frames: ${PACKET_FRAMES}`);
+    }
     const inputs = await page.evaluate(() => ({
       text: document.getElementById("text")?.value ?? null,
       seed: document.getElementById("seed")?.value ?? null,
