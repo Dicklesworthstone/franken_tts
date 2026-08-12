@@ -1123,6 +1123,17 @@ impl TransitionBucket {
 /// residual depth learns recurring `previous_frame_code -> next_frame_code` transitions as exact
 /// sequential outputs arrive. The sketch is strictly a proposal source: a collision, cold start,
 /// or bad guess can only cause verifier rejection and repair.
+///
+/// **Shipping status: unshipped, by measurement (2026-08-09).** Under the production sampler
+/// (T 0.9 / top-k 50) this drafter's proposals carry ~0.01 mean per-depth acceptance
+/// probability — expected accepted prefix 0.04 of 15 depths, speculative cost ≈16.6 body-read
+/// units against 15.0 sequential, strictly worse — so wiring it into the sampled path is a
+/// rejected lever (`docs/NEGATIVE_EVIDENCE.md`, `local-frankenmtp-sampled-drafter-v1`; do not
+/// retry without a drafter measured at ≳0.6 mean per-depth acceptance). The strict-greedy
+/// tier's argmax-match acceptance is a different, unmeasured number — and greedy residual
+/// decode currently has no shipped caller to speculate for: production samples both levels to
+/// avoid the measured silence attractor, and the greedy conformance reference must stay the
+/// plain sequential loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrankenMtpDrafter {
     previous_frame: Option<[usize; RESIDUAL_DEPTHS]>,
@@ -1228,7 +1239,12 @@ pub struct GreedySpeculativeFrame {
 ///
 /// This is greedy-only by construction — acceptance compares against the verifier's argmax. The
 /// production sampler (T 0.9, top-k 50) needs the sampled-mode acceptance rule
-/// (`frankentts-k-oq19-sampled-rule-w4q`) before speculation can reach the shipping path.
+/// (`frankentts-k-oq19-sampled-rule-w4q`) before speculation can reach the shipping path — and a
+/// viable drafter: the in-tree [`FrankenMtpDrafter`] measured ~0.01 mean per-depth acceptance
+/// under production sampling (`local-frankenmtp-sampled-drafter-v1`,
+/// `docs/NEGATIVE_EVIDENCE.md`). Until both exist this function has no non-test caller, and the
+/// plan's microdecoder traffic reduction (body read once, ≈79 MB, instead of 15×, ≈1.18 GB) is
+/// realized in NO shipped configuration — treat any claim otherwise as counterfeit.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn decode_frame_greedy_speculative(
@@ -1799,6 +1815,7 @@ fn decode_frame_with_selector_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ftts_kernels::int8::KernelPlanV0;
 
     fn weights_of(len: usize, seed: u32) -> Vec<f32> {
         let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
@@ -2366,7 +2383,7 @@ mod tests {
         // the same reason `q8_layer_is_bit_identical_across_every_available_tier` sweeps the
         // talker seam.
         for tier in ftts_kernels::int8::Int8Tier::available() {
-            let mode = QuantLinearMode::W8A8(tier);
+            let mode = QuantLinearMode::W8A8(KernelPlanV0::pinned(tier));
             for seed in 0..6_u32 {
                 let hidden = weights_of(FRAME_POSITIONS * config.hidden_size, 4_000 + seed);
 
@@ -2423,7 +2440,7 @@ mod tests {
             let q8 = MicroQuantRoute {
                 layers: &quant,
                 heads: None,
-                mode: QuantLinearMode::W8A8(tier),
+                mode: QuantLinearMode::W8A8(KernelPlanV0::pinned(tier)),
             };
 
             for (label, route) in [("f32", None), ("q8", Some(&q8))] {
@@ -2570,7 +2587,7 @@ mod tests {
             .flat_map(|tier| (0..4_u32).map(move |seed| (tier, seed)));
 
         for (tier, seed) in cases {
-            let mode = QuantLinearMode::W8A8(tier);
+            let mode = QuantLinearMode::W8A8(KernelPlanV0::pinned(tier));
             let route = MicroQuantRoute {
                 layers: &quant,
                 heads: None,
@@ -2683,7 +2700,7 @@ mod tests {
             let route = MicroQuantRoute {
                 layers: &quant,
                 heads: Some(&heads_q8),
-                mode: QuantLinearMode::W8A8(tier),
+                mode: QuantLinearMode::W8A8(KernelPlanV0::pinned(tier)),
             };
             for seed in 0..3_u32 {
                 let talker_hidden = weights_of(config.hidden_size, 950 + seed);
@@ -2746,7 +2763,9 @@ mod tests {
                 &head_q8,
                 &head,
                 &normed,
-                ftts_kernels::int8::QuantLinearMode::W8A8(ftts_kernels::int8::Int8Tier::Scalar),
+                ftts_kernels::int8::QuantLinearMode::W8A8(
+                    ftts_kernels::int8::KernelPlanV0::pinned(ftts_kernels::int8::Int8Tier::Scalar),
+                ),
                 &mut refined,
             );
 
@@ -2792,7 +2811,9 @@ mod tests {
                 sin,
                 &hidden,
                 &mut state,
-                ftts_kernels::int8::QuantLinearMode::W8A8(tier),
+                ftts_kernels::int8::QuantLinearMode::W8A8(
+                    ftts_kernels::int8::KernelPlanV0::pinned(tier),
+                ),
             );
             match &reference {
                 None => reference = Some(out),
@@ -2835,7 +2856,9 @@ mod tests {
             sin,
             &hidden,
             &mut q8_state,
-            ftts_kernels::int8::QuantLinearMode::W8A8(ftts_kernels::int8::Int8Tier::Autovec),
+            ftts_kernels::int8::QuantLinearMode::W8A8(ftts_kernels::int8::KernelPlanV0::pinned(
+                ftts_kernels::int8::Int8Tier::Autovec,
+            )),
         );
 
         let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();

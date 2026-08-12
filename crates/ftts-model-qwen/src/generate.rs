@@ -318,7 +318,6 @@ pub struct Int8Route {
     mode: QuantLinearMode,
 }
 
-
 /// Build the fused W8A8 tables ONCE, so they can outlive the artifact they were read from.
 ///
 /// # Why this is separable, and why it matters on a phone
@@ -377,9 +376,7 @@ pub fn prepare_int8_route(
                                 gate_up,
                                 down_proj,
                             })
-                            .unwrap_or_else(|| {
-                                TalkerLayerQuant::quantize(&*talker_config, layer)
-                            })
+                            .unwrap_or_else(|| TalkerLayerQuant::quantize(&*talker_config, layer))
                     })
                     .collect()
             } else {
@@ -523,10 +520,7 @@ impl<'a> QwenGenerator<'a> {
     /// Split out so the route can either be built here or handed in already built — the two
     /// constructors differ in nothing else, and duplicating a dozen shape assertions between them
     /// is how the two paths would quietly stop agreeing.
-    fn assemble(
-        config: QwenGeneratorConfig<'a>,
-        int8: Option<std::sync::Arc<Int8Route>>,
-    ) -> Self {
+    fn assemble(config: QwenGeneratorConfig<'a>, int8: Option<std::sync::Arc<Int8Route>>) -> Self {
         let hidden = config.talker_config.hidden_size;
         assert_eq!(
             config.feedback.talker_codec.len(),

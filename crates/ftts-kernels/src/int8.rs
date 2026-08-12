@@ -223,8 +223,11 @@ impl Int8Tier {
 /// the deal, and the fidelity gate is measured downstream, not asserted bitwise.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuantLinearMode {
-    /// Int8 activations times int8 weights, exact i32 accumulation.
-    W8A8(Int8Tier),
+    /// Int8 activations times int8 weights, exact i32 accumulation. Carries the full measured
+    /// plan so batched calls (prefill, the seq-16 verify) route to the batch-regime winner
+    /// instead of inheriting the GEMV winner; every tier is bit-identical per element, so the
+    /// split is purely a speed decision.
+    W8A8(KernelPlanV0),
     /// f32 activations times dequantized int8 weights, lane-ordered f32 accumulation.
     W8A16,
 }
@@ -245,7 +248,8 @@ impl QuantLinearMode {
 ///
 /// Eight independent f32 FMA lanes per dot product, weights widened from i8 in-register; the
 /// per-output-channel scale multiplies once after accumulation, mirroring the W8A8 dequant
-/// order. Weight-stationary loop, like [`linear_q8`].
+/// order. Weight-stationary loop, like [`linear_q8`], and like it fanning large calls out
+/// across the persistent team.
 ///
 /// # Panics
 ///
@@ -263,6 +267,17 @@ pub fn linear_w8a16(
     if let Some(bias) = bias {
         assert_eq!(bias.len(), n, "bias must be [n]");
     }
+    // Same speed-only fan-out gate as `linear_q8`: every output element is still one
+    // `dot_w8a16` over the same span in the same order, so the partitioned result is
+    // bit-identical per element. Before this gate existed, FTTS_INT8=w8a16 single-cored the
+    // whole model while w8a8 ran on the team.
+    if n * k >= TEAM_WORK_THRESHOLD_BYTES
+        && !crate::team::thread_bypassed()
+        && let Some(team) = crate::team::armed()
+    {
+        team.linear_w8a16(x, weight, bias, m, out);
+        return;
+    }
     for col in 0..n {
         let w_row = &weight.data[col * k..(col + 1) * k];
         let w_scale = weight.scales[col];
@@ -277,7 +292,10 @@ pub fn linear_w8a16(
 }
 
 /// Eight-lane f32 dot of an f32 row against an i8 weight row, widened in-register.
-fn dot_w8a16(x: &[f32], w: &[i8]) -> f32 {
+///
+/// `pub(crate)` so the team's column-partition worker runs the exact same reduction the
+/// serial loop runs — bit-identity between the two paths rests on sharing this function.
+pub(crate) fn dot_w8a16(x: &[f32], w: &[i8]) -> f32 {
     const LANES: usize = 8;
     let mut lanes = [0.0_f32; LANES];
     let chunks = x.len() / LANES;
@@ -303,7 +321,7 @@ fn dot_w8a16(x: &[f32], w: &[i8]) -> f32 {
 pub fn quant_mode_from_environment() -> QuantLinearMode {
     match std::env::var("FTTS_INT8").as_deref() {
         Ok("w8a16") => QuantLinearMode::W8A16,
-        _ => QuantLinearMode::W8A8(autotuned_plan().decode_gemv),
+        _ => QuantLinearMode::W8A8(autotuned_plan()),
     }
 }
 
@@ -317,7 +335,16 @@ pub fn quant_linear(
     out: &mut [f32],
 ) {
     match mode {
-        QuantLinearMode::W8A8(tier) => linear_q8_dynamic(x, weight, bias, m, out, tier),
+        QuantLinearMode::W8A8(plan) => {
+            // The same m threshold the codec route uses: offline/prefill batches take the
+            // measured batch-regime winner, decode GEMVs the GEMV winner.
+            let tier = if m > 4 {
+                plan.batch_gemm
+            } else {
+                plan.decode_gemv
+            };
+            linear_q8_dynamic(x, weight, bias, m, out, tier);
+        }
         QuantLinearMode::W8A16 => linear_w8a16(x, weight, bias, m, out),
     }
 }
@@ -333,6 +360,18 @@ pub struct KernelPlanV0 {
     pub decode_gemv: Int8Tier,
     /// Route for batched GEMMs (prefill, seq-16 verify, offline codec).
     pub batch_gemm: Int8Tier,
+}
+
+impl KernelPlanV0 {
+    /// Both regimes pinned to one tier — the `FTTS_INT8_TIER` A/B form and the shape tests use
+    /// to hold the route fixed.
+    #[must_use]
+    pub const fn pinned(tier: Int8Tier) -> Self {
+        Self {
+            decode_gemv: tier,
+            batch_gemm: tier,
+        }
+    }
 }
 
 /// Measures each available tier at the two live regimes and returns the winners.
@@ -352,20 +391,12 @@ pub fn autotuned_plan() -> KernelPlanV0 {
         // built, dispatchable, and never dispatched.
         #[cfg(target_arch = "wasm32")]
         {
-            let tier = Int8Tier::dispatch();
-            KernelPlanV0 {
-                decode_gemv: tier,
-                batch_gemm: tier,
-            }
+            KernelPlanV0::pinned(Int8Tier::dispatch())
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             if std::env::var("FTTS_INT8_TIER").is_ok() {
-                let forced = Int8Tier::dispatch();
-                return KernelPlanV0 {
-                    decode_gemv: forced,
-                    batch_gemm: forced,
-                };
+                return KernelPlanV0::pinned(Int8Tier::dispatch());
             }
             if let Some(cached) = load_persisted_plan() {
                 return cached;
@@ -959,16 +990,36 @@ pub fn linear_q8_dynamic(
 ) {
     let k = weight.k;
     assert_eq!(x.len(), m * k, "x must be [m, k]");
-    let mut x_q = vec![0_i8; m * k];
-    let mut x_scales = vec![0.0_f32; m];
-    for ((x_row, q_row), scale) in x
-        .chunks_exact(k)
-        .zip(x_q.chunks_exact_mut(k))
-        .zip(x_scales.iter_mut())
-    {
-        *scale = quantize_row_q8(x_row, q_row);
+    // Thread-local scratch instead of two per-call `vec!`s: this is the armed W8A8 entry the
+    // talker and microdecoder hit ~300 times per frame, and the doctrine pins "no allocator
+    // activity in steady-state decode" as load-bearing. Quantization runs on the caller thread
+    // before any team dispatch, and nothing below re-enters this function, so the borrow is
+    // never contended; the buffers only ever grow, to the largest `[m, k]` this thread has seen,
+    // and are sliced to the exact live extent so stale bytes past it are unreachable.
+    thread_local! {
+        static QUANT_SCRATCH: std::cell::RefCell<(Vec<i8>, Vec<f32>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
     }
-    linear_q8(&x_q, &x_scales, weight, bias, m, out, tier);
+    QUANT_SCRATCH.with(|scratch| {
+        let mut guard = scratch.borrow_mut();
+        let (q_buffer, scale_buffer) = &mut *guard;
+        if q_buffer.len() < m * k {
+            q_buffer.resize(m * k, 0);
+        }
+        if scale_buffer.len() < m {
+            scale_buffer.resize(m, 0.0);
+        }
+        let x_q = &mut q_buffer[..m * k];
+        let x_scales = &mut scale_buffer[..m];
+        for ((x_row, q_row), scale) in x
+            .chunks_exact(k)
+            .zip(x_q.chunks_exact_mut(k))
+            .zip(x_scales.iter_mut())
+        {
+            *scale = quantize_row_q8(x_row, q_row);
+        }
+        linear_q8(x_q, x_scales, weight, bias, m, out, tier);
+    });
 }
 
 #[cfg(test)]
@@ -1154,5 +1205,65 @@ mod tests {
 
     fn tail_seed(len: usize) -> u64 {
         0x7a11_0000 ^ len as u64
+    }
+
+    #[test]
+    fn quant_scratch_left_oversized_by_a_big_call_never_bleeds_into_a_small_one() {
+        // The dynamic entry reuses thread-local quant buffers that only grow. Run the largest
+        // batched shape first so the scratch holds 16×3072 stale bytes, then the m=1 decode
+        // shape, and demand bit-equality with the same computation through freshly allocated
+        // buffers via `linear_q8` directly.
+        let (big_m, big_k, big_n) = (16_usize, 3072_usize, 8_usize);
+        let big_weight: Vec<f32> = pseudo_random_q8(big_n * big_k, 91)
+            .iter()
+            .map(|&b| f32::from(b) / 64.0)
+            .collect();
+        let big_x: Vec<f32> = pseudo_random_q8(big_m * big_k, 92)
+            .iter()
+            .map(|&b| f32::from(b) / 64.0)
+            .collect();
+        let big_quantized = QuantizedMatrix::quantize(&big_weight, big_n, big_k);
+        let mut big_out = vec![0.0_f32; big_m * big_n];
+        linear_q8_dynamic(
+            &big_x,
+            &big_quantized,
+            None,
+            big_m,
+            &mut big_out,
+            Int8Tier::Scalar,
+        );
+
+        let (m, k, n) = (1_usize, 1024_usize, 32_usize);
+        let weight: Vec<f32> = pseudo_random_q8(n * k, 93)
+            .iter()
+            .map(|&b| f32::from(b) / 64.0)
+            .collect();
+        let x: Vec<f32> = pseudo_random_q8(m * k, 94)
+            .iter()
+            .map(|&b| f32::from(b) / 64.0)
+            .collect();
+        let quantized = QuantizedMatrix::quantize(&weight, n, k);
+        let mut via_scratch = vec![0.0_f32; m * n];
+        linear_q8_dynamic(&x, &quantized, None, m, &mut via_scratch, Int8Tier::Scalar);
+
+        let mut fresh_q = vec![0_i8; m * k];
+        let fresh_scale = quantize_row_q8(&x, &mut fresh_q);
+        let mut via_fresh = vec![0.0_f32; m * n];
+        linear_q8(
+            &fresh_q,
+            &[fresh_scale],
+            &quantized,
+            None,
+            m,
+            &mut via_fresh,
+            Int8Tier::Scalar,
+        );
+        for (index, (a, b)) in via_scratch.iter().zip(&via_fresh).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "scratch-path output differs from fresh-buffer output at {index}"
+            );
+        }
     }
 }

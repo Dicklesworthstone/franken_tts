@@ -1239,7 +1239,9 @@ mod tests {
                 &mut hidden,
                 seq,
                 &mut cache,
-                ftts_kernels::int8::QuantLinearMode::W8A8(tier),
+                ftts_kernels::int8::QuantLinearMode::W8A8(
+                    ftts_kernels::int8::KernelPlanV0::pinned(tier),
+                ),
             );
             match &reference {
                 None => reference = Some(hidden),
@@ -1303,7 +1305,9 @@ mod tests {
             &mut actual,
             seq,
             &mut q8_cache,
-            ftts_kernels::int8::QuantLinearMode::W8A8(ftts_kernels::int8::Int8Tier::Scalar),
+            ftts_kernels::int8::QuantLinearMode::W8A8(ftts_kernels::int8::KernelPlanV0::pinned(
+                ftts_kernels::int8::Int8Tier::Scalar,
+            )),
         );
 
         assert_eq!(q8_cache.len(), f32_cache.len());

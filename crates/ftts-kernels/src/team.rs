@@ -33,7 +33,7 @@
 //! look for `AtomicBool` sense flags. The atomic flavor remains a candidate once dispatch
 //! overhead itself shows up on a profile.
 
-use crate::int8::{Int8Tier, QuantizedMatrix, dot_i32};
+use crate::int8::{Int8Tier, QuantizedMatrix, dot_i32, dot_w8a16};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 /// One dispatched operation, shared read-only with every worker.
@@ -41,6 +41,8 @@ use std::sync::{Condvar, Mutex, OnceLock};
 enum Job {
     /// W8A8 linear partitioned over output columns.
     Linear(LinearJob),
+    /// W8A16 (weight-only) linear partitioned over output columns.
+    W8A16Linear(W8A16LinearJob),
     /// f32 GQA attention partitioned over query heads.
     Attention(AttentionJob),
     /// f32 dense linear (the packed GEMM) partitioned over output columns.
@@ -82,6 +84,26 @@ struct LinearJob {
     n: usize,
     k: usize,
     tier: Int8Tier,
+    /// Total partitions this dispatch, including the caller's partition 0.
+    partitions: usize,
+}
+
+/// The weight-only quantized route (`FTTS_INT8=w8a16`), partitioned over output columns.
+///
+/// Column partitioning is exact for the same reason as the W8A8 job: no reduction crosses a
+/// column, and every element is one `dot_w8a16` over the same span in the same order the
+/// serial loop would run.
+#[derive(Clone, Copy)]
+struct W8A16LinearJob {
+    x: *const f32,
+    w_data: *const i8,
+    w_scales: *const f32,
+    /// Null when the projection is bias-free.
+    bias: *const f32,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
     /// Total partitions this dispatch, including the caller's partition 0.
     partitions: usize,
 }
@@ -386,6 +408,7 @@ fn run_partition(job: &Job, worker: usize) {
     let _ = worker;
     match job {
         Job::Linear(job) => run_linear_partition(job, worker),
+        Job::W8A16Linear(job) => run_w8a16_linear_partition(job, worker),
         Job::Attention(job) => run_attention_partition(job, worker),
         Job::F32Linear(job) => run_f32_linear_partition(job, worker),
     }
@@ -466,6 +489,44 @@ fn run_linear_partition(job: &LinearJob, worker: usize) {
             let x_row = &x_q[row * job.k..(row + 1) * job.k];
             let acc = dot_i32(x_row, w_row, job.tier);
             let value = acc as f32 * (x_scales[row] * w_scale);
+            // SAFETY: `col` is inside this partition's exclusive range and `row < m`, so this
+            // address is written by no other partition for the duration of the dispatch.
+            unsafe {
+                *job.out.add(row * job.n + col) = bias_term.map_or(value, |b| value + b);
+            }
+        }
+    }
+}
+
+/// One worker's column stripe of a W8A16 job — the same loop `int8::linear_w8a16` runs
+/// serially, sharing `dot_w8a16`, so each element's f32 operation order is unchanged.
+fn run_w8a16_linear_partition(job: &W8A16LinearJob, worker: usize) {
+    let chunk = job.n.div_ceil(job.partitions);
+    let start = (worker * chunk).min(job.n);
+    let end = ((worker + 1) * chunk).min(job.n);
+    if start >= end {
+        return;
+    }
+    // SAFETY: module-docs facts 1-3, the same aliasing story as the W8A8 job — pointers outlive
+    // the dispatch, reads are shared-immutable, writes land only in this worker's column range,
+    // and the output stays a raw pointer because several live whole-buffer `&mut` would be UB
+    // even with disjoint writes.
+    let (x, w_data, w_scales, bias) = unsafe {
+        (
+            std::slice::from_raw_parts(job.x, job.m * job.k),
+            std::slice::from_raw_parts(job.w_data, job.n * job.k),
+            std::slice::from_raw_parts(job.w_scales, job.n),
+            (!job.bias.is_null()).then(|| std::slice::from_raw_parts(job.bias, job.n)),
+        )
+    };
+    for col in start..end {
+        let w_row = &w_data[col * job.k..(col + 1) * job.k];
+        let w_scale = w_scales[col];
+        let bias_term = bias.map(|b| b[col]);
+        for row in 0..job.m {
+            let x_row = &x[row * job.k..(row + 1) * job.k];
+            let acc = dot_w8a16(x_row, w_row);
+            let value = acc * w_scale;
             // SAFETY: `col` is inside this partition's exclusive range and `row < m`, so this
             // address is written by no other partition for the duration of the dispatch.
             unsafe {
@@ -582,6 +643,40 @@ impl Team {
         self.dispatch(job);
     }
 
+    /// Runs one W8A16 (weight-only) linear across the team. Bit-identical to the serial path
+    /// per element — every output element is the same `dot_w8a16` reduction.
+    ///
+    /// # Panics
+    ///
+    /// Panics on shape mismatches, exactly as the serial kernel does.
+    pub fn linear_w8a16(
+        &self,
+        x: &[f32],
+        weight: &QuantizedMatrix,
+        bias: Option<&[f32]>,
+        m: usize,
+        out: &mut [f32],
+    ) {
+        let (n, k) = (weight.n, weight.k);
+        assert_eq!(x.len(), m * k, "x must be [m, k]");
+        assert_eq!(out.len(), m * n, "out must be [m, n]");
+        if let Some(bias) = bias {
+            assert_eq!(bias.len(), n, "bias must be [n]");
+        }
+        let job = Job::W8A16Linear(W8A16LinearJob {
+            x: x.as_ptr(),
+            w_data: weight.data.as_ptr(),
+            w_scales: weight.scales.as_ptr(),
+            bias: bias.map_or(std::ptr::null(), <[f32]>::as_ptr),
+            out: out.as_mut_ptr(),
+            m,
+            n,
+            k,
+            partitions: self.partitions,
+        });
+        self.dispatch(job);
+    }
+
     /// Runs the default-arithmetic GQA attention across the team, partitioned over query
     /// heads. Bit-identical to the serial `f32ref::gqa_attention` (same extracted loop).
     ///
@@ -689,7 +784,7 @@ impl Team {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::int8::linear_q8;
+    use crate::int8::{linear_q8, linear_w8a16};
 
     /// One-shot fuse consumed by a worker of ONE SPECIFIC team.
     ///
@@ -818,6 +913,40 @@ mod tests {
     }
 
     #[test]
+    fn w8a16_partitioning_is_bit_identical_to_serial_at_model_shapes() {
+        for &(m, n, k) in &[
+            (1_usize, 2048_usize, 1024_usize),
+            (1, 1024, 3072),
+            (16, 3072, 1024),
+            (2, 517, 129), // deliberately ragged: tail partitions and odd K
+        ] {
+            let weight = matrix(n, k, 97 ^ (n as u64) << 20);
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 37 + 11) % 255) as f32 / 64.0 - 1.5)
+                .collect();
+            let bias: Vec<f32> = (0..n).map(|col| (col % 13) as f32 * 0.25 - 1.0).collect();
+            // A genuinely serial reference: the bypass keeps the entry point off the
+            // process-wide team even though these shapes clear its fan-out threshold.
+            let mut serial = vec![0.0_f32; m * n];
+            with_team_bypassed(|| {
+                linear_w8a16(&x, &weight, Some(&bias), m, &mut serial);
+            });
+            for partitions in [2_usize, 3, 4, 8] {
+                let team = test_team(partitions);
+                let mut parallel = vec![0.0_f32; m * n];
+                team.linear_w8a16(&x, &weight, Some(&bias), m, &mut parallel);
+                for (index, (a, b)) in serial.iter().zip(&parallel).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "w8a16 partitions={partitions} m={m} n={n} k={k} element {index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn thousands_of_mixed_dispatches_complete_without_deadlock() {
         // The many_utterances_without_deadlock policy at kernel scale: hammer one team with
         // mixed shapes; a hang here fails by test-harness timeout rather than passing silently.
@@ -826,8 +955,10 @@ mod tests {
         let weight_b = matrix(96, 128, 11);
         let x_a: Vec<i8> = vec![3; 512];
         let x_b: Vec<i8> = vec![-5; 2 * 128];
+        let x_c: Vec<f32> = vec![0.75; 512];
         let mut out_a = vec![0.0_f32; 256];
         let mut out_b = vec![0.0_f32; 2 * 96];
+        let mut out_c = vec![0.0_f32; 256];
         for _ in 0..2_000 {
             team.linear_q8(
                 &x_a,
@@ -847,9 +978,11 @@ mod tests {
                 &mut out_b,
                 Int8Tier::Scalar,
             );
+            team.linear_w8a16(&x_c, &weight_a, None, 1, &mut out_c);
         }
         assert!(out_a.iter().all(|value| value.is_finite()));
         assert!(out_b.iter().all(|value| value.is_finite()));
+        assert!(out_c.iter().all(|value| value.is_finite()));
     }
 
     #[test]

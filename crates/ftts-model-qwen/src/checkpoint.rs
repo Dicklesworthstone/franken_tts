@@ -1350,7 +1350,10 @@ impl TalkerCheckpoint {
     /// assuming: a silent failure here looks exactly like the memory saving working, right up
     /// until the device runs out anyway.
     pub fn release_artifact(&mut self) -> bool {
-        let previous = std::mem::replace(&mut self.text_embedding_source, TextEmbeddingSource::Released);
+        let previous = std::mem::replace(
+            &mut self.text_embedding_source,
+            TextEmbeddingSource::Released,
+        );
         match previous {
             TextEmbeddingSource::Fttsq(artifact) => {
                 // One handle in hand means one handle total, so dropping it frees the payload.
@@ -2093,7 +2096,11 @@ impl CodecCheckpoint {
             config,
             first_codebook,
             rest_codebooks,
-            first_output_proj: take(store, path, "decoder.quantizer.rvq_first.output_proj.weight")?,
+            first_output_proj: take(
+                store,
+                path,
+                "decoder.quantizer.rvq_first.output_proj.weight",
+            )?,
             rest_output_proj: take(store, path, "decoder.quantizer.rvq_rest.output_proj.weight")?,
             pre_conv: OwnedConv::load(store, path, "decoder.pre_conv.conv")?,
             input_proj: OwnedConv::load(store, path, "decoder.pre_transformer.input_proj")?,
@@ -2230,7 +2237,9 @@ mod tests {
             .flat_map(|i| {
                 // Distinct, non-zero, and different in both bytes, so a stride error or a
                 // byte-order slip cannot coincidentally still compare equal.
-                u16::try_from((i * 7 + 1) % 30_000).unwrap_or(1).to_le_bytes()
+                u16::try_from((i * 7 + 1) % 30_000)
+                    .unwrap_or(1)
+                    .to_le_bytes()
             })
             .collect();
         let hot = vec![1_u8, 2, 3, 4, 5, 6, 7, 8];
