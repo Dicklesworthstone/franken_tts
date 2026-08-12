@@ -582,11 +582,22 @@ async function handleMessage({ data }) {
           const sync = handle.createSyncAccessHandle
             ? await handle.createSyncAccessHandle()
             : null;
+          // ONE buffer, sized to the largest tensor, reused for all 271 of them.
+          //
+          // Allocating per tensor asked the browser for 271 fresh buffers totalling 0.46 GB, the
+          // largest 75.5 MB, right at the page's high-water mark. That is the same per-chunk
+          // allocation pattern already removed from the artifact drain, reintroduced here — and
+          // it is what put a phone back over its limit after the peak had come DOWN. The wasm
+          // side copies out of this synchronously, so one buffer is safe to reuse.
+          const widest = tensors.reduce((most, t) => Math.max(most, t.length), 0);
+          let pushedSinceReport = 0;
+          const scratchTensor = sync ? new Uint8Array(widest) : null;
           try {
             for (const tensor of tensors) {
               let bytes;
               if (sync) {
-                bytes = new Uint8Array(tensor.length);
+                // A VIEW, not a copy: nothing is allocated per tensor.
+                bytes = scratchTensor.subarray(0, tensor.length);
                 const read = sync.read(bytes, { at: tensor.at });
                 if (read !== tensor.length) {
                   throw new Error(`short codec tensor ${tensor.name}: ${read}/${tensor.length}`);
@@ -598,11 +609,18 @@ async function handleMessage({ data }) {
                 );
               }
               staging.push_codec_tensor(tensor.name, bytes);
-              reply("loadProgress", {
-                bytesDone: staging.filled(),
-                bytesTotal: stagedTotal(),
-                wasmBytes: memoryBytes(),
-              });
+              // Report on a byte cadence rather than per tensor: 271 postMessages, each
+              // allocating a structured-clone payload, is churn of exactly the kind this loop
+              // was just cleaned of.
+              pushedSinceReport += tensor.length;
+              if (pushedSinceReport >= INGEST_SLICE) {
+                pushedSinceReport = 0;
+                reply("loadProgress", {
+                  bytesDone: staging.filled(),
+                  bytesTotal: stagedTotal(),
+                  wasmBytes: memoryBytes(),
+                });
+              }
             }
           } finally {
             sync?.close();
