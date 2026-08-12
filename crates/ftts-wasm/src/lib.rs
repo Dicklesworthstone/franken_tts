@@ -11,22 +11,36 @@
 //! errors surface as thrown strings, never panics — a panic in wasm is an opaque
 //! `unreachable`, so every fallible edge maps to `Result<_, JsValue>`.
 
-use ftts_core::{FrameGenerator, NormalizationOptions, PreparedText, TextPreparer};
-use ftts_model_qwen::checkpoint::{
-    CODEC_LANGUAGE_ENGLISH_ID, CodecCheckpoint, TALKER_HIDDEN, TalkerCheckpoint, TextEmbeddingTable,
-};
-use ftts_model_qwen::generate::{QwenGenerator, QwenGeneratorConfig};
-use ftts_model_qwen::microdecoder::MicrodecoderConfig;
-use ftts_model_qwen::prompt::{CloneMode, PromptMode};
-use ftts_model_qwen::sampler::SamplingMode;
-use ftts_model_qwen::speaker::{Encoder as SpeakerEncoder, log_mel_from_24khz_pcm};
-use ftts_model_qwen::talker::TalkerConfig;
-use ftts_model_qwen::tokenizer::QwenTokenizer;
-#[cfg(not(unix))]
-use ftts_model_qwen::tokenizer::TokenizerFiles;
-use std::path::Path;
-use std::sync::Arc;
+use ftts_model_qwen::checkpoint::CodecCheckpoint;
 use wasm_bindgen::prelude::*;
+
+// The hydration-from-bytes and synthesis surface exists only where there is no filesystem
+// (everything `#[cfg(not(unix))]` below); these imports are gated with it so the workspace's
+// native `--all-targets` pass stays warning-free.
+#[cfg(not(unix))]
+use ftts_core::{FrameGenerator, NormalizationOptions, PreparedText, TextPreparer};
+#[cfg(not(unix))]
+use ftts_model_qwen::checkpoint::{
+    CODEC_LANGUAGE_ENGLISH_ID, TALKER_HIDDEN, TalkerCheckpoint, TextEmbeddingTable,
+};
+#[cfg(not(unix))]
+use ftts_model_qwen::generate::{QwenGenerator, QwenGeneratorConfig};
+#[cfg(not(unix))]
+use ftts_model_qwen::microdecoder::MicrodecoderConfig;
+#[cfg(not(unix))]
+use ftts_model_qwen::prompt::{CloneMode, PromptMode};
+#[cfg(not(unix))]
+use ftts_model_qwen::sampler::SamplingMode;
+#[cfg(not(unix))]
+use ftts_model_qwen::speaker::{Encoder as SpeakerEncoder, log_mel_from_24khz_pcm};
+#[cfg(not(unix))]
+use ftts_model_qwen::talker::TalkerConfig;
+#[cfg(not(unix))]
+use ftts_model_qwen::tokenizer::{QwenTokenizer, TokenizerFiles};
+#[cfg(not(unix))]
+use std::path::Path;
+#[cfg(not(unix))]
+use std::sync::Arc;
 
 /// The built-in voices, mirrored from the CLI's preset table (same files, same names).
 const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
@@ -91,7 +105,9 @@ pub fn install_panic_hook() {
 fn linear_memory_bytes() -> f64 {
     (core::arch::wasm32::memory_size(0) as f64) * 65_536.0
 }
-#[cfg(not(target_arch = "wasm32"))]
+// Exists only where its (not-unix) callers do; without the unix bound it is dead code on the
+// native hosts the workspace `--all-targets` check compiles.
+#[cfg(all(not(target_arch = "wasm32"), not(unix)))]
 fn linear_memory_bytes() -> f64 {
     0.0
 }
@@ -239,6 +255,10 @@ pub fn worker_team_width() -> usize {
 
 /// The loaded model: talker+microdecoder from the canonical artifact, codec from the raw
 /// speech-tokenizer checkpoint, tokenizer from its three text files.
+///
+/// Gated off unix with the rest of the byte-oriented surface: native hosts run the CLI's
+/// engine, and the workspace `--all-targets` check compiles this crate natively.
+#[cfg(not(unix))]
 #[wasm_bindgen]
 pub struct WasmEngine {
     talker: TalkerCheckpoint,
@@ -325,6 +345,10 @@ pub struct ModelStaging {
     /// Reserved by `reserve_fttsq`, which refuses to run before the codec is hydrated.
     fttsq: Vec<u8>,
     /// The talker side, complete and artifact-free, once `finish_artifact` has run.
+    ///
+    /// Gated like the type it holds: hydration-from-bytes exists only where there is no
+    /// filesystem, and the workspace `--all-targets` check compiles this crate natively.
+    #[cfg(not(unix))]
     hydrated: Option<HydratedArtifact>,
     /// Set when the caller reserved only the artifact's hot prefix, holding the 622 MB cold text
     /// embedding out of linear memory. Checked against the artifact's own directory at hydration,
@@ -350,6 +374,7 @@ impl ModelStaging {
     /// Throws when linear memory cannot be reserved, naming the byte count that failed — the
     /// honest signal on a device that simply does not have the memory.
     #[wasm_bindgen(constructor)]
+    #[allow(clippy::new_without_default)] // a JS-facing constructor; Default has no JS caller
     pub fn new() -> ModelStaging {
         // Reserves NOTHING. Both buffers are claimed explicitly, by the caller, in the order the
         // caller wants them laid out — which is the whole lever now that wasm memory can only
@@ -360,6 +385,7 @@ impl ModelStaging {
             codec_filled: 0,
             codec: None,
             fttsq: Vec::new(),
+            #[cfg(not(unix))]
             hydrated: None,
             cold_elided: None,
             codec_retired: 0,
@@ -379,6 +405,10 @@ impl ModelStaging {
     ///
     /// Throws when staging is incomplete, the prefix does not match the artifact's own declared
     /// layout, or hydration fails — each named.
+    ///
+    /// Gated off unix like `finish_codec` below: [`HydratedArtifact`] is the byte-oriented
+    /// loader's product and exists only where there is no filesystem.
+    #[cfg(not(unix))]
     pub fn finish_artifact(&mut self) -> Result<(), JsValue> {
         if self.hydrated.is_some() {
             return Err(js_error(
@@ -553,6 +583,7 @@ fn append_exact(target: &mut Vec<u8>, chunk: &[u8], what: &str) -> Result<(), Js
     Ok(())
 }
 
+#[cfg(not(unix))]
 #[wasm_bindgen]
 impl WasmEngine {
     /// Hydrate from bytes already resident in wasm memory, consuming the staging buffer.
