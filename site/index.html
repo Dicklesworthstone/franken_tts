@@ -304,6 +304,9 @@
             <!-- Shown only on devices measured to sit below hydration's ~2.5 GB resident set.
                  Styled inline rather than with a new utility class: the site ships a COMPILED
                  stylesheet, so a class invented here would silently render as nothing. -->
+            <!-- Shown when the page is stripped down for a resident engine on a small device.
+                 Lives in the playground because that is the only section that survives. -->
+            <p id="viz-note" class="pg-note hidden mb-3"></p>
             <div
               class="pg-status mb-3 hidden"
               id="memory-warning"
@@ -399,12 +402,6 @@
     </div>
 
     <div class="pg-panel rounded-2xl border border-white/5 bg-black/40 p-5 md:p-8 mb-10 reveal">
-      <!-- Revealed only when the diagrams are torn down to make room for a resident engine on a
-           small device. Sections vanishing with no explanation reads as a broken page. -->
-      <p id="viz-note" class="pg-note hidden">
-        The animated diagrams on this page are paused while the model is loaded, so the engine has
-        this device's memory to itself. Reload without loading the model to see them.
-      </p>
       <div id="anatomy-viz" aria-label="Animated anatomy of one synthesis frame"></div>
       <p class="pg-note mt-3 text-center">
         The microdecoder is small, but rereading its body fifteen times per frame makes it the

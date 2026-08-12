@@ -423,8 +423,32 @@ function releasePageMemoryForEngine() {
     node.replaceChildren();
     node.classList.add("hidden");
   }
+  // Then the rest of the page below the playground.
+  //
+  // Scrolling is what kills it. iOS Safari synthesized successfully and then died on the scroll
+  // down to the player, and the engine is not what moved — compositing is. Ten sections of
+  // marketing page with 27 reveal-animated blocks each want a layer as they come into view, and
+  // at ~1.6 GB resident there is nothing left to give them.
+  //
+  // Only the playground survives, and only on a device that needs it, and only until reload.
+  // Someone who loaded a 1.86 GB model came for the playground; the prose can wait for a tab
+  // that is not holding a neural network.
+  for (const section of document.querySelectorAll("section")) {
+    if (section.id === "playground" || section.id === "top") continue;
+    section.remove();
+  }
+  // Reveal observers on surviving nodes have nothing left to reveal, and the animations
+  // themselves are layer-creating. Show everything, animate nothing.
+  for (const revealed of document.querySelectorAll(".reveal")) {
+    revealed.classList.remove("reveal");
+  }
   const note = document.getElementById("viz-note");
-  if (note) note.classList.remove("hidden");
+  if (note) {
+    note.textContent =
+      "The rest of this page is hidden while the model is loaded, so the engine has this " +
+      "device's memory to itself. Reload without loading the model to read it.";
+    note.classList.remove("hidden");
+  }
 }
 
 async function loadFromStore() {
