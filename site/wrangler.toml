@@ -1,0 +1,12 @@
+# Pages project config. Exists for exactly one reason: the MODEL_BUCKET R2 binding,
+# which lets functions/model/[[path]].js serve the model from our own bucket (free
+# egress, no GitHub throttling) instead of proxying the GitHub release on every chunk.
+# deploy.sh stages this file alongside the site, so `wrangler pages deploy` applies
+# the binding on every deploy — no dashboard step to forget.
+name = "frankentts"
+compatibility_date = "2026-08-01"
+pages_build_output_dir = "."
+
+[[r2_buckets]]
+binding = "MODEL_BUCKET"
+bucket_name = "frankentts-model"

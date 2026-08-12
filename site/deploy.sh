@@ -21,5 +21,7 @@ for f in "$STAGE"/index.html "$STAGE"/app.js "$STAGE"/loader.js "$STAGE"/engine-
 done
 
 echo "deploying version $VERSION from $STAGE"
-(cd "$STAGE" && wrangler pages deploy . --project-name frankentts --branch main --commit-dirty=true)
+# Project name and the MODEL_BUCKET R2 binding come from wrangler.toml (staged with the
+# site); passing --project-name alongside a config that names the project is an error.
+(cd "$STAGE" && wrangler pages deploy --branch main --commit-dirty=true)
 echo "staged copy left at $STAGE (temp dir; not auto-deleted)"
