@@ -60,3 +60,5 @@ package-lock.json
 # Skill-loop progress scratch
 .skill-loop-progress.md
 .skill-loop-progress-*.md
+# Local screen-recording of the playground; the site does not reference it
+/demo.mp4
