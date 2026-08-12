@@ -10,8 +10,8 @@ keywords = ["tts", "speech", "qwen", "voice", "audio"]
 categories = ["multimedia::audio"]
 
 [dependencies]
-ftts-core = { path = "../ftts-core", version = "0.1.6" }
-ftts-kernels = { path = "../ftts-kernels", version = "0.1.6" }
+ftts-core = { path = "../ftts-core", version = "0.1.7" }
+ftts-kernels = { path = "../ftts-kernels", version = "0.1.7" }
 serde_json = "1.0"
 # One-shot SHA-256 only (see sha256::digest). RustCrypto dispatches the ARMv8 and x86 SHA
 # extensions at runtime, which turns whole-artifact verification from seconds into a rounding

@@ -15,7 +15,8 @@ individual commits are intentionally not cited.
 
 | Version | Date | Status | Summary |
 |---------|------|--------|---------|
-| 0.1.6 | 2026-08-10 | current | voice cards (a picture that IS the voice), phone↔CLI interop; iOS video export unstuck; output denoising |
+| 0.1.7 | 2026-08-12 | current | browser memory diet (no double-resident model), native↔browser parity harness, w8a16 multicore |
+| 0.1.6 | 2026-08-10 | superseded | voice cards (a picture that IS the voice), phone↔CLI interop; iOS video export unstuck; output denoising |
 | 0.1.5 | 2026-08-10 | superseded | browser engine 9.4× faster; iOS survives; enrollment denoises itself; Windows installer |
 | 0.1.4 | 2026-08-09 | superseded | faster than real time: worker team, pipelined codec, 2.5× faster startup |
 | 0.1.3 | 2026-08-09 | superseded | optimized route becomes the library-wide default; 48 kHz enrollment fix |
@@ -24,6 +25,57 @@ individual commits are intentionally not cited.
 | 0.1.0 | 2026-08-08 | first release | f32 reference engine, CLI, conformance ladder, artifact groundwork |
 
 ## [Unreleased]
+
+## [0.1.7] - 2026-08-12
+
+The browser stops paying for the model twice, proves its output against the
+CLI sample by sample, and the kernel team picks up the last two routes that
+were still running single-core.
+
+### Added
+
+- **CLI-golden browser conformance harness**: the playground exposes raw PCM,
+  and `site/harness/browser.mjs` compares a real in-browser synthesis against
+  a CLI-rendered golden of the same text and voice. The first codec frames are
+  mirrored on both sides for token-level triage when samples diverge. The
+  measured native↔browser gap is recorded as DISC-006.
+- `packet_frames` dial through the wasm synthesize ABI: codec packet size is
+  sweepable from the page (default stays 4). Output is bit-identical under
+  every schedule — the streaming==batch gate holds — so it is purely a
+  speed/memory dial.
+
+### Changed
+
+- **Browser memory diet** (recorded as PERF-006): the codec now streams into
+  the engine as widened tensors instead of staging a second safetensors copy,
+  the artifact hot prefix is released before codec staging begins, staging is
+  decoder-only (the encoder never crosses the wire), codec tensor ingestion
+  reuses one buffer instead of 271 allocations, and the page tears down its
+  animated diagrams and non-playground chrome while an engine is resident.
+  Net effect: the 2 GB model fits comfortably inside the browser tab's budget
+  instead of brushing against it.
+- The codec derives its transposed-conv column layout once per utterance
+  instead of once per frame, and one-shot artifact digests go through `sha2`
+  (streaming digests stay ours).
+- **Kernel team covers every quantized route**: `FTTS_INT8=w8a16` now fans out
+  across the persistent worker team exactly like the default w8a8 route
+  (3.6–5.0x per projection at the model's decode shapes in a kernel-level
+  A/B, provisional pending a quiet-host run); batched calls (prefill, the
+  seq-16 verify) route to the autotuned plan's measured batch-regime winner
+  instead of inheriting the single-row winner; and the armed W8A8 quant path
+  no longer allocates per call (thread-local scratch, in keeping with the
+  no-allocator-activity steady-state doctrine).
+- The FrankenMTP speculation track is now labeled unshipped at its code sites,
+  cross-referencing the measured negative evidence, so the in-tree primitives
+  cannot be mistaken for a realized traffic win.
+
+### Fixed
+
+- **Native↔browser parity**: wasm now uses the native f32 reduction order for
+  sample-level parity, and every target ships the same int8 default, so the
+  browser and the CLI run the same numerics route out of the box.
+- The installer accepts the checksum manifest we actually ship and tolerates
+  AppleDouble members in the archive.
 
 ## [0.1.6] - 2026-08-10
 
@@ -451,7 +503,11 @@ refer to the checked-in beads tracker at `.beads/issues.jsonl`.
   the enrollment parity gate is not yet closed.
 - CUDA and long-form/chunked synthesis are out of scope for this release.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.0...v0.1.1
