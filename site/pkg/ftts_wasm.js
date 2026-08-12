@@ -408,16 +408,17 @@ export class WasmEngine {
      * @param {bigint} seed
      * @param {number} max_frames
      * @param {Uint8Array} rows_bf16
+     * @param {number} packet_frames
      * @returns {Float32Array}
      */
-    synthesize_with_text_rows(text, speaker, seed, max_frames, rows_bf16) {
+    synthesize_with_text_rows(text, speaker, seed, max_frames, rows_bf16, packet_frames) {
         const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passArrayF32ToWasm0(speaker, wasm.__wbindgen_malloc);
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passArray8ToWasm0(rows_bf16, wasm.__wbindgen_malloc);
         const len2 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmengine_synthesize_with_text_rows(this.__wbg_ptr, ptr0, len0, ptr1, len1, seed, max_frames, ptr2, len2);
+        const ret = wasm.wasmengine_synthesize_with_text_rows(this.__wbg_ptr, ptr0, len0, ptr1, len1, seed, max_frames, ptr2, len2, packet_frames);
         if (ret[3]) {
             throw takeFromExternrefTable0(ret[2]);
         }
@@ -628,7 +629,7 @@ function __wbg_get_imports(memory) {
         __wbg___wbindgen_throw_344f42d3211c4765: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
-        __wbg_error_a939a14617c8f86a: function(arg0, arg1) {
+        __wbg_error_9d36f6305f3736aa: function(arg0, arg1) {
             console.error(getStringFromWasm0(arg0, arg1));
         },
         __wbg_now_86c0d4ba3fa605b8: function() {

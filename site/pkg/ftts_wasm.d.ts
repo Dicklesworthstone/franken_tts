@@ -248,7 +248,7 @@ export class WasmEngine {
      *
      * As [`WasmEngine::synthesize`], plus a refusal when the rows do not match the ids.
      */
-    synthesize_with_text_rows(text: string, speaker: Float32Array, seed: bigint, max_frames: number, rows_bf16: Uint8Array): Float32Array;
+    synthesize_with_text_rows(text: string, speaker: Float32Array, seed: bigint, max_frames: number, rows_bf16: Uint8Array, packet_frames: number): Float32Array;
     /**
      * The cold-text-embedding ids this exact text will need, in the order the rows must arrive.
      *
@@ -378,7 +378,7 @@ export interface InitOutput {
     readonly wasmengine_from_staging: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly wasmengine_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
     readonly wasmengine_synthesize: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => [number, number, number, number];
-    readonly wasmengine_synthesize_with_text_rows: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number) => [number, number, number, number];
+    readonly wasmengine_synthesize_with_text_rows: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => [number, number, number, number];
     readonly wasmengine_text_row_ids: (a: number, b: number, c: number) => [number, number, number, number];
     readonly worker_loop_entry: (a: number) => [number, number];
     readonly arm_worker_team: (a: number) => void;
