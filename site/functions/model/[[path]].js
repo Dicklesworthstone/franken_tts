@@ -1,4 +1,5 @@
-// Same-origin model mirror: R2 first, the pinned GitHub release as fallback.
+// Same-origin model mirror: R2 first, Hugging Face second, the pinned GitHub
+// release third.
 //
 // GitHub release assets send no CORS headers, so the browser cannot fetch them
 // cross-origin; this Pages Function serves them from the site's own origin. The
@@ -6,13 +7,17 @@
 // upload): reads through a binding cost no egress, involve no second HTTP hop,
 // and are not subject to GitHub's throttling — which surfaced as intermittent
 // 503s on the 32 MiB chunked download the day the playground got real traffic.
-// GitHub remains the fallback so a missing/misnamed bucket object degrades to
-// the old behavior instead of a dead download. The asset list is a strict
-// allowlist — this is a model mirror, not an open proxy.
+// The HF model repo and the GitHub release remain as ordered fallbacks so a
+// missing bucket object or a Cloudflare-side R2 problem degrades to a slower
+// download instead of a dead one. The asset list is a strict allowlist — this
+// is a model mirror, not an open proxy.
 //
 // Every byte served here is still endpoint- and digest-verified by the loader
 // against the pinned manifest, so a wrong or stale mirror object is rejected
 // client-side rather than trusted.
+
+const HF_BASE =
+  "https://huggingface.co/eigenvalue/franken-tts-qwen3-tts-12hz-0.6b-base/resolve/main/";
 
 const RELEASE_BASE =
   "https://github.com/Dicklesworthstone/franken_tts/releases/download/model-qwen3-tts-v1/";
@@ -62,8 +67,8 @@ function fromR2(object, rangeRequested, totalBytes) {
   return new Response(object.body, { status: 200, headers });
 }
 
-async function fromGitHub(request, asset) {
-  const upstream = new Request(RELEASE_BASE + asset, {
+async function fromUpstream(request, base, asset) {
+  const upstream = new Request(base + asset, {
     headers: request.headers.has("range")
       ? { range: request.headers.get("range") }
       : {},
@@ -95,11 +100,19 @@ export async function onRequestGet({ request, params, env }) {
         ? await env.MODEL_BUCKET.get(asset, { range })
         : await env.MODEL_BUCKET.get(asset);
       if (object) return fromR2(object, range !== null, object.size);
-      // Object missing from the bucket: fall through to GitHub.
+      // Object missing from the bucket: fall through to the mirrors.
     } catch {
-      // R2 hiccup: fall through to GitHub rather than 5xx the download.
+      // R2 hiccup: fall through to the mirrors rather than 5xx the download.
     }
   }
 
-  return fromGitHub(request, asset);
+  // Mirror order matters: HF's CDN has no per-repo throttling story like
+  // GitHub's release-asset limiter, so it absorbs chunked load better.
+  try {
+    const fromHf = await fromUpstream(request, HF_BASE, asset);
+    if (fromHf.status < 400) return fromHf;
+  } catch {
+    // HF unreachable: last stop below.
+  }
+  return fromUpstream(request, RELEASE_BASE, asset);
 }
