@@ -2472,12 +2472,24 @@ impl ModelManifest {
         })
     }
 
-    /// The release-asset URL for one file; the only endpoint `ftts pull` ever contacts.
-    fn download_url(&self, file: &ModelManifestFile) -> String {
-        format!(
-            "https://github.com/{}/releases/download/{}/{}",
-            self.repo, self.release_tag, file.asset
-        )
+    /// The ordered mirror URLs for one file; the only endpoints `ftts pull` ever contacts.
+    ///
+    /// Hugging Face first: the GitHub release-asset limiter 503'd real users' pulls under
+    /// chunked load (2026-08-12) while the same bytes served fine from the HF model repo, and
+    /// every asset there carries the release-asset name byte for byte. GitHub stays as the
+    /// fallback so either host failing degrades to a slower pull instead of a dead one; the
+    /// digest verification after download is what actually decides acceptance, either way.
+    fn download_urls(&self, file: &ModelManifestFile) -> [String; 2] {
+        [
+            format!(
+                "https://huggingface.co/Dicklesworthstone/franken-tts-qwen3-tts-12hz-0.6b-base/resolve/main/{}",
+                file.asset
+            ),
+            format!(
+                "https://github.com/{}/releases/download/{}/{}",
+                self.repo, self.release_tag, file.asset
+            ),
+        ]
     }
 
     fn total_bytes(&self) -> u64 {
@@ -2719,12 +2731,28 @@ fn pull_one_file(
             )));
         }
     }
-    let url = manifest.download_url(file);
-    let outcome = download_with_curl(&url, &staging, file.bytes)
-        .and_then(|()| verify_pulled_file(&staging, file));
-    if let Err(error) = outcome {
-        let _ = fs::remove_file(&staging);
-        return Err(error);
+    // Try each mirror in order; a failure (transport, HTTP, or digest) clears the staging
+    // debris and moves on, and only the LAST mirror's error surfaces — by then it is the
+    // honest answer to "why did the pull fail everywhere".
+    let urls = manifest.download_urls(file);
+    let mut last_error = None;
+    let mut verified = false;
+    for url in &urls {
+        match download_with_curl(url, &staging, file.bytes)
+            .and_then(|()| verify_pulled_file(&staging, file))
+        {
+            Ok(()) => {
+                verified = true;
+                break;
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&staging);
+                last_error = Some(error);
+            }
+        }
+    }
+    if !verified {
+        return Err(last_error.expect("at least one mirror was attempted"));
     }
     // Durability before publish: rename orders the directory entry, not the data. Without the
     // fsync a crash can leave a truncated file at the verified name — and the tokenizer/codec
@@ -4029,8 +4057,11 @@ mod tests {
             .find(|file| file.dest == MODEL_BASENAME)
             .expect("manifest carries the canonical artifact");
         assert_eq!(
-            manifest.download_url(main),
-            "https://github.com/Dicklesworthstone/franken_tts/releases/download/model-qwen3-tts-v1/qwen3-tts-12hz-0.6b-base.fttsq"
+            manifest.download_urls(main),
+            [
+                "https://huggingface.co/Dicklesworthstone/franken-tts-qwen3-tts-12hz-0.6b-base/resolve/main/qwen3-tts-12hz-0.6b-base.fttsq",
+                "https://github.com/Dicklesworthstone/franken_tts/releases/download/model-qwen3-tts-v1/qwen3-tts-12hz-0.6b-base.fttsq",
+            ]
         );
         assert!(
             !manifest
