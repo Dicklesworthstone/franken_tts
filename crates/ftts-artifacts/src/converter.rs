@@ -819,10 +819,11 @@ pub fn stream_matrix_q8_group64_section<W: std::io::Write + std::io::Seek>(
                 .map_err(|source| MatrixQuantizationError::Sink { row, source })?;
         }
     }
-    sink.finish().map_err(|source| MatrixQuantizationError::Sink {
-        row: row_count,
-        source,
-    })
+    sink.finish()
+        .map_err(|source| MatrixQuantizationError::Sink {
+            row: row_count,
+            source,
+        })
 }
 
 /// Converts a manifest-validated safetensors checkpoint into a portable `.fttsq` stream.
@@ -1058,37 +1059,37 @@ fn build_artifact_plan(
                 // Per-row storage keeps one scale per output channel; grouped storage keeps one
                 // per Q8_GROUP_WIDTH-element group. The payload bytes are identical either way;
                 // only the scale tensor's element count and declared shape differ.
-                let (scale_count, scales_shape) =
-                    if tensor.storage == TensorStoragePolicy::Q8PerGroup64 {
-                        let row_width = entry
-                            .element_count()
-                            .checked_div(rows)
-                            .filter(|width| width.is_multiple_of(Q8_GROUP_WIDTH))
-                            .ok_or_else(|| ConversionPlanError::Q8EmptyOutputChannel {
-                                name: tensor.source_name.clone(),
-                            })?;
-                        let groups_per_row = row_width / Q8_GROUP_WIDTH;
-                        let rows_u64 = u64::try_from(rows).map_err(|_| {
+                let (scale_count, scales_shape) = if tensor.storage
+                    == TensorStoragePolicy::Q8PerGroup64
+                {
+                    let row_width = entry
+                        .element_count()
+                        .checked_div(rows)
+                        .filter(|width| width.is_multiple_of(Q8_GROUP_WIDTH))
+                        .ok_or_else(|| ConversionPlanError::Q8EmptyOutputChannel {
+                            name: tensor.source_name.clone(),
+                        })?;
+                    let groups_per_row = row_width / Q8_GROUP_WIDTH;
+                    let rows_u64 =
+                        u64::try_from(rows).map_err(|_| ConversionPlanError::ShapeOutOfRange {
+                            name: tensor.source_name.clone(),
+                        })?;
+                    let groups_u64 = u64::try_from(groups_per_row).map_err(|_| {
+                        ConversionPlanError::ShapeOutOfRange {
+                            name: tensor.source_name.clone(),
+                        }
+                    })?;
+                    (rows * groups_per_row, vec![rows_u64, groups_u64])
+                } else {
+                    (
+                        rows,
+                        vec![u64::try_from(rows).map_err(|_| {
                             ConversionPlanError::ShapeOutOfRange {
                                 name: tensor.source_name.clone(),
                             }
-                        })?;
-                        let groups_u64 = u64::try_from(groups_per_row).map_err(|_| {
-                            ConversionPlanError::ShapeOutOfRange {
-                                name: tensor.source_name.clone(),
-                            }
-                        })?;
-                        (rows * groups_per_row, vec![rows_u64, groups_u64])
-                    } else {
-                        (
-                            rows,
-                            vec![u64::try_from(rows).map_err(|_| {
-                                ConversionPlanError::ShapeOutOfRange {
-                                    name: tensor.source_name.clone(),
-                                }
-                            })?],
-                        )
-                    };
+                        })?],
+                    )
+                };
                 let values_len = u64::try_from(entry.element_count()).map_err(|_| {
                     ConversionPlanError::SectionLengthOverflow {
                         name: tensor.source_name.clone(),
