@@ -14,11 +14,8 @@
 // against the pinned manifest, so a wrong or stale mirror object is rejected
 // client-side rather than trusted.
 
-// The repo is moving to the Dicklesworthstone org; HF serves permanent
-// redirects for moved repos and this fetch follows them, so the URL swap after
-// the move is cosmetic, not load-bearing.
 const HF_BASE =
-  "https://huggingface.co/eigenvalue/franken-tts-qwen3-tts-12hz-0.6b-base/resolve/main/";
+  "https://huggingface.co/Dicklesworthstone/franken-tts-qwen3-tts-12hz-0.6b-base/resolve/main/";
 
 const RELEASE_BASE =
   "https://github.com/Dicklesworthstone/franken_tts/releases/download/model-qwen3-tts-v1/";
