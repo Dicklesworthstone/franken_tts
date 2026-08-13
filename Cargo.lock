@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "ftts-artifacts"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ftts-core",
  "ftts-kernels",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "ftts-cli"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "clap",
  "fmd-font",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "ftts-conformance"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ftts-artifacts",
  "ftts-cli",
@@ -737,14 +737,14 @@ dependencies = [
 
 [[package]]
 name = "ftts-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "asupersync",
 ]
 
 [[package]]
 name = "ftts-ffi"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ftts-cli",
  "ftts-core",
@@ -755,14 +755,14 @@ dependencies = [
 
 [[package]]
 name = "ftts-kernels"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "ftts-model-qwen"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "fancy-regex",
  "ftts-artifacts",
@@ -775,18 +775,18 @@ dependencies = [
 
 [[package]]
 name = "ftts-video"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "fmd-font",
 ]
 
 [[package]]
 name = "ftts-voicecard"
-version = "0.1.7"
+version = "0.1.8"
 
 [[package]]
 name = "ftts-wasm"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ftts-artifacts",
  "ftts-core",

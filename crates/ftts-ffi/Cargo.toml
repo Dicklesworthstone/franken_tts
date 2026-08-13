@@ -12,10 +12,10 @@ publish = false
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-ftts-cli = { path = "../ftts-cli", version = "0.1.7" }
-ftts-core = { path = "../ftts-core", version = "0.1.7" }
-ftts-model-qwen = { path = "../ftts-model-qwen", version = "0.1.7" }
-ftts-video = { path = "../ftts-video", version = "0.1.7" }
+ftts-cli = { path = "../ftts-cli", version = "0.1.8" }
+ftts-core = { path = "../ftts-core", version = "0.1.8" }
+ftts-model-qwen = { path = "../ftts-model-qwen", version = "0.1.8" }
+ftts-video = { path = "../ftts-video", version = "0.1.8" }
 serde_json = "1.0"
 
 # NOT `workspace = true`: the workspace forbids `unsafe_code`, and a C ABI is definitionally

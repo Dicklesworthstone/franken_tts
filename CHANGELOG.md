@@ -15,7 +15,8 @@ individual commits are intentionally not cited.
 
 | Version | Date | Status | Summary |
 |---------|------|--------|---------|
-| 0.1.7 | 2026-08-12 | current | browser memory diet (no double-resident model), native↔browser parity harness, w8a16 multicore |
+| 0.1.8 | 2026-08-12 | current | model downloads survive GitHub throttling: Hugging Face is the primary mirror everywhere |
+| 0.1.7 | 2026-08-12 | superseded | browser memory diet (no double-resident model), native↔browser parity harness, w8a16 multicore |
 | 0.1.6 | 2026-08-10 | superseded | voice cards (a picture that IS the voice), phone↔CLI interop; iOS video export unstuck; output denoising |
 | 0.1.5 | 2026-08-10 | superseded | browser engine 9.4× faster; iOS survives; enrollment denoises itself; Windows installer |
 | 0.1.4 | 2026-08-09 | superseded | faster than real time: worker team, pipelined codec, 2.5× faster startup |
@@ -25,6 +26,34 @@ individual commits are intentionally not cited.
 | 0.1.0 | 2026-08-08 | first release | f32 reference engine, CLI, conformance ladder, artifact groundwork |
 
 ## [Unreleased]
+
+## [0.1.8] - 2026-08-12
+
+The model download stops depending on GitHub's goodwill. Within hours of real
+traffic, GitHub's release-asset limiter started returning 503s for the chunked
+downloads both `ftts pull` and the browser playground perform — and each had a
+single source, so a throttled host meant a dead download.
+
+### Fixed
+
+- **`ftts pull` tries ordered mirrors**: the Hugging Face model repo
+  ([Dicklesworthstone/franken-tts-qwen3-tts-12hz-0.6b-base](https://huggingface.co/Dicklesworthstone/franken-tts-qwen3-tts-12hz-0.6b-base))
+  first, the GitHub release second. Every asset carries its release name on
+  both hosts, digest verification decides acceptance exactly as before, and
+  only the last mirror's error surfaces when everything fails.
+- The playground's `/model` proxy serves the same chain (HF, then the site's
+  R2 bucket, then GitHub), so any single host failing degrades the download
+  to a slower one instead of a dead one.
+
+### Added
+
+- `ftts convert --embed-q8` (EXPERIMENTAL, native-only): stores the 622 MB
+  cold text embedding as Q8 with one scale per 64-element group, producing a
+  1.02 GB artifact instead of 1.31 GB. Grouped scales exist because per-row
+  scales measured 23.8 dB SQNR on the most common tokens' rows; groups lift
+  the floor to 35.0 dB (zero rows below 30 dB). Off by default until the
+  artifact-v2 listening and logit-parity gates pass; binaries at or below
+  0.1.7 refuse grouped artifacts loudly by name.
 
 ## [0.1.7] - 2026-08-12
 
@@ -503,7 +532,8 @@ refer to the checked-in beads tracker at `.beads/issues.jsonl`.
   the enrollment parity gate is not yet closed.
 - CUDA and long-form/chunked synthesis are out of scope for this release.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Dicklesworthstone/franken_tts/compare/v0.1.4...v0.1.5
