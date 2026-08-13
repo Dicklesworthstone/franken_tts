@@ -437,6 +437,14 @@ struct ConvertArgs {
     /// Destination .fttsq path. Refuses to overwrite an existing artifact.
     #[arg(short = 'o', long, value_name = "PATH")]
     output: PathBuf,
+
+    /// EXPERIMENTAL: store the 622 MB cold text embedding as Q8 (per-row scales) instead of
+    /// bf16, roughly halving it. The loader already reads both forms; bf16 remains the default
+    /// until the artifact-v2 gates pass (teacher-forced logit parity on the conformance corpus
+    /// plus the equivalence-bound listening protocol — frankentts-6ea1). Browser deployments
+    /// stay on bf16 artifacts for now: the playground's provided-rows path is bf16-only.
+    #[arg(long)]
+    embed_q8: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -836,7 +844,7 @@ fn run_convert_events(
             source.display()
         ))
     })?;
-    let (manifest, plan) = pinned_main_conversion_plan()?;
+    let (manifest, plan) = pinned_main_conversion_plan(args.embed_q8)?;
     let staging = conversion_staging_path(&args.output)?;
     emit_stage(run, emit, "source_preflight", "end", &mut seq)?;
 
@@ -956,8 +964,10 @@ fn conversion_staging_path(output: &Path) -> Result<PathBuf, FttsError> {
     Ok(staging)
 }
 
-fn pinned_main_conversion_plan() -> Result<(WeightsManifest, StreamingConversionPlan), FttsError> {
-    let specs = pinned_main_tensor_specs()?;
+fn pinned_main_conversion_plan(
+    embed_q8: bool,
+) -> Result<(WeightsManifest, StreamingConversionPlan), FttsError> {
+    let specs = pinned_main_tensor_specs(embed_q8)?;
     let manifest = WeightsManifest::from_expectations(
         "Qwen/Qwen3-TTS-12Hz-0.6B-Base main checkpoint",
         specs
@@ -989,8 +999,17 @@ fn pinned_main_conversion_plan() -> Result<(WeightsManifest, StreamingConversion
         "q8_recipe": "symmetric per-output-channel int8; zero_point=0; scale=max_abs(row)/127",
         "q8_tensor_count": q8_count,
         "verbatim_tensor_count": specs.len() - q8_count,
-        "q8_scope": "talker and residual-code-microdecoder attention/MLP projection matrices only",
-        "verbatim_scope": "norms, heads, embeddings, speaker path, and every tensor outside the reviewed Q8 projection set",
+        "q8_scope": if embed_q8 {
+            "talker and residual-code-microdecoder attention/MLP projection matrices, plus the cold text embedding (per-row scales; --embed-q8)"
+        } else {
+            "talker and residual-code-microdecoder attention/MLP projection matrices only"
+        },
+        "verbatim_scope": if embed_q8 {
+            "norms, heads, non-text embeddings, speaker path, and every tensor outside the reviewed Q8 set"
+        } else {
+            "norms, heads, embeddings, speaker path, and every tensor outside the reviewed Q8 projection set"
+        },
+        "embedding_q8": embed_q8,
     }));
     for spec in specs {
         let conversion = match spec.storage {
@@ -1006,7 +1025,7 @@ fn pinned_main_conversion_plan() -> Result<(WeightsManifest, StreamingConversion
     Ok((manifest, plan))
 }
 
-fn pinned_main_tensor_specs() -> Result<Vec<PinnedMainTensor>, FttsError> {
+fn pinned_main_tensor_specs(embed_q8: bool) -> Result<Vec<PinnedMainTensor>, FttsError> {
     let inventory: Value = serde_json::from_str(PINNED_TENSOR_INVENTORY).map_err(|error| {
         FttsError::Generic(format!(
             "checked-in tensor inventory is invalid JSON: {error}"
@@ -1060,7 +1079,13 @@ fn pinned_main_tensor_specs() -> Result<Vec<PinnedMainTensor>, FttsError> {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let storage = if is_q8_projection(&name) {
+        // The cold text embedding joins the Q8 set only on explicit request: 47.4% of the
+        // artifact (census, frankentts-o461), halved by per-row Q8, but it ships as default
+        // only after the artifact-v2 gates (frankentts-6ea1). `gather_fttsq` already reads
+        // both storage forms, so this is a converter-side policy, not a format change.
+        let storage = if is_q8_projection(&name)
+            || (embed_q8 && name == "talker.model.text_embedding.weight")
+        {
             TensorStoragePolicy::Q8PerOutputChannel
         } else {
             TensorStoragePolicy::Verbatim
@@ -3571,10 +3596,30 @@ mod tests {
     }
 
     #[test]
+    fn embed_q8_flag_flips_exactly_the_text_embedding_and_says_so_in_the_manifest() {
+        let default_specs = pinned_main_tensor_specs(false).expect("inventory parses");
+        let armed_specs = pinned_main_tensor_specs(true).expect("inventory parses");
+        assert_eq!(default_specs.len(), armed_specs.len());
+        for (default, armed) in default_specs.iter().zip(&armed_specs) {
+            assert_eq!(default.name, armed.name);
+            if default.name == "talker.model.text_embedding.weight" {
+                assert_eq!(default.storage, TensorStoragePolicy::Verbatim);
+                assert_eq!(armed.storage, TensorStoragePolicy::Q8PerOutputChannel);
+            } else {
+                assert_eq!(
+                    default.storage, armed.storage,
+                    "--embed-q8 must touch no tensor but the text embedding ({})",
+                    default.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn pinned_main_conversion_plan_preserves_the_reviewed_q8_boundary() {
-        let specs = pinned_main_tensor_specs().expect("checked-in main inventory parses");
+        let specs = pinned_main_tensor_specs(false).expect("checked-in main inventory parses");
         let (_manifest, _plan) =
-            pinned_main_conversion_plan().expect("checked-in main conversion plan builds");
+            pinned_main_conversion_plan(false).expect("checked-in main conversion plan builds");
         assert_eq!(specs.len(), PINNED_MAIN_TENSOR_COUNT);
         assert_eq!(
             specs
