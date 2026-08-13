@@ -844,21 +844,24 @@ impl TextEmbeddingTable {
                 "cold embedding payload length does not match its declared shape",
             ));
         }
+        // Per-row scales (one per row) and grouped scales (one per fixed-width group of a row,
+        // the converter's Q8PerGroup64 form) are both admitted; which one arrived is derived
+        // from the scale count, and anything that divides into neither is refused by name.
         let q8_scales = if dtype == StoredDtype::Q8 {
             let scales_name = scales_name.ok_or_else(|| {
-                artifact_tensor_error(
-                    path,
-                    name,
-                    "q8 cold embedding is missing its per-row scales",
-                )
+                artifact_tensor_error(path, name, "q8 cold embedding is missing its scales")
             })?;
             let scales = artifact_f32_values(artifact, path, &scales_name)?;
-            if scales.len() != TEXT_VOCAB {
+            if !scales.len().is_multiple_of(TEXT_VOCAB)
+                || scales.is_empty()
+                || !TEXT_EMBED_WIDTH.is_multiple_of(scales.len() / TEXT_VOCAB)
+            {
                 return Err(artifact_tensor_error(
                     path,
                     name,
                     format!(
-                        "q8 cold embedding has {TEXT_VOCAB} rows but {} scales",
+                        "q8 cold embedding has {TEXT_VOCAB} rows of width {TEXT_EMBED_WIDTH} \
+                         but {} scales (neither per-row nor an integral per-group form)",
                         scales.len()
                     ),
                 ));
@@ -867,6 +870,10 @@ impl TextEmbeddingTable {
         } else {
             None
         };
+        let q8_groups_per_row = q8_scales
+            .as_ref()
+            .map_or(1, |scales| scales.len() / TEXT_VOCAB);
+        let q8_group_width = TEXT_EMBED_WIDTH / q8_groups_per_row;
 
         let mut gathered: Vec<u32> = ids.to_vec();
         gathered.sort_unstable();
@@ -897,10 +904,11 @@ impl TextEmbeddingTable {
                     }
                 }
                 StoredDtype::Q8 => {
-                    let scale = q8_scales
+                    let row_scales = q8_scales
                         .as_ref()
-                        .and_then(|scales| scales.get(row))
-                        .copied()
+                        .and_then(|scales| {
+                            scales.get(row * q8_groups_per_row..(row + 1) * q8_groups_per_row)
+                        })
                         .ok_or_else(|| {
                             artifact_tensor_error(
                                 path,
@@ -908,8 +916,15 @@ impl TextEmbeddingTable {
                                 "q8 cold-embedding scale lookup failed",
                             )
                         })?;
-                    for (slot, value) in destination.iter_mut().zip(source) {
-                        *slot = f32::from(i8::from_ne_bytes([*value])) * scale;
+                    for (group_index, (slots, values)) in destination
+                        .chunks_mut(q8_group_width)
+                        .zip(source.chunks(q8_group_width))
+                        .enumerate()
+                    {
+                        let scale = row_scales[group_index];
+                        for (slot, value) in slots.iter_mut().zip(values) {
+                            *slot = f32::from(i8::from_ne_bytes([*value])) * scale;
+                        }
                     }
                 }
                 StoredDtype::Q4 => unreachable!("q4 cold embeddings returned above"),

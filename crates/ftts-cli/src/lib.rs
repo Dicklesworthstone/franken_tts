@@ -1000,7 +1000,7 @@ fn pinned_main_conversion_plan(
         "q8_tensor_count": q8_count,
         "verbatim_tensor_count": specs.len() - q8_count,
         "q8_scope": if embed_q8 {
-            "talker and residual-code-microdecoder attention/MLP projection matrices, plus the cold text embedding (per-row scales; --embed-q8)"
+            "talker and residual-code-microdecoder attention/MLP projection matrices, plus the cold text embedding (per-64-element-group scales; --embed-q8)"
         } else {
             "talker and residual-code-microdecoder attention/MLP projection matrices only"
         },
@@ -1080,13 +1080,15 @@ fn pinned_main_tensor_specs(embed_q8: bool) -> Result<Vec<PinnedMainTensor>, Ftt
             })
             .collect::<Result<Vec<_>, _>>()?;
         // The cold text embedding joins the Q8 set only on explicit request: 47.4% of the
-        // artifact (census, frankentts-o461), halved by per-row Q8, but it ships as default
-        // only after the artifact-v2 gates (frankentts-6ea1). `gather_fttsq` already reads
-        // both storage forms, so this is a converter-side policy, not a format change.
-        let storage = if is_q8_projection(&name)
-            || (embed_q8 && name == "talker.model.text_embedding.weight")
-        {
+        // artifact (census, frankentts-o461), halved by Q8, but it ships as default only
+        // after the artifact-v2 gates (frankentts-6ea1). GROUPED scales, not per-row: the
+        // most common tokens' rows measured 23.8 dB SQNR under one row scale (their energy
+        // is uneven across the row) and 35.0 dB under 64-element groups, for ~19 MB of
+        // scales. The loader reads grouped and per-row forms alike.
+        let storage = if is_q8_projection(&name) {
             TensorStoragePolicy::Q8PerOutputChannel
+        } else if embed_q8 && name == "talker.model.text_embedding.weight" {
+            TensorStoragePolicy::Q8PerGroup64
         } else {
             TensorStoragePolicy::Verbatim
         };
