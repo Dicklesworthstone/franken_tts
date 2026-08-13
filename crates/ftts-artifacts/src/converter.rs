@@ -812,7 +812,12 @@ pub fn stream_matrix_q8_group64_section<W: std::io::Write + std::io::Seek>(
         if !matrix.copy_row_f32(row, &mut source_row) {
             return Err(MatrixQuantizationError::SourceRowUnavailable { row });
         }
-        for (group_index, group) in source_row.chunks_exact(Q8_GROUP_WIDTH).enumerate() {
+        for (group_index, group) in source_row
+            .as_chunks::<Q8_GROUP_WIDTH>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let scale = quantize_output_channel_q8(group, &mut quantized_group)
                 .map_err(|source| MatrixQuantizationError::Quantization { row, source })?;
             sink.write_q8_row(row * groups_per_row + group_index, scale, &quantized_group)
@@ -1537,6 +1542,95 @@ mod tests {
             ]
             .concat()
         );
+    }
+
+    #[test]
+    fn grouped_q8_section_carries_one_scale_per_group_and_dequantizes_per_group() {
+        // Two rows of two groups each: within each row, one loud group and one quiet group.
+        // A per-row scale would quantize the quiet group at the loud group's step; per-group
+        // scales must recover it exactly at this tiny size (each group has <= 127 magnitudes).
+        let quiet = [0.001_f32, -0.002];
+        let source = f32_matrix(
+            2,
+            2 * Q8_GROUP_WIDTH,
+            &[
+                std::iter::repeat_n(1.27_f32, Q8_GROUP_WIDTH).collect::<Vec<_>>(),
+                quiet.iter().copied().cycle().take(Q8_GROUP_WIDTH).collect(),
+                std::iter::repeat_n(-2.54_f32, Q8_GROUP_WIDTH).collect(),
+                quiet.iter().copied().cycle().take(Q8_GROUP_WIDTH).collect(),
+            ]
+            .concat(),
+        );
+        let index = SafetensorsIndex::parse(&source).expect("fixture parses");
+        let matrix = index.view("matrix", &source).expect("matrix view exists");
+        let values_len = 2 * 2 * Q8_GROUP_WIDTH as u64;
+        let plan = FttsqStreamPlan::new("test-model", "a".repeat(64))
+            .license_notice("Copyright 2026 Alibaba Cloud\nApache-2.0")
+            .section("matrix", AccessClass::ColdTextEmbedding, values_len + 16)
+            .tensor(TensorEntry {
+                name: "matrix.weight".to_owned(),
+                section: "matrix".to_owned(),
+                dtype: StoredDtype::Q8,
+                shape: vec![2, 2 * Q8_GROUP_WIDTH as u64],
+                offset: 0,
+                length: values_len,
+                scales: Some("matrix.weight.scales".to_owned()),
+            })
+            .tensor(TensorEntry {
+                name: "matrix.weight.scales".to_owned(),
+                section: "matrix".to_owned(),
+                dtype: StoredDtype::F32,
+                shape: vec![2, 2],
+                offset: values_len,
+                length: 16,
+                scales: None,
+            });
+        let mut writer = plan
+            .begin(Cursor::new(Vec::new()))
+            .expect("section metadata is valid");
+        stream_matrix_q8_group64_section(&matrix, &mut writer, "matrix")
+            .expect("grouped matrix streams through the canonical primitive");
+        let artifact = writer
+            .finish()
+            .expect("completed section finalizes its digest")
+            .into_inner();
+        let reader = FttsqReader::open(&artifact).expect("artifact verifies");
+
+        let scales: Vec<f32> = reader
+            .tensor_bytes("matrix.weight.scales", &artifact)
+            .expect("scale bytes resolve")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
+            .collect();
+        assert_eq!(
+            scales.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            [
+                1.27_f32 / 127.0,
+                0.002_f32 / 127.0,
+                2.54_f32 / 127.0,
+                0.002_f32 / 127.0,
+            ]
+            .iter()
+            .map(|s| s.to_bits())
+            .collect::<Vec<_>>(),
+            "each group carries its own max-abs scale"
+        );
+        // The quiet groups dequantize exactly: their values are exact multiples of their own
+        // group scale, which the loud rows' scales could never represent.
+        let bytes = reader
+            .tensor_bytes("matrix.weight", &artifact)
+            .expect("Q8 bytes resolve");
+        let quiet_group_of_row_0 = &bytes[Q8_GROUP_WIDTH..2 * Q8_GROUP_WIDTH];
+        for (index, &byte) in quiet_group_of_row_0.iter().enumerate() {
+            let value = f32::from(i8::from_ne_bytes([byte])) * scales[1];
+            let expected = quiet[index % 2];
+            assert!(
+                (value - expected).abs() < 1e-9,
+                "quiet element {index}: {value} vs {expected}"
+            );
+        }
     }
 
     #[test]

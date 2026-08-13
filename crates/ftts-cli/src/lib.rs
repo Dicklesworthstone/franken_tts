@@ -1019,6 +1019,9 @@ fn pinned_main_conversion_plan(
             TensorStoragePolicy::Q8PerOutputChannel => {
                 TensorConversion::q8_per_output_channel(&spec.name, &spec.name, spec.access_class)
             }
+            TensorStoragePolicy::Q8PerGroup64 => {
+                TensorConversion::q8_per_group_64(&spec.name, &spec.name, spec.access_class)
+            }
         };
         plan = plan.tensor(conversion);
     }
@@ -3606,7 +3609,7 @@ mod tests {
             assert_eq!(default.name, armed.name);
             if default.name == "talker.model.text_embedding.weight" {
                 assert_eq!(default.storage, TensorStoragePolicy::Verbatim);
-                assert_eq!(armed.storage, TensorStoragePolicy::Q8PerOutputChannel);
+                assert_eq!(armed.storage, TensorStoragePolicy::Q8PerGroup64);
             } else {
                 assert_eq!(
                     default.storage, armed.storage,
