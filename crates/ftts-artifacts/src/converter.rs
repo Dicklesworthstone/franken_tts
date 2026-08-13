@@ -1549,7 +1549,7 @@ mod tests {
         // Two rows of two groups each: within each row, one loud group and one quiet group.
         // A per-row scale would quantize the quiet group at the loud group's step; per-group
         // scales must recover it exactly at this tiny size (each group has <= 127 magnitudes).
-        let quiet = [0.001_f32, -0.002];
+        let quiet = [0.00127_f32, -0.0005];
         let source = f32_matrix(
             2,
             2 * Q8_GROUP_WIDTH,
@@ -1608,9 +1608,9 @@ mod tests {
             scales.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
             [
                 1.27_f32 / 127.0,
-                0.002_f32 / 127.0,
+                0.00127_f32 / 127.0,
                 2.54_f32 / 127.0,
-                0.002_f32 / 127.0,
+                0.00127_f32 / 127.0,
             ]
             .iter()
             .map(|s| s.to_bits())
