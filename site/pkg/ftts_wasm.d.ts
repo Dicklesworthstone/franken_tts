@@ -70,6 +70,9 @@ export class ModelStaging {
      *
      * Throws when staging is incomplete, the prefix does not match the artifact's own declared
      * layout, or hydration fails — each named.
+     *
+     * Gated off unix like `finish_codec` below: [`HydratedArtifact`] is the byte-oriented
+     * loader's product and exists only where there is no filesystem.
      */
     finish_artifact(): void;
     /**
@@ -173,6 +176,9 @@ export class ModelStaging {
 /**
  * The loaded model: talker+microdecoder from the canonical artifact, codec from the raw
  * speech-tokenizer checkpoint, tokenizer from its three text files.
+ *
+ * Gated off unix with the rest of the byte-oriented surface: native hosts run the CLI's
+ * engine, and the workspace `--all-targets` check compiles this crate natively.
  */
 export class WasmEngine {
     free(): void;

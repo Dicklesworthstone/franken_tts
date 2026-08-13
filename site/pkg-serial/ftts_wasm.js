@@ -81,6 +81,9 @@ export class ModelStaging {
      *
      * Throws when staging is incomplete, the prefix does not match the artifact's own declared
      * layout, or hydration fails — each named.
+     *
+     * Gated off unix like `finish_codec` below: [`HydratedArtifact`] is the byte-oriented
+     * loader's product and exists only where there is no filesystem.
      */
     finish_artifact() {
         const ret = wasm.modelstaging_finish_artifact(this.__wbg_ptr);
@@ -232,6 +235,9 @@ if (Symbol.dispose) ModelStaging.prototype[Symbol.dispose] = ModelStaging.protot
 /**
  * The loaded model: talker+microdecoder from the canonical artifact, codec from the raw
  * speech-tokenizer checkpoint, tokenizer from its three text files.
+ *
+ * Gated off unix with the rest of the byte-oriented surface: native hosts run the CLI's
+ * engine, and the workspace `--all-targets` check compiles this crate natively.
  */
 export class WasmEngine {
     static __wrap(ptr) {
@@ -629,7 +635,7 @@ function __wbg_get_imports() {
         __wbg___wbindgen_throw_344f42d3211c4765: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
-        __wbg_error_9d36f6305f3736aa: function(arg0, arg1) {
+        __wbg_error_43ea8f8b6e12137c: function(arg0, arg1) {
             console.error(getStringFromWasm0(arg0, arg1));
         },
         __wbg_now_86c0d4ba3fa605b8: function() {
