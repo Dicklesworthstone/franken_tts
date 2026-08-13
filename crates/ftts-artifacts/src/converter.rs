@@ -32,6 +32,22 @@ pub const MAX_Q8_OUTPUT_CHANNEL_WIDTH: usize = 65_536;
 /// allocation while it waits to append that tail after the Q8 payload.
 pub const MAX_Q8_OUTPUT_CHANNELS: usize = 262_144;
 
+/// Group width for [`TensorStoragePolicy::Q8PerGroup64`], fixed rather than configurable.
+///
+/// 64 is where the cold-embedding SQNR sweep flattened (per-row 23.8 dB worst → 35.0 dB at
+/// group 64, +1.2 dB more at group 32 for double the scale bytes, frankentts-6ea1), and one
+/// fixed width keeps every grouped artifact readable by every grouped-aware loader — a
+/// per-artifact knob would be a compatibility surface with no measured benefit.
+pub const Q8_GROUP_WIDTH: usize = 64;
+
+/// Largest number of per-group scales one grouped conversion section may retain.
+///
+/// The grouped scale tail is necessarily larger than the per-row tail: the 151,936×2048 text
+/// embedding at group 64 carries 4,861,952 scales (18.5 MiB), which the sink holds until the
+/// payload finishes streaming. This cap admits that tensor with headroom while still refusing
+/// to let a malicious shape turn the tail into an unbounded allocation.
+pub const MAX_Q8_GROUP_SCALES: usize = 8_388_608;
+
 /// The storage recipe for one source tensor in a portable `.fttsq` artifact.
 ///
 /// The conversion plan must state this policy for every tensor in its source manifest. That makes
@@ -43,6 +59,14 @@ pub enum TensorStoragePolicy {
     Verbatim,
     /// Quantize a rank-two-or-greater weight matrix with canonical per-output-channel Q8 scales.
     Q8PerOutputChannel,
+    /// Quantize with one canonical Q8 scale per [`Q8_GROUP_WIDTH`]-element group of each row.
+    ///
+    /// For rows whose energy is uneven across the row (the cold text embedding's common-token
+    /// rows), a single row scale quantizes the quiet stretches at the loud stretch's step size;
+    /// per-group scales recover ~11 dB on the worst measured rows for ~3% payload overhead in
+    /// scales. The quantization primitive is the same [`quantize_output_channel_q8`], applied
+    /// per group, so grouped bytes remain bit-consistent with the canonical recipe.
+    Q8PerGroup64,
 }
 
 /// One source tensor's explicit artifact location and storage recipe.
@@ -82,6 +106,21 @@ impl TensorConversion {
             artifact_name: artifact_name.into(),
             access_class,
             storage: TensorStoragePolicy::Q8PerOutputChannel,
+        }
+    }
+
+    /// Declares a source matrix quantized with one Q8 scale per [`Q8_GROUP_WIDTH`]-element group.
+    #[must_use]
+    pub fn q8_per_group_64(
+        source_name: impl Into<String>,
+        artifact_name: impl Into<String>,
+        access_class: AccessClass,
+    ) -> Self {
+        Self {
+            source_name: source_name.into(),
+            artifact_name: artifact_name.into(),
+            access_class,
+            storage: TensorStoragePolicy::Q8PerGroup64,
         }
     }
 
@@ -597,14 +636,46 @@ impl<'a, W: std::io::Write + std::io::Seek> Q8SectionSink<'a, W> {
                 limit: MAX_Q8_OUTPUT_CHANNELS,
             });
         }
-        Ok(Self {
+        Ok(Self::unbounded(writer, section, expected_rows))
+    }
+
+    /// Starts writing one grouped-Q8 matrix section: one scale per group, not per row.
+    ///
+    /// Split from [`Q8SectionSink::new`] because the two paths have honestly different tail
+    /// bounds — see [`MAX_Q8_GROUP_SCALES`] — and sharing the larger bound would quietly weaken
+    /// the per-row path's one-MiB refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Q8SectionSinkError::OutputChannelCountTooLarge`] before allocating when the
+    /// planned scale tail exceeds [`MAX_Q8_GROUP_SCALES`].
+    pub fn new_grouped(
+        writer: &'a mut FttsqStreamingWriter<W>,
+        section: impl Into<String>,
+        expected_groups: usize,
+    ) -> Result<Self, Q8SectionSinkError> {
+        if expected_groups > MAX_Q8_GROUP_SCALES {
+            return Err(Q8SectionSinkError::OutputChannelCountTooLarge {
+                rows: expected_groups,
+                limit: MAX_Q8_GROUP_SCALES,
+            });
+        }
+        Ok(Self::unbounded(writer, section, expected_groups))
+    }
+
+    fn unbounded(
+        writer: &'a mut FttsqStreamingWriter<W>,
+        section: impl Into<String>,
+        expected_rows: usize,
+    ) -> Self {
+        Self {
             writer,
             section: section.into(),
             expected_rows,
             next_row: 0,
             value_bytes: Vec::new(),
             scale_bytes: Vec::with_capacity(expected_rows * std::mem::size_of::<f32>()),
-        })
+        }
     }
 
     /// Appends the scale tail after all Q8 values have been streamed.
@@ -688,6 +759,72 @@ pub fn stream_matrix_q8_section<W: std::io::Write + std::io::Seek>(
         })
 }
 
+/// Converts one safetensors matrix into a grouped-Q8 `.fttsq` section (one scale per
+/// [`Q8_GROUP_WIDTH`]-element group of every row).
+///
+/// Payload layout is byte-identical to the per-row form — groups of a row are contiguous, rows
+/// follow each other — so a reader walks the same row-major i8 bytes and only the scale lookup
+/// changes. Each group runs through the same [`quantize_output_channel_q8`] primitive the
+/// per-row path uses (a group is a row of width [`Q8_GROUP_WIDTH`] to the primitive), keeping
+/// offline artifact bytes and runtime quantization numerically identical by construction.
+///
+/// # Errors
+///
+/// Returns a precise source-shape, quantization, bounded-scale-tail, or artifact-write failure;
+/// a row width not divisible by [`Q8_GROUP_WIDTH`] is refused before any byte is written.
+pub fn stream_matrix_q8_group64_section<W: std::io::Write + std::io::Seek>(
+    matrix: &TensorView<'_>,
+    writer: &mut FttsqStreamingWriter<W>,
+    section: &str,
+) -> Result<(), MatrixQuantizationError<Q8SectionSinkError>> {
+    let shape = matrix.shape();
+    if shape.len() < 2 {
+        return Err(MatrixQuantizationError::ExpectedMatrix { rank: shape.len() });
+    }
+    let Some(&row_count) = shape.first() else {
+        return Err(MatrixQuantizationError::ExpectedMatrix { rank: 0 });
+    };
+    let row_width = matrix.row_len();
+    if row_width == 0 || !row_width.is_multiple_of(Q8_GROUP_WIDTH) {
+        return Err(MatrixQuantizationError::EmptyOutputChannel {
+            shape: shape.to_vec(),
+        });
+    }
+    if row_width > MAX_Q8_OUTPUT_CHANNEL_WIDTH {
+        return Err(MatrixQuantizationError::OutputChannelTooWide {
+            width: row_width,
+            limit: MAX_Q8_OUTPUT_CHANNEL_WIDTH,
+        });
+    }
+    let groups_per_row = row_width / Q8_GROUP_WIDTH;
+    let total_groups = row_count.checked_mul(groups_per_row).ok_or(
+        MatrixQuantizationError::OutputChannelTooWide {
+            width: row_width,
+            limit: MAX_Q8_OUTPUT_CHANNEL_WIDTH,
+        },
+    )?;
+    let mut sink = Q8SectionSink::new_grouped(writer, section, total_groups)
+        .map_err(|source| MatrixQuantizationError::Sink { row: 0, source })?;
+
+    let mut source_row = vec![0.0_f32; row_width];
+    let mut quantized_group = [0_i8; Q8_GROUP_WIDTH];
+    for row in 0..row_count {
+        if !matrix.copy_row_f32(row, &mut source_row) {
+            return Err(MatrixQuantizationError::SourceRowUnavailable { row });
+        }
+        for (group_index, group) in source_row.chunks_exact(Q8_GROUP_WIDTH).enumerate() {
+            let scale = quantize_output_channel_q8(group, &mut quantized_group)
+                .map_err(|source| MatrixQuantizationError::Quantization { row, source })?;
+            sink.write_q8_row(row * groups_per_row + group_index, scale, &quantized_group)
+                .map_err(|source| MatrixQuantizationError::Sink { row, source })?;
+        }
+    }
+    sink.finish().map_err(|source| MatrixQuantizationError::Sink {
+        row: row_count,
+        source,
+    })
+}
+
 /// Converts a manifest-validated safetensors checkpoint into a portable `.fttsq` stream.
 ///
 /// The source is borrowed so a caller may provide a memory map rather than a copied checkpoint.
@@ -746,6 +883,10 @@ pub fn convert_safetensors_streaming<W: std::io::Write + std::io::Seek>(
                 stream_matrix_q8_section(&matrix_or_values, &mut writer, section)
                     .map_err(StreamingConversionError::Quantization)?;
             }
+            TensorStoragePolicy::Q8PerGroup64 => {
+                stream_matrix_q8_group64_section(&matrix_or_values, &mut writer, section)
+                    .map_err(StreamingConversionError::Quantization)?;
+            }
         }
     }
 
@@ -783,7 +924,10 @@ fn build_artifact_plan(
                 name: tensor.artifact_name.clone(),
             });
         }
-        if tensor.storage == TensorStoragePolicy::Q8PerOutputChannel {
+        if matches!(
+            tensor.storage,
+            TensorStoragePolicy::Q8PerOutputChannel | TensorStoragePolicy::Q8PerGroup64
+        ) {
             let entry = index.entry(&tensor.source_name).ok_or_else(|| {
                 ConversionPlanError::SourceTensorMissing {
                     name: tensor.source_name.clone(),
@@ -827,6 +971,23 @@ fn build_artifact_plan(
                     rows,
                     limit: MAX_Q8_OUTPUT_CHANNELS,
                 });
+            }
+            if tensor.storage == TensorStoragePolicy::Q8PerGroup64 {
+                // The grouped stream refuses this too, but the plan is reviewed before a
+                // multi-gigabyte conversion opens an output file — refuse it here first.
+                if !row_width.is_multiple_of(Q8_GROUP_WIDTH) {
+                    return Err(ConversionPlanError::Q8EmptyOutputChannel {
+                        name: tensor.source_name.clone(),
+                    });
+                }
+                let groups = rows * (row_width / Q8_GROUP_WIDTH);
+                if groups > MAX_Q8_GROUP_SCALES {
+                    return Err(ConversionPlanError::Q8OutputChannelCountTooLarge {
+                        name: tensor.source_name.clone(),
+                        rows: groups,
+                        limit: MAX_Q8_GROUP_SCALES,
+                    });
+                }
             }
             let scales_name = tensor.scales_name();
             if !seen_artifacts.insert(scales_name.clone()) {
@@ -887,22 +1048,56 @@ fn build_artifact_plan(
                     }
                 })?;
             }
-            TensorStoragePolicy::Q8PerOutputChannel => {
+            TensorStoragePolicy::Q8PerOutputChannel | TensorStoragePolicy::Q8PerGroup64 => {
                 let rows = entry.shape.first().copied().ok_or_else(|| {
                     ConversionPlanError::Q8RequiresMatrix {
                         name: tensor.source_name.clone(),
                         rank: entry.shape.len(),
                     }
                 })?;
+                // Per-row storage keeps one scale per output channel; grouped storage keeps one
+                // per Q8_GROUP_WIDTH-element group. The payload bytes are identical either way;
+                // only the scale tensor's element count and declared shape differ.
+                let (scale_count, scales_shape) =
+                    if tensor.storage == TensorStoragePolicy::Q8PerGroup64 {
+                        let row_width = entry
+                            .element_count()
+                            .checked_div(rows)
+                            .filter(|width| width.is_multiple_of(Q8_GROUP_WIDTH))
+                            .ok_or_else(|| ConversionPlanError::Q8EmptyOutputChannel {
+                                name: tensor.source_name.clone(),
+                            })?;
+                        let groups_per_row = row_width / Q8_GROUP_WIDTH;
+                        let rows_u64 = u64::try_from(rows).map_err(|_| {
+                            ConversionPlanError::ShapeOutOfRange {
+                                name: tensor.source_name.clone(),
+                            }
+                        })?;
+                        let groups_u64 = u64::try_from(groups_per_row).map_err(|_| {
+                            ConversionPlanError::ShapeOutOfRange {
+                                name: tensor.source_name.clone(),
+                            }
+                        })?;
+                        (rows * groups_per_row, vec![rows_u64, groups_u64])
+                    } else {
+                        (
+                            rows,
+                            vec![u64::try_from(rows).map_err(|_| {
+                                ConversionPlanError::ShapeOutOfRange {
+                                    name: tensor.source_name.clone(),
+                                }
+                            })?],
+                        )
+                    };
                 let values_len = u64::try_from(entry.element_count()).map_err(|_| {
                     ConversionPlanError::SectionLengthOverflow {
                         name: tensor.source_name.clone(),
                     }
                 })?;
-                let scales_len = u64::try_from(rows)
+                let scales_len = u64::try_from(scale_count)
                     .ok()
-                    .and_then(|rows| {
-                        rows.checked_mul(u64::try_from(std::mem::size_of::<f32>()).ok()?)
+                    .and_then(|count| {
+                        count.checked_mul(u64::try_from(std::mem::size_of::<f32>()).ok()?)
                     })
                     .ok_or_else(|| ConversionPlanError::SectionLengthOverflow {
                         name: tensor.source_name.clone(),
@@ -927,11 +1122,7 @@ fn build_artifact_plan(
                         name: scales_name,
                         section: section.to_owned(),
                         dtype: StoredDtype::F32,
-                        shape: vec![u64::try_from(rows).map_err(|_| {
-                            ConversionPlanError::ShapeOutOfRange {
-                                name: tensor.source_name.clone(),
-                            }
-                        })?],
+                        shape: scales_shape,
                         offset: running.checked_add(values_len).ok_or_else(|| {
                             ConversionPlanError::SectionLengthOverflow {
                                 name: tensor.source_name.clone(),
