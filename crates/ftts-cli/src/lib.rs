@@ -3773,6 +3773,7 @@ mod tests {
             // before any destination is created.
             source: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
             output: PathBuf::from("never-created.fttsq"),
+            embed_q8: false,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
