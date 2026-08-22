@@ -459,6 +459,15 @@ struct ConvertArgs {
     /// stay on bf16 artifacts for now: the playground's provided-rows path is bf16-only.
     #[arg(long)]
     embed_q8: bool,
+
+    /// EXPERIMENTAL: store the microdecoder's per-depth residual embedding tables and
+    /// scoring heads (~126 MB of bf16 across thirty tensors) as per-row Q8 instead,
+    /// roughly halving that block. The loader dequantizes both forms; bf16 stays the
+    /// default until the artifact-v2 gates pass (per-depth teacher-forced logit KL/top-k
+    /// plus the equivalence-bound listening protocol — frankentts-x7bt, following the
+    /// --embed-q8 precedent of frankentts-6ea1/NE-008).
+    #[arg(long)]
+    micro_q8: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -905,8 +914,8 @@ fn run_convert_events(
     start.insert("model".to_owned(), Value::Null);
     start.insert("voice".to_owned(), Value::Null);
     emit(&Value::Object(start))?;
-
     let mut seq = 0_u64;
+
     emit_stage(run, emit, "source_preflight", "begin", &mut seq)?;
     let source = resolve_pinned_main_source(&args.source)?;
     let mapping = MappedFile::open(&source).map_err(|error| {
@@ -915,7 +924,7 @@ fn run_convert_events(
             source.display()
         ))
     })?;
-    let (manifest, plan) = pinned_main_conversion_plan(args.embed_q8)?;
+    let (manifest, plan) = pinned_main_conversion_plan(args.embed_q8, args.micro_q8)?;
     let staging = conversion_staging_path(&args.output)?;
     emit_stage(run, emit, "source_preflight", "end", &mut seq)?;
 
@@ -1026,19 +1035,14 @@ fn conversion_staging_path(output: &Path) -> Result<PathBuf, FttsError> {
         ".{file_name}.fttsq-converting-{}-{nonce}",
         std::process::id()
     ));
-    if staging.exists() {
-        return Err(FttsError::Input(format!(
-            "conversion staging path already exists {}; inspect or move it before retrying",
-            staging.display()
-        )));
-    }
     Ok(staging)
 }
 
 fn pinned_main_conversion_plan(
     embed_q8: bool,
+    micro_q8: bool,
 ) -> Result<(WeightsManifest, StreamingConversionPlan), FttsError> {
-    let specs = pinned_main_tensor_specs(embed_q8)?;
+    let specs = pinned_main_tensor_specs(embed_q8, micro_q8)?;
     let manifest = WeightsManifest::from_expectations(
         "Qwen/Qwen3-TTS-12Hz-0.6B-Base main checkpoint",
         specs
@@ -1070,17 +1074,19 @@ fn pinned_main_conversion_plan(
         "q8_recipe": "symmetric per-output-channel int8; zero_point=0; scale=max_abs(row)/127",
         "q8_tensor_count": q8_count,
         "verbatim_tensor_count": specs.len() - q8_count,
-        "q8_scope": if embed_q8 {
-            "talker and residual-code-microdecoder attention/MLP projection matrices, plus the cold text embedding (per-64-element-group scales; --embed-q8)"
-        } else {
-            "talker and residual-code-microdecoder attention/MLP projection matrices only"
+        "q8_scope": match (embed_q8, micro_q8) {
+            (true, true) => "talker and residual-code-microdecoder attention/MLP projection matrices, plus the cold text embedding (per-64-element-group scales; --embed-q8) and the microdecoder per-depth embedding/head tables (--micro-q8)",
+            (true, false) => "talker and residual-code-microdecoder attention/MLP projection matrices, plus the cold text embedding (per-64-element-group scales; --embed-q8)",
+            (false, true) => "talker and residual-code-microdecoder attention/MLP projection matrices, plus the microdecoder per-depth embedding/head tables (--micro-q8)",
+            (false, false) => "talker and residual-code-microdecoder attention/MLP projection matrices only",
         },
-        "verbatim_scope": if embed_q8 {
-            "norms, heads, non-text embeddings, speaker path, and every tensor outside the reviewed Q8 set"
+        "verbatim_scope": if embed_q8 || micro_q8 {
+            "norms, non-Q8 embeddings and heads, speaker path, and every tensor outside the reviewed Q8 set"
         } else {
             "norms, heads, embeddings, speaker path, and every tensor outside the reviewed Q8 projection set"
         },
         "embedding_q8": embed_q8,
+        "micro_tables_q8": micro_q8,
     }));
     for spec in specs {
         let conversion = match spec.storage {
@@ -1099,7 +1105,10 @@ fn pinned_main_conversion_plan(
     Ok((manifest, plan))
 }
 
-fn pinned_main_tensor_specs(embed_q8: bool) -> Result<Vec<PinnedMainTensor>, FttsError> {
+fn pinned_main_tensor_specs(
+    embed_q8: bool,
+    micro_q8: bool,
+) -> Result<Vec<PinnedMainTensor>, FttsError> {
     let inventory: Value = serde_json::from_str(PINNED_TENSOR_INVENTORY).map_err(|error| {
         FttsError::Generic(format!(
             "checked-in tensor inventory is invalid JSON: {error}"
@@ -1163,6 +1172,8 @@ fn pinned_main_tensor_specs(embed_q8: bool) -> Result<Vec<PinnedMainTensor>, Ftt
             TensorStoragePolicy::Q8PerOutputChannel
         } else if embed_q8 && name == "talker.model.text_embedding.weight" {
             TensorStoragePolicy::Q8PerGroup64
+        } else if micro_q8 && is_micro_table(&name) {
+            TensorStoragePolicy::Q8PerOutputChannel
         } else {
             TensorStoragePolicy::Verbatim
         };
@@ -1205,6 +1216,18 @@ fn is_q8_projection(name: &str) -> bool {
         ]
         .iter()
         .any(|suffix| name.ends_with(suffix))
+}
+
+/// The microdecoder's per-depth residual embedding tables and scoring heads: the ~126 MB
+/// bf16 block the census flagged as the second-largest wide surface after the cold text
+/// embedding (frankentts-o461). Fifteen `[2048, 1024]` tables each side; `--micro-q8`
+/// stores them per-row Q8, which halves them and which [`crate::synth`] consumes
+/// natively — heads feed the int8 refine path's coarse pass directly, and the embedding
+/// gather dequantizes one row at a time (bead frankentts-x7bt).
+fn is_micro_table(name: &str) -> bool {
+    (name.starts_with("talker.code_predictor.model.codec_embedding.")
+        || name.starts_with("talker.code_predictor.lm_head."))
+        && name.ends_with(".weight")
 }
 
 fn main_access_class(name: &str) -> Result<AccessClass, FttsError> {
@@ -4025,8 +4048,8 @@ mod tests {
 
     #[test]
     fn embed_q8_flag_flips_exactly_the_text_embedding_and_says_so_in_the_manifest() {
-        let default_specs = pinned_main_tensor_specs(false).expect("inventory parses");
-        let armed_specs = pinned_main_tensor_specs(true).expect("inventory parses");
+        let default_specs = pinned_main_tensor_specs(false, false).expect("inventory parses");
+        let armed_specs = pinned_main_tensor_specs(true, false).expect("inventory parses");
         assert_eq!(default_specs.len(), armed_specs.len());
         for (default, armed) in default_specs.iter().zip(&armed_specs) {
             assert_eq!(default.name, armed.name);
@@ -4044,10 +4067,42 @@ mod tests {
     }
 
     #[test]
+    fn micro_q8_flag_flips_exactly_the_microdecoder_tables_and_says_so_in_the_manifest() {
+        let default_specs = pinned_main_tensor_specs(false, false).expect("inventory parses");
+        let armed_specs = pinned_main_tensor_specs(false, true).expect("inventory parses");
+        assert_eq!(default_specs.len(), armed_specs.len());
+        let mut flipped = 0;
+        for (default, armed) in default_specs.iter().zip(&armed_specs) {
+            assert_eq!(default.name, armed.name);
+            if is_micro_table(&default.name) {
+                assert_eq!(default.storage, TensorStoragePolicy::Verbatim);
+                assert_eq!(
+                    armed.storage,
+                    TensorStoragePolicy::Q8PerOutputChannel,
+                    "--micro-q8 must quantize every microdecoder table ({})",
+                    armed.name
+                );
+                flipped += 1;
+            } else {
+                assert_eq!(
+                    default.storage, armed.storage,
+                    "--micro-q8 must touch no tensor outside the microdecoder tables ({})",
+                    default.name
+                );
+            }
+        }
+        assert_eq!(
+            flipped, 30,
+            "15 residual embedding tables plus 15 scoring heads"
+        );
+    }
+
+    #[test]
     fn pinned_main_conversion_plan_preserves_the_reviewed_q8_boundary() {
-        let specs = pinned_main_tensor_specs(false).expect("checked-in main inventory parses");
-        let (_manifest, _plan) =
-            pinned_main_conversion_plan(false).expect("checked-in main conversion plan builds");
+        let specs =
+            pinned_main_tensor_specs(false, false).expect("checked-in main inventory parses");
+        let (_manifest, _plan) = pinned_main_conversion_plan(false, false)
+            .expect("checked-in main conversion plan builds");
         assert_eq!(specs.len(), PINNED_MAIN_TENSOR_COUNT);
         assert_eq!(
             specs
@@ -4202,6 +4257,7 @@ mod tests {
             source: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
             output: PathBuf::from("never-created.fttsq"),
             embed_q8: false,
+            micro_q8: false,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
