@@ -1070,22 +1070,28 @@ impl TalkerCheckpoint {
     ) -> Result<Self, CheckpointError> {
         let path = label;
         let source = TextEmbeddingSource::Fttsq(Arc::clone(&artifact));
-        let elide = {
+        let q8_present = {
             let artifact = Arc::clone(&artifact);
-            let q8_present = move |name: &str| {
+            move |name: &str| {
                 artifact
                     .reader()
                     .tensor(name)
                     .is_some_and(|entry| entry.dtype == StoredDtype::Q8 && entry.scales.is_some())
-            };
+            }
+        };
+        // Heads are all-or-nothing across the fifteen depths, and this ONE verdict must
+        // gate BOTH the elide closure and the post-load Q8 read below: gating the read on
+        // the flag alone made a bf16-heads artifact (the currently shipped one) fail every
+        // load with "q8 head vanished" — the closure had correctly refused to elide, and
+        // the read then demanded Q8 bytes that were never there.
+        let heads_all_q8 = elision.micro_heads
+            && (0..RESIDUAL_DEPTHS)
+                .all(|head| q8_present(&format!("talker.code_predictor.lm_head.{head}.weight")));
+        let elide = {
+            let q8_present = q8_present.clone();
             move |name: &str| {
-                // Heads are all-or-nothing across the fifteen depths: a mixed artifact
-                // would leave some scoring depths without either form, so the set elides
-                // only when every head is verifiably Q8 in the artifact.
-                if elision.micro_heads && name.starts_with("talker.code_predictor.lm_head.") {
-                    return (0..RESIDUAL_DEPTHS).all(|head| {
-                        q8_present(&format!("talker.code_predictor.lm_head.{head}.weight"))
-                    });
+                if name.starts_with("talker.code_predictor.lm_head.") {
+                    return heads_all_q8;
                 }
                 let stack_elided = if name.starts_with("talker.code_predictor.model.layers.") {
                     elision.micro
@@ -1129,8 +1135,8 @@ impl TalkerCheckpoint {
                 })
             },
         )?;
-        if elision.micro_heads {
-            // The elide closure only fires when all fifteen heads are verifiably Q8, so
+        if heads_all_q8 {
+            // The shared verdict above guarantees all fifteen heads are verifiably Q8, so
             // these reads cannot miss; a failure here is an artifact that changed under
             // us, not a mixed form, and it fails the load rather than degrading.
             let heads_q8 = (0..RESIDUAL_DEPTHS)
