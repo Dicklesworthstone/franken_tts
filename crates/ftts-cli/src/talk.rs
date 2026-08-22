@@ -93,7 +93,9 @@ struct ActiveUtterance {
     /// Target-token count admitted so far (initial text + accepted appends), for the
     /// truncation receipt.
     target_tokens: u64,
-    /// The wrapped target ids fed so far, for decoding the spoken prefix on cancel.
+    /// The RAW target ids (pre-wrapper) fed so far: what the listener can actually
+    /// hear, and what the spoken-prefix decode must draw from — the assistant wrapper
+    /// is prompt scaffolding, never speech.
     target_ids: Vec<u32>,
     /// Whether the text stream was finished (continue:false, flush, or EOF rule).
     text_finished: bool,
@@ -539,10 +541,10 @@ fn route(
     while let Ok(message) = inbox.recv() {
         match message {
             RouterIn::StdinClosed => {
-                // EOF == shutdown: cancel anything in flight, then end.
-                if let Some(active) = active.take() {
-                    active.cancellation.cancel();
-                    wait_for_done(inbox, &active.context, active.utterance);
+                // EOF == shutdown: cancel anything in flight, EMIT ITS RECEIPT, then end.
+                if let Some(state) = active.take() {
+                    state.cancellation.cancel();
+                    settle_utterance(sid, loaded, &state, inbox, events, ledger, next_seq)?;
                 }
                 break;
             }
@@ -551,10 +553,11 @@ fn route(
                 utterance,
                 outcome,
             } => {
+                let state = active.take();
                 let receipt = finish_utterance(
                     sid,
                     loaded,
-                    &mut active,
+                    state.as_ref(),
                     &context,
                     utterance,
                     outcome,
@@ -621,9 +624,9 @@ fn route(
                 match op.as_str() {
                     "shutdown" => {
                         emit(events, ack(next_seq()), false)?;
-                        if let Some(active) = active.take() {
-                            active.cancellation.cancel();
-                            wait_for_done(inbox, &active.context, active.utterance);
+                        if let Some(state) = active.take() {
+                            state.cancellation.cancel();
+                            settle_utterance(sid, loaded, &state, inbox, events, ledger, next_seq)?;
                         }
                         break;
                     }
@@ -844,7 +847,7 @@ fn route(
                                         ))
                                     })?;
                                 let cancellation = CancellationToken::new();
-                                let target_ids = wrapped_target_ids(loaded, &head_owned)?;
+                                let (target_ids, _) = chunk_target_ids(loaded, &head_owned)?;
                                 let mut utterance = ActiveUtterance {
                                     context: context_name.clone(),
                                     utterance: utterance_index,
@@ -907,13 +910,16 @@ fn route(
     Ok(())
 }
 
-/// Tokenize + wrap one text chunk exactly as synthesis does.
-fn wrapped_target_ids(loaded: &LoadedModel, text: &str) -> Result<Vec<u32>, FttsError> {
+/// Tokenize one chunk exactly as synthesis does, returning `(raw ids, wrapped ids)` —
+/// wrapped for the engine, raw for the truncation receipt (the wrapper is scaffolding).
+fn chunk_target_ids(loaded: &LoadedModel, text: &str) -> Result<(Vec<u32>, Vec<u32>), FttsError> {
     let prepared = loaded
         .shared_tokenizer()
         .prepare(text, &ftts_core::NormalizationOptions::default())
         .map_err(|error| FttsError::Input(format!("text preparation failed: {error}")))?;
-    Ok(ftts_model_qwen::checkpoint::TalkerCheckpoint::wrap_target_ids(&prepared.token_ids))
+    let wrapped =
+        ftts_model_qwen::checkpoint::TalkerCheckpoint::wrap_target_ids(&prepared.token_ids);
+    Ok((prepared.token_ids, wrapped))
 }
 
 /// Send one already-hygienic chunk into the active utterance's feed.
@@ -922,9 +928,9 @@ fn send_append(
     utterance: &mut ActiveUtterance,
     chunk: &str,
 ) -> Result<(), FttsError> {
-    let wrapped = wrapped_target_ids(loaded, chunk)?;
-    utterance.target_tokens += wrapped.len() as u64;
-    utterance.target_ids.extend_from_slice(&wrapped);
+    let (raw, wrapped) = chunk_target_ids(loaded, chunk)?;
+    utterance.target_tokens += raw.len() as u64;
+    utterance.target_ids.extend_from_slice(&raw);
     let prepared = ftts_core::PreparedText::new(
         wrapped,
         ftts_core::NormalizationTrace {
@@ -946,14 +952,13 @@ fn send_append(
 fn finish_utterance(
     sid: &str,
     loaded: &LoadedModel,
-    active: &mut Option<ActiveUtterance>,
+    state: Option<&ActiveUtterance>,
     context: &str,
     utterance: u64,
     outcome: UtteranceOutcome,
     ledger: &DeliveryLedger,
     next_seq: &dyn Fn() -> u64,
 ) -> serde_json::Map<String, Value> {
-    let state = active.take();
     match outcome {
         UtteranceOutcome::Complete {
             frames,
@@ -985,7 +990,6 @@ fn finish_utterance(
             object.insert("frames_delivered".to_owned(), json!(frames_delivered));
             object.insert("audio_ms".to_owned(), json!(frames_delivered * 80));
             let (spoken_tokens, spoken_text) = state
-                .as_ref()
                 .map(|active| spoken_prefix(loaded, active, frames_delivered))
                 .unwrap_or((0, String::new()));
             object.insert("text_spoken_tokens".to_owned(), json!(spoken_tokens));
@@ -1028,18 +1032,38 @@ fn spoken_prefix(
     (tokens, text)
 }
 
-/// Wait for the synthesis thread's Done for a specific utterance, discarding others.
-fn wait_for_done(inbox: &Receiver<RouterIn>, context: &str, utterance: u64) {
+/// Wait out a cancelled utterance during shutdown and emit its terminal receipt — the
+/// orchestrator's transcript truncation depends on it even when the session is ending.
+fn settle_utterance(
+    sid: &str,
+    loaded: &LoadedModel,
+    state: &ActiveUtterance,
+    inbox: &Receiver<RouterIn>,
+    events: &SyncSender<String>,
+    ledger: &DeliveryLedger,
+    next_seq: &dyn Fn() -> u64,
+) -> Result<(), FttsError> {
     while let Ok(message) = inbox.recv() {
         if let RouterIn::Done {
-            context: done_context,
-            utterance: done_utterance,
-            ..
+            context,
+            utterance,
+            outcome,
         } = message
-            && done_context == context
-            && done_utterance == utterance
+            && context == state.context
+            && utterance == state.utterance
         {
-            return;
+            let receipt = finish_utterance(
+                sid,
+                loaded,
+                Some(state),
+                &context,
+                utterance,
+                outcome,
+                ledger,
+                next_seq,
+            );
+            return emit(events, receipt, false);
         }
     }
+    Ok(())
 }

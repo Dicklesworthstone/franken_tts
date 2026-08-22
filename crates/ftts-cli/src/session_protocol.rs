@@ -394,14 +394,18 @@ pub const SESSION_EVENTS: &[EventSpec] = &[
                 name: "text_spoken_tokens",
                 ty: "u64",
                 required: true,
-                summary: "tokens whose text is inside the delivered audio",
+                summary: "UPPER BOUND: target tokens the model had consumed by the delivered \
+                          frames. Consumption (one token per frame INTO the model) runs ahead \
+                          of speech, so the audio may end mid-way through this prefix",
             },
             FieldSpec {
                 name: "spoken_text",
                 ty: "string",
                 required: true,
-                summary: "tokenizer-decoded prefix actually delivered, so the orchestrator can \
-                          rewrite its turn to what the user heard",
+                summary: "tokenizer-decoded CONSUMED prefix — a safe upper bound on what was \
+                          heard, never less. Exact audio<->text alignment is not claimed; an \
+                          orchestrator rewriting its turn chooses between possible repetition \
+                          (trim harder) and possible phantom context (keep the bound)",
             },
         ],
     },
