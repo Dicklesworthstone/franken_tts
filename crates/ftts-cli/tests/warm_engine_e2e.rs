@@ -106,7 +106,9 @@ fn synthesize_utterance(
 
 fn same_samples(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len()
-        && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 #[test]
