@@ -850,10 +850,12 @@ fn run_talk_command(
             },
         )
     };
+    let settings = EffectiveSettings::resolve(cli, environment)?;
     talk::run_talk(
         &bundle,
         args.pcm_out.as_ref(),
         &voices,
+        settings.normalization_options(),
         cli.seed.unwrap_or(0),
     )
 }

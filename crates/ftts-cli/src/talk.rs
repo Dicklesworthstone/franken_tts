@@ -64,14 +64,21 @@ const PCM_QUEUE_PACKETS: usize = 32;
 /// Event-line queue to the stdout owner.
 const EVENT_QUEUE_LINES: usize = 256;
 
-/// One decoded packet on its way to the audio channel.
-struct PcmJob {
-    context: String,
-    utterance: u64,
-    samples: Vec<f32>,
-    frames: usize,
-    /// Set on the first packet of an utterance: milliseconds from synthesis start.
-    ttfa_ms: Option<u64>,
+/// Work for the PCM writer: decoded packets, or a drain fence.
+enum PcmJob {
+    /// One decoded packet on its way to the audio channel.
+    Audio {
+        context: String,
+        utterance: u64,
+        samples: Vec<f32>,
+        frames: usize,
+        /// Set on the first packet of an utterance: milliseconds from synthesis start.
+        ttfa_ms: Option<u64>,
+    },
+    /// A drain barrier: acknowledged only after every prior packet is written and
+    /// accounted. The synthesis thread fences before reporting an utterance done, so
+    /// the router's receipt (frames_delivered et al.) can never race the last write.
+    Fence(SyncSender<()>),
 }
 
 /// Everything the router tracks per open context.
@@ -128,6 +135,7 @@ struct SpeakJob {
     context: String,
     utterance: u64,
     text: String,
+    normalization: ftts_core::NormalizationOptions,
     effective_seed: u64,
     speaker: Vec<f32>,
     feed_rx: ftts_core::BoundedReceiver<TextControl>,
@@ -152,7 +160,7 @@ impl PcmPacketSink for QueueSink {
             Some(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX))
         };
         self.queue
-            .send(PcmJob {
+            .send(PcmJob::Audio {
                 context: self.context.clone(),
                 utterance: self.utterance,
                 samples: samples.to_vec(),
@@ -257,7 +265,11 @@ fn open_audio_channel(pcm_out: Option<&PathBuf>) -> Result<AudioChannel, FttsErr
 /// for the next chunk (or a flush). `continue:false` sends everything.
 fn split_tail(text: &str) -> (&str, &str) {
     match text.rfind(char::is_whitespace) {
-        Some(at) => text.split_at(at + text[at..].chars().next().map_or(1, char::len_utf8)),
+        // The whitespace goes WITH the tail: BPE attaches a space to the FOLLOWING
+        // word ("Ġword"), so a head ending in space would tokenize the next chunk's
+        // first word bare and diverge from the whole-text stream — the exact seam the
+        // chunked==whole gate exists to catch (and did, live).
+        Some(at) => text.split_at(at),
         None => ("", text),
     }
 }
@@ -271,6 +283,7 @@ pub fn run_talk(
     bundle: &synth::ModelBundle,
     pcm_out: Option<&PathBuf>,
     voices: &(dyn Fn(&str) -> Result<Vec<f32>, FttsError> + Sync),
+    normalization: ftts_core::NormalizationOptions,
     default_context_seed: u64,
 ) -> Result<(), FttsError> {
     let stdin = std::io::stdin();
@@ -308,8 +321,12 @@ pub fn run_talk(
         });
 
         // --- stdin reader ---------------------------------------------------------
+        // DETACHED, not scope-joined: a client that sends `shutdown` while keeping
+        // stdin open would otherwise pin the scope (and the process) on a blocked
+        // read_line forever. The reader owns the process Stdin ('static), its sends
+        // fail harmlessly once the router is gone, and process exit reaps it.
         let stdin_tx = router_tx.clone();
-        let reader = scope.spawn(move || {
+        std::thread::spawn(move || {
             let mut stdin = stdin.lock();
             let mut line = String::new();
             loop {
@@ -337,8 +354,21 @@ pub fn run_talk(
         let pcm_writer = scope.spawn(move || -> Result<(), FttsError> {
             let mut frame_index_in_utterance: HashMap<(String, u64), u64> = HashMap::new();
             while let Ok(job) = pcm_rx.recv() {
-                let mut bytes = Vec::with_capacity(job.samples.len() * 2);
-                for sample in &job.samples {
+                let PcmJob::Audio {
+                    context,
+                    utterance,
+                    samples,
+                    frames,
+                    ttfa_ms,
+                } = job
+                else {
+                    if let PcmJob::Fence(ack) = job {
+                        let _ = ack.send(());
+                    }
+                    continue;
+                };
+                let mut bytes = Vec::with_capacity(samples.len() * 2);
+                for sample in &samples {
                     bytes
                         .extend_from_slice(&ftts_core::audio::sample_to_i16(*sample).to_le_bytes());
                 }
@@ -353,21 +383,21 @@ pub fn run_talk(
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 ledger_ref
                     .utterance_frames
-                    .fetch_add(job.frames as u64, Ordering::Relaxed);
-                let key = (job.context.clone(), job.utterance);
+                    .fetch_add(frames as u64, Ordering::Relaxed);
+                let key = (context.clone(), utterance);
                 let frame_index = frame_index_in_utterance.entry(key).or_insert(0);
                 let mut event =
                     SessionEvent::Audio.object(&sid_pcm, seq_ref.fetch_add(1, Ordering::Relaxed));
-                event.insert("context".to_owned(), json!(job.context));
-                event.insert("utterance".to_owned(), json!(job.utterance));
+                event.insert("context".to_owned(), json!(context));
+                event.insert("utterance".to_owned(), json!(utterance));
                 event.insert("byte_offset".to_owned(), json!(offset_before));
                 event.insert("bytes".to_owned(), json!(bytes.len() as u64));
-                event.insert("frames".to_owned(), json!(job.frames as u64));
+                event.insert("frames".to_owned(), json!(frames as u64));
                 event.insert("frame_index".to_owned(), json!(*frame_index));
-                if let Some(ttfa_ms) = job.ttfa_ms {
+                if let Some(ttfa_ms) = ttfa_ms {
                     event.insert("ttfa_ms".to_owned(), json!(ttfa_ms));
                 }
-                *frame_index += job.frames as u64;
+                *frame_index += frames as u64;
                 emit(&pcm_events, event, false)?;
             }
             Ok(())
@@ -414,14 +444,15 @@ pub fn run_talk(
                     let mut object = SessionEvent::TextUnderrun
                         .object(&observer_sid, seq_ref.fetch_add(1, Ordering::Relaxed));
                     object.insert("context".to_owned(), json!(observer_context));
-                    object.insert("utterance".to_owned(), json!(observer_utterance));
+                    let _ = observer_utterance; // the frozen shape carries context only
                     object.insert(
                         "waited_ms".to_owned(),
                         json!(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX)),
                     );
                     let _ = emit(&events, object, true);
                 };
-                let request = SynthesisRequest::new(job.text.clone());
+                let request = SynthesisRequest::new(job.text.clone())
+                    .with_normalization_options(job.normalization.clone());
                 let result = synth::synthesize(
                     loaded_ref,
                     engine_ref,
@@ -434,6 +465,12 @@ pub fn run_talk(
                     Some(&job.feed_rx),
                     Some(&mut sink),
                 );
+                // Drain fence: every packet this utterance queued is written and
+                // accounted before the router hears Done — receipts never race audio.
+                let (fence_tx, fence_rx) = sync_channel::<()>(1);
+                if pcm_tx_synth.send(PcmJob::Fence(fence_tx)).is_ok() {
+                    let _ = fence_rx.recv();
+                }
                 let outcome = match result {
                     Ok(done) => UtteranceOutcome::Complete {
                         frames: done.frames,
@@ -468,6 +505,7 @@ pub fn run_talk(
             &bundle.root.display().to_string(),
             &engine,
             &loaded,
+            &normalization,
             voices,
             default_context_seed,
             &router_rx,
@@ -485,9 +523,6 @@ pub fn run_talk(
         pcm_writer.join().expect("pcm writer")?;
         drop(event_tx);
         writer.join().expect("stdout owner")?;
-        // The reader may be blocked on stdin; it exits on EOF. Do not join it if stdin
-        // is still open — the process is ending anyway once the router returned.
-        drop(reader);
         result
     })
 }
@@ -499,6 +534,7 @@ fn route(
     model_label: &str,
     _engine: &TtsEngine,
     loaded: &LoadedModel,
+    normalization: &ftts_core::NormalizationOptions,
     voices: &dyn Fn(&str) -> Result<Vec<f32>, FttsError>,
     default_context_seed: u64,
     inbox: &Receiver<RouterIn>,
@@ -726,7 +762,7 @@ fn route(
                         (Some(utterance), Some(state)) if utterance.context == context_name => {
                             let tail = std::mem::take(&mut state.tail);
                             if !tail.is_empty() {
-                                send_append(loaded, utterance, &tail)?;
+                                send_append(loaded, normalization, utterance, &tail)?;
                             }
                             utterance
                                 .feed
@@ -800,7 +836,7 @@ fn route(
                                     (combined.as_str(), "")
                                 };
                                 if !head.is_empty() {
-                                    send_append(loaded, utterance, head)?;
+                                    send_append(loaded, normalization, utterance, head)?;
                                 }
                                 state.tail = tail.to_owned();
                                 if !keep_open {
@@ -863,7 +899,8 @@ fn route(
                                         ))
                                     })?;
                                 let cancellation = CancellationToken::new();
-                                let (target_ids, _) = chunk_target_ids(loaded, &head_owned)?;
+                                let (target_ids, _) =
+                                    chunk_target_ids(loaded, &head_owned, normalization)?;
                                 let mut utterance = ActiveUtterance {
                                     context: context_name.clone(),
                                     utterance: utterance_index,
@@ -889,6 +926,7 @@ fn route(
                                     context: context_name.clone(),
                                     utterance: utterance_index,
                                     text: head_owned,
+                                    normalization: normalization.clone(),
                                     effective_seed,
                                     speaker: state.speaker.clone(),
                                     feed_rx,
@@ -930,10 +968,14 @@ fn route(
 
 /// Tokenize one chunk exactly as synthesis does, returning `(raw ids, wrapped ids)` —
 /// wrapped for the engine, raw for the truncation receipt (the wrapper is scaffolding).
-fn chunk_target_ids(loaded: &LoadedModel, text: &str) -> Result<(Vec<u32>, Vec<u32>), FttsError> {
+fn chunk_target_ids(
+    loaded: &LoadedModel,
+    text: &str,
+    normalization: &ftts_core::NormalizationOptions,
+) -> Result<(Vec<u32>, Vec<u32>), FttsError> {
     let prepared = loaded
         .shared_tokenizer()
-        .prepare(text, &ftts_core::NormalizationOptions::default())
+        .prepare(text, normalization)
         .map_err(|error| FttsError::Input(format!("text preparation failed: {error}")))?;
     let wrapped =
         ftts_model_qwen::checkpoint::TalkerCheckpoint::wrap_target_ids(&prepared.token_ids);
@@ -943,10 +985,11 @@ fn chunk_target_ids(loaded: &LoadedModel, text: &str) -> Result<(Vec<u32>, Vec<u
 /// Send one already-hygienic chunk into the active utterance's feed.
 fn send_append(
     loaded: &LoadedModel,
+    normalization: &ftts_core::NormalizationOptions,
     utterance: &mut ActiveUtterance,
     chunk: &str,
 ) -> Result<(), FttsError> {
-    let (raw, wrapped) = chunk_target_ids(loaded, chunk)?;
+    let (raw, wrapped) = chunk_target_ids(loaded, chunk, normalization)?;
     utterance.target_tokens += raw.len() as u64;
     utterance.target_ids.extend_from_slice(&raw);
     let prepared = ftts_core::PreparedText::new(

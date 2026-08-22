@@ -253,6 +253,10 @@ fn a_session_utterance_matches_one_shot_say_bit_for_bit() {
             "--no-resident",
             "--profile",
             "interactive",
+            // Pin the voice: bare `say` prefers an enrolled default.spk when the host
+            // has one, and this gate must compare renditions, not speakers.
+            "--voice",
+            "matt",
             "--seed",
         ])
         .arg(seed.to_string())
