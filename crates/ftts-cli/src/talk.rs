@@ -609,21 +609,25 @@ fn route(
                     .unwrap_or_default()
                     .to_owned();
 
-                let ack = |seq: u64| {
-                    let mut object = SessionEvent::Ack.object(sid, seq);
-                    if let Some(id) = &id {
-                        object.insert("id".to_owned(), json!(id));
-                    }
+                // The ack is the id-echo mechanism and `ack.id` is REQUIRED by the frozen
+                // schema: an op without a client id gets no ack (its effects are its
+                // acknowledgement). `maybe_ack` returns None in that case.
+                let maybe_ack = |seq: &dyn Fn() -> u64| -> Option<serde_json::Map<String, Value>> {
+                    let id = id.as_ref()?;
+                    let mut object = SessionEvent::Ack.object(sid, seq());
+                    object.insert("id".to_owned(), json!(id));
                     object.insert("op".to_owned(), json!(op));
                     if !context_name.is_empty() {
                         object.insert("context".to_owned(), json!(context_name));
                     }
-                    object
+                    Some(object)
                 };
 
                 match op.as_str() {
                     "shutdown" => {
-                        emit(events, ack(next_seq()), false)?;
+                        if let Some(ack) = maybe_ack(&next_seq) {
+                            emit(events, ack, false)?;
+                        }
                         if let Some(state) = active.take() {
                             state.cancellation.cancel();
                             settle_utterance(sid, loaded, &state, inbox, events, ledger, next_seq)?;
@@ -651,7 +655,9 @@ fn route(
                                         tail: String::new(),
                                     },
                                 );
-                                emit(events, ack(next_seq()), false)?;
+                                if let Some(ack) = maybe_ack(&next_seq) {
+                                    emit(events, ack, false)?;
+                                }
                                 let mut object = SessionEvent::ContextOpen.object(sid, next_seq());
                                 object.insert("context".to_owned(), json!(context_name));
                                 object.insert("voice".to_owned(), json!(voice));
@@ -688,7 +694,9 @@ fn route(
                             continue;
                         }
                         contexts.remove(&context_name);
-                        emit(events, ack(next_seq()), false)?;
+                        if let Some(ack) = maybe_ack(&next_seq) {
+                            emit(events, ack, false)?;
+                        }
                         let mut object = SessionEvent::ContextClosed.object(sid, next_seq());
                         object.insert("context".to_owned(), json!(context_name));
                         emit(events, object, false)?;
@@ -697,7 +705,9 @@ fn route(
                         match &active {
                             Some(utterance) if utterance.context == context_name => {
                                 utterance.cancellation.cancel();
-                                emit(events, ack(next_seq()), false)?;
+                                if let Some(ack) = maybe_ack(&next_seq) {
+                                    emit(events, ack, false)?;
+                                }
                                 // The receipt follows via Done{Cancelled}.
                             }
                             _ => emit(
@@ -727,7 +737,9 @@ fn route(
                                     ))
                                 })?;
                             utterance.text_finished = true;
-                            emit(events, ack(next_seq()), false)?;
+                            if let Some(ack) = maybe_ack(&next_seq) {
+                                emit(events, ack, false)?;
+                            }
                         }
                         _ => emit(
                             events,
@@ -802,7 +814,9 @@ fn route(
                                         })?;
                                     utterance.text_finished = true;
                                 }
-                                emit(events, ack(next_seq()), false)?;
+                                if let Some(ack) = maybe_ack(&next_seq) {
+                                    emit(events, ack, false)?;
+                                }
                             }
                             Some(other) => {
                                 emit(
@@ -830,7 +844,9 @@ fn route(
                                 if head_owned.trim().is_empty() {
                                     // Nothing speakable yet: hold everything.
                                     state.tail = combined;
-                                    emit(events, ack(next_seq()), false)?;
+                                    if let Some(ack) = maybe_ack(&next_seq) {
+                                        emit(events, ack, false)?;
+                                    }
                                     continue;
                                 }
                                 state.tail = tail;
@@ -884,7 +900,9 @@ fn route(
                                     )
                                 })?;
                                 active = Some(utterance);
-                                emit(events, ack(next_seq()), false)?;
+                                if let Some(ack) = maybe_ack(&next_seq) {
+                                    emit(events, ack, false)?;
+                                }
                             }
                         }
                     }
