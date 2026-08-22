@@ -646,7 +646,9 @@ fn resident_client_cancel_discards_and_the_daemon_survives() {
     // discarded reply therefore delivered zero packets to stdout.
     let events = parse_and_validate(&stdout_path, "resident cancel events");
     assert!(
-        !events.iter().any(|event| event_name(event) == "audio_chunk"),
+        !events
+            .iter()
+            .any(|event| event_name(event) == "audio_chunk"),
         "a discarded resident run must not emit audio_chunk events"
     );
     let terminal = terminal_event(
