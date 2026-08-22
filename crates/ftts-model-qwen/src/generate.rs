@@ -1186,7 +1186,9 @@ mod tests {
             microdecoder_weights: MicrodecoderWeights {
                 layers: micro_layers,
                 talker_codec_embedding: &weights.talker_codec_embedding,
-                residual_embeddings: micro_residual,
+                residual_embeddings: crate::microdecoder::ResidualEmbeddings::Widened(
+                    micro_residual,
+                ),
                 heads: micro_heads,
                 final_norm: &weights.norm,
             },
@@ -1700,6 +1702,148 @@ mod tests {
         );
     }
 
+    /// Shared driver for the parity gates: run a continuation with a scripted feed
+    /// (`chunks[0]` starts the utterance; later chunks are appended on demand whenever
+    /// the generator stalls), and assert its frames equal the whole-text run of the
+    /// concatenation. Every stall point is exercised by construction when chunks are
+    /// single tokens: each boundary waits in AwaitingText until fed.
+    fn assert_drip_feed_matches_whole(chunks: &[&[u32]], label: &str) {
+        let weights = TinyWeights::new(1.0);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+
+        let whole_ids: Vec<u32> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        let mut whole = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback.clone(),
+            7,
+            SamplingMode::CanonicalGreedy,
+        );
+        whole
+            .begin_utterance(&prepared(&whole_ids), UtteranceStart::Fresh)
+            .expect("whole-text begin");
+        let mut whole_frames = Vec::new();
+        for _ in 0..64 {
+            match whole.next_frame().expect("whole frame") {
+                FrameStep::Frame(frame) => whole_frames.push(frame),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("{label}: whole-text run stalled"),
+            }
+        }
+
+        let mut drip = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback,
+            7,
+            SamplingMode::CanonicalGreedy,
+        );
+        drip.begin_utterance(&prepared(chunks[0]), UtteranceStart::Continuation)
+            .expect("continuation begin");
+        let mut pending = chunks[1..].iter();
+        let mut finished_text = false;
+        let mut drip_frames = Vec::new();
+        let mut stalls = 0_usize;
+        for _ in 0..512 {
+            match drip.next_frame().expect("drip frame") {
+                FrameStep::Frame(frame) => drip_frames.push(frame),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => {
+                    stalls += 1;
+                    match pending.next() {
+                        Some(chunk) => drip.append_text(&prepared(chunk)).expect("append"),
+                        None => {
+                            assert!(!finished_text, "{label}: stalled after finish_text");
+                            drip.finish_text().expect("finish");
+                            finished_text = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            drip_frames, whole_frames,
+            "{label}: drip-fed codes diverged from whole-text codes (stalls={stalls})"
+        );
+        // The stall-coverage claim holds only when the model consumed the whole feed:
+        // an early EOS (legal for these synthetic weights) ends the run before later
+        // boundaries exist, so requiring a stall per boundary there would be false.
+        if finished_text {
+            assert!(
+                stalls >= chunks.len().saturating_sub(1),
+                "{label}: expected a stall per boundary, saw {stalls}"
+            );
+        }
+    }
+
+    /// Gate: a stall at EVERY consecutive frame boundary (single-token drip) changes
+    /// nothing — the strongest form of the stall metamorphic (bead frankentts-hsio).
+    #[test]
+    fn single_token_drip_feed_stalling_at_every_boundary_matches_whole_text() {
+        assert_drip_feed_matches_whole(&[&[1], &[2], &[3], &[0]], "every-boundary drip");
+    }
+
+    /// Gate: EOS-equivalence timings (bead frankentts-hsio). finish_text before the
+    /// first frame, and finish_text delivered from inside a stall, both reproduce the
+    /// whole-text run exactly; mid-generation finish is covered by
+    /// `chunked_appends_match_whole_text_bit_for_bit`.
+    #[test]
+    fn finish_text_timing_is_equivalence_preserving() {
+        // (a) Finish before the first frame == Fresh run of the same text.
+        assert_drip_feed_matches_whole(&[&[1]], "finish-before-first-frame");
+        // (c) Finish from inside a stall: the driver above always finishes from a stall
+        // when the feed runs dry, so a two-chunk case exercises append-then-stall-then-
+        // finish; assert_drip_feed_matches_whole verified (a) with zero appends.
+        assert_drip_feed_matches_whole(&[&[1], &[2]], "finish-during-stall");
+    }
+
+    /// Gate: seeded boundary fuzz (bead frankentts-hsio) — random token sequences split
+    /// at random boundaries, every case must match its whole-text run bit for bit. LCG
+    /// seeding so any failure names a reproducible case in its label.
+    #[test]
+    fn random_chunk_boundaries_always_match_the_whole_text_run() {
+        let mut state: u64 = 0x00C0_FFEE_D00D_5EED;
+        let mut next = move |bound: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        for case in 0..24 {
+            let token_count = 2 + next(6) as usize; // 2..=7 tokens
+            // The synthetic table gathers exactly ids 0..=3 (see `gathered` above).
+            let ids: Vec<u32> = (0..token_count).map(|_| next(4) as u32).collect();
+            // Random split points: each boundary independently starts a new chunk.
+            let mut chunks: Vec<Vec<u32>> = vec![vec![ids[0]]];
+            for &id in &ids[1..] {
+                if next(2) == 0 {
+                    chunks.push(Vec::new());
+                }
+                chunks.last_mut().expect("nonempty").push(id);
+            }
+            let chunk_slices: Vec<&[u32]> = chunks.iter().map(Vec::as_slice).collect();
+            assert_drip_feed_matches_whole(&chunk_slices, &format!("fuzz case {case} ids={ids:?}"));
+        }
+    }
+
     /// THE exactness gate: chunk-fed synthesis is bit-identical to whole-text synthesis when
     /// the token stream is identical and each append lands before the frame that would consume
     /// it. Positions, KV, and every code must agree — appending text changes the trailing-row
@@ -1908,7 +2052,9 @@ mod tests {
             microdecoder_weights: MicrodecoderWeights {
                 layers: &micro_layers,
                 talker_codec_embedding: &weights.talker_codec_embedding,
-                residual_embeddings: &micro_residual,
+                residual_embeddings: crate::microdecoder::ResidualEmbeddings::Widened(
+                    &micro_residual,
+                ),
                 heads: &micro_heads,
                 final_norm: &weights.norm,
             },

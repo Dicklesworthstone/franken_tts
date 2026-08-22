@@ -947,8 +947,8 @@ pub struct MicroQuantRoute<'a> {
 /// path, never under a reference pin).
 const HEAD_REFINE_CANDIDATES: usize = 96;
 
-/// Scores one residual head via the int8 kernel, then rebuilds an exact-f32 logit row for the
-/// top candidates.
+/// Scores one residual head via the int8 kernel, then rebuilds an exact-f32 logit row for
+/// the top candidates.
 ///
 /// The skill's "int8 head + top-K refine" structural lever: the 2,048-way head matvec is the
 /// microdecoder's second-largest per-step cost after the body, and the sampler only ever looks
@@ -956,9 +956,16 @@ const HEAD_REFINE_CANDIDATES: usize = 96;
 /// [`HEAD_REFINE_CANDIDATES`] logits are then recomputed with the reference's own per-row
 /// scalar dot, so every value the sampler can select is bit-identical to the full-f32 row.
 /// Unrefined positions are `-inf` and unpickable.
+///
+/// `head_f32` is the widened refine source. `None` means artifact-native Q8 hydration left
+/// no widened head resident: the refine source is then the stored Q8 row itself,
+/// dequantized on demand — exactly the f32 matvec of the *stored* weights, so the refined
+/// row stays self-consistent with the coarse pass, which scores those same bytes. It is
+/// NOT bit-identical to a bf16-verbatim artifact's rows; that difference belongs to the
+/// artifact recipe, not to this function.
 fn score_head_refined(
     head_q8: &QuantizedMatrix,
-    head_f32: &[f32],
+    head_f32: Option<&[f32]>,
     normed: &[f32],
     mode: QuantLinearMode,
     logits: &mut [f32],
@@ -973,11 +980,13 @@ fn score_head_refined(
         vocab,
         "refined head must cover the full vocabulary"
     );
-    assert_eq!(
-        head_f32.len(),
-        vocab * hidden,
-        "refined f32 head must be [vocab, hidden]"
-    );
+    if let Some(head) = head_f32 {
+        assert_eq!(
+            head.len(),
+            vocab * hidden,
+            "refined f32 head must be [vocab, hidden]"
+        );
+    }
     assert_eq!(
         head_q8.k, hidden,
         "refined q8 head reduction width mismatch"
@@ -1003,9 +1012,21 @@ fn score_head_refined(
 
     logits.fill(f32::NEG_INFINITY);
     for &token in &candidates {
-        // The reference matvec's per-row arithmetic: one left-to-right scalar dot. The refined
-        // value is therefore exactly the full-f32 row's value at this token.
-        let row = &head_f32[token * hidden..(token + 1) * hidden];
+        // The reference matvec's per-row arithmetic: one left-to-right scalar dot. Against a
+        // widened head the refined value is exactly that head's row value; against a
+        // Q8-native head it is exactly the dequantized stored row's value — self-consistent
+        // with the coarse pass either way.
+        let dequantized;
+        let row: &[f32] = match head_f32 {
+            Some(head) => &head[token * hidden..(token + 1) * hidden],
+            None => {
+                dequantized = head_q8.data[token * hidden..(token + 1) * hidden]
+                    .iter()
+                    .map(|&value| value as f32 * head_q8.scales[token])
+                    .collect::<Vec<f32>>();
+                &dequantized
+            }
+        };
         let mut sum = 0.0_f32;
         for index in 0..hidden {
             sum += row[index] * normed[index];
@@ -1030,6 +1051,67 @@ pub fn argmax(logits: &[f32]) -> usize {
     }
     best
 }
+/// The microdecoder's per-depth residual embedding tables (positions 2..=15).
+///
+/// The widened arm is the reference form: plain f32 rows. The quantized arm stores each
+/// `[RESIDUAL_VOCAB, hidden]` table as per-row symmetric Q8 with one f32 scale per row —
+/// the exact [`QuantizedMatrix`] layout the converter's `Q8PerOutputChannel` policy
+/// writes — and dequantizes a row only when a step gathers it: fifteen 1,024-wide row
+/// reads per frame against ~31 MB of widened tables held for a whole run (bead
+/// frankentts-x7bt; kill-switch `FTTS_ARTIFACT_Q8=0` restores widening at hydration).
+#[derive(Clone, Copy, Debug)]
+pub enum ResidualEmbeddings<'a> {
+    /// Widened f32 rows, one table per depth.
+    Widened(&'a [&'a [f32]]),
+    /// Per-row Q8 tables, one per depth, dequantized on gather.
+    Quantized(&'a [QuantizedMatrix]),
+}
+
+impl ResidualEmbeddings<'_> {
+    /// The number of per-depth tables.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Widened(tables) => tables.len(),
+            Self::Quantized(tables) => tables.len(),
+        }
+    }
+
+    /// Whether there are no tables at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Gathers one embedding row: a copy for widened tables, a scale-multiply dequantize
+    /// for quantized ones. The dequantized value is exactly what the converter's canonical
+    /// recipe would widen the stored byte to.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `token` is outside the table or the row width disagrees with `hidden`.
+    #[must_use]
+    pub fn row(&self, table: usize, token: usize, hidden: usize) -> Vec<f32> {
+        match self {
+            Self::Widened(tables) => embedding_row(tables[table], token, hidden),
+            Self::Quantized(tables) => {
+                let matrix = &tables[table];
+                assert_eq!(matrix.k, hidden, "embedding row width mismatch");
+                let start = token * hidden;
+                assert!(
+                    start + hidden <= matrix.data.len(),
+                    "token {token} is outside a [{}, {hidden}] embedding table",
+                    matrix.n
+                );
+                let scale = matrix.scales[token];
+                matrix.data[start..start + hidden]
+                    .iter()
+                    .map(|&value| value as f32 * scale)
+                    .collect()
+            }
+        }
+    }
+}
 
 /// Everything the 15-step loop needs, borrowed for one frame.
 #[derive(Clone, Copy, Debug)]
@@ -1039,7 +1121,7 @@ pub struct MicrodecoderWeights<'a> {
     /// The **talker's** codec embedding, `[TALKER_CODEC_VOCAB, hidden]`. Position 1 only.
     pub talker_codec_embedding: &'a [f32],
     /// Per-depth embeddings, 14 tables of `[RESIDUAL_VOCAB, hidden]`, for positions 2..=15.
-    pub residual_embeddings: &'a [&'a [f32]],
+    pub residual_embeddings: ResidualEmbeddings<'a>,
     /// Per-depth heads, 15 tables of `[RESIDUAL_VOCAB, hidden]`.
     pub heads: &'a [&'a [f32]],
     /// Final RMSNorm weight applied before each head, `[hidden]`.
@@ -1533,8 +1615,8 @@ fn frame_input_block(
             PositionRole::ResidualEmbedding { table, .. } => table,
             role => panic!("position {position} must use a residual embedding, got {role:?}"),
         };
-        hidden.extend_from_slice(&embedding_row(
-            weights.residual_embeddings[table],
+        hidden.extend_from_slice(&weights.residual_embeddings.row(
+            table,
             drafted_codes[position - 2],
             config.hidden_size,
         ));
@@ -1565,7 +1647,13 @@ fn score_frame_heads(
         let mut row = vec![0.0_f32; RESIDUAL_VOCAB];
         match quant_heads {
             Some((heads, mode)) => {
-                score_head_refined(&heads[head], weights.heads[head], &normed, mode, &mut row);
+                score_head_refined(
+                    &heads[head],
+                    Some(weights.heads[head]),
+                    &normed,
+                    mode,
+                    &mut row,
+                );
             }
             None => matvec(weights.heads[head], &normed, &mut row),
         }
@@ -1737,11 +1825,11 @@ fn decode_frame_with_selector_inner(
                     config.hidden_size,
                 )
             }
-            PositionRole::ResidualEmbedding { table, .. } => embedding_row(
-                weights.residual_embeddings[table],
-                previous_code,
-                config.hidden_size,
-            ),
+            PositionRole::ResidualEmbedding { table, .. } => {
+                weights
+                    .residual_embeddings
+                    .row(table, previous_code, config.hidden_size)
+            }
         };
 
         for (index, layer) in weights.layers.iter().enumerate() {
@@ -1783,7 +1871,7 @@ fn decode_frame_with_selector_inner(
         match quant.and_then(|route| route.heads.map(|heads| (heads, route.mode))) {
             Some((heads, mode)) => score_head_refined(
                 &heads[head],
-                weights.heads[head],
+                Some(weights.heads[head]),
                 &normed,
                 mode,
                 &mut logits,
@@ -1857,19 +1945,18 @@ mod tests {
 
         for position in 0..FRAME_POSITIONS {
             let role = position_role(position);
-            let mut hidden = match role {
-                PositionRole::Conditioning => talker_hidden.to_vec(),
-                PositionRole::PrimaryCodeEmbedding { .. } => embedding_row(
-                    weights.talker_codec_embedding,
-                    primary_code,
-                    config.hidden_size,
-                ),
-                PositionRole::ResidualEmbedding { table, .. } => embedding_row(
-                    weights.residual_embeddings[table],
-                    drafted_codes[position - 2],
-                    config.hidden_size,
-                ),
-            };
+            let mut hidden =
+                match role {
+                    PositionRole::Conditioning => talker_hidden.to_vec(),
+                    PositionRole::PrimaryCodeEmbedding { .. } => embedding_row(
+                        weights.talker_codec_embedding,
+                        primary_code,
+                        config.hidden_size,
+                    ),
+                    PositionRole::ResidualEmbedding { table, .. } => weights
+                        .residual_embeddings
+                        .row(table, drafted_codes[position - 2], config.hidden_size),
+                };
 
             for (index, layer) in weights.layers.iter().enumerate() {
                 hidden = layer_step(
@@ -2576,7 +2663,7 @@ mod tests {
         let weights = MicrodecoderWeights {
             layers: &borrowed,
             talker_codec_embedding: &talker_codec,
-            residual_embeddings: &residual_refs,
+            residual_embeddings: ResidualEmbeddings::Widened(&residual_refs),
             heads: &head_refs,
             final_norm: &final_norm,
         };
@@ -2681,7 +2768,7 @@ mod tests {
         let weights = MicrodecoderWeights {
             layers: &borrowed,
             talker_codec_embedding: &talker_codec,
-            residual_embeddings: &residual_refs,
+            residual_embeddings: ResidualEmbeddings::Widened(&residual_refs),
             heads: &head_refs,
             final_norm: &final_norm,
         };
@@ -2761,7 +2848,7 @@ mod tests {
             let mut refined = vec![0.0_f32; vocab];
             score_head_refined(
                 &head_q8,
-                &head,
+                Some(&head),
                 &normed,
                 ftts_kernels::int8::QuantLinearMode::W8A8(
                     ftts_kernels::int8::KernelPlanV0::pinned(ftts_kernels::int8::Int8Tier::Scalar),
@@ -2920,7 +3007,7 @@ mod tests {
             MicrodecoderWeights {
                 layers,
                 talker_codec_embedding: &self.talker_codec_embedding,
-                residual_embeddings: embeddings,
+                residual_embeddings: ResidualEmbeddings::Widened(embeddings),
                 heads,
                 final_norm: &self.final_norm,
             }
