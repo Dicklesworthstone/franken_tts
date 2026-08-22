@@ -21,7 +21,10 @@ license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/franken_tts"
 
 [workspace.dependencies]
-asupersync = { path = "../asupersync", version = "0.4.0", default-features = false }
+# Pinned to crates.io (latest published), NOT the sibling checkout: the sibling's main
+# is mid-development and its transient states (deny-lint failures, API churn) were
+# breaking every downstream cold build. Owner directive 2026-08-22. Bump deliberately.
+asupersync = { version = "0.4.9", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
