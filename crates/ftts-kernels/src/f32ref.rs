@@ -267,6 +267,26 @@ pub fn linear_with_accumulation(
         crate::packed_gemm::linear_packed(x, weight, bias, m, k, n, out);
         return;
     }
+    // A single-row call — the interactive profile's per-frame codec GEMV, which is most of the
+    // browser's remaining frame budget — takes the same team route when one is armed. The exact-
+    // ness argument is identical to the batch arm above: column stripes never split a reduction,
+    // and packed's m = 1 shapes are pinned bit-equal to this very scalar dot by
+    // `packed_matches_scalar_bit_for_bit`. NE-004 does not cover this lever: it measured
+    // single-thread register blocking on the int8 GEMV as neutral, whereas this is worker
+    // parallelism on the f32 path — a different kernel on a different axis. Without an armed
+    // team the scalar dot below stays, exactly as before. The floor is computed over n * k
+    // because single-row work scales with depth, not with rows; the old m * n form could never
+    // admit one row at any real geometry.
+    if m == 1 && packed_preserves_order {
+        const GEMV_FLOOR: usize = 64 * 1024;
+        if n * k >= GEMV_FLOOR
+            && !crate::team::thread_bypassed()
+            && let Some(team) = crate::team::armed()
+        {
+            team.linear_f32(x, weight, bias, m, k, n, out);
+            return;
+        }
+    }
 
     for row in 0..m {
         let x_row = &x[row * k..row * k + k];
@@ -1622,5 +1642,60 @@ mod tests {
             };
             assert_eq!(*value, expected, "lane {lane}");
         }
+    }
+    #[test]
+    fn single_row_codec_gemv_matches_the_bypassed_scalar_bits_through_the_team() {
+        // The interactive profile's per-frame codec call: m = 1 at the binding worst-case
+        // im2col reduction (block_00, kernel 7 x 1024 -> 1536, so k = 7168). With the native
+        // team self-armed this must dispatch across workers; bypassed, it must fall through to
+        // the scalar dot. Both routes write the same bits — that is the whole claim of the new
+        // arm in `linear_with_accumulation`.
+        let (m, k, n) = (1usize, 7168usize, 1536usize);
+        assert!(
+            n * k >= 64 * 1024,
+            "the shape must clear the GEMV dispatch floor or the test pins nothing"
+        );
+        let mut state = 0x51ED_5EED_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f32 / 8_388_608.0 * 2.0 - 1.0
+        };
+        let x: Vec<f32> = (0..m * k).map(|_| next()).collect();
+        let weight: Vec<f32> = (0..n * k).map(|_| next()).collect();
+        let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+
+        let mut via_team = vec![0.0f32; m * n];
+        linear_with_accumulation(
+            &x,
+            &weight,
+            Some(&bias),
+            m,
+            k,
+            n,
+            F32LinearAccumulation::AccelerateBiasSeededRowInvariant,
+            &mut via_team,
+        );
+
+        let mut bypassed = vec![0.0f32; m * n];
+        crate::team::with_team_bypassed(|| {
+            linear_with_accumulation(
+                &x,
+                &weight,
+                Some(&bias),
+                m,
+                k,
+                n,
+                F32LinearAccumulation::AccelerateBiasSeededRowInvariant,
+                &mut bypassed,
+            );
+        });
+
+        assert_eq!(
+            via_team.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            bypassed.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the team-routed GEMV diverged from the bypassed scalar dot"
+        );
     }
 }

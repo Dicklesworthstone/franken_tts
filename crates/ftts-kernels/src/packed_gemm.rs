@@ -333,10 +333,19 @@ mod tests {
     #[test]
     fn every_partition_count_reproduces_the_serial_bits() {
         let shapes = [
+            // Batch-regime codec geometry (the original four).
             (32, 7168, 1536),
             (72, 512, 512),
             (48, 512, 1024),
             (17, 96, 40),
+            // Single-row GEMV at real codec geometry — the interactive profile's per-frame
+            // calls this team route now serves: a transformer projection, the binding
+            // worst-case im2col reduction (block_00, kernel 7 x 1024 -> 1536), an upsample
+            // pointwise pair, and one below-the-GEMV-floor shape that must stay exact too.
+            (1, 512, 1024),
+            (1, 7168, 1536),
+            (1, 1024, 4096),
+            (1, 8, 3),
         ];
         for (index, &(m, k, n)) in shapes.iter().enumerate() {
             let x = deterministic(m * k, 0x9E11_0000 + index as u64);
