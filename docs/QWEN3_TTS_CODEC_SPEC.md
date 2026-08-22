@@ -245,6 +245,16 @@ Two things follow, and both need a decision before the codec streaming contract 
 - The proportional cut is only equal to `ref_len * 1920` when `wav_len == total_len * 1920` exactly.
   Whether the chunked path can make it inexact (off-by-a-few-samples boundary offset) is
   **[OPEN]** — filed as a follow-up rather than guessed. Tracked in §8.
+- **Derived for THIS implementation (2026-08-22, frankentts-5yl recon):** our decoder is strictly
+  causal and emits exactly 1,920 samples per frame with full-context streaming state (§6), so after
+  decoding `total_len` frames the waveform length IS `total_len * 1920` — no chunk tail, no
+  partial-frame overshoot. Substituting into the official rule:
+  `cut = round(ref_len / total_len * total_len * 1920) = ref_len * 1920`, exactly. The [OPEN]
+  off-by-a-few-samples concern therefore cannot arise on this decoder: streaming ICL may simply
+  drop the first `ref_len * 1920` samples of the prefixed decode and remain identical to the
+  reference's proportional rule. This argument covers only OUR causal full-retention path; the
+  upstream CHUNKED path keeps its own [OPEN] status above.
+
 
 ---
 
