@@ -340,9 +340,8 @@ fn file_mode_sigint_leaves_a_valid_partial_wav_and_exits_promptly() {
     let stderr_path = dir.join("noise.txt");
     let mut child = spawn_to_files(
         &[
-            "--no-resident",
-            "--robot",
             "say",
+            "--no-resident",
             "--seed",
             "7",
             LONG_TEXT,
@@ -408,9 +407,8 @@ fn prefill_phase_sigint_pins_the_zero_sample_artifact() {
     let stderr_path = dir.join("noise.txt");
     let mut child = spawn_to_files(
         &[
-            "--no-resident",
-            "--robot",
             "say",
+            "--no-resident",
             LONG_TEXT,
             out.to_str().expect("utf8 out"),
         ],
@@ -460,14 +458,7 @@ fn raw_mode_sigint_stops_at_a_packet_boundary_with_exact_accounting() {
     let pcm_path = dir.join("stream.pcm");
     let events_path = dir.join("events.ndjson");
     let mut child = spawn_to_files(
-        &[
-            "--no-resident",
-            "--robot",
-            "--stream",
-            "raw",
-            "say",
-            LONG_TEXT,
-        ],
+        &["say", "--no-resident", "--stream", "raw", LONG_TEXT],
         &[],
         &pcm_path,
         &events_path,
@@ -533,9 +524,8 @@ fn compressed_target_cancel_skips_the_encoder_and_keeps_the_staging_wav() {
     let stderr_path = dir.join("noise.txt");
     let mut child = spawn_to_files(
         &[
-            "--no-resident",
-            "--robot",
             "say",
+            "--no-resident",
             LONG_TEXT,
             out.to_str().expect("utf8 out"),
         ],
@@ -615,12 +605,7 @@ fn resident_client_cancel_discards_and_the_daemon_survives() {
     let stdout_path = dir.join("b-events.ndjson");
     let stderr_path = dir.join("b-noise.txt");
     let mut child = spawn_to_files(
-        &[
-            "--robot",
-            "say",
-            LONG_TEXT,
-            long_out.to_str().expect("utf8"),
-        ],
+        &["say", LONG_TEXT, long_out.to_str().expect("utf8")],
         &resident_env,
         &stdout_path,
         &stderr_path,
