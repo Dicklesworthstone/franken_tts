@@ -1870,6 +1870,10 @@ impl FrameGenerator for TeeGenerator<'_> {
 /// Map an engine refusal onto the CLI's exit-code contract.
 fn engine_error(error: EngineError) -> FttsError {
     match error {
+        // A cooperative cancellation is not a generic failure: the CLI exit-code
+        // contract (and the battery's library-level assertions) need the documented
+        // class, not a stringly-typed Generic.
+        EngineError::Cancelled => FttsError::Cancelled("synthesis cancelled".to_owned()),
         EngineError::BudgetExceeded(_) => FttsError::BudgetTimeout(error.to_string()),
         EngineError::ResourceAdmission(_) => FttsError::BudgetTimeout(error.to_string()),
         EngineError::TextPreparation(_) => FttsError::Input(error.to_string()),

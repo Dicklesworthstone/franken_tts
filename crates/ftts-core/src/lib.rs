@@ -2111,6 +2111,89 @@ mod tests {
         worker.join().expect("watchdog worker does not panic");
     }
 
+    /// Cancellation-storm variant of the watchdog (bead frankentts-9t5v): many
+    /// consecutive utterances on ONE engine, each cancelled at a deterministic
+    /// pseudo-random frame boundary. The tripwire for any new channel topology: a
+    /// cancel that leaks a slot, wedges a bounded send, or loses the admission guard
+    /// hangs this within a few utterances. LCG "randomness" so failures reproduce.
+    #[test]
+    fn cancel_storm_across_many_utterances_without_deadlock() {
+        struct CancelPartway {
+            remaining: usize,
+            token: CancellationToken,
+        }
+        impl FrameGenerator for CancelPartway {
+            fn begin_utterance(
+                &mut self,
+                _prepared: &PreparedText,
+                _mode: UtteranceStart,
+            ) -> Result<(), GenerationError> {
+                Ok(())
+            }
+
+            fn append_text(&mut self, _prepared: &PreparedText) -> Result<(), GenerationError> {
+                Ok(())
+            }
+
+            fn finish_text(&mut self) -> Result<(), GenerationError> {
+                Ok(())
+            }
+
+            fn next_frame(&mut self) -> Result<FrameStep, GenerationError> {
+                if self.remaining == 0 {
+                    self.token.cancel();
+                    return Ok(FrameStep::Finished);
+                }
+                self.remaining -= 1;
+                Ok(FrameStep::Frame(CodeFrame { codes: vec![0; 16] }))
+            }
+        }
+
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let engine = engine_with_budget(Duration::from_secs(1));
+            let observer = RecordingObserver::default();
+            let mut state = 0x2545_F491_4F6C_DD1D_u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 33) as usize
+            };
+            for _ in 0..64 {
+                let token = CancellationToken::new();
+                let frames = 1 + next() % 8;
+                let cancel_after = next() % (frames + 1);
+                let outcome = engine.synthesize(
+                    SynthesisRequest::new("storm"),
+                    &TestTextPreparer,
+                    &mut CancelPartway {
+                        remaining: cancel_after,
+                        token: token.clone(),
+                    },
+                    &token,
+                    &observer,
+                    None,
+                );
+                // Both exits are clean: the generator ran out (Ok) or the token
+                // tripped mid-loop (Cancelled). Anything else — hang, other error —
+                // fails the watchdog below or panics here.
+                assert!(
+                    outcome.is_ok() || matches!(&outcome, Err(EngineError::Cancelled)),
+                    "unexpected storm outcome: {outcome:?}"
+                );
+            }
+            done_sender
+                .send(())
+                .expect("watchdog completion receiver lives");
+        });
+
+        done_receiver
+            .recv_timeout(Duration::from_secs(8))
+            .expect("cancel-storm watchdog expired");
+        worker.join().expect("storm worker does not panic");
+    }
+
     // ------------------------------------------------------------------ continuation stalls
 
     /// A continuation-aware fake: emits one frame per "supplied" text unit, returns
