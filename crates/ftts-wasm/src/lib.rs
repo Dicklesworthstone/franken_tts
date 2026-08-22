@@ -1023,6 +1023,7 @@ impl WasmEngine {
                 talker_config: TalkerConfig::default(),
                 talker_weights: self.talker.talker_weights(&talker_layers),
                 text: self.talker.text_weights(&table),
+                cold_rows: None,
                 feedback: self.talker.feedback_tables(&residual),
                 microdecoder_config: MicrodecoderConfig::default(),
                 microdecoder_weights: self.talker.microdecoder_weights(

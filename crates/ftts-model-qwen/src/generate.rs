@@ -268,12 +268,35 @@ pub struct ReferencePrompt {
     pub codec: Vec<HiddenState>,
 }
 
+/// A source of cold text-embedding rows for token ids that were NOT part of the initial
+/// utterance gather — the continuation-append analog of the wasm playground's cold-row
+/// injection. The generator batch-gathers missing ids through this at `append_text`
+/// time, on the synthesis thread between frames (never inside the frame hot loop), and
+/// keeps them in a private overlay consulted when the compact primary table misses.
+/// Absent a source, an append reaching ungathered ids keeps today's fail-closed error.
+pub trait ColdTextRows {
+    /// Returns `(sorted ids, row-major rows at the text embed width)` covering `ids`.
+    ///
+    /// # Errors
+    ///
+    /// If any id cannot be produced; partial coverage is an error, not a silent gap.
+    fn gather_rows(&self, ids: &[u32]) -> Result<(Vec<u32>, Vec<f32>), GenerationError>;
+}
+
+impl std::fmt::Debug for dyn ColdTextRows + '_ {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ColdTextRows")
+    }
+}
+
 /// Everything a [`QwenGenerator`] borrows or owns for its lifetime.
-#[derive(Clone, Debug)]
 pub struct QwenGeneratorConfig<'a> {
     pub talker_config: TalkerConfig,
     pub talker_weights: TalkerWeights<'a>,
     pub text: TextEmbeddingWeights<'a>,
+    /// Cold-row source for continuation appends; `None` keeps appends restricted to the
+    /// initially gathered id set (fail-closed).
+    pub cold_rows: Option<&'a dyn ColdTextRows>,
     pub feedback: FeedbackTables<'a>,
     pub microdecoder_config: MicrodecoderConfig,
     pub microdecoder_weights: MicrodecoderWeights<'a>,
@@ -445,6 +468,12 @@ pub struct QwenGenerator<'a> {
     talker_config: TalkerConfig,
     talker_weights: TalkerWeights<'a>,
     text: TextEmbeddingWeights<'a>,
+    /// Cold-row source for continuation appends (see [`ColdTextRows`]).
+    cold_rows: Option<&'a dyn ColdTextRows>,
+    /// Overlay for rows gathered after construction: sorted ids and their row-major
+    /// embeddings at `text.embed_width`, consulted when the primary table misses.
+    overlay_ids: Vec<u32>,
+    overlay_rows: Vec<f32>,
     feedback: FeedbackTables<'a>,
     microdecoder_config: MicrodecoderConfig,
     microdecoder_weights: MicrodecoderWeights<'a>,
@@ -591,6 +620,9 @@ impl<'a> QwenGenerator<'a> {
             kv: TalkerKvCache::new(),
             frame_state,
             utterance: None,
+            cold_rows: config.cold_rows,
+            overlay_ids: Vec::new(),
+            overlay_rows: Vec::new(),
             int8,
         }
     }
@@ -602,18 +634,84 @@ impl<'a> QwenGenerator<'a> {
     }
 
     /// Embeds token ids through the cold table and projects them to talker width.
+    /// Makes every id in `ids` resolvable by [`Self::project_text_ids`], batch-gathering
+    /// the misses through the cold-row source into the overlay.
+    ///
+    /// Runs on the synthesis thread between frames (the `append_text` path), never in
+    /// the frame hot loop; the gather is one bounded read per missing id from the cold
+    /// table. Partial coverage from the source is an error — a silently missing row
+    /// would surface later as fluent wrong audio.
+    fn ensure_text_rows(&mut self, ids: &[u32]) -> Result<(), GenerationError> {
+        let mut missing: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.text.gathered.binary_search(id).is_err()
+                    && self.overlay_ids.binary_search(id).is_err()
+            })
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        let Some(source) = self.cold_rows else {
+            return Err(GenerationError::new(format!(
+                "append reaches {} text id(s) outside the gathered table (first: {}) and no \
+                 cold-row source is attached; construct the generator with `cold_rows` to \
+                 support continuation appends over the open vocabulary",
+                missing.len(),
+                missing[0]
+            )));
+        };
+        let (got_ids, rows) = source.gather_rows(&missing)?;
+        let width = self.text.embed_width;
+        if got_ids.len() * width != rows.len() {
+            return Err(GenerationError::new(format!(
+                "cold-row source returned {} rows worth of data for {} ids at width {width}",
+                rows.len() / width.max(1),
+                got_ids.len()
+            )));
+        }
+        for id in &missing {
+            if got_ids.binary_search(id).is_err() {
+                return Err(GenerationError::new(format!(
+                    "cold-row source did not cover text id {id}"
+                )));
+            }
+        }
+        for (slot, id) in got_ids.iter().enumerate() {
+            if let Err(at) = self.overlay_ids.binary_search(id) {
+                self.overlay_ids.insert(at, *id);
+                let row = &rows[slot * width..(slot + 1) * width];
+                self.overlay_rows
+                    .splice(at * width..at * width, row.iter().copied());
+            }
+        }
+        Ok(())
+    }
+
     fn project_text_ids(&self, ids: &[u32]) -> Result<Vec<HiddenState>, GenerationError> {
         let embed_width = self.text.embed_width;
         let mut embedded = Vec::with_capacity(ids.len() * embed_width);
         for &id in ids {
-            let Ok(slot) = self.text.gathered.binary_search(&id) else {
+            if let Ok(slot) = self.text.gathered.binary_search(&id) {
+                embedded.extend_from_slice(
+                    &self.text.table[slot * embed_width..(slot + 1) * embed_width],
+                );
+                continue;
+            }
+            // Rows gathered after construction (continuation appends) live in the overlay.
+            let Ok(slot) = self.overlay_ids.binary_search(&id) else {
                 return Err(GenerationError::new(format!(
                     "text token {id} was not gathered into the compact embedding table; the \
-                     utterance id set must cover every id the prompt can reach"
+                     utterance id set must cover every id the prompt can reach, or a cold-row \
+                     source must be attached for continuation appends"
                 )));
             };
-            embedded
-                .extend_from_slice(&self.text.table[slot * embed_width..(slot + 1) * embed_width]);
+            embedded.extend_from_slice(
+                &self.overlay_rows[slot * embed_width..(slot + 1) * embed_width],
+            );
         }
 
         let hidden = self.talker_config.hidden_size;
@@ -824,6 +922,7 @@ impl FrameGenerator for QwenGenerator<'_> {
         }
         let ids =
             prompt::extract_prompt_text_ids(&prepared.token_ids, None).map_err(generation_error)?;
+        self.ensure_text_rows(&ids.target)?;
         let rows = self.project_text_ids(&ids.target)?;
         // Appended rows join the trailing stream and are consumed at their index — position
         // numbering (`next_position`, the KV cache) is untouched by construction, which the
@@ -1178,6 +1277,7 @@ mod tests {
                 fc2_weight: &weights.text_fc2,
                 fc2_bias: &weights.text_fc2_bias,
             },
+            cold_rows: None,
             feedback: FeedbackTables {
                 talker_codec: &weights.talker_codec_embedding,
                 residual: residual_feedback,
@@ -1609,6 +1709,206 @@ mod tests {
             7,
             SamplingMode::CanonicalGreedy,
         )
+    }
+
+    /// A fixed synthetic cold-row source over `(ids, rows)` pairs at embed width 4.
+    struct FixedColdRows {
+        ids: Vec<u32>,
+        rows: Vec<f32>,
+    }
+
+    impl ColdTextRows for FixedColdRows {
+        fn gather_rows(&self, ids: &[u32]) -> Result<(Vec<u32>, Vec<f32>), GenerationError> {
+            let mut got_ids = Vec::new();
+            let mut rows = Vec::new();
+            for &id in ids {
+                let Ok(slot) = self.ids.binary_search(&id) else {
+                    return Err(GenerationError::new(format!("no cold row for id {id}")));
+                };
+                got_ids.push(id);
+                rows.extend_from_slice(&self.rows[slot * 4..(slot + 1) * 4]);
+            }
+            Ok((got_ids, rows))
+        }
+    }
+
+    /// `generator()` with a caller-supplied text table, gather set, and cold-row source —
+    /// the cold-row gate needs the two runs to differ ONLY in where id coverage comes from.
+    #[allow(clippy::too_many_arguments)] // test helper: explicit beats a params struct here
+    fn generator_with_text<'w>(
+        weights: &'w TinyWeights,
+        micro_layers: &'w [LayerWeights<'w>],
+        micro_residual: &'w [&'w [f32]],
+        micro_heads: &'w [&'w [f32]],
+        residual_feedback: Vec<&'w [f32]>,
+        text_table: &'w [f32],
+        text_gathered: &'w [u32],
+        cold_rows: Option<&'w dyn ColdTextRows>,
+    ) -> QwenGenerator<'w> {
+        QwenGenerator::new(QwenGeneratorConfig {
+            talker_config: talker_config(),
+            talker_weights: TalkerWeights {
+                layers: vec![weights.talker_layer(); TALKER_LAYER_COUNT],
+                final_norm: &weights.norm,
+                codec_head: &weights.codec_head,
+            },
+            text: TextEmbeddingWeights {
+                table: text_table,
+                gathered: text_gathered,
+                embed_width: 4,
+                fc1_weight: &weights.text_fc1,
+                fc1_bias: &weights.text_fc1_bias,
+                fc2_weight: &weights.text_fc2,
+                fc2_bias: &weights.text_fc2_bias,
+            },
+            cold_rows,
+            feedback: FeedbackTables {
+                talker_codec: &weights.talker_codec_embedding,
+                residual: residual_feedback,
+            },
+            microdecoder_config: microdecoder_config(),
+            microdecoder_weights: MicrodecoderWeights {
+                layers: micro_layers,
+                talker_codec_embedding: &weights.talker_codec_embedding,
+                residual_embeddings: crate::microdecoder::ResidualEmbeddings::Widened(
+                    micro_residual,
+                ),
+                heads: micro_heads,
+                final_norm: &weights.norm,
+            },
+            prompt_mode: PromptMode {
+                clone_mode: CloneMode::XVector,
+                non_streaming_mode: false,
+            },
+            header: header(),
+            tts_eos: vec![0.5; HIDDEN],
+            reference: None,
+            sampling_mode: SamplingMode::CanonicalGreedy,
+            seed: 7,
+        })
+    }
+
+    /// The cold-row gate (bead frankentts-edz0's re-gather seam): a continuation append
+    /// reaching an id OUTSIDE the initial gather resolves through the ColdTextRows source
+    /// and produces frames bit-identical to a whole-text run whose table simply included
+    /// that id from the start. Also pins fail-closed behavior without a source.
+    #[test]
+    fn appends_outside_the_initial_gather_resolve_through_the_cold_row_source() {
+        let weights = TinyWeights::new(1.0);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+
+        // Row for id 4, absent from TinyWeights' table (ids 0..=3). Kept deliberately in
+        // the same magnitude family as the base rows.
+        let extended_table: Vec<f32> = weights
+            .text_table
+            .iter()
+            .copied()
+            .chain([0.16, 0.17, 0.18, 0.19])
+            .collect();
+        let extended_gathered: Vec<u32> = vec![0, 1, 2, 3, 4];
+
+        let mut whole = generator_with_text(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback.clone(),
+            &extended_table,
+            &extended_gathered,
+            None,
+        );
+        whole
+            .begin_utterance(&prepared(&[1, 4, 2]), UtteranceStart::Fresh)
+            .expect("whole-text begin");
+        let mut whole_frames = Vec::new();
+        for _ in 0..32 {
+            match whole.next_frame().expect("whole frame") {
+                FrameStep::Frame(frame) => whole_frames.push(frame),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("whole run must not stall"),
+            }
+        }
+
+        // The continuation's PRIMARY table never learns id 4; the source supplies it.
+        let source = FixedColdRows {
+            ids: vec![4],
+            rows: vec![0.16, 0.17, 0.18, 0.19],
+        };
+        let mut cont = generator_with_text(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback.clone(),
+            &weights.text_table,
+            &[0, 1, 2, 3],
+            Some(&source),
+        );
+        cont.begin_utterance(&prepared(&[1]), UtteranceStart::Continuation)
+            .expect("continuation begin");
+        let mut cont_frames = Vec::new();
+        let mut fed = 0;
+        for _ in 0..64 {
+            match cont.next_frame().expect("continuation frame") {
+                FrameStep::Frame(frame) => cont_frames.push(frame),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => match fed {
+                    0 => {
+                        cont.append_text(&prepared(&[4])).expect("cold-id append");
+                        fed = 1;
+                    }
+                    1 => {
+                        cont.append_text(&prepared(&[2])).expect("warm-id append");
+                        fed = 2;
+                    }
+                    _ => cont.finish_text().expect("finish"),
+                },
+            }
+        }
+        assert_eq!(
+            cont_frames, whole_frames,
+            "cold-row-resolved continuation diverged from the extended-table whole run"
+        );
+
+        // Fail-closed without a source: the same cold append is a clear error, and the
+        // utterance survives to keep speaking its admitted text.
+        let mut bare = generator_with_text(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback,
+            &weights.text_table,
+            &[0, 1, 2, 3],
+            None,
+        );
+        bare.begin_utterance(&prepared(&[1]), UtteranceStart::Continuation)
+            .expect("continuation begin");
+        let error = bare
+            .append_text(&prepared(&[4]))
+            .expect_err("cold append without a source must fail closed");
+        assert!(
+            error.to_string().contains("cold-row"),
+            "error names the missing capability: {error}"
+        );
+        assert!(
+            matches!(
+                bare.next_frame().expect("still runs"),
+                FrameStep::AwaitingText
+            ),
+            "the utterance survives a refused append"
+        );
     }
 
     /// The stall gate: a continuation that CATCHES UP (AwaitingText returned, repeatedly)
@@ -2044,6 +2344,7 @@ mod tests {
                 fc2_weight: &weights.text_fc2,
                 fc2_bias: &weights.text_fc2_bias,
             },
+            cold_rows: None,
             feedback: FeedbackTables {
                 talker_codec: &weights.talker_codec_embedding,
                 residual: residual_feedback,

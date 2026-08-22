@@ -88,6 +88,7 @@ fn main() {
         talker_config: TalkerConfig::default(),
         talker_weights: talker.talker_weights(&talker_layers),
         text: talker.text_weights(&table),
+        cold_rows: None,
         feedback: talker.feedback_tables(&residual),
         microdecoder_config: MicrodecoderConfig::default(),
         microdecoder_weights: talker.microdecoder_weights(&micro_layers, micro_residual, &heads),

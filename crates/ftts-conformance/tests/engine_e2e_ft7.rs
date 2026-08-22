@@ -312,6 +312,7 @@ impl Hydrated {
                 fc2_weight: &self.text_stub_fc2,
                 fc2_bias: &self.text_stub_fc2_bias,
             },
+            cold_rows: None,
             feedback: FeedbackTables {
                 talker_codec: &self.talker_codec_embedding,
                 residual: self.residual_embeddings.iter().map(Vec::as_slice).collect(),
@@ -322,7 +323,9 @@ impl Hydrated {
                 talker_codec_embedding: &self.talker_codec_embedding,
                 // The microdecoder's internal tables for positions 2..=15 are the first 14 of the
                 // same per-depth set the feedback path uses.
-                residual_embeddings: micro_residual,
+                residual_embeddings: ftts_model_qwen::microdecoder::ResidualEmbeddings::Widened(
+                    micro_residual,
+                ),
                 heads: micro_heads,
                 final_norm: &self.micro_final_norm,
             },

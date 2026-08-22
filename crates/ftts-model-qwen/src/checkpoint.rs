@@ -1607,10 +1607,29 @@ impl TalkerCheckpoint {
         })
     }
 
+    /// Cold rows for continuation appends: the same gather the utterance setup uses,
+    /// exposed through the generator's [`crate::generate::ColdTextRows`] seam so text
+    /// appended mid-utterance can reach ids outside the initial gather.
+    fn gather_cold_rows(
+        &self,
+        ids: &[u32],
+    ) -> Result<(Vec<u32>, Vec<f32>), ftts_core::GenerationError> {
+        let table = self.gather_text_rows(ids).map_err(|error| {
+            ftts_core::GenerationError::new(format!("cold-row gather failed: {error}"))
+        })?;
+        Ok((table.gathered_ids().to_vec(), table.compact_rows().to_vec()))
+    }
+
     /// The `tts_eos` hidden state that trails the target text.
     #[must_use]
     pub fn tts_eos(&self, table: &TextEmbeddingTable) -> HiddenState {
         self.project_text_id(table, TTS_EOS_TOKEN_ID)
+    }
+}
+
+impl crate::generate::ColdTextRows for TalkerCheckpoint {
+    fn gather_rows(&self, ids: &[u32]) -> Result<(Vec<u32>, Vec<f32>), ftts_core::GenerationError> {
+        self.gather_cold_rows(ids)
     }
 }
 

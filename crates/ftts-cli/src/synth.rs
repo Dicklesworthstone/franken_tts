@@ -1619,6 +1619,7 @@ pub fn synthesize(
         talker_config: TalkerConfig::default(),
         talker_weights: model.talker.talker_weights(&talker_layers),
         text: model.talker.text_weights(&table),
+        cold_rows: Some(&model.talker),
         feedback: model.talker.feedback_tables(&residual),
         microdecoder_config: MicrodecoderConfig::default(),
         microdecoder_weights: model.talker.microdecoder_weights(
