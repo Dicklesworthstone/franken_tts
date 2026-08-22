@@ -1499,6 +1499,14 @@ impl TextPreparer for PreparedPassThrough {
     }
 }
 
+impl LoadedModel {
+    /// The tokenizer, for callers that prepare continuation chunks outside `synthesize`
+    /// (the talk session) with byte-for-byte the same preparation this module uses.
+    pub(crate) fn shared_tokenizer(&self) -> &ftts_model_qwen::tokenizer::QwenTokenizer {
+        &self.tokenizer
+    }
+}
+
 /// A completed synthesis: the codes the talker produced and the audio they decode to.
 pub struct SynthesizedAudio {
     /// Codec frames generated before the stop.

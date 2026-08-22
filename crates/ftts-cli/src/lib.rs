@@ -9,6 +9,7 @@ pub mod robot;
 pub mod session_protocol;
 pub mod style;
 pub mod synth;
+pub mod talk;
 
 pub use error::{FttsError, FttsExitCode};
 pub use robot::{EventType, validate_event, validate_ndjson};
@@ -248,6 +249,11 @@ enum Command {
     Convert(ConvertArgs),
     /// Download and verify the pinned model files into the model directory.
     Pull(PullArgs),
+    /// Hold a live conversation session: NDJSON ops on stdin, schema-v2 events on
+    /// stdout, raw s16le 24 kHz PCM on fd 3 (Unix) or --pcm-out. One warm model for
+    /// the whole exchange; the resident daemon is never involved. See
+    /// `ftts robot schema --contract session` for the wire contract.
+    Talk(TalkArgs),
     /// Emit versioned, line-oriented robot contract data.
     Robot(RobotArgs),
     /// Report local configuration and readiness without inference.
@@ -788,10 +794,53 @@ fn dispatch(
         Command::Card(args) => run_card(args, stdout),
         Command::Convert(args) => run_convert(&cli, args, environment, stdout, stderr),
         Command::Pull(args) => run_pull(args, environment, stdout),
+        Command::Talk(args) => run_talk_command(&cli, args, environment),
         Command::Robot(args) => run_robot(args.command.clone(), environment, stdout),
         Command::Doctor(args) => run_doctor(args, environment, stdout),
         Command::ResidentDaemon(args) => resident::run_daemon(&args.bundle_root),
     }
+}
+
+/// `ftts talk`: the live conversation session (bead frankentts-edz0). Model resolution
+/// and voice naming reuse `say`'s exact surfaces; transport rules live in `talk`.
+fn run_talk_command(
+    cli: &Cli,
+    args: &TalkArgs,
+    environment: &Environment,
+) -> Result<(), FttsError> {
+    let model = resolve_model(args.model.as_deref(), environment)?;
+    let bundle = synth::ModelBundle::resolve(Path::new(&model))?;
+    let voices = |name: &str| -> Result<Vec<f32>, FttsError> {
+        let path = match materialize_preset_voice(name) {
+            Some(result) => result?,
+            None => PathBuf::from(name),
+        };
+        synth::speaker_from_voice(
+            &bundle,
+            &path,
+            synth::ReferenceCleanup {
+                denoise: None,
+                dereverb: None,
+            },
+        )
+    };
+    talk::run_talk(
+        &bundle,
+        args.pcm_out.as_ref(),
+        &voices,
+        cli.seed.unwrap_or(0),
+    )
+}
+
+#[derive(Debug, clap::Args)]
+struct TalkArgs {
+    /// Model directory (defaults to the standard cache location).
+    #[arg(long, value_name = "DIR")]
+    model: Option<PathBuf>,
+    /// Write session PCM here (file or FIFO). Default on Unix: inherited fd 3.
+    /// Required on Windows, where fd inheritance does not exist.
+    #[arg(long, value_name = "PATH")]
+    pcm_out: Option<PathBuf>,
 }
 
 /// A source tensor pinned by the truth-pack inventory and its reviewed storage policy.
