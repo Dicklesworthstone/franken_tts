@@ -32,7 +32,9 @@ use ftts_core::{
 use ftts_model_qwen::checkpoint::{
     CODEC_LANGUAGE_ENGLISH_ID, CheckpointError, CodecCheckpoint, TALKER_HIDDEN, TalkerCheckpoint,
 };
-use ftts_model_qwen::generate::{prepare_int8_route, Int8Route, QwenGenerator, QwenGeneratorConfig};
+use ftts_model_qwen::generate::{
+    Int8Route, QwenGenerator, QwenGeneratorConfig, prepare_int8_route,
+};
 use ftts_model_qwen::microdecoder::MicrodecoderConfig;
 use ftts_model_qwen::prompt::{CloneMode, PromptMode};
 use ftts_model_qwen::sampler::SamplingMode;
@@ -1587,7 +1589,11 @@ pub fn synthesize(
         text: model.talker.text_weights(&table),
         feedback: model.talker.feedback_tables(&residual),
         microdecoder_config: MicrodecoderConfig::default(),
-        microdecoder_weights: model.talker.microdecoder_weights(&micro_layers, micro_residual, &heads),
+        microdecoder_weights: model.talker.microdecoder_weights(
+            &micro_layers,
+            micro_residual,
+            &heads,
+        ),
         prompt_mode: PromptMode {
             clone_mode: CloneMode::XVector,
             non_streaming_mode: false,
