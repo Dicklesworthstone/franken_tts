@@ -18,7 +18,9 @@ use wasm_bindgen::prelude::*;
 // (everything `#[cfg(not(unix))]` below); these imports are gated with it so the workspace's
 // native `--all-targets` pass stays warning-free.
 #[cfg(not(unix))]
-use ftts_core::{FrameGenerator, FrameStep, NormalizationOptions, PreparedText, TextPreparer, UtteranceStart};
+use ftts_core::{
+    FrameGenerator, FrameStep, NormalizationOptions, PreparedText, TextPreparer, UtteranceStart,
+};
 #[cfg(not(unix))]
 use ftts_model_qwen::checkpoint::{
     CODEC_LANGUAGE_ENGLISH_ID, TALKER_HIDDEN, TalkerCheckpoint, TextEmbeddingTable,
