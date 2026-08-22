@@ -1951,6 +1951,22 @@ fn run_say_events(
     } else {
         None
     };
+    // Robot-mode resident observability (bead frankentts-xw2v): which path served the
+    // request, as a stage pair so the begin/end discipline holds. The stage NAME
+    // carries the state — `resident-hit` (daemon served it), `resident-miss`
+    // (consulted but none served; inline fallback) — because the strict-closed stage
+    // schema has no spare field and zero schema churn is the standing rule. Not
+    // emitted when the resident was disabled outright: `--no-resident` runs are
+    // ordinary inline runs, not resident events.
+    if use_resident {
+        let state = if resident_audio.is_some() {
+            "hit"
+        } else {
+            "miss"
+        };
+        emit_stage(run, emit, &format!("resident-{state}"), "begin", &mut seq)?;
+        emit_stage(run, emit, &format!("resident-{state}"), "end", &mut seq)?;
+    }
     // Whether the in-process live path already wrote PCM and emitted `audio_chunk` events
     // during synthesis. The resident path cannot (its v1 wire reply is one whole blob), so
     // it keeps the post-synthesis packetization below.
