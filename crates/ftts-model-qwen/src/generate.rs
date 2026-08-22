@@ -10,7 +10,9 @@
 //! Everything heavy is borrowed: checkpoint hydration owns the tensors and this type holds `&[f32]`
 //! views, so an utterance never clones a weight table.
 
-use ftts_core::{CodeFrame, FrameGenerator, GenerationError, PreparedText, UtteranceStart};
+use ftts_core::{
+    CodeFrame, FrameGenerator, FrameStep, GenerationError, PreparedText, UtteranceStart,
+};
 
 use crate::microdecoder::{
     self, FrameState, MicroLayerQuant, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_VOCAB,
@@ -853,14 +855,27 @@ impl FrameGenerator for QwenGenerator<'_> {
         Ok(())
     }
 
-    fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError> {
+    fn next_frame(&mut self) -> Result<FrameStep, GenerationError> {
         let Some(utterance) = self.utterance.as_mut() else {
             return Err(GenerationError::new(
                 "next_frame called before begin_utterance",
             ));
         };
         if utterance.finished {
-            return Ok(None);
+            return Ok(FrameStep::Finished);
+        }
+        // ENTRY GATE, before anything stateful: this call's feedback step would consume
+        // trailing text row `frames_emitted` (see the `.get(utterance.frames_emitted)`
+        // read below). If that row does not exist yet on an open continuation, proceeding
+        // would substitute `tts_pad` — the model's "text is over" signal — and wind the
+        // utterance down early because the caller's LLM was slow. Stall instead. Placed
+        // before `select_talker` so no RNG is drawn: a stalled-then-resumed run stays
+        // bit-identical to a never-stalled one, which the parity gate pins.
+        if utterance.continuation
+            && !utterance.text_finished
+            && utterance.frames_emitted >= utterance.trailing_text_hidden.len()
+        {
+            return Ok(FrameStep::AwaitingText);
         }
 
         let primary = self
@@ -873,7 +888,7 @@ impl FrameGenerator for QwenGenerator<'_> {
             .map_err(generation_error)?;
         if primary == CODEC_EOS_TOKEN_ID {
             utterance.finished = true;
-            return Ok(None);
+            return Ok(FrameStep::Finished);
         }
 
         // The subtalker follows the run's decode mode: greedy conformance stays zero-RNG, while
@@ -990,7 +1005,7 @@ impl FrameGenerator for QwenGenerator<'_> {
         utterance.next_position += 1;
         utterance.frames_emitted += 1;
         utterance.group_zero_history.push(primary);
-        Ok(Some(CodeFrame { codes }))
+        Ok(FrameStep::Frame(CodeFrame { codes }))
     }
 }
 
@@ -1234,8 +1249,9 @@ mod tests {
         let mut frames = Vec::new();
         for _ in 0..max_frames {
             match generator.next_frame().expect("frame generation succeeds") {
-                Some(frame) => frames.push(frame),
-                None => break,
+                FrameStep::Frame(frame) => frames.push(frame),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("fresh utterance must never await text"),
             }
         }
         frames
@@ -1339,10 +1355,10 @@ mod tests {
         let prefill_len = generator.cached_positions();
         assert_eq!(prefill_len, 6);
 
-        let frame = generator
-            .next_frame()
-            .expect("frame generation succeeds")
-            .expect("all-zero heads cannot reach EOS");
+        let frame = match generator.next_frame().expect("frame generation succeeds") {
+            FrameStep::Frame(frame) => frame,
+            other => panic!("all-zero heads cannot reach EOS or stall, got {other:?}"),
+        };
         assert_eq!(frame.codes.len(), CODE_GROUP_COUNT);
         assert!((frame.codes[0] as usize) < PRIMARY_CODE_VOCAB_SIZE);
         assert!(
@@ -1387,12 +1403,15 @@ mod tests {
         generator
             .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
             .expect("valid tiny prompt");
-        while generator.next_frame().expect("frames succeed").is_some() {}
+        while matches!(
+            generator.next_frame().expect("frames succeed"),
+            FrameStep::Frame(_)
+        ) {}
         assert_eq!(
             generator
                 .next_frame()
                 .expect("finished utterance is stable"),
-            None,
+            FrameStep::Finished,
             "EOS must be sticky until the next begin_utterance"
         );
     }
@@ -1433,10 +1452,13 @@ mod tests {
         generator
             .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
             .expect("valid tiny prompt");
-        generator
-            .next_frame()
-            .expect("frame generation succeeds")
-            .expect("frame emitted");
+        assert!(
+            matches!(
+                generator.next_frame().expect("frame generation succeeds"),
+                FrameStep::Frame(_)
+            ),
+            "frame emitted"
+        );
 
         generator
             .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
@@ -1488,7 +1510,7 @@ mod tests {
             .expect("valid test prefill");
 
         let mut frames = Vec::new();
-        while let Some(frame) = streamed
+        while let FrameStep::Frame(frame) = streamed
             .next_frame()
             .expect("streamed frame generation succeeds")
         {
@@ -1543,17 +1565,14 @@ mod tests {
         // instead make the replayed side take the same decision, prove it is the same decision,
         // and only then require the two states to be identical in every field.
         assert!(
-            replayed
-                .next_frame()
-                .expect("replayed terminal decision")
-                .is_none(),
+            replayed.next_frame().expect("replayed terminal decision") == FrameStep::Finished,
             "the replayed state must make the same EOS decision"
         );
         assert!(
             streamed
                 .next_frame()
                 .expect("streamed EOS must stay sticky")
-                .is_none(),
+                == FrameStep::Finished,
         );
         assert_eq!(
             streamed.utterance, replayed.utterance,
@@ -1588,6 +1607,97 @@ mod tests {
             7,
             SamplingMode::CanonicalGreedy,
         )
+    }
+
+    /// The stall gate: a continuation that CATCHES UP (AwaitingText returned, repeatedly)
+    /// and then resumes on appended text produces bit-identical frames to the whole-text
+    /// run. Repeated stalled polls must be side-effect-free — no RNG draw, no KV growth,
+    /// no position advance — or the resumed run would diverge. This is the generator-seam
+    /// half of the standing chunked==whole invariant (bead frankentts-e0wr); the engine-
+    /// level wait loop is proven separately in ftts-core.
+    #[test]
+    fn a_stalled_then_resumed_continuation_matches_the_whole_text_run() {
+        let weights = TinyWeights::new(1.0);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+
+        let mut whole = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback.clone(),
+            7,
+            SamplingMode::CanonicalGreedy,
+        );
+        whole
+            .begin_utterance(&prepared(&[1, 2, 3]), UtteranceStart::Fresh)
+            .expect("whole-text begin");
+
+        // Continuation starts with ONLY the prefill token: zero trailing headroom, so the
+        // very first frame catches up and must stall.
+        let mut stalled = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback,
+            7,
+            SamplingMode::CanonicalGreedy,
+        );
+        stalled
+            .begin_utterance(&prepared(&[1]), UtteranceStart::Continuation)
+            .expect("continuation begin");
+
+        let positions_before = stalled.cached_positions();
+        for poll in 0..3 {
+            assert_eq!(
+                stalled.next_frame().expect("stalled poll succeeds"),
+                FrameStep::AwaitingText,
+                "poll {poll}: an exhausted open continuation must stall, not consume pad"
+            );
+        }
+        assert_eq!(
+            stalled.cached_positions(),
+            positions_before,
+            "stalled polls must not grow the KV cache"
+        );
+
+        stalled
+            .append_text(&prepared(&[2, 3]))
+            .expect("append resumes the stream");
+        stalled.finish_text().expect("finish the text stream");
+
+        let mut stalled_frames = Vec::new();
+        for _ in 0..6 {
+            match stalled.next_frame().expect("resumed frame") {
+                FrameStep::Frame(frame) => stalled_frames.push(frame),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("finished stream must not stall again"),
+            }
+        }
+        let mut whole_frames = Vec::new();
+        for _ in 0..stalled_frames.len() {
+            match whole.next_frame().expect("whole frame") {
+                FrameStep::Frame(frame) => whole_frames.push(frame),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("whole-text utterance must never await text"),
+            }
+        }
+        assert_eq!(
+            stalled_frames, whole_frames,
+            "a stalled-then-resumed run diverged from the never-stalled run"
+        );
     }
 
     /// THE exactness gate: chunk-fed synthesis is bit-identical to whole-text synthesis when
@@ -1649,16 +1759,18 @@ mod tests {
                 chunked.finish_text().expect("finish the text stream");
             }
             match chunked.next_frame().expect("chunked frame") {
-                Some(frame) => chunked_frames.push(frame),
-                None => break,
+                FrameStep::Frame(frame) => chunked_frames.push(frame),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("chunked run stalled: append landed late"),
             }
         }
 
         let mut whole_frames = Vec::new();
         for _ in 0..chunked_frames.len() {
             match whole.next_frame().expect("whole frame") {
-                Some(frame) => whole_frames.push(frame),
-                None => break,
+                FrameStep::Frame(frame) => whole_frames.push(frame),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("whole-text utterance must never await text"),
             }
         }
 

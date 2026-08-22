@@ -98,6 +98,16 @@ pub struct EngineConfig {
     pub enroll_stage_budget: Duration,
     /// Predicted-peak-memory policy applied to every synthesis request.
     pub admission: admission::AdmissionPolicy,
+    /// Maximum time a continuation utterance may stall in [`FrameStep::AwaitingText`]
+    /// before the engine finishes its text stream for it.
+    ///
+    /// A stall is a caller that has not yet supplied more text — a slow LLM, not a wedged
+    /// generator — so it is excluded from the synthesis budget. This cap bounds the wait:
+    /// on expiry the engine calls `finish_text` and lets the utterance end through the
+    /// model's own EOS, so a conversation whose text source died degrades to a completed
+    /// sentence, never a hung process. Fixed timeout = the deterministic fallback the
+    /// Alien-Artifact contract requires of any adaptive-ish behavior.
+    pub text_stall_timeout: Duration,
 }
 
 impl Default for EngineConfig {
@@ -111,9 +121,20 @@ impl Default for EngineConfig {
             synthesis_frame_budget: DEFAULT_SYNTHESIS_FRAME_BUDGET * slowdown,
             enroll_stage_budget: DEFAULT_ENROLL_BUDGET,
             admission: admission::AdmissionPolicy::default(),
+            text_stall_timeout: DEFAULT_TEXT_STALL_TIMEOUT,
         }
     }
 }
+
+/// Default cap on one continuous [`FrameStep::AwaitingText`] stall (see
+/// [`EngineConfig::text_stall_timeout`]). Generous on purpose: a conversation can pause
+/// while its LLM thinks, and the cost of waiting is silence, not resources — the frame
+/// loop is parked, not spinning.
+pub const DEFAULT_TEXT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often a stalled frame loop wakes to check cancellation and the stall cap while
+/// waiting for text. 10 ms keeps cancel latency well inside one frame without busy-spin.
+const TEXT_STALL_POLL: Duration = Duration::from_millis(10);
 
 /// The multiplier applied to the synthesis budgets for the current build profile.
 ///
@@ -239,6 +260,8 @@ pub enum StreamKind {
     Pcm,
     /// Structured lifecycle events only.
     Events,
+    /// Incremental text controls feeding a continuation utterance.
+    Text,
 }
 
 /// A PCM packet emitted by the codec path.
@@ -318,6 +341,23 @@ pub struct BoundedReceiver<T> {
 }
 
 impl<T> BoundedReceiver<T> {
+    /// Takes one item without blocking; `Ok(None)` when the queue is momentarily empty.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::StreamDisconnected`] once every sender is gone (after the queue
+    /// drains) — for a text-control feed the caller treats that as end-of-text, not a
+    /// failure.
+    pub fn try_next(&self) -> Result<Option<T>, EngineError> {
+        match self.receiver.try_recv() {
+            Ok(item) => Ok(Some(item)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(EngineError::StreamDisconnected(self.kind))
+            }
+        }
+    }
+
     /// Receives one item, timing out when no item arrives in `timeout`.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<T, EngineError> {
         match self.receiver.recv_timeout(timeout) {
@@ -334,6 +374,54 @@ fn bounded_queue<T>(capacity: usize, kind: StreamKind) -> (BoundedSender<T>, Bou
         BoundedSender { kind, sender },
         BoundedReceiver { kind, receiver },
     )
+}
+
+/// One incremental text instruction for a continuation utterance.
+///
+/// Produced by a session/caller thread, consumed by the synthesis thread between frames
+/// (the engine applies it to the generator, which owns tokenizer-independent projection).
+/// Chunk-boundary hygiene (withholding a trailing partial word so BPE cannot merge across
+/// a chunk seam) is the PRODUCER's responsibility — the engine applies chunks verbatim.
+#[derive(Clone, Debug)]
+pub enum TextControl {
+    /// Extend the open utterance with an already-prepared text chunk.
+    Append(PreparedText),
+    /// No more text will arrive; the terminal EOS becomes reachable.
+    Finish,
+}
+
+/// Creates the bounded feed a caller uses to stream text into a continuation synthesis.
+///
+/// Dropping the sender is equivalent to sending [`TextControl::Finish`]: the engine
+/// treats disconnect as end-of-text, so a session that crashes mid-conversation degrades
+/// to a completed sentence rather than a stalled loop.
+///
+/// # Errors
+///
+/// If `capacity` is zero.
+pub fn text_control_queue(
+    capacity: usize,
+) -> Result<(BoundedSender<TextControl>, BoundedReceiver<TextControl>), EngineError> {
+    if capacity == 0 {
+        return Err(EngineError::InvalidConfiguration(
+            "text control queue capacity must be greater than zero",
+        ));
+    }
+    Ok(bounded_queue(capacity, StreamKind::Text))
+}
+
+/// One step of the autoregressive frame loop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameStep {
+    /// A generated 16-code frame.
+    Frame(CodeFrame),
+    /// The model emitted codec EOS; the utterance is complete.
+    Finished,
+    /// A continuation utterance caught up with its known text: generating another frame
+    /// would substitute the model's "text is over" pad signal and wind the utterance
+    /// down early. Side-effect-free by contract — no RNG draw, no KV growth, no position
+    /// advance — so a stalled-then-resumed run is bit-identical to a never-stalled one.
+    AwaitingText,
 }
 
 /// The caller-visible text-normalization policy.
@@ -569,8 +657,13 @@ pub trait FrameGenerator {
     /// Marks the open continuation's text stream complete, making the terminal EOS reachable.
     fn finish_text(&mut self) -> Result<(), GenerationError>;
 
-    /// Produces the next 16-code frame, or `None` once the model emits codec EOS.
-    fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError>;
+    /// Advances the frame loop by one step.
+    ///
+    /// [`FrameStep::AwaitingText`] is legal only for continuation utterances whose text
+    /// is exhausted and unfinished, and MUST be side-effect-free: returning it and being
+    /// called again after an append must produce exactly the frames a never-stalled run
+    /// would. The engine owns all waiting — implementations never block here.
+    fn next_frame(&mut self) -> Result<FrameStep, GenerationError>;
 }
 
 /// A synchronous synthesis request.
@@ -713,6 +806,19 @@ pub enum SynthesisEvent {
     },
     /// A talker-frame boundary was reached.
     FrameProgress { frame: u64 },
+    /// A continuation stall ended: text arrived after `waited` of [`FrameStep::AwaitingText`].
+    ///
+    /// Sessions surface this as their `text_underrun` wire event. Generation at >1x
+    /// real time normally hides short stalls behind the delivered-audio lead; this event
+    /// is how a caller learns the lead ran dry.
+    TextUnderrun { waited: Duration },
+    /// A continuation stall hit [`EngineConfig::text_stall_timeout`] (or its feed
+    /// disconnected / was never supplied): the engine finished the text stream itself so
+    /// the utterance ends through the model's own EOS instead of hanging.
+    TextStallEnded { waited: Duration },
+    /// An append was refused by rolling admission (context ceiling); the in-flight
+    /// utterance continues unchanged with the text it already has.
+    TextAppendRejected { requested_tokens: u64 },
     /// A caller explicitly requested a privacy-safe normalization trace summary.
     TextPrepared {
         /// Number of token ids that entered the model path.
@@ -842,6 +948,7 @@ impl TtsEngine {
         frame_generator: &mut dyn FrameGenerator,
         cancellation: &CancellationToken,
         observer: &dyn SynthesisObserver,
+        text_feed: Option<&BoundedReceiver<TextControl>>,
     ) -> Result<SynthesisResult, EngineError> {
         let _admission = self.acquire_synthesis_admission(observer)?;
         cancellation.checkpoint().inspect_err(|_| {
@@ -900,22 +1007,77 @@ impl TtsEngine {
         let startup_budget = self.config.synthesis_stage_budget;
         let frame_budget = self.config.synthesis_frame_budget;
         let mut code_frames: Vec<CodeFrame> = Vec::new();
+        // A text feed makes this a continuation: the terminal EOS is held back until the
+        // feed finishes (explicitly, by disconnect, or by the stall cap).
+        let mode = if text_feed.is_some() {
+            UtteranceStart::Continuation
+        } else {
+            UtteranceStart::Fresh
+        };
         frame_generator
-            .begin_utterance(&prepared, UtteranceStart::Fresh)
+            .begin_utterance(&prepared, mode)
             .map_err(EngineError::Generation)?;
+        let mut plan = plan;
+        let mut total_prompt_tokens = prompt_tokens;
+        // Stall time is a waiting caller, not a wedged generator: it is excluded from the
+        // rolling deadline so a slow LLM cannot trip the wedge detector, while a generator
+        // that stops moving OUTSIDE a stall is still caught within one frame budget.
+        let mut stalled_total = Duration::ZERO;
+        // Set once the text stream is over — by Finish, by feed disconnect, or by the
+        // stall cap — so end-of-text is applied exactly once.
+        let mut text_done = false;
+        let mut feed_closed = text_feed.is_none();
         while (code_frames.len() as u64) < plan.predicted_max_frames {
             cancellation.checkpoint().inspect_err(|_| {
                 observer.on_event(SynthesisEvent::Health {
                     event: HealthEvent::Cancelled,
                 });
             })?;
+            // Apply any text controls that arrived while frames were being generated, so
+            // appends land at the earliest frame boundary rather than only during stalls.
+            if let Some(feed) = text_feed
+                && !feed_closed
+                && !text_done
+            {
+                loop {
+                    match feed.try_next() {
+                        Ok(Some(control)) => {
+                            if self.apply_text_control(
+                                control,
+                                frame_generator,
+                                &mut plan,
+                                &mut total_prompt_tokens,
+                                &mut text_done,
+                                observer,
+                            )? {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(EngineError::StreamDisconnected(_)) => {
+                            // Every sender is gone: nothing more can ever arrive. Treat
+                            // it as Finish so the utterance completes instead of stalling
+                            // to the cap.
+                            self.finish_text_once(
+                                frame_generator,
+                                &mut text_done,
+                                Duration::ZERO,
+                                observer,
+                            )?;
+                            feed_closed = true;
+                            break;
+                        }
+                        Err(other) => return Err(other),
+                    }
+                }
+            }
             // Saturating, because a caller-supplied frame budget times a large frame count can
             // overflow `Duration`; an unreachable deadline is the right answer there, not a panic.
             let deadline = frame_budget
                 .checked_mul(u32::try_from(code_frames.len()).unwrap_or(u32::MAX))
                 .and_then(|earned| earned.checked_add(startup_budget))
                 .unwrap_or(Duration::MAX);
-            if started.elapsed() > deadline {
+            if started.elapsed().saturating_sub(stalled_total) > deadline {
                 observer.on_event(SynthesisEvent::Health {
                     event: HealthEvent::BudgetExceeded,
                 });
@@ -925,13 +1087,69 @@ impl TtsEngine {
                 .next_frame()
                 .map_err(EngineError::Generation)?
             {
-                Some(frame) => {
+                FrameStep::Frame(frame) => {
                     observer.on_event(SynthesisEvent::FrameProgress {
                         frame: code_frames.len() as u64,
                     });
                     code_frames.push(frame);
                 }
-                None => break,
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => {
+                    let stall_started = Instant::now();
+                    let resumed = 'stall: {
+                        if feed_closed || text_done {
+                            // Nothing can arrive (no feed, or it already ended) yet the
+                            // generator still awaits text — end the stream for it rather
+                            // than spin. `text_done` here means a logic mismatch a test
+                            // would catch; `feed_closed` is the documented no-feed case.
+                            break 'stall false;
+                        }
+                        let feed = text_feed.expect("feed_closed is true when text_feed is None");
+                        loop {
+                            cancellation.checkpoint().inspect_err(|_| {
+                                observer.on_event(SynthesisEvent::Health {
+                                    event: HealthEvent::Cancelled,
+                                });
+                            })?;
+                            if stall_started.elapsed() >= self.config.text_stall_timeout {
+                                break 'stall false;
+                            }
+                            match feed.recv_timeout(TEXT_STALL_POLL) {
+                                Ok(control) => {
+                                    let finished = self.apply_text_control(
+                                        control,
+                                        frame_generator,
+                                        &mut plan,
+                                        &mut total_prompt_tokens,
+                                        &mut text_done,
+                                        observer,
+                                    )?;
+                                    if !finished {
+                                        observer.on_event(SynthesisEvent::TextUnderrun {
+                                            waited: stall_started.elapsed(),
+                                        });
+                                    }
+                                    break 'stall true;
+                                }
+                                Err(EngineError::QueueTimeout) => {}
+                                Err(EngineError::StreamDisconnected(_)) => {
+                                    feed_closed = true;
+                                    break 'stall false;
+                                }
+                                Err(other) => return Err(other),
+                            }
+                        }
+                    };
+                    if !resumed {
+                        self.finish_text_once(
+                            frame_generator,
+                            &mut text_done,
+                            stall_started.elapsed(),
+                            observer,
+                        )?;
+                    }
+                    stalled_total += stall_started.elapsed();
+                }
             }
         }
         observer.on_event(SynthesisEvent::StageFinished {
@@ -941,8 +1159,84 @@ impl TtsEngine {
         Ok(SynthesisResult {
             generated_frames: code_frames.len() as u64,
             code_frames,
-            prepared_token_count: prepared.token_ids.len(),
+            prepared_token_count: usize::try_from(total_prompt_tokens)
+                .unwrap_or(prepared.token_ids.len()),
         })
+    }
+
+    /// Applies one [`TextControl`] to the generator on the synthesis thread.
+    ///
+    /// Returns `true` when the control ended the text stream. An [`TextControl::Append`]
+    /// passes ROLLING ADMISSION first — the same policy that admitted the request,
+    /// re-evaluated at the grown token count. A refused append leaves the in-flight
+    /// utterance untouched (the caller hears about it via
+    /// [`SynthesisEvent::TextAppendRejected`] and the utterance speaks the text it has);
+    /// an admitted one updates the frame cap so a growing utterance earns proportionally
+    /// more frames, with the context ceiling as the hard bound protecting the KV budget.
+    fn apply_text_control(
+        &self,
+        control: TextControl,
+        frame_generator: &mut dyn FrameGenerator,
+        plan: &mut admission::AdmissionPlan,
+        total_prompt_tokens: &mut u64,
+        text_done: &mut bool,
+        observer: &dyn SynthesisObserver,
+    ) -> Result<bool, EngineError> {
+        match control {
+            TextControl::Append(prepared) => {
+                let added = prepared.token_ids.len() as u64;
+                let requested = total_prompt_tokens.saturating_add(added);
+                match self.config.admission.admit(requested) {
+                    Ok(new_plan) => {
+                        frame_generator
+                            .append_text(&prepared)
+                            .map_err(EngineError::Generation)?;
+                        observer.on_event(SynthesisEvent::ResourceAdmission {
+                            admitted: true,
+                            predicted_max_frames: new_plan.predicted_max_frames,
+                            predicted_peak_bytes: new_plan.predicted_peak_bytes,
+                            budget_bytes: new_plan.budget_bytes,
+                        });
+                        *plan = new_plan;
+                        *total_prompt_tokens = requested;
+                        Ok(false)
+                    }
+                    Err(_) => {
+                        observer.on_event(SynthesisEvent::TextAppendRejected {
+                            requested_tokens: requested,
+                        });
+                        Ok(false)
+                    }
+                }
+            }
+            TextControl::Finish => {
+                if !*text_done {
+                    frame_generator
+                        .finish_text()
+                        .map_err(EngineError::Generation)?;
+                    *text_done = true;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Ends the text stream on the generator's behalf, exactly once, and says so.
+    fn finish_text_once(
+        &self,
+        frame_generator: &mut dyn FrameGenerator,
+        text_done: &mut bool,
+        waited: Duration,
+        observer: &dyn SynthesisObserver,
+    ) -> Result<(), EngineError> {
+        if !*text_done {
+            frame_generator
+                .finish_text()
+                .map_err(EngineError::Generation)?;
+            *text_done = true;
+            observer.on_event(SynthesisEvent::TextStallEnded { waited });
+        }
+        Ok(())
     }
 
     /// Runs the Phase 0 enrollment shell through the owned runtime.
@@ -1134,18 +1428,18 @@ mod tests {
             ))
         }
 
-        fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError> {
+        fn next_frame(&mut self) -> Result<FrameStep, GenerationError> {
             assert!(self.began, "next_frame before begin_utterance");
             if self.remaining == 0 {
                 let Some(stall) = self.stall else {
-                    return Ok(None);
+                    return Ok(FrameStep::Finished);
                 };
                 thread::sleep(stall);
-                return Ok(Some(CodeFrame { codes: vec![0; 16] }));
+                return Ok(FrameStep::Frame(CodeFrame { codes: vec![0; 16] }));
             }
             self.remaining -= 1;
             thread::sleep(self.per_frame);
-            Ok(Some(CodeFrame { codes: vec![0; 16] }))
+            Ok(FrameStep::Frame(CodeFrame { codes: vec![0; 16] }))
         }
     }
 
@@ -1173,6 +1467,7 @@ mod tests {
                 &mut generator,
                 &CancellationToken::new(),
                 &observer,
+                None,
             )
             .expect("a steadily-progressing run must not be refused");
 
@@ -1204,6 +1499,7 @@ mod tests {
                 &mut generator,
                 &CancellationToken::new(),
                 &observer,
+                None,
             )
             .expect_err("a stalled generator must still be refused");
         let elapsed = started.elapsed();
@@ -1311,17 +1607,17 @@ mod tests {
             ))
         }
 
-        fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError> {
+        fn next_frame(&mut self) -> Result<FrameStep, GenerationError> {
             assert!(self.began, "next_frame before begin_utterance");
             self.polls += 1;
             if self.endless {
-                return Ok(Some(CodeFrame { codes: vec![0; 16] }));
+                return Ok(FrameStep::Frame(CodeFrame { codes: vec![0; 16] }));
             }
             if self.remaining == 0 {
-                return Ok(None);
+                return Ok(FrameStep::Finished);
             }
             self.remaining -= 1;
-            Ok(Some(CodeFrame { codes: vec![0; 16] }))
+            Ok(FrameStep::Frame(CodeFrame { codes: vec![0; 16] }))
         }
     }
 
@@ -1395,6 +1691,7 @@ mod tests {
                 &mut generator,
                 &CancellationToken::new(),
                 &observer,
+                None,
             )
             .expect("scripted pipeline succeeds");
 
@@ -1428,6 +1725,7 @@ mod tests {
                 &mut generator,
                 &CancellationToken::new(),
                 &observer,
+                None,
             )
             .expect("a ceiling-bound utterance still completes");
 
@@ -1461,6 +1759,7 @@ mod tests {
                 &mut generator,
                 &CancellationToken::new(),
                 &observer,
+                None,
             )
             .expect("scripted pipeline succeeds");
 
@@ -1486,6 +1785,7 @@ mod tests {
                 &mut generator,
                 &cancellation,
                 &observer,
+                None,
             )
             .expect("scripted pipeline succeeds");
 
@@ -1544,6 +1844,7 @@ mod tests {
                 &mut ScriptedFrameGenerator::emitting(0),
                 &cancellation,
                 &observer,
+                None,
             )
             .expect_err("an unaffordable request must be refused");
 
@@ -1625,6 +1926,7 @@ mod tests {
                 &mut ScriptedFrameGenerator::emitting(0),
                 &cancellation,
                 &observer,
+                None,
             )
             .expect_err("cancelled request must not run");
 
@@ -1717,6 +2019,7 @@ mod tests {
                 &mut ScriptedFrameGenerator::emitting(0),
                 &CancellationToken::new(),
                 &observer,
+                None,
             )
             .expect("explicit trace request succeeds");
 
@@ -1793,6 +2096,7 @@ mod tests {
                         &mut ScriptedFrameGenerator::emitting(1),
                         &CancellationToken::new(),
                         &observer,
+                        None,
                     )
                     .expect("empty utterance succeeds");
             }
@@ -1805,5 +2109,355 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("many utterances watchdog expired");
         worker.join().expect("watchdog worker does not panic");
+    }
+
+    // ------------------------------------------------------------------ continuation stalls
+
+    /// A continuation-aware fake: emits one frame per "supplied" text unit, returns
+    /// `AwaitingText` when it catches up on an open continuation, and after `finish_text`
+    /// emits `tail` more frames before `Finished` (the model's pad-driven windup).
+    struct ContinuationFakeGenerator {
+        supplied: usize,
+        consumed: usize,
+        text_done: bool,
+        continuation: bool,
+        tail: usize,
+        appends: usize,
+    }
+
+    impl ContinuationFakeGenerator {
+        fn starting_with(supplied: usize, tail: usize) -> Self {
+            Self {
+                supplied,
+                consumed: 0,
+                text_done: false,
+                continuation: false,
+                tail,
+                appends: 0,
+            }
+        }
+    }
+
+    impl FrameGenerator for ContinuationFakeGenerator {
+        fn begin_utterance(
+            &mut self,
+            _prepared: &PreparedText,
+            mode: UtteranceStart,
+        ) -> Result<(), GenerationError> {
+            self.continuation = matches!(mode, UtteranceStart::Continuation);
+            if !self.continuation {
+                self.text_done = true;
+            }
+            Ok(())
+        }
+
+        fn append_text(&mut self, prepared: &PreparedText) -> Result<(), GenerationError> {
+            assert!(self.continuation, "append on a fresh utterance");
+            assert!(!self.text_done, "append after finish_text");
+            self.supplied += prepared.token_ids.len();
+            self.appends += 1;
+            Ok(())
+        }
+
+        fn finish_text(&mut self) -> Result<(), GenerationError> {
+            assert!(!self.text_done, "finish_text twice");
+            self.text_done = true;
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> Result<FrameStep, GenerationError> {
+            if self.consumed < self.supplied {
+                self.consumed += 1;
+                return Ok(FrameStep::Frame(CodeFrame { codes: vec![0; 16] }));
+            }
+            if !self.text_done {
+                return Ok(FrameStep::AwaitingText);
+            }
+            if self.tail > 0 {
+                self.tail -= 1;
+                return Ok(FrameStep::Frame(CodeFrame { codes: vec![0; 16] }));
+            }
+            Ok(FrameStep::Finished)
+        }
+    }
+
+    fn stall_engine(text_stall_timeout: Duration) -> TtsEngine {
+        TtsEngine::new(EngineConfig {
+            synthesis_stage_budget: Duration::from_secs(5),
+            text_stall_timeout,
+            ..EngineConfig::default()
+        })
+        .expect("engine starts")
+    }
+
+    fn appended_text(tokens: usize) -> PreparedText {
+        PreparedText::new(
+            vec![7; tokens],
+            NormalizationTrace {
+                mode: NormalizationMode::Verbatim,
+                unicode_version: "15.1.0".to_owned(),
+                changes: Vec::new(),
+            },
+        )
+    }
+
+    /// Controls queued before the loop starts are drained at frame boundaries: the run
+    /// never stalls, no underrun event fires, and appended text extends the utterance.
+    #[test]
+    fn pre_queued_appends_extend_the_utterance_without_a_stall() {
+        let engine = stall_engine(Duration::from_secs(5));
+        let observer = RecordingObserver::default();
+        let mut generator = ContinuationFakeGenerator::starting_with(2, 1);
+        let (feed_tx, feed_rx) = text_control_queue(8).expect("queue");
+        let token = CancellationToken::new();
+        feed_tx
+            .send(TextControl::Append(appended_text(3)), &token)
+            .expect("append queued");
+        feed_tx
+            .send(TextControl::Finish, &token)
+            .expect("finish queued");
+
+        let result = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &CancellationToken::new(),
+                &observer,
+                Some(&feed_rx),
+            )
+            .expect("continuation completes");
+
+        // 2 initial + 3 appended + 1 tail frame after finish.
+        assert_eq!(result.generated_frames, 6);
+        assert_eq!(generator.appends, 1);
+        assert!(
+            !observer
+                .events()
+                .iter()
+                .any(|event| matches!(event, SynthesisEvent::TextUnderrun { .. })),
+            "pre-queued text must not register as an underrun"
+        );
+    }
+
+    /// A genuine stall: text arrives while the loop is parked in AwaitingText. The run
+    /// resumes, completes, and reports the underrun with a non-zero wait.
+    #[test]
+    fn a_stall_resumes_on_late_text_and_reports_the_underrun() {
+        let engine = stall_engine(Duration::from_secs(5));
+        let observer = RecordingObserver::default();
+        let mut generator = ContinuationFakeGenerator::starting_with(1, 0);
+        let (feed_tx, feed_rx) = text_control_queue(8).expect("queue");
+
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(60));
+            let token = CancellationToken::new();
+            feed_tx
+                .send(TextControl::Append(appended_text(2)), &token)
+                .expect("late append");
+            feed_tx.send(TextControl::Finish, &token).expect("finish");
+            // Sender drops here; disconnect after Finish is a no-op for the engine.
+        });
+
+        let result = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &CancellationToken::new(),
+                &observer,
+                Some(&feed_rx),
+            )
+            .expect("stalled continuation completes");
+        sender.join().expect("sender thread");
+
+        assert_eq!(result.generated_frames, 3);
+        let underrun_waits: Vec<Duration> = observer
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                SynthesisEvent::TextUnderrun { waited } => Some(*waited),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            underrun_waits
+                .iter()
+                .any(|waited| *waited >= Duration::from_millis(40)),
+            "the stall must be visible as an underrun with a real wait, got {underrun_waits:?}"
+        );
+    }
+
+    /// Cancellation reaches a parked stall within the poll interval, not the stall cap.
+    #[test]
+    fn cancellation_interrupts_a_stall_promptly() {
+        let engine = stall_engine(Duration::from_secs(60));
+        let observer = RecordingObserver::default();
+        let mut generator = ContinuationFakeGenerator::starting_with(1, 0);
+        let (_feed_tx, feed_rx) = text_control_queue(8).expect("queue");
+        let cancellation = CancellationToken::new();
+        let trip = cancellation.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            trip.cancel();
+        });
+
+        let started = Instant::now();
+        let error = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &cancellation,
+                &observer,
+                Some(&feed_rx),
+            )
+            .expect_err("cancel during stall must abort");
+        canceller.join().expect("canceller");
+
+        assert_eq!(error, EngineError::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancel must not wait out the 60 s stall cap"
+        );
+    }
+
+    /// The stall cap is a deterministic fallback: with no text ever arriving, the engine
+    /// finishes the stream itself and the utterance ends through the generator's windup.
+    #[test]
+    fn the_stall_cap_finishes_the_text_stream_deterministically() {
+        let engine = stall_engine(Duration::from_millis(40));
+        let observer = RecordingObserver::default();
+        let mut generator = ContinuationFakeGenerator::starting_with(1, 2);
+        // Sender stays alive: this is a silent LLM, not a dropped one.
+        let (_feed_tx, feed_rx) = text_control_queue(8).expect("queue");
+
+        let result = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &CancellationToken::new(),
+                &observer,
+                Some(&feed_rx),
+            )
+            .expect("capped stall still completes");
+
+        assert_eq!(result.generated_frames, 3, "1 supplied + 2 windup frames");
+        assert!(
+            observer
+                .events()
+                .iter()
+                .any(|event| matches!(event, SynthesisEvent::TextStallEnded { .. })),
+            "the cap must be visible on the record"
+        );
+    }
+
+    /// Dropping every sender IS finish: the engine treats disconnect as end-of-text.
+    #[test]
+    fn feed_disconnect_is_end_of_text() {
+        let engine = stall_engine(Duration::from_secs(60));
+        let observer = RecordingObserver::default();
+        let mut generator = ContinuationFakeGenerator::starting_with(2, 1);
+        let (feed_tx, feed_rx) = text_control_queue(8).expect("queue");
+        drop(feed_tx);
+
+        let started = Instant::now();
+        let result = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &CancellationToken::new(),
+                &observer,
+                Some(&feed_rx),
+            )
+            .expect("disconnected feed completes the utterance");
+
+        assert_eq!(result.generated_frames, 3);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "disconnect must not wait out the stall cap"
+        );
+    }
+
+    /// Stall time is excluded from the rolling budget: a frame budget that would refuse a
+    /// 200 ms delay as a wedge does not refuse the same delay spent waiting for text.
+    #[test]
+    fn stall_time_is_not_charged_against_the_synthesis_budget() {
+        let engine = TtsEngine::new(EngineConfig {
+            synthesis_stage_budget: Duration::from_millis(80),
+            synthesis_frame_budget: Duration::from_millis(10),
+            text_stall_timeout: Duration::from_secs(5),
+            ..EngineConfig::default()
+        })
+        .expect("engine starts");
+        let observer = RecordingObserver::default();
+        let mut generator = ContinuationFakeGenerator::starting_with(1, 0);
+        let (feed_tx, feed_rx) = text_control_queue(8).expect("queue");
+
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            let token = CancellationToken::new();
+            feed_tx
+                .send(TextControl::Append(appended_text(1)), &token)
+                .expect("late append");
+            feed_tx.send(TextControl::Finish, &token).expect("finish");
+        });
+
+        let result = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &CancellationToken::new(),
+                &observer,
+                Some(&feed_rx),
+            )
+            .expect("a 200 ms text wait is a stall, not a wedge");
+        sender.join().expect("sender");
+        assert_eq!(result.generated_frames, 2);
+    }
+
+    /// An append that would blow the context ceiling is refused, visibly, and the run
+    /// keeps speaking the text it already has.
+    #[test]
+    fn a_ceiling_breaking_append_is_rejected_and_the_run_survives() {
+        let engine = stall_engine(Duration::from_millis(40));
+        let observer = RecordingObserver::default();
+        let mut generator = ContinuationFakeGenerator::starting_with(2, 1);
+        let (feed_tx, feed_rx) = text_control_queue(8).expect("queue");
+        let token = CancellationToken::new();
+        // Far past MAX_CONTEXT_TOKENS in one append.
+        feed_tx
+            .send(TextControl::Append(appended_text(100_000)), &token)
+            .expect("oversized append queued");
+
+        let result = engine
+            .synthesize(
+                SynthesisRequest::new(""),
+                &TestTextPreparer,
+                &mut generator,
+                &CancellationToken::new(),
+                &observer,
+                Some(&feed_rx),
+            )
+            .expect("the run survives a rejected append");
+
+        assert_eq!(
+            generator.appends, 0,
+            "the rejected append never reached the generator"
+        );
+        assert_eq!(
+            result.generated_frames, 3,
+            "2 supplied + 1 windup after the stall cap"
+        );
+        assert!(
+            observer
+                .events()
+                .iter()
+                .any(|event| matches!(event, SynthesisEvent::TextAppendRejected { .. })),
+            "the rejection must be on the record"
+        );
     }
 }

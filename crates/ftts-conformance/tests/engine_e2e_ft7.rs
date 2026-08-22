@@ -57,7 +57,7 @@ use ftts_conformance::npy;
 use ftts_conformance::oracle::{FixtureError, OracleFixtures, SeamRef};
 use ftts_conformance::report::{OracleTier, Outcome, Receipt};
 use ftts_core::{
-    CancellationToken, CodeFrame, EngineConfig, FrameGenerator, GenerationError,
+    CancellationToken, EngineConfig, FrameGenerator, FrameStep, GenerationError,
     NormalizationOptions, NormalizationTrace, PreparedText, SynthesisEvent, SynthesisRequest,
     TextPreparationError, TextPreparer, TtsEngine,
 };
@@ -397,7 +397,7 @@ impl FrameGenerator for OraclePromptGenerator<'_> {
         ))
     }
 
-    fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError> {
+    fn next_frame(&mut self) -> Result<FrameStep, GenerationError> {
         self.inner.next_frame()
     }
 }
@@ -546,6 +546,7 @@ fn engine_synthesize_reproduces_the_whole_oracle_utterance_exactly() {
             &mut generator,
             &CancellationToken::new(),
             &observer,
+            None,
         )
         .expect("synthesis completes within budget");
 
@@ -661,10 +662,12 @@ fn engine_synthesize_reproduces_the_whole_oracle_utterance_exactly() {
             result.generated_frames
         );
         assert!(
-            generator
-                .next_frame()
-                .expect("polling a finished generator is not an error")
-                .is_none(),
+            matches!(
+                generator
+                    .next_frame()
+                    .expect("polling a finished generator is not an error"),
+                FrameStep::Finished
+            ),
             "after EOS the generator must stay finished, not resume"
         );
         Receipt::new(TEST_NAME, Outcome::Passed)
@@ -760,13 +763,14 @@ fn production_mode_codes_probe() {
         .expect("prefill accepted");
     for frame in 0..14 {
         match generator.next_frame().expect("frame generation succeeds") {
-            Some(code_frame) => {
+            FrameStep::Frame(code_frame) => {
                 eprintln!("frame {frame:02}: {:?}", code_frame.codes);
             }
-            None => {
+            FrameStep::Finished => {
                 eprintln!("frame {frame:02}: EOS drawn — utterance ended");
                 break;
             }
+            FrameStep::AwaitingText => unreachable!("fresh utterance never awaits text"),
         }
     }
 }

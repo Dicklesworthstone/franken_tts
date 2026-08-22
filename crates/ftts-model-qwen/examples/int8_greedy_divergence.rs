@@ -117,15 +117,16 @@ fn main() {
         .expect("prefill");
     for frame in 0..max_frames {
         match generator.next_frame().expect("frame") {
-            Some(code_frame) => {
+            ftts_core::FrameStep::Frame(code_frame) => {
                 let rendered: Vec<String> =
                     code_frame.codes.iter().map(ToString::to_string).collect();
                 println!("frame {frame:03}: {}", rendered.join(" "));
             }
-            None => {
+            ftts_core::FrameStep::Finished => {
                 println!("frame {frame:03}: EOS");
                 break;
             }
+            ftts_core::FrameStep::AwaitingText => unreachable!("fresh utterance"),
         }
     }
 }
