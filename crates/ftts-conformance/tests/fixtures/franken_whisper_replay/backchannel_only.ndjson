@@ -1,0 +1,17 @@
+# franken_whisper -> ftts seam replay fixture: BACKCHANNEL ONLY
+#
+# Contract block: see normal_turn.ndjson (identical envelope rules).
+#
+# Scenario: listener back-channel ("yeah", "right") while the OTHER side talks — technically valid
+# endpointed turns per the v1 silence rule. Orchestrator expectation: DO NOT hand these to the LLM
+# as instructions; the demo policy (bead frankentts-4ie8) filters short low-content endpoints.
+# The fixtures exist so that policy has something deterministic to be tested against; fw itself
+# still emits them — filtering is the orchestrator's job, not fw's.
+{"schema_version":"1.1.0","event":"vad.start","run_id":"fw-replay-backchannel-1","seq":0,"ts":31.000}
+{"schema_version":"1.1.0","event":"speech_started","run_id":"fw-replay-backchannel-1","seq":1,"ts":31.007}
+{"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-backchannel-1","seq":2,"ts":31.240,"text":"Yeah","start_sec":31.050,"end_sec":31.230,"confidence":0.58,"speaker":"user"}
+{"schema_version":"1.1.0","event":"utterance_end","run_id":"fw-replay-backchannel-1","seq":3,"ts":31.610,"utterance_id":"u3","reason":"endpoint","text":"Yeah."}
+{"schema_version":"1.1.0","event":"vad.start","run_id":"fw-replay-backchannel-1","seq":4,"ts":33.100}
+{"schema_version":"1.1.0","event":"speech_started","run_id":"fw-replay-backchannel-1","seq":5,"ts":33.104}
+{"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-backchannel-1","seq":6,"ts":33.330,"text":"Right, right","start_sec":33.140,"end_sec":33.320,"confidence":0.61,"speaker":"user"}
+{"schema_version":"1.1.0","event":"utterance_end","run_id":"fw-replay-backchannel-1","seq":7,"ts":33.700,"utterance_id":"u4","reason":"endpoint","text":"Right, right."}

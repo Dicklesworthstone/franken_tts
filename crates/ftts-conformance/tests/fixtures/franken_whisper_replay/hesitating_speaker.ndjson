@@ -1,0 +1,17 @@
+# franken_whisper -> ftts seam replay fixture: HESITATING SPEAKER
+#
+# Contract block: see normal_turn.ndjson (identical envelope rules; not repeated per file).
+#
+# Scenario: speaker starts, stalls ("um"), the speculative partial gets RETRACTED, speech resumes,
+# a long intra-utterance pause (~900 ms) sits under the VAD min-silence threshold, then the turn
+# ends. Orchestrator expectation: nothing is handed to the LLM until utterance_end; the retracted
+# hypothesis never reaches it because only deltas/end-text are piped.
+{"schema_version":"1.1.0","event":"vad.start","run_id":"fw-replay-hesitant-1","seq":0,"ts":20.000}
+{"schema_version":"1.1.0","event":"speech_started","run_id":"fw-replay-hesitant-1","seq":1,"ts":20.006}
+{"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-hesitant-1","seq":2,"ts":20.420,"text":"Um","start_sec":20.010,"end_sec":20.400,"confidence":0.44,"speaker":"user"}
+{"schema_version":"1.1.0","event":"transcript.retract","run_id":"fw-replay-hesitant-1","seq":3,"ts":20.610,"text":"Um"}
+{"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-hesitant-1","seq":4,"ts":21.180,"text":"Maybe we could","start_sec":20.900,"end_sec":21.150,"confidence":0.62,"speaker":"user"}
+{"schema_version":"1.1.0","event":"transcript.delta","run_id":"fw-replay-hesitant-1","seq":5,"ts":21.400,"text":"Maybe we could","utterance_id":"u1"}
+{"schema_version":"1.1.0","event":"transcript.delta","run_id":"fw-replay-hesitant-1","seq":6,"ts":22.350,"text":"Maybe we could ship the release Friday","utterance_id":"u1"}
+{"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-hesitant-1","seq":7,"ts":22.500,"text":"Maybe we could ship the release Friday if QA passes","start_sec":20.900,"end_sec":22.480,"confidence":0.83,"speaker":"user"}
+{"schema_version":"1.1.0","event":"utterance_end","run_id":"fw-replay-hesitant-1","seq":8,"ts":23.380,"utterance_id":"u1","reason":"endpoint","text":"Maybe we could ship the release Friday if QA passes."}

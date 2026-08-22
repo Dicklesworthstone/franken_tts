@@ -1,0 +1,17 @@
+# franken_whisper -> ftts seam replay fixture: BARGE-IN MID-AGENT-SPEECH
+#
+# Contract block: see normal_turn.ndjson (identical envelope rules).
+#
+# Scenario: the agent (ftts) is mid-playback of a long answer when the user starts talking.
+# speech_started arrives at t=2.006 while agent audio is still playing — this is THE barge-in
+# trigger: the orchestrator cancels ftts synthesis/playback at the next frame boundary (the armed
+# CancellationToken from frankentts-3xk2) and speaks speak_cancelled's spoken_text back to the LLM
+# so its next turn accounts for what the user actually heard. The user then asks a short question;
+# note the endpoint fires quickly despite the previous turn still ringing out.
+{"schema_version":"1.1.0","event":"vad.start","run_id":"fw-replay-bargein-1","seq":0,"ts":2.000}
+{"schema_version":"1.1.0","event":"speech_started","run_id":"fw-replay-bargein-1","seq":1,"ts":2.005}
+{"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-bargein-1","seq":2,"ts":2.290,"text":"Wait","start_sec":2.010,"end_sec":2.280,"confidence":0.66,"speaker":"user"}
+{"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-bargein-1","seq":3,"ts":2.730,"text":"Wait, skip that","start_sec":2.010,"end_sec":2.710,"confidence":0.84,"speaker":"user"}
+{"schema_version":"1.1.0","event":"transcript.delta","run_id":"fw-replay-bargein-1","seq":4,"ts":2.810,"text":"Wait, skip that","utterance_id":"u2"}
+{"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-bargein-1","seq":5,"ts":3.120,"text":"Wait, skip that part","start_sec":2.010,"end_sec":3.100,"confidence":0.9,"speaker":"user"}
+{"schema_version":"1.1.0","event":"utterance_end","run_id":"fw-replay-bargein-1","seq":6,"ts":3.450,"utterance_id":"u2","reason":"endpoint","text":"Wait, skip that part."}

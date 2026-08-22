@@ -1,0 +1,32 @@
+# franken_whisper -> ftts seam replay fixture: NORMAL TURN
+#
+# SEAM CONTRACT (agreed with the fw agent, bead frankentts-yex8, thread frankentts-yex8):
+# - fw speaks its own envelope; ftts never asks it to churn a frozen schema for cosmetics.
+#   Envelope divergences, pinned so nobody "helpfully" unifies them later:
+#     * schema_version is a STRING here ("1.1.0"); ftts robot v1 / talk v2 use INTEGERs 1 and 2.
+#     * event names are dotted (transcript.partial); ftts uses flat snake_case.
+# - Event vocabulary encoded by these fixtures:
+#     vad.start                     — VAD onset (segmentation, NOT conversational endpointing)
+#     speech_started                — early low-latency "user started speaking"; this is the
+#                                     barge-in trigger input to the orchestrator
+#     transcript.partial            — speculative fast-model hypothesis; MUTABLE, may be followed
+#                                     by transcript.retract; NEVER pipe to the LLM
+#     transcript.delta              — append-only COMMITTED text; pipe deltas or utterance_end.text
+#                                     to the LLM, nothing else
+#     utterance_end                 — explicit conversational end-of-turn, distinct from VAD
+#                                     segmentation; {utterance_id, reason: endpoint|timeout|
+#                                     max_len|session_end, text}; THE hand-off trigger to the LLM
+# - Timing assumptions: endpoint = ~300 ms min-silence + max backstop (v1 ask, semantic
+#   endpointing later); partial latency well under 400 ms from speech onset; ts is seconds,
+#   monotone per run; seq strictly increases per line.
+#
+# Scenario: one clean question, no hesitations. Orchestrator expectation: cancel any in-flight ftts
+# playback on speech_started (barge-in), wait for utterance_end, hand text to the LLM.
+{"schema_version":"1.1.0","event":"vad.start","run_id":"fw-replay-normal-1","seq":0,"ts":0.000}
+{"schema_version":"1.1.0","event":"speech_started","run_id":"fw-replay-normal-1","seq":1,"ts":0.008}
+{"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-normal-1","seq":2,"ts":0.310,"text":"What's the","start_sec":0.020,"end_sec":0.300,"confidence":0.71,"speaker":"user"}
+{"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-normal-1","seq":3,"ts":0.560,"text":"What's the weather","start_sec":0.020,"end_sec":0.550,"confidence":0.88,"speaker":"user"}
+{"schema_version":"1.1.0","event":"transcript.delta","run_id":"fw-replay-normal-1","seq":4,"ts":0.610,"text":"What's the weather","utterance_id":"u1"}
+{"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-normal-1","seq":5,"ts":0.940,"text":"What's the weather tomorrow","start_sec":0.020,"end_sec":0.930,"confidence":0.93,"speaker":"user"}
+{"schema_version":"1.1.0","event":"transcript.delta","run_id":"fw-replay-normal-1","seq":6,"ts":1.010,"text":"What's the weather tomorrow","utterance_id":"u1"}
+{"schema_version":"1.1.0","event":"utterance_end","run_id":"fw-replay-normal-1","seq":7,"ts":1.340,"utterance_id":"u1","reason":"endpoint","text":"What's the weather tomorrow?"}
