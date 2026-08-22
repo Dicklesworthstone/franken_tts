@@ -32,7 +32,7 @@ use ftts_core::{
 use ftts_model_qwen::checkpoint::{
     CODEC_LANGUAGE_ENGLISH_ID, CheckpointError, CodecCheckpoint, TALKER_HIDDEN, TalkerCheckpoint,
 };
-use ftts_model_qwen::generate::{QwenGenerator, QwenGeneratorConfig};
+use ftts_model_qwen::generate::{prepare_int8_route, Int8Route, QwenGenerator, QwenGeneratorConfig};
 use ftts_model_qwen::microdecoder::MicrodecoderConfig;
 use ftts_model_qwen::prompt::{CloneMode, PromptMode};
 use ftts_model_qwen::sampler::SamplingMode;
@@ -152,6 +152,16 @@ pub struct LoadedModel {
     /// widened f32 copies, scales included). Never re-opened: every `MappedFttsq::open`
     /// re-verifies the whole artifact's digests, ~1.3 GB of hashing.
     artifact: Option<std::sync::Arc<ftts_artifacts::fttsq::MappedFttsq>>,
+    /// The fused int8 route, built once per loaded model and lent to every utterance after.
+    ///
+    /// Building the route is a ~0.46 GB Q8 copy of the hot weights (~146 ms measured); doing it
+    /// per utterance taxed every warm synthesis — exactly what the wasm engine fixed by caching
+    /// `hydrated.int8` across presses. `None` inside the lock means "the optimized route is off
+    /// for this process" (`FTTS_INT8=0`), cached so the env is read once rather than re-litigated
+    /// per utterance. The route borrows nothing from the artifact once built, so it outlives any
+    /// one generator. Cold one-shot runs build it here exactly where they previously built it
+    /// inside [`QwenGenerator::new_with_artifact`] — same inputs, same bytes, same total work.
+    int8_route: std::sync::OnceLock<Option<std::sync::Arc<Int8Route>>>,
 }
 
 impl LoadedModel {
@@ -201,7 +211,6 @@ impl LoadedModel {
         });
         let tokenizer = tokenizer
             .map_err(|error| FttsError::ArtifactFormat(format!("tokenizer unusable: {error}")))?;
-
         let talker = talker.map_err(checkpoint_error)?;
         // Shared, not re-opened: a second MappedFttsq::open would re-verify the whole artifact's
         // digests (~1.3 GB of hashing) for a mapping the checkpoint already carries.
@@ -211,6 +220,9 @@ impl LoadedModel {
             codec: codec.map_err(checkpoint_error)?,
             tokenizer,
             artifact,
+            // Runtime-input initializer (needs the hydrated weights + artifact), so OnceLock
+            // rather than LazyLock per the project's lazy-cell rule.
+            int8_route: std::sync::OnceLock::new(),
         })
     }
 }
@@ -1563,40 +1575,54 @@ pub fn synthesize(
     // fifteen-table set the talker feedback path uses.
     let micro_residual = &residual[..residual.len() - 1];
 
-    let mut generator = QwenGenerator::new_with_artifact(
-        QwenGeneratorConfig {
-            talker_config: TalkerConfig::default(),
-            talker_weights: model.talker.talker_weights(&talker_layers),
-            text: model.talker.text_weights(&table),
-            feedback: model.talker.feedback_tables(&residual),
-            microdecoder_config: MicrodecoderConfig::default(),
-            microdecoder_weights: model.talker.microdecoder_weights(
-                &micro_layers,
-                micro_residual,
-                &heads,
-            ),
-            prompt_mode: PromptMode {
-                clone_mode: CloneMode::XVector,
-                non_streaming_mode: false,
-            },
-            header,
-            tts_eos,
-            reference: None,
-            // The PRODUCT samples, exactly as the pinned upstream runtime does
-            // (generation_config.json: do_sample=true, T=0.9, top_k=50, repetition_penalty=1.05,
-            // subtalker likewise); canonical greedy remains the conformance decoder only. The p7r
-            // forensics that certified this path: our talker draw stack matched torch's choices
-            // code-for-code for seven straight frames from the same prefill, the silence defect was
-            // the subtalker being forced greedy under a sampled talker (a measured silence
-            // attractor the reference reproduces in that mismatched configuration), and with the
-            // subtalker sampling per depth the engine's utterance envelope matches the reference's
-            // sampled runs (peak frame RMS 0.086 with trailing silence). Determinism scope: build +
-            // ISA + sampler version + seed, 16 draws per frame.
-            sampling_mode: SamplingMode::Production,
-            seed,
+    // The fused int8 tables are a process asset, not an utterance one: the first utterance on
+    // this LoadedModel pays the ~146 ms Q8-table build and every later one borrows the same
+    // Arc (the wasm engine has cached `hydrated.int8` across presses since its first release).
+    // new_with_artifact would rebuild identical tables per call from the same weights and
+    // artifact; lending the prepared ones changes no bytes — the route is built from exactly
+    // the config below, and assemble() is shared by both constructors.
+    let generator_config = QwenGeneratorConfig {
+        talker_config: TalkerConfig::default(),
+        talker_weights: model.talker.talker_weights(&talker_layers),
+        text: model.talker.text_weights(&table),
+        feedback: model.talker.feedback_tables(&residual),
+        microdecoder_config: MicrodecoderConfig::default(),
+        microdecoder_weights: model.talker.microdecoder_weights(&micro_layers, micro_residual, &heads),
+        prompt_mode: PromptMode {
+            clone_mode: CloneMode::XVector,
+            non_streaming_mode: false,
         },
-        model.artifact.as_deref(),
-    );
+        header,
+        tts_eos,
+        reference: None,
+        // The PRODUCT samples, exactly as the pinned upstream runtime does
+        // (generation_config.json: do_sample=true, T=0.9, top_k=50, repetition_penalty=1.05,
+        // subtalker likewise); canonical greedy remains the conformance decoder only. The p7r
+        // forensics that certified this path: our talker draw stack matched torch's choices
+        // code-for-code for seven straight frames from the same prefill, the silence defect was
+        // the subtalker being forced greedy under a sampled talker (a measured silence
+        // attractor the reference reproduces in that mismatched configuration), and with the
+        // subtalker sampling per depth the engine's utterance envelope matches the reference's
+        // sampled runs (peak frame RMS 0.086 with trailing silence). Determinism scope: build +
+        // ISA + sampler version + seed, 16 draws per frame.
+        sampling_mode: SamplingMode::Production,
+        seed,
+    };
+    let int8 = model.int8_route.get_or_init(|| {
+        ftts_kernels::route::optimized_default("FTTS_INT8")
+            .then(|| {
+                prepare_int8_route(
+                    &generator_config.talker_config,
+                    &generator_config.talker_weights,
+                    &generator_config.microdecoder_config,
+                    &generator_config.microdecoder_weights,
+                    model.artifact.as_deref(),
+                )
+            })
+            .flatten()
+            .map(std::sync::Arc::new)
+    });
+    let mut generator = QwenGenerator::new_with_prepared_int8(generator_config, int8.clone());
 
     // 5. The engine owns admission, the budget, cancellation, and the frame loop — and the
     // codec decodes IN PARALLEL with it: a tee on the generator feeds every produced frame
@@ -1711,13 +1737,19 @@ pub fn synthesize(
                 )
                 .map_err(engine_error);
             drop(tee); // closes the channel; the worker drains the tail packet and exits
-            let pcm = worker.join().expect("codec worker must not panic");
-            // The engine's error wins the report: when generation fails, the worker usually
-            // fails too (starved or fed a partial stream), and its complaint would bury the
-            // actual cause.
-            let result = result?;
-            let (pcm, ttfa) = pcm?;
-            Ok((result, pcm, ttfa))
+            let worker_outcome = worker.join().expect("codec worker must not panic");
+            // Error precedence: a worker `Err` is always the ROOT cause. A worker merely
+            // starved by an engine failure does not error — its recv loop ends on the
+            // disconnect and it returns the partial PCM it decoded — so the only way the
+            // worker carries an error is a genuine codec/format/sink failure, which is
+            // also what killed the engine loop through the tee's failed send. Reporting
+            // the engine's induced "worker stopped accepting frames" instead would bury
+            // the sink's abort reason — the barge-in path's actual signal.
+            match (result, worker_outcome) {
+                (_, Err(worker_error)) => Err(worker_error),
+                (Err(engine_failure), Ok(_)) => Err(engine_failure),
+                (Ok(result), Ok((pcm, ttfa))) => Ok((result, pcm, ttfa)),
+            }
         },
     )?;
 

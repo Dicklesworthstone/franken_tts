@@ -1725,6 +1725,10 @@ fn run_say_events(
             // pace instead of buffering unboundedly. Channel disconnect is the shutdown
             // signal in both directions: the producer dropping its senders ends the consume
             // loop, and the consumer dropping the receiver aborts the producer's next send.
+            // One consumer thread serves both pipes, so a stalled EVENT reader also pauses
+            // synthesis — bounded and cancel-aware, and the fail-closed consumer contract
+            // (drain both streams concurrently) already forbids that consumer shape; the
+            // independent-queue design belongs to the talk session, not the one-shot CLI.
             enum Live {
                 Packet(Vec<f32>, usize),
                 Progress(u64, Option<u64>),
@@ -1808,8 +1812,9 @@ fn run_say_events(
                         })(),
                         Live::Progress(frame, total) => (|| -> Result<(), FttsError> {
                             // The frozen catalogue pins `frame` as "throttled, never one
-                            // per frame": at most one per second, and never before the
-                            // first packet's `output` stage exists.
+                            // per frame": at most one per second. A frame event MAY
+                            // precede stage{output,begin} — frames 1..packet exist before
+                            // the first packet decodes, and early progress is the point.
                             let due = last_frame_event
                                 .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
                             if due {
