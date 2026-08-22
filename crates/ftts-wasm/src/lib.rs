@@ -18,7 +18,7 @@ use wasm_bindgen::prelude::*;
 // (everything `#[cfg(not(unix))]` below); these imports are gated with it so the workspace's
 // native `--all-targets` pass stays warning-free.
 #[cfg(not(unix))]
-use ftts_core::{FrameGenerator, NormalizationOptions, PreparedText, TextPreparer};
+use ftts_core::{FrameGenerator, FrameStep, NormalizationOptions, PreparedText, TextPreparer, UtteranceStart};
 #[cfg(not(unix))]
 use ftts_model_qwen::checkpoint::{
     CODEC_LANGUAGE_ENGLISH_ID, TALKER_HIDDEN, TalkerCheckpoint, TextEmbeddingTable,
@@ -1048,7 +1048,7 @@ impl WasmEngine {
         let mem_after_generator = linear_memory_bytes();
         let prefill_started = clock();
         generator
-            .begin_utterance(&prepared)
+            .begin_utterance(&prepared, UtteranceStart::Fresh)
             .map_err(|error| js_error("prefill failed", error))?;
         let prefill_ms = clock() - prefill_started;
         let mem_after_prefill = linear_memory_bytes();
@@ -1104,7 +1104,7 @@ impl WasmEngine {
                 .map_err(|error| js_error("generation failed", error))?;
             frames_ms += clock() - frame_started;
             match step {
-                Some(frame) => {
+                FrameStep::Frame(frame) => {
                     // The first frames' codes, for cross-target comparison. Audio can only say
                     // THAT two builds diverge; codes say whether the divergence is upstream of the
                     // codec (token generation) or inside it, which is the difference between
@@ -1123,7 +1123,17 @@ impl WasmEngine {
                         flush(&mut state, &mut packet, &mut emitted_in_packet, &mut pcm)?;
                     }
                 }
-                None => break,
+                FrameStep::Finished => break,
+                // `AwaitingText` is legal only for continuation utterances, and this path always
+                // starts `Fresh` with no append_text/finish_text calls — reaching it here would
+                // mean a contract break upstream. Fail loudly rather than silently truncating
+                // the utterance's tail.
+                FrameStep::AwaitingText => {
+                    return Err(js_error(
+                        "generation stalled awaiting text",
+                        "a fresh utterance must never await text",
+                    ));
+                }
             }
         }
         flush(&mut state, &mut packet, &mut emitted_in_packet, &mut pcm)?;
