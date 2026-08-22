@@ -530,14 +530,44 @@ impl fmt::Display for GenerationError {
 
 impl std::error::Error for GenerationError {}
 
+/// How one utterance's text stream relates to future [`FrameGenerator::append_text`] calls.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UtteranceStart {
+    /// The whole text is known now; the terminal EOS marker rides in the initial prompt.
+    #[default]
+    Fresh,
+    /// The text stream stays open: codec EOS becomes reachable only after
+    /// [`FrameGenerator::finish_text`], and [`FrameGenerator::append_text`] may extend the
+    /// utterance while frames are being generated.
+    Continuation,
+}
+
 /// Model-specific autoregressive frame generation behind the blocking engine facade.
 ///
 /// Like [`TextPreparer`], `ftts-core` owns only the boundary: the model crate implements the
-/// prompt assembly, talker forward, and 15-step microdecoder behind these two calls, and the
+/// prompt assembly, talker forward, and 15-step microdecoder behind these calls, and the
 /// engine owns admission, budgets, cancellation, and observer events around them.
 pub trait FrameGenerator {
     /// Prepares per-utterance state (prompt assembly and talker prefill) for one request.
-    fn begin_utterance(&mut self, prepared: &PreparedText) -> Result<(), GenerationError>;
+    ///
+    /// `Continuation` requires streaming x-vector assembly; ICL and non-streaming prompts
+    /// reject it explicitly rather than approximating it.
+    fn begin_utterance(
+        &mut self,
+        prepared: &PreparedText,
+        mode: UtteranceStart,
+    ) -> Result<(), GenerationError>;
+
+    /// Extends the open utterance's trailing text with an already-prepared chunk.
+    ///
+    /// Tokenization and normalization belong to the caller (chunk-boundary hygiene included):
+    /// this receives `PreparedText`, runs the cold-table gather and text projection between
+    /// frames on the synthesis thread, and changes nothing about position numbering — appended
+    /// rows are consumed at future frame indices exactly as if they had always been there.
+    fn append_text(&mut self, prepared: &PreparedText) -> Result<(), GenerationError>;
+
+    /// Marks the open continuation's text stream complete, making the terminal EOS reachable.
+    fn finish_text(&mut self) -> Result<(), GenerationError>;
 
     /// Produces the next 16-code frame, or `None` once the model emits codec EOS.
     fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError>;
@@ -871,7 +901,7 @@ impl TtsEngine {
         let frame_budget = self.config.synthesis_frame_budget;
         let mut code_frames: Vec<CodeFrame> = Vec::new();
         frame_generator
-            .begin_utterance(&prepared)
+            .begin_utterance(&prepared, UtteranceStart::Fresh)
             .map_err(EngineError::Generation)?;
         while (code_frames.len() as u64) < plan.predicted_max_frames {
             cancellation.checkpoint().inspect_err(|_| {
@@ -1083,9 +1113,25 @@ mod tests {
     }
 
     impl FrameGenerator for PacedFrameGenerator {
-        fn begin_utterance(&mut self, _prepared: &PreparedText) -> Result<(), GenerationError> {
+        fn begin_utterance(
+            &mut self,
+            _prepared: &PreparedText,
+            _mode: UtteranceStart,
+        ) -> Result<(), GenerationError> {
             self.began = true;
             Ok(())
+        }
+
+        fn append_text(&mut self, _prepared: &PreparedText) -> Result<(), GenerationError> {
+            Err(GenerationError::new(
+                "the pacing fake does not model text appends",
+            ))
+        }
+
+        fn finish_text(&mut self) -> Result<(), GenerationError> {
+            Err(GenerationError::new(
+                "the pacing fake does not model text appends",
+            ))
         }
 
         fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError> {
@@ -1244,9 +1290,25 @@ mod tests {
     }
 
     impl FrameGenerator for ScriptedFrameGenerator {
-        fn begin_utterance(&mut self, _prepared: &PreparedText) -> Result<(), GenerationError> {
+        fn begin_utterance(
+            &mut self,
+            _prepared: &PreparedText,
+            _mode: UtteranceStart,
+        ) -> Result<(), GenerationError> {
             self.began = true;
             Ok(())
+        }
+
+        fn append_text(&mut self, _prepared: &PreparedText) -> Result<(), GenerationError> {
+            Err(GenerationError::new(
+                "the scripted fake does not model text appends",
+            ))
+        }
+
+        fn finish_text(&mut self) -> Result<(), GenerationError> {
+            Err(GenerationError::new(
+                "the scripted fake does not model text appends",
+            ))
         }
 
         fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError> {

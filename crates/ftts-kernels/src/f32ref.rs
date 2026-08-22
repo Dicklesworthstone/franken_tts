@@ -424,6 +424,9 @@ fn accelerate_sgemm(
     true
 }
 
+// The stub must mirror the real Accelerate entry's eight parameters exactly so both cfg
+// arms are call-site identical; the arity is the contract, not a design smell.
+#[allow(clippy::too_many_arguments)]
 #[cfg(not(all(feature = "accelerate-sgemm", target_os = "macos")))]
 fn accelerate_sgemm(
     _x: &[f32],

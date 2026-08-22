@@ -177,6 +177,7 @@ fn prompt_header_derives_the_reference_prefill() {
             reference_text: None,
             reference_codec: None,
             tts_eos,
+            hold_tts_eos: false,
         })
         .expect("assemble prompt");
 

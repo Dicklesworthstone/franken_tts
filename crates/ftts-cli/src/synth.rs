@@ -27,7 +27,7 @@ use crate::error::FttsError;
 use ftts_core::{
     CancellationToken, EngineError, FrameGenerator, GenerationError, NormalizationOptions,
     NormalizationTrace, PreparedText, SynthesisObserver, SynthesisRequest, TextPreparationError,
-    TextPreparer, TtsEngine,
+    TextPreparer, TtsEngine, UtteranceStart,
 };
 use ftts_model_qwen::checkpoint::{
     CODEC_LANGUAGE_ENGLISH_ID, CheckpointError, CodecCheckpoint, TALKER_HIDDEN, TalkerCheckpoint,
@@ -1797,8 +1797,20 @@ struct TeeGenerator<'a> {
 }
 
 impl FrameGenerator for TeeGenerator<'_> {
-    fn begin_utterance(&mut self, prepared: &PreparedText) -> Result<(), GenerationError> {
-        self.inner.begin_utterance(prepared)
+    fn begin_utterance(
+        &mut self,
+        prepared: &PreparedText,
+        mode: UtteranceStart,
+    ) -> Result<(), GenerationError> {
+        self.inner.begin_utterance(prepared, mode)
+    }
+
+    fn append_text(&mut self, prepared: &PreparedText) -> Result<(), GenerationError> {
+        self.inner.append_text(prepared)
+    }
+
+    fn finish_text(&mut self) -> Result<(), GenerationError> {
+        self.inner.finish_text()
     }
 
     fn next_frame(&mut self) -> Result<Option<ftts_core::CodeFrame>, GenerationError> {

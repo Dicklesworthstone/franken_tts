@@ -376,9 +376,25 @@ struct OraclePromptGenerator<'a> {
 }
 
 impl FrameGenerator for OraclePromptGenerator<'_> {
-    fn begin_utterance(&mut self, _prepared: &PreparedText) -> Result<(), GenerationError> {
+    fn begin_utterance(
+        &mut self,
+        _prepared: &PreparedText,
+        _mode: ftts_core::UtteranceStart,
+    ) -> Result<(), GenerationError> {
         self.inner
             .begin_with_prefill(&self.prefill, self.seq, self.trailing_text_hidden.clone())
+    }
+
+    fn append_text(&mut self, _prepared: &PreparedText) -> Result<(), GenerationError> {
+        Err(GenerationError::new(
+            "the oracle-prompt fixture does not model text appends",
+        ))
+    }
+
+    fn finish_text(&mut self) -> Result<(), GenerationError> {
+        Err(GenerationError::new(
+            "the oracle-prompt fixture does not model text appends",
+        ))
     }
 
     fn next_frame(&mut self) -> Result<Option<CodeFrame>, GenerationError> {

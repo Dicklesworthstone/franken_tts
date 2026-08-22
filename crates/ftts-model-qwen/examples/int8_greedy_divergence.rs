@@ -112,7 +112,9 @@ fn main() {
         }
     );
 
-    generator.begin_utterance(&prepared).expect("prefill");
+    generator
+        .begin_utterance(&prepared, ftts_core::UtteranceStart::Fresh)
+        .expect("prefill");
     for frame in 0..max_frames {
         match generator.next_frame().expect("frame") {
             Some(code_frame) => {

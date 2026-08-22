@@ -10,14 +10,14 @@
 //! Everything heavy is borrowed: checkpoint hydration owns the tensors and this type holds `&[f32]`
 //! views, so an utterance never clones a weight table.
 
-use ftts_core::{CodeFrame, FrameGenerator, GenerationError, PreparedText};
+use ftts_core::{CodeFrame, FrameGenerator, GenerationError, PreparedText, UtteranceStart};
 
 use crate::microdecoder::{
     self, FrameState, MicroLayerQuant, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_VOCAB,
     RopeTable,
 };
 use crate::prompt::{
-    self, HiddenState, PromptAssemblyInput, PromptError, PromptHeader, PromptMode,
+    self, CloneMode, HiddenState, PromptAssemblyInput, PromptError, PromptHeader, PromptMode,
 };
 use crate::sampler::{CODEC_EOS_TOKEN_ID, QwenSampler, SamplingMode};
 use crate::talker::{
@@ -220,7 +220,6 @@ fn artifact_q8_enabled() -> bool {
         Ok("0") | Ok("off") | Ok("false")
     )
 }
-
 /// The cold text embedding table and the learned biased SiLU text projection.
 ///
 /// Production widths are `(embed_width, intermediate, hidden) = (2048, 2048, 1024)`; the fields
@@ -279,7 +278,6 @@ pub struct QwenGeneratorConfig<'a> {
     pub prompt_mode: PromptMode,
     pub header: PromptHeader,
     pub tts_eos: HiddenState,
-    /// Required for ICL clone mode, ignored for x-vector.
     pub reference: Option<ReferencePrompt>,
     pub sampling_mode: SamplingMode,
     /// Seed for the production sampler; canonical greedy never consumes RNG state.
@@ -300,6 +298,11 @@ struct UtteranceState {
     /// Group-0 codes only — residuals never enter the repetition-penalty history.
     group_zero_history: Vec<u32>,
     finished: bool,
+    /// Whether this utterance accepts text chunks and holds its terminal EOS back.
+    continuation: bool,
+    /// The terminal EOS marker is inside the trailing stream: true for fresh utterances from
+    /// the start, and for continuations once `finish_text` releases it.
+    text_finished: bool,
 }
 
 /// The armed W8A8 int8 route: quantized projection tables for both stacks plus the dot tier.
@@ -702,6 +705,9 @@ impl<'a> QwenGenerator<'a> {
             frames_emitted: 0,
             group_zero_history: Vec::new(),
             finished: false,
+            // Fresh semantics by default; `begin_utterance` overrides for continuations.
+            continuation: false,
+            text_finished: true,
         });
     }
 }
@@ -722,7 +728,19 @@ fn causal_mask(seq: usize) -> Vec<f32> {
 }
 
 impl FrameGenerator for QwenGenerator<'_> {
-    fn begin_utterance(&mut self, prepared: &PreparedText) -> Result<(), GenerationError> {
+    fn begin_utterance(
+        &mut self,
+        prepared: &PreparedText,
+        mode: UtteranceStart,
+    ) -> Result<(), GenerationError> {
+        if matches!(mode, UtteranceStart::Continuation)
+            && (self.prompt_mode.clone_mode == CloneMode::Icl || !self.prompt_mode.streaming())
+        {
+            return Err(GenerationError::new(
+                "continuations require streaming x-vector assembly; ICL and non-streaming \
+                 prompts reject them",
+            ));
+        }
         self.utterance = None;
 
         let ids = prompt::extract_prompt_text_ids(
@@ -743,6 +761,7 @@ impl FrameGenerator for QwenGenerator<'_> {
             reference_text,
             reference_codec: self.reference.as_ref().map(|r| r.codec.clone()),
             tts_eos: self.tts_eos.clone(),
+            hold_tts_eos: matches!(mode, UtteranceStart::Continuation),
         })
         .map_err(generation_error)?;
 
@@ -763,6 +782,74 @@ impl FrameGenerator for QwenGenerator<'_> {
         }
 
         self.run_prefill(hidden, seq, assembly.trailing_text_hidden);
+        if matches!(mode, UtteranceStart::Continuation)
+            && let Some(utterance) = self.utterance.as_mut()
+        {
+            utterance.continuation = true;
+            utterance.text_finished = false;
+        }
+        Ok(())
+    }
+
+    fn append_text(&mut self, prepared: &PreparedText) -> Result<(), GenerationError> {
+        if self.utterance.is_none() {
+            return Err(GenerationError::new(
+                "append_text called before begin_utterance",
+            ));
+        }
+        let (continuation, text_finished, finished) = match &self.utterance {
+            Some(utterance) => (
+                utterance.continuation,
+                utterance.text_finished,
+                utterance.finished,
+            ),
+            None => unreachable!("checked above"),
+        };
+        if finished {
+            return Err(GenerationError::new(
+                "append_text after the model emitted codec EOS; the utterance is over",
+            ));
+        }
+        if !continuation {
+            return Err(GenerationError::new(
+                "append_text on a fresh utterance whose terminal EOS already rode in the prompt",
+            ));
+        }
+        if text_finished {
+            return Err(GenerationError::new(
+                "append_text after finish_text: the terminal EOS is already reachable",
+            ));
+        }
+        let ids =
+            prompt::extract_prompt_text_ids(&prepared.token_ids, None).map_err(generation_error)?;
+        let rows = self.project_text_ids(&ids.target)?;
+        // Appended rows join the trailing stream and are consumed at their index — position
+        // numbering (`next_position`, the KV cache) is untouched by construction, which the
+        // chunked-versus-whole test pins bit-for-bit.
+        if let Some(utterance) = self.utterance.as_mut() {
+            utterance.trailing_text_hidden.extend(rows);
+        }
+        Ok(())
+    }
+
+    fn finish_text(&mut self) -> Result<(), GenerationError> {
+        let Some(utterance) = self.utterance.as_mut() else {
+            return Err(GenerationError::new(
+                "finish_text called before begin_utterance",
+            ));
+        };
+        if !utterance.continuation {
+            return Err(GenerationError::new(
+                "finish_text on a fresh utterance: its terminal EOS was never held back",
+            ));
+        }
+        if utterance.text_finished {
+            return Err(GenerationError::new(
+                "finish_text called twice on one utterance",
+            ));
+        }
+        utterance.trailing_text_hidden.push(self.tts_eos.clone());
+        utterance.text_finished = true;
         Ok(())
     }
 
@@ -1142,7 +1229,7 @@ mod tests {
             mode,
         );
         generator
-            .begin_utterance(&prepared(&[1, 2]))
+            .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
             .expect("valid tiny prompt");
         let mut frames = Vec::new();
         for _ in 0..max_frames {
@@ -1213,7 +1300,11 @@ mod tests {
                 changes: Vec::new(),
             },
         );
-        assert!(generator.begin_utterance(&bad).is_err());
+        assert!(
+            generator
+                .begin_utterance(&bad, UtteranceStart::Fresh)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1241,7 +1332,7 @@ mod tests {
             SamplingMode::CanonicalGreedy,
         );
         generator
-            .begin_utterance(&prepared(&[1, 2]))
+            .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
             .expect("valid tiny prompt");
         // XVector streaming with a 2-token target: role (3) + summed header (2) + one target/BOS
         // position.
@@ -1294,7 +1385,7 @@ mod tests {
             SamplingMode::CanonicalGreedy,
         );
         generator
-            .begin_utterance(&prepared(&[1, 2]))
+            .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
             .expect("valid tiny prompt");
         while generator.next_frame().expect("frames succeed").is_some() {}
         assert_eq!(
@@ -1340,7 +1431,7 @@ mod tests {
             SamplingMode::CanonicalGreedy,
         );
         generator
-            .begin_utterance(&prepared(&[1, 2]))
+            .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
             .expect("valid tiny prompt");
         generator
             .next_frame()
@@ -1348,7 +1439,7 @@ mod tests {
             .expect("frame emitted");
 
         generator
-            .begin_utterance(&prepared(&[1, 2]))
+            .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
             .expect("second utterance");
         assert_eq!(
             generator.cached_positions(),
@@ -1471,6 +1562,293 @@ mod tests {
         assert_eq!(
             streamed.kv, replayed.kv,
             "the aligned terminal decisions must not have touched the KV buffers"
+        );
+    }
+
+    // ── frankentts-g6an: the continuation API ────────────────────────────────────────────
+
+    /// Builds a generator over the tiny synthetic weights for continuation tests.
+    fn continuation_generator<'w>(
+        weights: &'w TinyWeights,
+        micro_layers: &'w [LayerWeights<'w>],
+        micro_residual: &'w [&'w [f32]],
+        micro_heads: &'w [&'w [f32]],
+    ) -> QwenGenerator<'w> {
+        let residual_feedback: Vec<&'w [f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        generator(
+            weights,
+            micro_layers,
+            micro_residual,
+            micro_heads,
+            residual_feedback,
+            7,
+            SamplingMode::CanonicalGreedy,
+        )
+    }
+
+    /// THE exactness gate: chunk-fed synthesis is bit-identical to whole-text synthesis when
+    /// the token stream is identical and each append lands before the frame that would consume
+    /// it. Positions, KV, and every code must agree — appending text changes the trailing-row
+    /// supply and nothing else.
+    #[test]
+    fn chunked_appends_match_whole_text_bit_for_bit() {
+        let weights = TinyWeights::new(1.0);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+
+        // Whole text [1, 2, 3]: first row rides in prefill, trailing = [r2, r3, eos].
+        let mut whole = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback.clone(),
+            7,
+            SamplingMode::CanonicalGreedy,
+        );
+        whole
+            .begin_utterance(&prepared(&[1, 2, 3]), UtteranceStart::Fresh)
+            .expect("whole-text begin");
+
+        // Chunked: chunk 1 = [1, 2] (two trailing rows of headroom), then [3] arrives while
+        // the second frame is the next consumer, then the stream finishes.
+        let mut chunked = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback,
+            7,
+            SamplingMode::CanonicalGreedy,
+        );
+        chunked
+            .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Continuation)
+            .expect("continuation begin");
+        let mut chunked_frames = Vec::new();
+        for frame_index in 0..6 {
+            if frame_index == 1 {
+                chunked
+                    .append_text(&prepared(&[3]))
+                    .expect("append before the consuming frame");
+            }
+            if frame_index == 2 {
+                chunked.finish_text().expect("finish the text stream");
+            }
+            match chunked.next_frame().expect("chunked frame") {
+                Some(frame) => chunked_frames.push(frame),
+                None => break,
+            }
+        }
+
+        let mut whole_frames = Vec::new();
+        for _ in 0..chunked_frames.len() {
+            match whole.next_frame().expect("whole frame") {
+                Some(frame) => whole_frames.push(frame),
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            chunked_frames, whole_frames,
+            "chunk-fed codes diverged from whole-text codes"
+        );
+        // Position invariance: the append changed nothing about mRoPE numbering.
+        assert_eq!(
+            chunked.cached_positions(),
+            whole.cached_positions(),
+            "appended text must not shift talker positions"
+        );
+        assert_eq!(
+            chunked.utterance.as_ref().expect("state").next_position,
+            whole.utterance.as_ref().expect("state").next_position,
+        );
+    }
+
+    #[test]
+    fn continuation_holds_the_terminal_until_finish_text() {
+        let weights = TinyWeights::new(1.0);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let mut cont_gen =
+            continuation_generator(&weights, &micro_layers, &micro_residual, &micro_heads);
+        cont_gen
+            .begin_utterance(&prepared(&[1]), UtteranceStart::Continuation)
+            .expect("continuation begin");
+        let state = cont_gen.utterance.as_ref().expect("state exists");
+        assert!(state.continuation && !state.text_finished);
+        let eos = vec![0.5; HIDDEN];
+        assert!(
+            state
+                .trailing_text_hidden
+                .last()
+                .is_none_or(|row| row != &eos),
+            "the terminal EOS must be held out of the stream"
+        );
+
+        cont_gen
+            .finish_text()
+            .expect("finish releases the terminal");
+        let state = cont_gen.utterance.as_ref().expect("state exists");
+        assert!(state.text_finished);
+        assert_eq!(
+            state.trailing_text_hidden.last().expect("terminal present"),
+            &eos,
+            "finish_text must append exactly the configured tts_eos row"
+        );
+    }
+
+    #[test]
+    fn continuation_errors_are_clean_not_panics() {
+        let weights = TinyWeights::new(1.0);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let mut cont_gen =
+            continuation_generator(&weights, &micro_layers, &micro_residual, &micro_heads);
+        assert!(
+            cont_gen.append_text(&prepared(&[1])).is_err(),
+            "before begin"
+        );
+        assert!(cont_gen.finish_text().is_err(), "finish before begin");
+
+        cont_gen
+            .begin_utterance(&prepared(&[1]), UtteranceStart::Fresh)
+            .expect("fresh begin");
+        assert!(
+            cont_gen.append_text(&prepared(&[2])).is_err(),
+            "append on a fresh utterance is rejected"
+        );
+        assert!(
+            cont_gen.finish_text().is_err(),
+            "finish on a fresh utterance is rejected"
+        );
+
+        cont_gen
+            .begin_utterance(&prepared(&[1]), UtteranceStart::Continuation)
+            .expect("continuation begin");
+        cont_gen.finish_text().expect("first finish");
+        assert!(cont_gen.finish_text().is_err(), "double finish is rejected");
+        assert!(
+            cont_gen.append_text(&prepared(&[2])).is_err(),
+            "append after finish"
+        );
+    }
+
+    #[test]
+    fn non_streaming_prompts_reject_continuations() {
+        let weights = TinyWeights::new(1.0);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let mut cont_gen = QwenGenerator::new(QwenGeneratorConfig {
+            talker_config: talker_config(),
+            talker_weights: TalkerWeights {
+                layers: vec![weights.talker_layer(); TALKER_LAYER_COUNT],
+                final_norm: &weights.norm,
+                codec_head: &weights.codec_head,
+            },
+            text: TextEmbeddingWeights {
+                table: &weights.text_table,
+                gathered: &[0, 1, 2, 3],
+                embed_width: 4,
+                fc1_weight: &weights.text_fc1,
+                fc1_bias: &weights.text_fc1_bias,
+                fc2_weight: &weights.text_fc2,
+                fc2_bias: &weights.text_fc2_bias,
+            },
+            feedback: FeedbackTables {
+                talker_codec: &weights.talker_codec_embedding,
+                residual: residual_feedback,
+            },
+            microdecoder_config: microdecoder_config(),
+            microdecoder_weights: MicrodecoderWeights {
+                layers: &micro_layers,
+                talker_codec_embedding: &weights.talker_codec_embedding,
+                residual_embeddings: &micro_residual,
+                heads: &micro_heads,
+                final_norm: &weights.norm,
+            },
+            prompt_mode: PromptMode {
+                clone_mode: CloneMode::XVector,
+                non_streaming_mode: true,
+            },
+            header: header(),
+            tts_eos: vec![0.5; HIDDEN],
+            reference: None,
+            sampling_mode: SamplingMode::CanonicalGreedy,
+            seed: 7,
+        });
+        let error = cont_gen
+            .begin_utterance(&prepared(&[1]), UtteranceStart::Continuation)
+            .expect_err("non-streaming must reject continuations");
+        assert!(
+            error.to_string().contains("streaming x-vector"),
+            "error should name the requirement: {error}"
+        );
+    }
+
+    /// Cost receipt for the session's per-chunk append path (bead frankentts-g6an): the
+    /// gather + projection must fit inside one 80 ms frame budget with room to spare. Measured
+    /// on the tiny synthetic weights — the real-weights receipt lands with the session e2e;
+    /// this one exists to catch a gross algorithmic regression (an accidental O(n²) copy).
+    #[test]
+    fn append_cost_fits_inside_one_frame_budget() {
+        let weights = TinyWeights::new(1.0);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let mut cont_gen =
+            continuation_generator(&weights, &micro_layers, &micro_residual, &micro_heads);
+        cont_gen
+            .begin_utterance(&prepared(&[1]), UtteranceStart::Continuation)
+            .expect("begin");
+        let chunk: Vec<u32> = std::iter::repeat_n(2_u32, 25).collect();
+        let chunk = prepared(&chunk);
+        let started = std::time::Instant::now();
+        cont_gen.append_text(&chunk).expect("append succeeds");
+        let elapsed = started.elapsed();
+        println!(
+            "append receipt (tiny synthetic weights, 25 tokens): {elapsed:?}; frame budget 80 ms"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(80),
+            "append cost {elapsed:?} exceeded the 80 ms frame budget"
         );
     }
 }

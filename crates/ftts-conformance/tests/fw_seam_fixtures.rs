@@ -154,10 +154,8 @@ fn deltas_are_append_only_within_an_utterance() {
                     // The finalized text must CONTAIN everything committed so far — the
                     // finalizer may adjust punctuation but never drop committed words.
                     if let Some(last) = last_delta_per_utterance.get(id) {
-                        let normalize = |s: &str| {
-                            s.trim_end_matches(|c: char| c == '.' || c == '?' || c == '!')
-                                .to_lowercase()
-                        };
+                        let normalize =
+                            |s: &str| s.trim_end_matches(['.', '?', '!']).to_lowercase();
                         assert!(
                             normalize(value["text"].as_str().expect("text"))
                                 .contains(&normalize(last)),

@@ -93,6 +93,11 @@ pub struct PromptAssemblyInput {
     /// Per-frame sum of the sixteen reference-code embeddings, required only in ICL mode.
     pub reference_codec: Option<Vec<HiddenState>>,
     pub tts_eos: HiddenState,
+    /// Continuation mode (bead frankentts-g6an): hold the terminal `tts_eos` OUT of the
+    /// assembled stream so codec EOS stays unreachable until [`PromptAssembly`] consumers
+    /// explicitly release it. Only meaningful for the streaming x-vector path; `validate_input`
+    /// rejects the combination everywhere else.
+    pub hold_tts_eos: bool,
 }
 
 /// A fully assembled talker prefill and its subsequent one-hidden-per-frame text stream.
@@ -107,11 +112,19 @@ pub struct PromptAssembly {
 /// Prompt-building failures are explicit rather than silently truncating or broadcasting vectors.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PromptError {
-    InvalidWrapper { kind: &'static str },
+    InvalidWrapper {
+        kind: &'static str,
+    },
     InvalidHeader,
     MissingIclReferenceText,
     MissingIclReferenceCodec,
-    WidthMismatch { expected: usize, actual: usize },
+    /// `hold_tts_eos` was requested for a prompt shape that cannot stream continuations
+    /// (ICL mode, or any non-streaming assembly whose text is fully embedded in prefill).
+    UnsupportedContinuation,
+    WidthMismatch {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for PromptError {
@@ -127,6 +140,10 @@ impl fmt::Display for PromptError {
             Self::MissingIclReferenceCodec => {
                 formatter.write_str("ICL prompt lacks reference codec states")
             }
+            Self::UnsupportedContinuation => write!(
+                formatter,
+                "continuations require streaming x-vector prompt assembly"
+            ),
             Self::WidthMismatch { expected, actual } => write!(
                 formatter,
                 "hidden-state width {actual} differs from {expected}"
@@ -140,9 +157,6 @@ impl std::error::Error for PromptError {}
 /// Assembles one Base voice-clone prompt exactly as the pinned `generate` branches do.
 ///
 /// The shape contracts are deliberately encoded in the branches themselves:
-/// `H+T1+T2`, `H+T2`, `H+1`, and `H+|text|+2` for nonempty target text.  A zero-token target
-/// follows PyTorch's zero-length broadcast behavior in the streaming x-vector branch: no first
-/// position is appended and only EOS trails.  It is tested explicitly instead of inventing text.
 pub fn assemble_prompt(input: PromptAssemblyInput) -> Result<PromptAssembly, PromptError> {
     validate_input(&input)?;
     let PromptAssemblyInput {
@@ -152,6 +166,7 @@ pub fn assemble_prompt(input: PromptAssemblyInput) -> Result<PromptAssembly, Pro
         reference_text,
         reference_codec,
         tts_eos,
+        hold_tts_eos,
     } = input;
     let width = header.tts_pad.len();
     let mut prefill = header.role.clone();
@@ -188,6 +203,7 @@ pub fn assemble_prompt(input: PromptAssemblyInput) -> Result<PromptAssembly, Pro
             tts_eos,
             mode.non_streaming_mode,
             width,
+            hold_tts_eos,
         ),
         CloneMode::XVector => Ok(assemble_xvector(
             prefill,
@@ -199,10 +215,13 @@ pub fn assemble_prompt(input: PromptAssemblyInput) -> Result<PromptAssembly, Pro
             tts_eos,
             mode.non_streaming_mode,
             width,
+            hold_tts_eos,
         )),
     }
 }
 
+// One positional per prompt ingredient mirrors the pinned upstream call shape; a params
+// struct would obscure the branch-by-branch shape contracts this module exists to encode.
 #[allow(clippy::too_many_arguments)]
 fn assemble_icl(
     prefill: &mut Vec<HiddenState>,
@@ -216,7 +235,9 @@ fn assemble_icl(
     tts_eos: HiddenState,
     non_streaming: bool,
     width: usize,
+    hold_tts_eos: bool,
 ) -> Result<PromptAssembly, PromptError> {
+    debug_assert!(!hold_tts_eos, "validated upstream; see validate_input");
     // M:1978-1998: text is ref ++ target ++ eos; codec is bos ++ reference frames.
     let reference_text_len = reference_text.len();
     let mut text_stream = reference_text;
@@ -269,7 +290,12 @@ fn assemble_xvector(
     tts_eos: HiddenState,
     non_streaming: bool,
     width: usize,
+    hold_tts_eos: bool,
 ) -> PromptAssembly {
+    debug_assert!(
+        !(hold_tts_eos && non_streaming),
+        "validated upstream; see validate_input"
+    );
     if non_streaming {
         for state in target_text {
             prefill.push(add(&state, &codec_pad, width));
@@ -286,13 +312,21 @@ fn assemble_xvector(
     if target_text.is_empty() {
         return PromptAssembly {
             prefill,
-            trailing_text_hidden: vec![tts_eos],
+            // Continuation holds the terminal back entirely: an empty stream means every
+            // generated frame falls through to `tts_pad` until text or EOS arrives.
+            trailing_text_hidden: if hold_tts_eos {
+                Vec::new()
+            } else {
+                vec![tts_eos]
+            },
             target_independent_prefix_len: header_len,
         };
     }
     let first = target_text.remove(0);
     prefill.push(add(&first, &codec_bos, width));
-    target_text.push(tts_eos);
+    if !hold_tts_eos {
+        target_text.push(tts_eos);
+    }
     PromptAssembly {
         prefill,
         trailing_text_hidden: target_text,
@@ -301,6 +335,9 @@ fn assemble_xvector(
 }
 
 fn validate_input(input: &PromptAssemblyInput) -> Result<(), PromptError> {
+    if input.hold_tts_eos && (input.mode.clone_mode == CloneMode::Icl || !input.mode.streaming()) {
+        return Err(PromptError::UnsupportedContinuation);
+    }
     if input.header.role.len() != ROLE_PREFIX_IDS.len() || input.header.codec_prefill.len() < 2 {
         return Err(PromptError::InvalidHeader);
     }
@@ -359,6 +396,7 @@ mod tests {
     fn input(mode: PromptMode) -> PromptAssemblyInput {
         PromptAssemblyInput {
             mode,
+            hold_tts_eos: false,
             header: PromptHeader {
                 role: vec![v(10.0), v(11.0), v(12.0)],
                 // 4 language tags + speaker + codec pad + codec BOS: H = 3 + (7 - 1) = 9.
