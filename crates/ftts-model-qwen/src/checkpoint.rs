@@ -40,7 +40,8 @@ use crate::codec::{
 };
 use crate::generate::{FeedbackTables, TextEmbeddingWeights};
 use crate::microdecoder::{
-    LayerWeights, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_DEPTHS, ResidualEmbeddings,
+    LayerWeights, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_DEPTHS, RESIDUAL_VOCAB,
+    ResidualEmbeddings,
 };
 use crate::prompt::{HiddenState, PromptHeader, ROLE_PREFIX_IDS};
 use crate::talker::{TalkerLayerWeights, TalkerWeights};
@@ -48,6 +49,7 @@ use ftts_artifacts::{
     fttsq::{MappedFttsq, StoredDtype},
     safetensors::SafetensorsFile,
 };
+use ftts_kernels::int8::QuantizedMatrix;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -514,17 +516,25 @@ const HOT_PROJECTION_SUFFIXES: [&str; 7] = [
     "mlp.down_proj.weight",
 ];
 
-/// Which decode stacks may skip widening their hot projections at hydration.
+/// Which decode surfaces may skip widening at hydration.
 ///
-/// Both flags must reflect the CURRENT armed route for this process: an elided stack's f32
-/// projection slices are empty, and the f32 forward's shape assertions fail loudly (never
-/// silently) if a route change routes an elided layer back through f32 arithmetic.
+/// `talker`/`micro` skip the seven per-layer hot projections of each stack. `micro_heads`
+/// skips the microdecoder's fifteen per-depth scoring heads: they feed only the int8
+/// coarse-score path, which reads the artifact's per-row Q8 bytes natively (bead
+/// frankentts-x7bt), so a widened copy is pure startup cost when the artifact verifiably
+/// carries all fifteen as Q8 — all-or-nothing, like a layer's projections.
+///
+/// All flags must reflect the CURRENT armed route for this process: an elided surface's
+/// f32 slices are empty, and the f32 forward fails loudly (never silently) if a route
+/// change routes it back through f32 arithmetic.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HotElision {
     /// Skip the talker stack's seven per-layer projections.
     pub talker: bool,
     /// Skip the microdecoder stack's seven per-layer projections.
     pub micro: bool,
+    /// Skip widening the microdecoder's fifteen per-depth heads.
+    pub micro_heads: bool,
 }
 
 /// Widens `names` concurrently, returning the tensors in the order the names were given.
@@ -977,10 +987,22 @@ pub struct TalkerCheckpoint {
     micro_layers: Vec<OwnedAttentionLayer>,
     micro_final_norm: Vec<f32>,
     micro_heads: Vec<Vec<f32>>,
+    /// The fifteen per-depth heads read artifact-natively when [`HotElision::micro_heads`]
+    /// elided their widened forms. `None` on every other path: safetensors loads, default
+    /// hydration, and `FTTS_ARTIFACT_Q8=0` forensics all keep widened heads instead.
+    micro_heads_q8: Option<Vec<QuantizedMatrix>>,
     fc1_weight: Vec<f32>,
     fc1_bias: Vec<f32>,
     fc2_weight: Vec<f32>,
     fc2_bias: Vec<f32>,
+}
+
+impl TalkerCheckpoint {
+    /// The artifact-native per-depth Q8 heads, present exactly when widening was elided.
+    #[must_use]
+    pub fn micro_heads_q8(&self) -> Option<&[QuantizedMatrix]> {
+        self.micro_heads_q8.as_deref()
+    }
 }
 
 impl TalkerCheckpoint {
@@ -1057,6 +1079,14 @@ impl TalkerCheckpoint {
                     .is_some_and(|entry| entry.dtype == StoredDtype::Q8 && entry.scales.is_some())
             };
             move |name: &str| {
+                // Heads are all-or-nothing across the fifteen depths: a mixed artifact
+                // would leave some scoring depths without either form, so the set elides
+                // only when every head is verifiably Q8 in the artifact.
+                if elision.micro_heads && name.starts_with("talker.code_predictor.lm_head.") {
+                    return (0..RESIDUAL_DEPTHS).all(|head| {
+                        q8_present(&format!("talker.code_predictor.lm_head.{head}.weight"))
+                    });
+                }
                 let stack_elided = if name.starts_with("talker.code_predictor.model.layers.") {
                     elision.micro
                 } else if name.starts_with("talker.model.layers.") {
@@ -1084,7 +1114,7 @@ impl TalkerCheckpoint {
             }
         };
         let shape_artifact = Arc::clone(&artifact);
-        Self::load_with(
+        let mut loaded = Self::load_with(
             path,
             source,
             |name| widen_fttsq(&artifact, path, name),
@@ -1098,7 +1128,32 @@ impl TalkerCheckpoint {
                         .collect()
                 })
             },
-        )
+        )?;
+        if elision.micro_heads {
+            // The elide closure only fires when all fifteen heads are verifiably Q8, so
+            // these reads cannot miss; a failure here is an artifact that changed under
+            // us, not a mixed form, and it fails the load rather than degrading.
+            let heads_q8 = (0..RESIDUAL_DEPTHS)
+                .map(|head| {
+                    let name = format!("talker.code_predictor.lm_head.{head}.weight");
+                    crate::generate::q8_from_artifact(
+                        &artifact,
+                        &name,
+                        RESIDUAL_VOCAB,
+                        TALKER_HIDDEN,
+                    )
+                    .ok_or_else(|| {
+                        artifact_tensor_error(
+                            path,
+                            &name,
+                            "q8 head vanished between elision check and read",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, CheckpointError>>()?;
+            loaded.micro_heads_q8 = Some(heads_q8);
+        }
+        Ok(loaded)
     }
 
     fn load_with(
@@ -1333,6 +1388,7 @@ impl TalkerCheckpoint {
                 Some(hidden * TEXT_EMBED_WIDTH),
             )?,
             fc2_bias: single("talker.text_projection.linear_fc2.bias", Some(hidden))?,
+            micro_heads_q8: None,
         })
     }
 

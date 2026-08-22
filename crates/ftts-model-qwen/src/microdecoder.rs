@@ -1649,7 +1649,13 @@ fn score_frame_heads(
             Some((heads, mode)) => {
                 score_head_refined(
                     &heads[head],
-                    Some(weights.heads[head]),
+                    // Under head elision (frankentts-x7bt) the widened rows are empty and
+                    // the refine source is the stored Q8 row itself, dequantized on demand.
+                    weights
+                        .heads
+                        .get(head)
+                        .copied()
+                        .filter(|row| !row.is_empty()),
                     &normed,
                     mode,
                     &mut row,
@@ -1871,7 +1877,11 @@ fn decode_frame_with_selector_inner(
         match quant.and_then(|route| route.heads.map(|heads| (heads, route.mode))) {
             Some((heads, mode)) => score_head_refined(
                 &heads[head],
-                Some(weights.heads[head]),
+                weights
+                    .heads
+                    .get(head)
+                    .copied()
+                    .filter(|row| !row.is_empty()),
                 &normed,
                 mode,
                 &mut logits,
@@ -2954,6 +2964,82 @@ mod tests {
         assert!(
             cosine > 0.99,
             "W8A8 layer step diverged from the f32 reference: cosine {cosine}"
+        );
+    }
+
+    #[test]
+    fn q8_embedding_gather_dequantizes_exactly_the_stored_rows() {
+        // The Quantized arm's gather must reproduce the stored bytes' own dequantize
+        // bit-for-bit — that is the whole contract the artifact-native path relies on —
+        // and stay within the canonical quantizer's half-step bound of the source row.
+        let hidden = 64_usize;
+        let table = weights_of(RESIDUAL_VOCAB * hidden, 77);
+        let q8 = ftts_kernels::int8::QuantizedMatrix::quantize(&table, RESIDUAL_VOCAB, hidden);
+        let embeddings = ResidualEmbeddings::Quantized(std::slice::from_ref(&q8));
+
+        for token in [0_usize, 1, 17, RESIDUAL_VOCAB / 2, RESIDUAL_VOCAB - 1] {
+            let gathered = embeddings.row(0, token, hidden);
+            let start = token * hidden;
+            let scale = q8.scales[token];
+            for (index, &value) in q8.data[start..start + hidden].iter().enumerate() {
+                assert_eq!(
+                    gathered[index].to_bits(),
+                    (value as f32 * scale).to_bits(),
+                    "gathered row {token} element {index} is not the stored byte's dequantize"
+                );
+            }
+            for (index, gathered_value) in gathered.iter().enumerate() {
+                let error = (gathered_value - table[start + index]).abs();
+                assert!(
+                    error <= scale * 0.5 + f32::EPSILON * scale.abs(),
+                    "row {token} element {index} drifted {error:e} beyond half a step ({scale:e})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refined_head_without_widened_source_is_the_stored_rows_own_matvec() {
+        // With no widened head resident (artifact-native Q8 hydration), the refine pass
+        // must produce exactly the dequantized stored rows' scalar-dot values — self-
+        // consistent with the coarse pass, which scores those same bytes.
+        let vocab = 128_usize;
+        let hidden = 32_usize;
+        let head = weights_of(vocab * hidden, 505);
+        let normed = weights_of(hidden, 909);
+        let head_q8 = ftts_kernels::int8::QuantizedMatrix::quantize(&head, vocab, hidden);
+
+        let mut logits = vec![0.0_f32; vocab];
+        score_head_refined(
+            &head_q8,
+            None,
+            &normed,
+            ftts_kernels::int8::QuantLinearMode::W8A8(ftts_kernels::int8::KernelPlanV0::pinned(
+                ftts_kernels::int8::Int8Tier::Scalar,
+            )),
+            &mut logits,
+        );
+
+        let mut checked = 0;
+        for (token, logit) in logits.iter().enumerate() {
+            let expected: f32 = head_q8.data[token * hidden..(token + 1) * hidden]
+                .iter()
+                .zip(&normed)
+                .map(|(&byte, &weight)| f32::from(byte) * head_q8.scales[token] * weight)
+                .sum();
+            if *logit == f32::NEG_INFINITY {
+                continue; // not a refine candidate this pass
+            }
+            assert_eq!(
+                logit.to_bits(),
+                expected.to_bits(),
+                "refined logit {token} is not the dequantized row's own dot product"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "refine produced {checked} candidates; the fixture should admit more than one"
         );
     }
 

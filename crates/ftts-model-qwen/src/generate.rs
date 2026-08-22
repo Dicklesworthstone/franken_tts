@@ -214,10 +214,11 @@ pub fn hot_elision_from_environment() -> crate::checkpoint::HotElision {
     crate::checkpoint::HotElision {
         talker,
         micro,
-        // Conservative until the head-elision policy lands: keep widening the
-        // per-depth heads (the pre-refactor behavior). The owner of the HotElision
-        // change wires the real gate.
-        micro_heads: false,
+        // The per-depth heads feed only the int8 coarse-score path, which reads the
+        // artifact's Q8 bytes natively (frankentts-x7bt); widening them is pure startup
+        // cost whenever the artifact verifiably carries all fifteen as Q8 — the load-time
+        // closure enforces that all-or-nothing and keeps widened heads otherwise.
+        micro_heads: micro,
     }
 }
 
