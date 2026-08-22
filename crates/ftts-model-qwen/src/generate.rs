@@ -443,15 +443,30 @@ pub fn prepare_int8_route(
                 Vec::new()
             },
             micro_heads: if arm_micro {
-                microdecoder_weights
-                    .heads
-                    .iter()
+                (0..microdecoder_weights.heads.len())
                     .map(|head| {
-                        ftts_kernels::int8::QuantizedMatrix::quantize(
-                            head,
-                            RESIDUAL_VOCAB,
-                            microdecoder_config.hidden_size,
-                        )
+                        // A --micro-q8 artifact carries the head verbatim as per-row Q8
+                        // (frankentts-x7bt): consuming those bytes skips the requantize
+                        // pass and makes the stored bytes authoritative. The fallback is
+                        // bit-identical — quantizing the widened form of the same rows
+                        // reproduces scale (max|row| = 127·scale) and values exactly — so
+                        // this is a startup-cost lever, never a numerics one.
+                        artifact
+                            .and_then(|artifact| {
+                                q8_from_artifact(
+                                    artifact,
+                                    &format!("talker.code_predictor.lm_head.{head}.weight"),
+                                    RESIDUAL_VOCAB,
+                                    microdecoder_config.hidden_size,
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                ftts_kernels::int8::QuantizedMatrix::quantize(
+                                    microdecoder_weights.heads[head],
+                                    RESIDUAL_VOCAB,
+                                    microdecoder_config.hidden_size,
+                                )
+                            })
                     })
                     .collect()
             } else {
