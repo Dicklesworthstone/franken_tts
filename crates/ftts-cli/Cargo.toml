@@ -12,6 +12,7 @@ autobins = false
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+ctrlc = { version = "3.5.2", features = ["termination"] }
 ftts-artifacts = { path = "../ftts-artifacts", version = "0.1.8" }
 ftts-core = { path = "../ftts-core", version = "0.1.8" }
 ftts-kernels = { path = "../ftts-kernels", version = "0.1.8" }

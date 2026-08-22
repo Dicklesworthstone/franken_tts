@@ -299,6 +299,7 @@ pub unsafe extern "C" fn ftts_synthesize(
             // streaming FFI (chunk callback) exposes it; 4 is the historical cadence.
             4,
             None,
+            None,
         ) {
             Ok(audio) => {
                 let mut pcm = audio.pcm.into_boxed_slice();

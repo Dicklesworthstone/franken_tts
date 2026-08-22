@@ -140,6 +140,8 @@ fn say_pipeline_writes_audible_wav() {
         0,
         &cancellation,
         &observer,
+        4,
+        None,
         None,
     )
     .expect("synthesis");

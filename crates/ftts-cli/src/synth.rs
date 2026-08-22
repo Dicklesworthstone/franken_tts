@@ -1570,6 +1570,7 @@ pub fn synthesize(
     cancellation: &CancellationToken,
     observer: &dyn SynthesisObserver,
     packet_frames: usize,
+    text_feed: Option<&ftts_core::BoundedReceiver<ftts_core::TextControl>>,
     pcm_sink: Option<&mut dyn PcmPacketSink>,
 ) -> Result<SynthesizedAudio, FttsError> {
     if packet_frames == 0 {
@@ -1774,6 +1775,7 @@ pub fn synthesize(
                     &mut tee as &mut dyn FrameGenerator,
                     cancellation,
                     observer,
+                    text_feed,
                 )
                 .map_err(engine_error);
             drop(tee); // closes the channel; the worker drains the tail packet and exits
@@ -1852,16 +1854,16 @@ impl FrameGenerator for TeeGenerator<'_> {
         self.inner.finish_text()
     }
 
-    fn next_frame(&mut self) -> Result<Option<ftts_core::CodeFrame>, GenerationError> {
-        let frame = self.inner.next_frame()?;
-        if let Some(frame) = &frame
+    fn next_frame(&mut self) -> Result<ftts_core::FrameStep, GenerationError> {
+        let step = self.inner.next_frame()?;
+        if let ftts_core::FrameStep::Frame(frame) = &step
             && self.frames.send(frame.clone()).is_err()
         {
             return Err(GenerationError::new(
                 "the codec worker stopped accepting frames; its error follows at join",
             ));
         }
-        Ok(frame)
+        Ok(step)
     }
 }
 

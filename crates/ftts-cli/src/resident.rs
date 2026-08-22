@@ -784,6 +784,7 @@ fn handle_connection(
         // historical decode cadence.
         4,
         None,
+        None,
     ) {
         Ok(audio) => {
             let header = json!({

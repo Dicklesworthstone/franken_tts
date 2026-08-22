@@ -19,7 +19,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 #[cfg(test)]
 use clap::CommandFactory;
@@ -228,6 +228,11 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Validate or synthesize text with an optional voice pack.
+    ///
+    /// Signals: the first SIGINT/SIGTERM stops the run cooperatively — audio already
+    /// delivered is finalized (a valid WAV of whatever landed; a compressed encoding
+    /// is skipped and the partial WAV kept) — and the run ends with `run_error` kind
+    /// "cancelled", exit code 6. A second signal exits immediately.
     Say(SayArgs),
     /// Synthesize text and render a share-ready branded video of it.
     #[command(name = "make-video")]
@@ -1190,6 +1195,143 @@ fn pinned_license_notice() -> String {
     )
 }
 
+/// The SIGINT/SIGTERM bridge for one `say` run (bead frankentts-astz).
+///
+/// `ctrlc` delivers signals on its own thread, so the registered closure is ordinary
+/// code, not an async-signal handler: the first strike records [`CancelState::tripped`]
+/// and trips the engine token (the frame loop notices within one 80 ms frame); any
+/// later strike exits immediately with the cancelled code — the behavioral equivalent
+/// of restoring the default disposition, so a wedged process can still be killed. The
+/// OS hook is installed once per process and each run swaps in its own state; a failed
+/// install degrades to the default disposition rather than failing the run.
+struct CancelState {
+    /// Signal strikes seen so far: first vs force-exit.
+    signals: std::sync::atomic::AtomicU32,
+    /// Set by the first signal; polled where the token cannot reach — the resident
+    /// daemon round-trip, whose v1 wire protocol has no cancel operation.
+    tripped: std::sync::atomic::AtomicBool,
+    /// Tripped by the first signal; aborts the in-process engine loop.
+    token: ftts_core::CancellationToken,
+}
+
+impl CancelState {
+    fn new() -> Self {
+        Self {
+            signals: std::sync::atomic::AtomicU32::new(0),
+            tripped: std::sync::atomic::AtomicBool::new(false),
+            token: ftts_core::CancellationToken::new(),
+        }
+    }
+
+    /// Whether any cancellation request has landed, by either route.
+    fn was_tripped(&self) -> bool {
+        self.tripped.load(std::sync::atomic::Ordering::Relaxed) || self.token.is_cancelled()
+    }
+}
+
+/// What one delivered signal means for the run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrikeAction {
+    /// First signal: cancel cooperatively.
+    Trip,
+    /// Any later signal: stop now.
+    ForceExit,
+}
+
+/// The pure two-strike decision, unit-tested here; real delivery timing belongs to
+/// the cancellation e2e battery (`frankentts-9t5v`).
+fn next_strike_action(signals_seen: u32) -> StrikeAction {
+    if signals_seen <= 1 {
+        StrikeAction::Trip
+    } else {
+        StrikeAction::ForceExit
+    }
+}
+
+/// The ctrlc hook itself, installed on first force. It reads [`ACTIVE_CANCEL`] on
+/// every delivery, so later runs replace the served state without touching the OS
+/// handler again.
+static SIGNAL_HOOK: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| {
+    // Best effort by design: if the hook cannot be installed (exotic platform,
+    // sandbox), Ctrl-C keeps its default killing disposition instead.
+    let _ = ctrlc::set_handler(|| {
+        let Ok(guard) = ACTIVE_CANCEL.lock() else {
+            return;
+        };
+        let Some(state) = guard.as_ref() else {
+            return;
+        };
+        let seen = state
+            .signals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        drop(guard);
+        match next_strike_action(seen) {
+            StrikeAction::Trip => trip_active_cancel(),
+            StrikeAction::ForceExit => {
+                std::process::exit(i32::from(FttsExitCode::Cancelled.as_u8()));
+            }
+        }
+    });
+});
+
+static ACTIVE_CANCEL: std::sync::Mutex<Option<std::sync::Arc<CancelState>>> =
+    std::sync::Mutex::new(None);
+
+/// Make `state` the run the signal bridge serves.
+fn install_cancel_handler(state: std::sync::Arc<CancelState>) {
+    LazyLock::force(&SIGNAL_HOOK);
+    *ACTIVE_CANCEL.lock().expect("cancel-state mutex poisoned") = Some(state);
+}
+
+/// Record the cancellation and trip whichever engine token is currently serving.
+fn trip_active_cancel() {
+    let Ok(guard) = ACTIVE_CANCEL.lock() else {
+        return;
+    };
+    if let Some(state) = guard.as_ref() {
+        state
+            .tripped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state.token.cancel();
+    }
+}
+
+/// Finalize what a cancelled run already delivered and word the disposition for the
+/// terminal event's message field — the existing `run_error` shape carries it, no new
+/// fields anywhere.
+///
+/// File sinks get their header patched to exactly the samples that landed: a parseable
+/// partial artifact beats a torn file. Compressed targets keep that partial WAV at its
+/// staging path and skip the system encoder entirely — handing a truncated file to the
+/// encoder would produce garbage or nothing, never a valid `.m4a`, and the event says
+/// so. Raw streams already ended at a packet boundary; the streamed byte count is the
+/// accounting receipt.
+fn cancelled_run_disposition(audio: AudioOutput, plan: Option<&OutputPlan>) -> FttsError {
+    let streamed_bytes = audio.byte_offset();
+    let samples = match audio.finish() {
+        Ok(samples) => samples,
+        Err(error) => {
+            return FttsError::Cancelled(format!(
+                "cancelled by signal; the partial WAV could not be finalized: {error}"
+            ));
+        }
+    };
+    let message = match plan {
+        None => format!("cancelled by signal after streaming {streamed_bytes} raw PCM bytes"),
+        Some(plan) if plan.format == OutputFormat::Wav => format!(
+            "cancelled after {samples} samples; partial WAV kept at {}",
+            plan.final_path.display()
+        ),
+        Some(plan) => format!(
+            "cancelled after {samples} samples; encoding to {} skipped, partial WAV kept at {}",
+            plan.final_path.display(),
+            plan.wav_path.display()
+        ),
+    };
+    FttsError::Cancelled(message)
+}
+
 fn run_say(
     cli: &Cli,
     args: &SayArgs,
@@ -1685,9 +1827,16 @@ fn run_say_events(
     // future switch to the production sampler silently irreproducible.
     let seed = cli.seed.unwrap_or(0);
 
+    // The signal bridge goes up before anything slow: a SIGINT during the resident
+    // round-trip must land somewhere even though the v1 wire protocol cannot cancel
+    // the daemon. Inline synthesis shares this token, so one handler serves both
+    // paths (bead frankentts-astz).
+    let cancel = std::sync::Arc::new(CancelState::new());
+    install_cancel_handler(cancel.clone());
+
     emit_stage(run, emit, "synthesis", "begin", &mut seq)?;
     let resident_audio = if use_resident {
-        resident::try_synthesize(
+        let audio = resident::try_synthesize(
             &bundle,
             &resident::WireRequest {
                 text: &request.text,
@@ -1696,7 +1845,18 @@ fn run_say_events(
                 speaker: &speaker,
                 seed,
             },
-        )?
+        )?;
+        // The daemon finished anyway — v1 has no cancel op — but honoring the request
+        // means discarding the reply, not shipping audio the user asked us to stop
+        // making. Same terminal shape as an inline cancel: run_error, exit 6.
+        if audio.is_some() && cancel.was_tripped() {
+            return Err(FttsError::Cancelled(
+                "cancelled while the resident engine was serving the request; its \
+                 completed audio was discarded"
+                    .to_owned(),
+            ));
+        }
+        audio
     } else {
         None
     };
@@ -1714,7 +1874,10 @@ fn run_say_events(
             };
             let engine = ftts_core::TtsEngine::from_process_environment()
                 .map_err(|error| FttsError::Generic(format!("cannot start the engine: {error}")))?;
-            let cancellation = ftts_core::CancellationToken::new();
+            // The engine loop aborts on the SHARED token: one SIGINT trips it through
+            // the signal bridge, and `cancel.was_tripped()` is what turns whatever
+            // refusal the abort produces into the cancelled disposition below.
+            let cancellation = &cancel.token;
 
             // In-process synthesis streams for real: the engine runs on a scoped thread with
             // a channel-backed PcmPacketSink, and THIS thread — which owns `emit`, the audio
@@ -1779,9 +1942,10 @@ fn run_say_events(
                         &request,
                         &speaker,
                         seed,
-                        &cancellation,
+                        cancellation,
                         &observer,
                         usize::from(settings.packet_frames.frames_per_packet()),
+                        None,
                         Some(&mut sink),
                     )
                 });
@@ -1852,7 +2016,19 @@ fn run_say_events(
                     Some(error) => Err(error),
                     None => produced,
                 }
-            })?;
+            });
+            let produced = match produced {
+                Ok(produced) => produced,
+                Err(error) => {
+                    // A signal during synthesis outranks whatever refusal the abort
+                    // produced: the run reports cancelled (exit 6) with its partial-
+                    // artifact disposition, never an incidental channel error.
+                    if cancel.was_tripped() {
+                        return Err(cancelled_run_disposition(audio, output_plan.as_ref()));
+                    }
+                    return Err(error);
+                }
+            };
             (produced, true)
         }
     };
@@ -4457,5 +4633,93 @@ mod tests {
                 "{fallback:?}"
             );
         }
+    }
+
+    /// Two-strike semantics: the first signal cancels cooperatively, every later one
+    /// is a force-exit — the state machine the ctrlc hook runs.
+    #[test]
+    fn first_signal_trips_and_later_signals_force_exit() {
+        assert_eq!(next_strike_action(0), StrikeAction::Trip);
+        assert_eq!(next_strike_action(1), StrikeAction::Trip);
+        assert_eq!(next_strike_action(2), StrikeAction::ForceExit);
+        assert_eq!(next_strike_action(9), StrikeAction::ForceExit);
+    }
+
+    /// The handler-trip path without an OS signal: tripping the shared token through
+    /// the same routine the hook calls must flip both the flag and the engine token,
+    /// which is what `was_tripped` reports to the run's error paths.
+    #[test]
+    fn trip_active_cancel_marks_the_state_and_token() {
+        let cancel = std::sync::Arc::new(CancelState::new());
+        assert!(!cancel.was_tripped(), "fresh state starts untripped");
+
+        // Install as the served run, then trip exactly as the signal hook would.
+        *ACTIVE_CANCEL.lock().expect("lock") = Some(cancel.clone());
+        cancel.token.cancel();
+        trip_active_cancel();
+
+        assert!(cancel.tripped.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(cancel.was_tripped(), "both routes must report tripped");
+        // Restore so other tests never observe this state.
+        *ACTIVE_CANCEL.lock().expect("lock") = None;
+    }
+
+    /// The disposition wording per sink kind: file sinks name the kept artifact,
+    /// compressed targets state the skipped encoding and staging path, raw streams
+    /// report streamed bytes. These messages ride the EXISTING run_error.message
+    /// field — no new event vocabulary anywhere.
+    #[test]
+    fn cancelled_dispositions_name_what_happened_to_the_audio() {
+        let scratch = std::env::temp_dir().join(format!(
+            "ftts-cancel-disposition-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+
+        // WAV: partial file finalized at the requested path.
+        let wav_plan = OutputPlan::for_path(&scratch.join("out.wav")).expect("wav plan");
+        let audio = AudioOutput::wav(&wav_plan.wav_path).expect("wav sink");
+        let error = cancelled_run_disposition(audio, Some(&wav_plan));
+        assert_eq!(error.exit_code(), FttsExitCode::Cancelled);
+        assert!(error.to_string().contains("partial WAV kept at"), "{error}");
+        assert!(error.to_string().contains("out.wav"), "{error}");
+
+        // Compressed: encoding skipped, staging WAV named.
+        let m4a_plan = OutputPlan::for_path(&scratch.join("out.m4a")).expect("m4a plan");
+        assert_eq!(
+            m4a_plan.format,
+            OutputFormat::M4a,
+            "extension selects the compressed arm"
+        );
+        assert!(
+            m4a_plan
+                .wav_path
+                .to_string_lossy()
+                .ends_with(".ftts-staging.wav")
+        );
+        let audio = AudioOutput::wav(&m4a_plan.wav_path).expect("staging sink");
+        let error = cancelled_run_disposition(audio, Some(&m4a_plan));
+        assert!(error.to_string().contains("encoding to"), "{error}");
+        assert!(error.to_string().contains("skipped"), "{error}");
+        assert!(error.to_string().contains(".ftts-staging.wav"), "{error}");
+
+        // Raw: no artifact exists; the byte count is the receipt.
+        let audio = AudioOutput::raw();
+        let error = cancelled_run_disposition(audio, None);
+        assert!(
+            error.to_string().contains("streaming 0 raw PCM bytes"),
+            "{error}"
+        );
+
+        // A zero-packet WAV run still leaves a parseable (header-only) file behind.
+        let empty_plan = OutputPlan::for_path(&scratch.join("empty.wav")).expect("plan");
+        let audio = AudioOutput::wav(&empty_plan.wav_path).expect("sink");
+        let _ = cancelled_run_disposition(audio, Some(&empty_plan));
+        let header = std::fs::read(&empty_plan.final_path).expect("finalized wav");
+        assert!(header.len() >= 44, "RIFF header present: {}", header.len());
+        assert_eq!(&header[..4], b"RIFF", "must be a parseable RIFF file");
     }
 }

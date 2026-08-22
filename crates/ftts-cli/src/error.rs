@@ -55,6 +55,11 @@ pub enum FttsError {
     BudgetTimeout(String),
     ArtifactFormat(String),
     EnrollmentQualityRefusal(String),
+    /// The run stopped because SIGINT/SIGTERM asked it to. The message states what the
+    /// cancelled run left behind — the finalized partial artifact, or the encoding that
+    /// was skipped — so the existing `run_error` shape carries the whole disposition
+    /// without any new fields.
+    Cancelled(String),
     /// A `ftts talk` transport death no op could cause and no op can recover from.
     SessionTransport(String),
 }
@@ -86,6 +91,10 @@ impl FttsError {
             Self::EnrollmentQualityRefusal(_) => {
                 "supply a cleaner reference, or pass --force to accept the warned-about quality"
             }
+            Self::Cancelled(_) => {
+                "the run stopped because a signal asked it to; re-run the command to \
+                 synthesize again"
+            }
             Self::SessionTransport(_) => {
                 "the session process is exiting; restart `ftts talk`. If it \
                                            recurs, check that the PCM consumer is still draining \
@@ -104,6 +113,7 @@ impl FttsError {
             Self::BudgetTimeout(_) => FttsExitCode::BudgetTimeout,
             Self::ArtifactFormat(_) => FttsExitCode::ArtifactFormat,
             Self::EnrollmentQualityRefusal(_) => FttsExitCode::EnrollmentQualityRefusal,
+            Self::Cancelled(_) => FttsExitCode::Cancelled,
             Self::SessionTransport(_) => FttsExitCode::SessionTransport,
         }
     }
@@ -119,6 +129,7 @@ impl fmt::Display for FttsError {
             | Self::BudgetTimeout(message)
             | Self::ArtifactFormat(message)
             | Self::EnrollmentQualityRefusal(message)
+            | Self::Cancelled(message)
             | Self::SessionTransport(message) => formatter.write_str(message),
         }
     }
@@ -148,5 +159,16 @@ mod tests {
         for (code, expected) in cases {
             assert_eq!(code.as_u8(), expected, "{}", code.description());
         }
+    }
+
+    /// The cancellation contract: an interrupted run reports exit code 6 under kind
+    /// "cancelled" through the same mapping every other failure class uses.
+    #[test]
+    fn cancelled_errors_carry_the_documented_terminal_shape() {
+        let error = super::FttsError::Cancelled("partial WAV kept at out.wav".to_owned());
+        assert_eq!(error.exit_code().as_u8(), 6);
+        assert_eq!(error.exit_code().description(), "cancelled");
+        assert_eq!(error.to_string(), "partial WAV kept at out.wav");
+        assert!(!error.remediation().is_empty());
     }
 }
