@@ -227,6 +227,16 @@ impl LoadedModel {
             int8_route: std::sync::OnceLock::new(),
         })
     }
+
+    /// Whether the fused int8 route has been built for this loaded model.
+    ///
+    /// Observability for warm-start receipts: a caller that sees this flip to true knows every
+    /// later utterance borrows the prepared tables instead of rebuilding them (bead
+    /// frankentts-wlvg), without reaching into the route itself.
+    #[must_use]
+    pub fn int8_route_ready(&self) -> bool {
+        self.int8_route.get().is_some()
+    }
 }
 
 /// Read a precomputed 1,024-wide speaker vector.
