@@ -156,6 +156,16 @@ def main():
     parser.add_argument("--replay", default=str(FIXTURES / "normal_turn.ndjson"))
     parser.add_argument("--voice", default="matt")
     parser.add_argument("--llm-ttft-ms", type=int, default=300, help="simulated canned-LLM first-sentence latency")
+    parser.add_argument(
+        "--llm",
+        default="canned",
+        help="'canned' (deterministic, measures OUR loop) or 'exec:<command>' — the "
+             "command receives the user text on stdin and prints the reply (a real "
+             "agent, ollama wrapper, etc.); its latency then dominates and is reported "
+             "as measured, not simulated",
+    )
+    parser.add_argument("--turns", type=int, default=1,
+                        help="replay the fixture this many times for a longer table")
     parser.add_argument("--session-dir", default="/tmp/ftts-talk-demo")
     parser.add_argument("--play", action="store_true", help="play PCM through sox/ffplay if present")
     parser.add_argument(
@@ -171,12 +181,13 @@ def main():
         json.loads(line)
         for line in Path(args.replay).read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")  # fixtures carry contract headers
-    ]
+    ] * max(args.turns, 1)
     talk = Talk(args.ftts, Path(args.session_dir), args.play)
     talk.send({"op": "open", "context": "demo", "voice": args.voice, "seed": 7, "id": "open"})
     talk.wait(lambda e: e["event"] == "context_open")
 
     turns = []
+    transcript = []
     reply_index = 0
     utterance = None
     speaking = False
@@ -220,14 +231,25 @@ def main():
             talk.send({"op": "cancel", "context": "demo", "id": f"cancel-{utterance}"})
             receipt = talk.wait(lambda e: e["event"] == "speak_cancelled")
             speaking = False
+            # THE truncation consumption: the assistant turn in the running transcript
+            # becomes only what was (at most) heard — the receipt, used downstream.
+            if transcript and transcript[-1][0] == "assistant":
+                transcript[-1] = ("assistant (interrupted)", receipt["spoken_text"])
             log({"turn": "barge-in", "spoken_upper_bound": receipt["spoken_text"],
                  "frames_delivered": receipt["frames_delivered"]})
         if kind == "utterance_end" and event.get("text"):
             ensure_idle()
             t_endpoint = time.monotonic()
-            time.sleep(args.llm_ttft_ms / 1000.0)  # canned LLM "thinks"
-            reply = CANNED_REPLIES[reply_index % len(CANNED_REPLIES)]
-            reply_index += 1
+            if args.llm.startswith("exec:"):
+                # A real model: its own latency, measured not simulated.
+                reply = subprocess.run(
+                    args.llm[5:], shell=True, input=event["text"],
+                    capture_output=True, text=True, timeout=120,
+                ).stdout.strip() or "I did not catch that."
+            else:
+                time.sleep(args.llm_ttft_ms / 1000.0)  # canned LLM "thinks"
+                reply = CANNED_REPLIES[reply_index % len(CANNED_REPLIES)]
+                reply_index += 1
             t_llm_first = time.monotonic()
             chunks = sentence_chunks(reply)
             talk.send({"op": "say", "context": "demo", "text": chunks[0], "continue": True})
@@ -251,6 +273,8 @@ def main():
                 "voice_to_voice_ms": round((t_audio - t_endpoint) * 1000),
                 "ttfa_ms_reported": first_audio.get("ttfa_ms"),
             }
+            transcript.append(("user", event["text"]))
+            transcript.append(("assistant", reply))
             turns.append(turn)
             log(turn)
             # Do NOT block for the receipt here: the reply keeps speaking while the
@@ -265,14 +289,17 @@ def main():
     if turns:
         v2v = sorted(t["voice_to_voice_ms"] for t in turns)
         tts = sorted(t["say_to_first_audio_ms"] for t in turns)
+        p95 = v2v[min(len(v2v) - 1, int(len(v2v) * 0.95))]
         log({
             "summary": True,
             "turns": len(turns),
-            "voice_to_voice_ms": {"p50": v2v[len(v2v) // 2], "max": v2v[-1]},
+            "voice_to_voice_ms": {"p50": v2v[len(v2v) // 2], "p95": p95, "max": v2v[-1]},
             "say_to_first_audio_ms": {"p50": tts[len(tts) // 2], "max": tts[-1]},
-            "note": "one-shot run output; llm_ttft is simulated (--llm-ttft-ms); "
+            "host_load_avg": list(os.getloadavg()),
+            "note": "one-shot run output; canned llm_ttft is simulated (--llm-ttft-ms); "
                     "endpointing/finalization stages arrive with live fw mode",
         })
+        log({"final_transcript": [f"{role}: {text}" for role, text in transcript]})
 
 
 if __name__ == "__main__":
