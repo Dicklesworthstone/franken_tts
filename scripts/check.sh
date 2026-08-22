@@ -222,6 +222,30 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 3d. The wasm bindings compile against the CURRENT core API.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Every native stage above skips the entire ftts-wasm byte surface — it is
+# #[cfg(not(unix))] — so fmt/clippy/test can all stay green while main does not
+# compile for the browser at all. That happened for real (frankentts-1a60): the
+# FrameGenerator API change landed with ftts-wasm unmigrated, invisible until
+# someone ran ./site/build.sh. This stage is the tripwire: same target, plain
+# prebuilt-wasm-std check (build.sh's -Z build-std stays deploy-only).
+#
+# Local by design on two counts: remote workers lack the prebuilt wasm32 std,
+# and the code being compiled is exactly what native stages cannot see. The
+# bypass env is the cargo shim's own documented loop-break — no shim changes.
+stage_start "wasm bindings compile against core API"
+if ! rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
+    stage_skip "rustup target wasm32-unknown-unknown not installed (rustup target add wasm32-unknown-unknown)"
+else
+    if ! RCH_CARGO_WRAPPER_BYPASS=1 cargo check -p ftts-wasm --locked --target wasm32-unknown-unknown; then
+        stage_fail "ftts-wasm does not compile for wasm32 against current core APIs — the browser build is red while native gates stay green; migrate crates/ftts-wasm/src/lib.rs to the current ftts-core/ftts-model-qwen APIs"
+    fi
+    stage_pass
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 4. Formatting
 # ─────────────────────────────────────────────────────────────────────────────
 stage_start "cargo fmt --check"
