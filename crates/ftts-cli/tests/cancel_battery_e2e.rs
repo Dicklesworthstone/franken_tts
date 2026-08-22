@@ -363,8 +363,11 @@ fn file_mode_sigint_leaves_a_valid_partial_wav_and_exits_promptly() {
     let code = status.code().unwrap_or(-1);
     assert_eq!(code, 6, "cancelled run must exit 6, got {code}");
 
+    // The catalogue puts audio_chunk on stdout but run_error on STDERR, on both
+    // stream shapes — the terminal event lives on the error stream.
     let events = parse_and_validate(&stdout_path, "robot events");
-    let terminal = terminal_event(&events, "file mode");
+    let errors = parse_and_validate(&stderr_path, "robot stderr");
+    let terminal = terminal_event(&errors, "file mode stderr");
     assert_eq!(
         event_name(&terminal),
         "run_error",
@@ -429,7 +432,10 @@ fn prefill_phase_sigint_pins_the_zero_sample_artifact() {
     assert_eq!(status.code().unwrap_or(-1), 6);
 
     let events = parse_and_validate(&stdout_path, "prefill events");
-    let terminal = terminal_event(&events, "prefill");
+    let terminal = terminal_event(
+        &parse_and_validate(&stderr_path, "prefill stderr"),
+        "prefill",
+    );
     assert_eq!(terminal["kind"], "cancelled");
     let data_size = validated_wav_data_size(&out, "prefill WAV");
     assert_eq!(
@@ -553,7 +559,10 @@ fn compressed_target_cancel_skips_the_encoder_and_keeps_the_staging_wav() {
     let data_size = validated_wav_data_size(&staging, "staging WAV");
 
     let events = parse_and_validate(&stdout_path, "compressed events");
-    let terminal = terminal_event(&events, "compressed");
+    let terminal = terminal_event(
+        &parse_and_validate(&stderr_path, "compressed stderr"),
+        "compressed",
+    );
     assert_eq!(terminal["kind"], "cancelled");
     let message = terminal["message"].as_str().expect("message present");
     assert!(
@@ -625,7 +634,10 @@ fn resident_client_cancel_discards_and_the_daemon_survives() {
         "discarded reply must not be written to the requested output"
     );
     let events = parse_and_validate(&stdout_path, "resident cancel events");
-    let terminal = terminal_event(&events, "resident cancel");
+    let terminal = terminal_event(
+        &parse_and_validate(&stderr_path, "resident cancel stderr"),
+        "resident cancel",
+    );
     assert_eq!(terminal["kind"], "cancelled");
     let message = terminal["message"].as_str().unwrap_or_default();
     assert!(
