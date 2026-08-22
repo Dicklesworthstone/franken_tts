@@ -474,6 +474,8 @@ enum RobotCommand {
         #[arg(default_value = "run")]
         contract: SchemaContract,
     },
+    /// Print a versioned machine-readable readiness event.
+    Health,
     /// Print available backend routes without probing model weights.
     Backends,
     /// Print the self-test state; no unavailable kernel is reported as passing.

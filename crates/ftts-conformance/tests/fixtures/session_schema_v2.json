@@ -1,0 +1,972 @@
+{
+  "audio_contract": "raw PCM s16le mono 24 kHz on a separate channel; nothing but PCM ever appears there; audio events' byte_offset/bytes are the sequencing authority",
+  "contract": "session",
+  "environment_variables": [
+    "FTTS_MODEL_DIR",
+    "FTTS_DEFAULT_VOICE",
+    "FTTS_THREADS",
+    "FTTS_PROFILE",
+    "FTTS_PACKET_FRAMES",
+    "FTTS_MATH_MODE",
+    "FTTS_QUANT",
+    "FTTS_FORCE_ARCH",
+    "FTTS_NUMA",
+    "FTTS_MAX_FRAMES",
+    "FTTS_MEMORY_BUDGET_MB",
+    "FTTS_STAGE_BUDGET_SYNTHESIS_MS",
+    "FTTS_STAGE_BUDGET_FRAME_MS",
+    "FTTS_STAGE_BUDGET_ENROLL_MS",
+    "FTTS_NO_RESIDENT",
+    "FTTS_RESIDENT_IDLE_SECS",
+    "FTTS_RESIDENT_DIR",
+    "FTTS_RESIDENT_LOG",
+    "FTTS_RESIDENT_SPAWN_WAIT_SECS",
+    "FTTS_RESIDENT_CLIENT_TIMEOUT_SECS",
+    "FTTS_DENOISE_ENGINE",
+    "FTTS_INT8",
+    "FTTS_INT8_TIER",
+    "FTTS_INT8_SCOPE",
+    "FTTS_INT8_CODEC",
+    "FTTS_INT8_THREADS",
+    "FTTS_ARTIFACT_Q8",
+    "FTTS_FAST_SNAKE"
+  ],
+  "event": "session_schema",
+  "events": [
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "version",
+          "required": true,
+          "summary": "binary version of the serving process",
+          "type": "string"
+        },
+        {
+          "name": "model",
+          "required": true,
+          "summary": "model digest or artifact identifier in force",
+          "type": "string"
+        },
+        {
+          "name": "route",
+          "required": true,
+          "summary": "kernel route identifier (e.g. the int8 default)",
+          "type": "string"
+        },
+        {
+          "name": "pcm",
+          "required": true,
+          "summary": "audio shape: {format: \"s16le\", rate: 24000, channels: 1}",
+          "type": "object"
+        },
+        {
+          "name": "pid",
+          "required": true,
+          "summary": "process id of the session, for lifecycle management",
+          "type": "u64"
+        }
+      ],
+      "kind": "stream",
+      "name": "session_start",
+      "stream": "events",
+      "summary": "emitted once when the model is loaded and the session accepts ops"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "id",
+          "required": true,
+          "summary": "the op's client id, or null when the op carried none",
+          "type": "string|null"
+        },
+        {
+          "name": "op",
+          "required": true,
+          "summary": "the op name being acknowledged",
+          "type": "string"
+        },
+        {
+          "name": "context",
+          "required": true,
+          "summary": "the op's context, or null for context-less ops (shutdown)",
+          "type": "string|null"
+        }
+      ],
+      "kind": "stream",
+      "name": "ack",
+      "stream": "events",
+      "summary": "acceptance receipt for one well-formed op"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "voice",
+          "required": true,
+          "summary": "resolved voice descriptor: preset name or file path",
+          "type": "string"
+        },
+        {
+          "name": "seed",
+          "required": true,
+          "summary": "the context seed in force; per-utterance seeds derive from it",
+          "type": "u64"
+        }
+      ],
+      "kind": "stream",
+      "name": "context_open",
+      "stream": "events",
+      "summary": "a context exists and its voice is resolved"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "utterance",
+          "required": true,
+          "summary": "per-context utterance counter, starting at 0",
+          "type": "u64"
+        },
+        {
+          "name": "seed",
+          "required": true,
+          "summary": "the effective seed for this utterance (derived or overridden)",
+          "type": "u64"
+        }
+      ],
+      "kind": "stream",
+      "name": "speak_start",
+      "stream": "events",
+      "summary": "synthesis began for one utterance"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "utterance",
+          "required": true,
+          "summary": "which utterance the packet belongs to",
+          "type": "u64"
+        },
+        {
+          "name": "byte_offset",
+          "required": true,
+          "summary": "cumulative offset of this packet's first byte in the session-global PCM stream",
+          "type": "u64"
+        },
+        {
+          "name": "bytes",
+          "required": true,
+          "summary": "packet size in bytes on the audio channel",
+          "type": "u64"
+        },
+        {
+          "name": "frames",
+          "required": true,
+          "summary": "80 ms codec frames the packet carries",
+          "type": "u64"
+        },
+        {
+          "name": "frame_index",
+          "required": true,
+          "summary": "index of the packet's first frame within its utterance",
+          "type": "u64"
+        },
+        {
+          "name": "ttfa_ms",
+          "required": false,
+          "summary": "time to first audible sample, present only on an utterance's first packet",
+          "type": "u64"
+        }
+      ],
+      "kind": "stream",
+      "name": "audio",
+      "stream": "events",
+      "summary": "one packet of PCM was handed to the audio channel"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "utterance",
+          "required": true,
+          "summary": "which utterance is progressing",
+          "type": "u64"
+        },
+        {
+          "name": "frames_emitted",
+          "required": true,
+          "summary": "codec frames delivered so far",
+          "type": "u64"
+        },
+        {
+          "name": "text_consumed_tokens",
+          "required": true,
+          "summary": "tokens the generator has already consumed",
+          "type": "u64"
+        },
+        {
+          "name": "text_buffered_tokens",
+          "required": true,
+          "summary": "tokens appended but not yet consumed",
+          "type": "u64"
+        }
+      ],
+      "kind": "stream",
+      "name": "progress",
+      "stream": "events",
+      "summary": "rate-limited (~1/s) generation progress for a speaking utterance"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "queued_ms",
+          "required": true,
+          "summary": "delivered-but-unconsumed audio, in milliseconds",
+          "type": "u64"
+        }
+      ],
+      "kind": "stream",
+      "name": "buffer",
+      "stream": "events",
+      "summary": "audio-channel depth: the orchestrator's pacing signal"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "waited_ms",
+          "required": true,
+          "summary": "how long synthesis stalled awaiting text",
+          "type": "u64"
+        }
+      ],
+      "kind": "stream",
+      "name": "text_underrun",
+      "stream": "events",
+      "summary": "the generator ran out of text and waited for the client"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "utterance",
+          "required": true,
+          "summary": "which utterance was cut short",
+          "type": "u64"
+        },
+        {
+          "name": "frames_delivered",
+          "required": true,
+          "summary": "codec frames delivered before the stop",
+          "type": "u64"
+        },
+        {
+          "name": "audio_ms",
+          "required": true,
+          "summary": "audio delivered before the stop",
+          "type": "u64"
+        },
+        {
+          "name": "text_spoken_tokens",
+          "required": true,
+          "summary": "tokens whose text is inside the delivered audio",
+          "type": "u64"
+        },
+        {
+          "name": "spoken_text",
+          "required": true,
+          "summary": "tokenizer-decoded prefix actually delivered, so the orchestrator can rewrite its turn to what the user heard",
+          "type": "string"
+        }
+      ],
+      "kind": "stream",
+      "name": "speak_cancelled",
+      "stream": "events",
+      "summary": "frame-boundary stop with a truncation receipt"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "utterance",
+          "required": true,
+          "summary": "which utterance completed",
+          "type": "u64"
+        },
+        {
+          "name": "frames",
+          "required": true,
+          "summary": "total codec frames",
+          "type": "u64"
+        },
+        {
+          "name": "audio_ms",
+          "required": true,
+          "summary": "total audio duration",
+          "type": "u64"
+        },
+        {
+          "name": "ttfa_ms",
+          "required": true,
+          "summary": "time to first audible sample for this utterance",
+          "type": "u64"
+        },
+        {
+          "name": "rtf",
+          "required": true,
+          "summary": "real-time factor: synthesis wall time over audio duration",
+          "type": "number"
+        }
+      ],
+      "kind": "stream",
+      "name": "speak_complete",
+      "stream": "events",
+      "summary": "an utterance finished on its own (EOS)"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        }
+      ],
+      "kind": "stream",
+      "name": "context_closed",
+      "stream": "events",
+      "summary": "a context is finished; its id may be reused by a later open"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        }
+      ],
+      "kind": "stream",
+      "name": "session_end",
+      "stream": "events",
+      "summary": "the session drained and is exiting cleanly"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "kind",
+          "required": true,
+          "summary": "stable error class the client can branch on",
+          "type": "string"
+        },
+        {
+          "name": "message",
+          "required": true,
+          "summary": "what happened, naming the offending value",
+          "type": "string"
+        },
+        {
+          "name": "remediation",
+          "required": true,
+          "summary": "the action that fixes it",
+          "type": "string"
+        }
+      ],
+      "kind": "stream",
+      "name": "session_error",
+      "stream": "events",
+      "summary": "a rejected op or a session-level problem; the session survives op errors"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "summary": "correlates the events of one session process",
+          "type": "string"
+        },
+        {
+          "name": "seq",
+          "required": true,
+          "summary": "monotonically increasing per stdout line within the session",
+          "type": "u64"
+        },
+        {
+          "name": "contract",
+          "required": true,
+          "summary": "always \"session\"; distinguishes the reply from the v1 run schema",
+          "type": "string"
+        },
+        {
+          "name": "events",
+          "required": true,
+          "summary": "the event catalogue",
+          "type": "array"
+        },
+        {
+          "name": "ops",
+          "required": true,
+          "summary": "the op catalogue",
+          "type": "array"
+        },
+        {
+          "name": "stdin_contract",
+          "required": true,
+          "summary": "how a client drives the session",
+          "type": "string"
+        },
+        {
+          "name": "audio_contract",
+          "required": true,
+          "summary": "how PCM reaches the client and how it is sequenced",
+          "type": "string"
+        },
+        {
+          "name": "seed_derivation",
+          "required": true,
+          "summary": "the pinned per-utterance seed function",
+          "type": "string"
+        },
+        {
+          "name": "environment_variables",
+          "required": true,
+          "summary": "environment knobs the session reads",
+          "type": "array"
+        },
+        {
+          "name": "exit_codes",
+          "required": true,
+          "summary": "every documented exit code, including the session-transport code",
+          "type": "object"
+        }
+      ],
+      "kind": "reply",
+      "name": "session_schema",
+      "stream": "events",
+      "summary": "self-description of this contract, printed by `ftts robot schema session`"
+    }
+  ],
+  "exit_codes": {
+    "0": "success",
+    "1": "generic error",
+    "2": "usage or CLI error",
+    "3": "model not found or not resolvable",
+    "4": "input error",
+    "5": "budget or timeout exceeded",
+    "6": "cancelled",
+    "7": "artifact format or version mismatch",
+    "8": "enrollment-quality refusal",
+    "9": "talk-session transport failed"
+  },
+  "ops": [
+    {
+      "fields": [
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "voice",
+          "required": false,
+          "summary": "preset name, .spk path, or voice-card image path; default voice when absent",
+          "type": "string"
+        },
+        {
+          "name": "seed",
+          "required": false,
+          "summary": "context seed; derived from the session default when absent",
+          "type": "u64"
+        },
+        {
+          "name": "id",
+          "required": false,
+          "summary": "optional client correlation id, echoed in the matching ack or session_error",
+          "type": "string"
+        }
+      ],
+      "kind": "stream",
+      "name": "open",
+      "stream": "events",
+      "summary": "create a context with a resolved voice and a context seed"
+    },
+    {
+      "fields": [
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "text",
+          "required": true,
+          "summary": "text to speak; chunks concatenate verbatim across says",
+          "type": "string"
+        },
+        {
+          "name": "continue",
+          "required": false,
+          "summary": "keep the utterance open for further say ops (default false)",
+          "type": "bool"
+        },
+        {
+          "name": "seed",
+          "required": false,
+          "summary": "per-utterance seed override",
+          "type": "u64"
+        },
+        {
+          "name": "id",
+          "required": false,
+          "summary": "optional client correlation id, echoed in the matching ack or session_error",
+          "type": "string"
+        }
+      ],
+      "kind": "stream",
+      "name": "say",
+      "stream": "events",
+      "summary": "speak text in a context; continue:true holds the utterance open for appends"
+    },
+    {
+      "fields": [
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "id",
+          "required": false,
+          "summary": "optional client correlation id, echoed in the matching ack or session_error",
+          "type": "string"
+        }
+      ],
+      "kind": "stream",
+      "name": "flush",
+      "stream": "events",
+      "summary": "release any withheld partial word and finish the open utterance"
+    },
+    {
+      "fields": [
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "id",
+          "required": false,
+          "summary": "optional client correlation id, echoed in the matching ack or session_error",
+          "type": "string"
+        }
+      ],
+      "kind": "stream",
+      "name": "cancel",
+      "stream": "events",
+      "summary": "stop the speaking utterance at the next frame boundary"
+    },
+    {
+      "fields": [
+        {
+          "name": "context",
+          "required": true,
+          "summary": "names one conversation context within the session",
+          "type": "string"
+        },
+        {
+          "name": "id",
+          "required": false,
+          "summary": "optional client correlation id, echoed in the matching ack or session_error",
+          "type": "string"
+        }
+      ],
+      "kind": "stream",
+      "name": "close",
+      "stream": "events",
+      "summary": "finish and remove a context"
+    },
+    {
+      "fields": [
+        {
+          "name": "id",
+          "required": false,
+          "summary": "optional client correlation id, echoed in the matching ack or session_error",
+          "type": "string"
+        }
+      ],
+      "kind": "stream",
+      "name": "shutdown",
+      "stream": "events",
+      "summary": "drain and exit the session cleanly"
+    }
+  ],
+  "schema_version": 2,
+  "seed_derivation": "effective_seed(context_seed, utterance_index) = splitmix64(context_seed ^ utterance_index), pinned with fixed vectors",
+  "seq": 0,
+  "session_id": "schema",
+  "stdin_contract": "one JSON object per line; unknown fields are rejected; a malformed line yields session_error and the session survives"
+}

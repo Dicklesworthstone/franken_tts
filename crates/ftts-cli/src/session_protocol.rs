@@ -94,10 +94,7 @@ impl SessionEvent {
     /// An object carrying the envelope, ready for this event's own fields.
     pub fn object(self, session_id: &str, seq: u64) -> serde_json::Map<String, Value> {
         let mut object = serde_json::Map::new();
-        object.insert(
-            "schema_version".to_owned(),
-            json!(SESSION_SCHEMA_VERSION),
-        );
+        object.insert("schema_version".to_owned(), json!(SESSION_SCHEMA_VERSION));
         object.insert("event".to_owned(), json!(self.name()));
         object.insert("session_id".to_owned(), json!(session_id));
         object.insert("seq".to_owned(), json!(seq));
@@ -628,7 +625,7 @@ pub const SESSION_OPS: &[EventSpec] = &[
 ];
 
 /// The v2 session event contract.
-pub fn session_contract() -> WireContract {
+pub(crate) fn session_contract() -> WireContract {
     WireContract {
         version: Some(SESSION_SCHEMA_VERSION),
         discriminator: "event",
@@ -638,7 +635,7 @@ pub fn session_contract() -> WireContract {
 }
 
 /// The session op contract: unversioned client-to-server objects, strict-closed all the same.
-pub fn session_op_contract() -> WireContract {
+pub(crate) fn session_op_contract() -> WireContract {
     WireContract {
         version: None,
         discriminator: "op",
@@ -737,18 +734,24 @@ pub fn session_schema_document(environment_variables: &[&str]) -> Value {
     object.insert("ops".to_owned(), json!(render(&ops)));
     object.insert(
         "stdin_contract".to_owned(),
-        json!("one JSON object per line; unknown fields are rejected; a malformed line yields \
-               session_error and the session survives"),
+        json!(
+            "one JSON object per line; unknown fields are rejected; a malformed line yields \
+               session_error and the session survives"
+        ),
     );
     object.insert(
         "audio_contract".to_owned(),
-        json!("raw PCM s16le mono 24 kHz on a separate channel; nothing but PCM ever appears \
-               there; audio events' byte_offset/bytes are the sequencing authority"),
+        json!(
+            "raw PCM s16le mono 24 kHz on a separate channel; nothing but PCM ever appears \
+               there; audio events' byte_offset/bytes are the sequencing authority"
+        ),
     );
     object.insert(
         "seed_derivation".to_owned(),
-        json!("effective_seed(context_seed, utterance_index) = splitmix64(context_seed ^ \
-               utterance_index), pinned with fixed vectors"),
+        json!(
+            "effective_seed(context_seed, utterance_index) = splitmix64(context_seed ^ \
+               utterance_index), pinned with fixed vectors"
+        ),
     );
     object.insert(
         "environment_variables".to_owned(),
@@ -923,6 +926,9 @@ mod tests {
                 code.description()
             );
         }
-        assert!(map.contains_key("9"), "the transport code must be published");
+        assert!(
+            map.contains_key("9"),
+            "the transport code must be published"
+        );
     }
 }

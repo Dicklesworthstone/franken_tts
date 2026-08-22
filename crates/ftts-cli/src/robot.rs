@@ -78,7 +78,7 @@ pub enum Stream {
 }
 
 impl Stream {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Events => "events",
             Self::Stderr => "stderr",
@@ -94,7 +94,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Stream => "stream",
             Self::Reply => "reply",
@@ -1033,6 +1033,9 @@ pub(crate) fn validate_object(value: &Value, contract: &WireContract) -> Vec<Str
         .iter()
         .chain(spec.fields.iter())
         .map(|field| field.name)
+        // The discriminator itself is always legal (`op` on session ops carries no envelope
+        // entry of its own; `event` is in v1's common fields either way).
+        .chain(std::iter::once(discriminator))
         .collect();
     for key in object.keys() {
         if !known.contains(&key.as_str()) {
@@ -1049,6 +1052,46 @@ pub(crate) fn validate_object(value: &Value, contract: &WireContract) -> Vec<Str
 /// Check one emitted run object against the v1 catalogue. An empty result means it conforms.
 pub fn validate_event(value: &Value) -> Vec<String> {
     validate_object(value, &run_contract())
+}
+
+/// Validate a whole NDJSON stream, reporting the line number of each violation.
+pub fn validate_ndjson(stream: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (index, line) in stream.lines().enumerate() {
+        let line_number = index + 1;
+        if line.trim().is_empty() {
+            problems.push(format!(
+                "line {line_number}: blank line in an NDJSON stream"
+            ));
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => problems.extend(
+                validate_event(&value)
+                    .into_iter()
+                    .map(|problem| format!("line {line_number}: {problem}")),
+            ),
+            Err(error) => problems.push(format!("line {line_number}: not valid JSON: {error}")),
+        }
+    }
+    problems
+}
+
+fn exit_codes_json() -> BTreeMap<String, String> {
+    [
+        FttsExitCode::Success,
+        FttsExitCode::Generic,
+        FttsExitCode::Usage,
+        FttsExitCode::ModelNotFound,
+        FttsExitCode::Input,
+        FttsExitCode::BudgetTimeout,
+        FttsExitCode::Cancelled,
+        FttsExitCode::ArtifactFormat,
+        FttsExitCode::EnrollmentQualityRefusal,
+    ]
+    .into_iter()
+    .map(|code| (code.as_u8().to_string(), code.description().to_owned()))
+    .collect()
 }
 
 /// Render an engine health signal as its robot event.
