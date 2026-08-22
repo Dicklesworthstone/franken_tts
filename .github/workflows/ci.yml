@@ -56,8 +56,12 @@ env:
   # Sibling repositories are pinned by commit, not by branch: the workspace consumes them
   # through path dependencies, so an upstream force-push would otherwise change what we build
   # against without any diff here. Bump these deliberately.
-  FRANKENTORCH_REF: 886965dc7302165a3cfbce517eea2dcd4ef9c3b6
-  ASUPERSYNC_REF: 89b182ba40e9f0ba1262a36214e63c06d7f7b959
+  # Bumped 2026-08-22 to the sibling HEADs this workspace's local gate built and ran against
+  # (stages 8-11: fmt, check, clippy -D warnings, five-target cross-check all green at ad9e6f6;
+  # stage 12 executed every unit/integration suite against the same checkouts). See
+  # docs/CI_AND_GATES.md for the tracking policy: pins move only behind a verified gate run.
+  FRANKENTORCH_REF: 9627f39cea7462b8f6d55bed5009c271ec6c736b
+  ASUPERSYNC_REF: 2f465d716736f8eeebbbebe148f14d875b107e9c
 
 jobs:
   gate:
