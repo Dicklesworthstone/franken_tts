@@ -608,8 +608,14 @@ fn resident_client_cancel_discards_and_the_daemon_survives() {
     let warm_ms = started.elapsed().as_millis();
     assert_eq!(warm.code().unwrap_or(-1), 0, "warmup run must succeed");
 
-    // B: long run, cancelled after the first packet the CLIENT sees. The v1 wire
-    // cannot interrupt the daemon; the client discards the reply when it lands.
+    // B: long run, cancelled WHILE THE DAEMON SYNTHESIZES. On the v1 wire the client
+    // sees no events until the whole blob arrives (the post-synthesis packetizer
+    // emits them), so an event marker here would fire only after completion — the
+    // trigger must be wall-clock (the battery spec allows exactly this for
+    // real-signal cases). The daemon is warm from A, so by 25 s in, generation is
+    // well underway. SIGINT sets the client's flag; the client stays blocked on the
+    // wire until the daemon finishes, then discards and exits 6 — the documented v1
+    // boundary this case pins.
     let long_out = dir.join("never.wav");
     let stdout_path = dir.join("b-events.ndjson");
     let stderr_path = dir.join("b-noise.txt");
@@ -619,19 +625,16 @@ fn resident_client_cancel_discards_and_the_daemon_survives() {
         &stdout_path,
         &stderr_path,
     );
-    assert!(
-        wait_for_marker(
-            &stdout_path,
-            "\"event\":\"audio_chunk\"",
-            Duration::from_secs(300)
-        ),
-        "cancelled resident run never produced a packet"
-    );
+    std::thread::sleep(Duration::from_secs(25));
     let (status, latency) = sigint_and_wait(child);
     assert_eq!(status.code().unwrap_or(-1), 6);
-    assert!(
-        !long_out.exists(),
-        "discarded reply must not be written to the requested output"
+    // The sink OPENS the output file before synthesis starts, so a discarded
+    // resident reply leaves a HEADER-ONLY WAV (zero samples) rather than no file —
+    // pin that exact, parseable shape.
+    assert_eq!(
+        validated_wav_data_size(&long_out, "discarded reply"),
+        0,
+        "a discarded resident reply must contain no audio samples"
     );
     let events = parse_and_validate(&stdout_path, "resident cancel events");
     let terminal = terminal_event(
