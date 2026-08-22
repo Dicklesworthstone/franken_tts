@@ -174,11 +174,24 @@ impl PcmPacketSink for QueueSink {
 }
 
 /// Shared counters the PCM writer maintains and the router reads for receipts.
-#[derive(Default)]
 struct DeliveryLedger {
     session_bytes: AtomicU64,
     /// Frames of the CURRENT utterance actually written to the audio channel.
     utterance_frames: AtomicU64,
+    /// The CURRENT utterance's delivery TTFA in ms (u64::MAX until the first packet
+    /// lands). Same clock as the first `audio` event's `ttfa_ms`, so `speak_complete`
+    /// reports the number the orchestrator already saw — one basis, no confusion.
+    utterance_ttfa_ms: AtomicU64,
+}
+
+impl Default for DeliveryLedger {
+    fn default() -> Self {
+        Self {
+            session_bytes: AtomicU64::new(0),
+            utterance_frames: AtomicU64::new(0),
+            utterance_ttfa_ms: AtomicU64::new(u64::MAX),
+        }
+    }
 }
 
 /// Emit one event line to the stdout owner. Lifecycle events block (never dropped);
@@ -268,7 +281,10 @@ fn split_tail(text: &str) -> (&str, &str) {
         // The whitespace goes WITH the tail: BPE attaches a space to the FOLLOWING
         // word ("Ġword"), so a head ending in space would tokenize the next chunk's
         // first word bare and diverge from the whole-text stream — the exact seam the
-        // chunked==whole gate exists to catch (and did, live).
+        // chunked==whole gate exists to catch (and did, live). Known residual: a run
+        // of MULTIPLE whitespace characters at a chunk boundary can still split a
+        // multi-space token; LLM sentence streams do not produce those, and the
+        // chunked==whole gate is the tripwire if one ever matters.
         Some(at) => text.split_at(at),
         None => ("", text),
     }
@@ -384,6 +400,11 @@ pub fn run_talk(
                 ledger_ref
                     .utterance_frames
                     .fetch_add(frames as u64, Ordering::Relaxed);
+                if let Some(ttfa_ms) = ttfa_ms {
+                    ledger_ref
+                        .utterance_ttfa_ms
+                        .store(ttfa_ms, Ordering::Relaxed);
+                }
                 let key = (context.clone(), utterance);
                 let frame_index = frame_index_in_utterance.entry(key).or_insert(0);
                 let mut event =
@@ -433,7 +454,6 @@ pub fn run_talk(
                 let observer_state = Mutex::new(synth_events.clone());
                 let observer_sid = sid_synth.clone();
                 let observer_context = job.context.clone();
-                let observer_utterance = job.utterance;
                 let observer = move |event: SynthesisEvent| {
                     let SynthesisEvent::TextUnderrun { waited } = event else {
                         return;
@@ -444,7 +464,6 @@ pub fn run_talk(
                     let mut object = SessionEvent::TextUnderrun
                         .object(&observer_sid, seq_ref.fetch_add(1, Ordering::Relaxed));
                     object.insert("context".to_owned(), json!(observer_context));
-                    let _ = observer_utterance; // the frozen shape carries context only
                     object.insert(
                         "waited_ms".to_owned(),
                         json!(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX)),
@@ -671,6 +690,22 @@ fn route(
                         break;
                     }
                     "open" => {
+                        if active
+                            .as_ref()
+                            .is_some_and(|utterance| utterance.context == context_name)
+                        {
+                            emit(
+                                events,
+                                error_event(
+                                    "busy",
+                                    format!("context {context_name} is speaking"),
+                                    "cancel or wait for the receipt before reopening a context",
+                                    next_seq(),
+                                ),
+                                false,
+                            )?;
+                            continue;
+                        }
                         let voice = value
                             .get("voice")
                             .and_then(Value::as_str)
@@ -741,6 +776,12 @@ fn route(
                         match &active {
                             Some(utterance) if utterance.context == context_name => {
                                 utterance.cancellation.cancel();
+                                // The withheld tail belonged to the utterance being
+                                // killed; leaking it into the NEXT say would prepend a
+                                // fragment of the interrupted turn to the new reply.
+                                if let Some(state) = contexts.get_mut(&context_name) {
+                                    state.tail.clear();
+                                }
                                 if let Some(ack) = maybe_ack(&next_seq) {
                                     emit(events, ack, false)?;
                                 }
@@ -761,18 +802,20 @@ fn route(
                     "flush" => match (&mut active, contexts.get_mut(&context_name)) {
                         (Some(utterance), Some(state)) if utterance.context == context_name => {
                             let tail = std::mem::take(&mut state.tail);
-                            if !tail.is_empty() {
-                                send_append(loaded, normalization, utterance, &tail)?;
+                            if !tail.is_empty()
+                                && send_append(loaded, normalization, utterance, &tail).is_err()
+                            {
+                                // The utterance is ending under us (benign race) or the
+                                // tail failed to prepare; either way it belonged to the
+                                // dying utterance — drop it, the receipt is the truth.
                             }
-                            utterance
+                            if utterance
                                 .feed
                                 .send(TextControl::Finish, &utterance.cancellation)
-                                .map_err(|error| {
-                                    FttsError::SessionTransport(format!(
-                                        "cannot finish the text stream: {error}"
-                                    ))
-                                })?;
-                            utterance.text_finished = true;
+                                .is_ok()
+                            {
+                                utterance.text_finished = true;
+                            }
                             if let Some(ack) = maybe_ack(&next_seq) {
                                 emit(events, ack, false)?;
                             }
@@ -835,20 +878,42 @@ fn route(
                                 } else {
                                     (combined.as_str(), "")
                                 };
-                                if !head.is_empty() {
-                                    send_append(loaded, normalization, utterance, head)?;
+                                if !head.is_empty()
+                                    && let Err(error) =
+                                        send_append(loaded, normalization, utterance, head)
+                                {
+                                    // NEVER fatal: a bad chunk (kind "input") or an
+                                    // append racing the utterance's end (the cancel-
+                                    // aware send trips, or the engine finished and
+                                    // dropped the feed) must not kill the session.
+                                    let kind = match &error {
+                                        FttsError::Input(_) => "input",
+                                        _ => "ending",
+                                    };
+                                    emit(
+                                        events,
+                                        error_event(
+                                            kind,
+                                            error.to_string(),
+                                            "the utterance's receipt is authoritative; \
+                                             say again after it arrives",
+                                            next_seq(),
+                                        ),
+                                        false,
+                                    )?;
+                                    continue;
                                 }
                                 state.tail = tail.to_owned();
                                 if !keep_open {
-                                    utterance
+                                    // A failed Finish means the utterance is already
+                                    // ending on its own; the receipt is the truth.
+                                    if utterance
                                         .feed
                                         .send(TextControl::Finish, &utterance.cancellation)
-                                        .map_err(|error| {
-                                            FttsError::SessionTransport(format!(
-                                                "cannot finish the text stream: {error}"
-                                            ))
-                                        })?;
-                                    utterance.text_finished = true;
+                                        .is_ok()
+                                    {
+                                        utterance.text_finished = true;
+                                    }
                                 }
                                 if let Some(ack) = maybe_ack(&next_seq) {
                                     emit(events, ack, false)?;
@@ -886,6 +951,25 @@ fn route(
                                     continue;
                                 }
                                 state.tail = tail;
+                                // Tokenize FIRST: a refused text must not burn an
+                                // utterance index or kill the session (kind "input").
+                                let target_ids =
+                                    match chunk_target_ids(loaded, &head_owned, normalization) {
+                                        Ok((raw, _)) => raw,
+                                        Err(error) => {
+                                            emit(
+                                                events,
+                                                error_event(
+                                                    "input",
+                                                    error.to_string(),
+                                                    "fix the text; the context is unharmed",
+                                                    next_seq(),
+                                                ),
+                                                false,
+                                            )?;
+                                            continue;
+                                        }
+                                    };
                                 let utterance_index = state.utterances_started;
                                 state.utterances_started += 1;
                                 let effective_seed = value
@@ -899,8 +983,6 @@ fn route(
                                         ))
                                     })?;
                                 let cancellation = CancellationToken::new();
-                                let (target_ids, _) =
-                                    chunk_target_ids(loaded, &head_owned, normalization)?;
                                 let mut utterance = ActiveUtterance {
                                     context: context_name.clone(),
                                     utterance: utterance_index,
@@ -911,6 +993,9 @@ fn route(
                                     text_finished: false,
                                 };
                                 if !keep_open {
+                                    // Infallible in practice: the receiver is still in
+                                    // our hands (feed_rx below) and the token is fresh,
+                                    // so a failure here is a wiring bug worth dying on.
                                     utterance
                                         .feed
                                         .send(TextControl::Finish, &cancellation)
@@ -922,6 +1007,7 @@ fn route(
                                     utterance.text_finished = true;
                                 }
                                 ledger.utterance_frames.store(0, Ordering::Relaxed);
+                                ledger.utterance_ttfa_ms.store(u64::MAX, Ordering::Relaxed);
                                 jobs.send(SpeakJob {
                                     context: context_name.clone(),
                                     utterance: utterance_index,
@@ -990,8 +1076,6 @@ fn send_append(
     chunk: &str,
 ) -> Result<(), FttsError> {
     let (raw, wrapped) = chunk_target_ids(loaded, chunk, normalization)?;
-    utterance.target_tokens += raw.len() as u64;
-    utterance.target_ids.extend_from_slice(&raw);
     let prepared = ftts_core::PreparedText::new(
         wrapped,
         ftts_core::NormalizationTrace {
@@ -1005,7 +1089,12 @@ fn send_append(
         .send(TextControl::Append(prepared), &utterance.cancellation)
         .map_err(|error| {
             FttsError::SessionTransport(format!("cannot append to the text stream: {error}"))
-        })
+        })?;
+    // Receipt bookkeeping only AFTER the send: a failed append never reached the
+    // model, so counting it would inflate the truncation upper bound.
+    utterance.target_tokens += raw.len() as u64;
+    utterance.target_ids.extend_from_slice(&raw);
+    Ok(())
 }
 
 /// Build the terminal receipt for an utterance and clear the active slot.
@@ -1032,6 +1121,15 @@ fn finish_utterance(
             object.insert("utterance".to_owned(), json!(utterance));
             object.insert("frames".to_owned(), json!(frames));
             object.insert("audio_ms".to_owned(), json!(audio_ms));
+            // One TTFA basis per session: the delivery clock the first `audio` event
+            // used. The synthesize-internal audible mark is the fallback for the
+            // degenerate no-delivery case only.
+            let delivered_ttfa = ledger.utterance_ttfa_ms.load(Ordering::Relaxed);
+            let ttfa_ms = if delivered_ttfa == u64::MAX {
+                ttfa_ms
+            } else {
+                Some(delivered_ttfa)
+            };
             if let Some(ttfa_ms) = ttfa_ms {
                 object.insert("ttfa_ms".to_owned(), json!(ttfa_ms));
             }
@@ -1060,7 +1158,14 @@ fn finish_utterance(
         UtteranceOutcome::Failed(message) => {
             let mut object = SessionEvent::SessionError.object(sid, next_seq());
             object.insert("kind".to_owned(), json!("synthesis"));
-            object.insert("message".to_owned(), json!(message));
+            // session_error carries no utterance field (frozen shape), so the
+            // correlation the orchestrator needs rides in the message text.
+            object.insert(
+                "message".to_owned(),
+                json!(format!(
+                    "context {context} utterance {utterance}: {message}"
+                )),
+            );
             object.insert(
                 "remediation".to_owned(),
                 json!("the session survives; open a fresh utterance or context"),
@@ -1078,9 +1183,9 @@ fn spoken_prefix(
     active: &ActiveUtterance,
     frames_delivered: u64,
 ) -> (u64, String) {
-    // `target_ids` are WRAPPED ids; the trailing text the model consumes excludes the
-    // wrapper prefix (in prefill) and suffix. Conservative rule: cap at delivered
-    // frames, never exceed the target ids we actually fed.
+    // `target_ids` are the RAW target ids (wrapper scaffolding excluded at capture).
+    // Conservative rule: cap at delivered frames, never exceed the ids actually fed —
+    // and per the documented semantics this is a consumed-text UPPER BOUND on speech.
     let tokens = frames_delivered.min(active.target_tokens);
     let take = usize::try_from(tokens).unwrap_or(usize::MAX);
     let prefix_ids: Vec<u32> = active.target_ids.iter().copied().take(take).collect();

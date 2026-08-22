@@ -40,7 +40,7 @@ const MROPE_THETA: f32 = 1.0e6;
 /// the bf16→f32 widen and the f32→int8 requantize the runtime route would otherwise pay at
 /// startup. `None` (wrong dtype, missing scales, geometry mismatch) sends the caller to the
 /// runtime-quantization fallback rather than failing hydration.
-fn q8_from_artifact(
+pub(crate) fn q8_from_artifact(
     artifact: &MappedFttsq,
     name: &str,
     n: usize,
@@ -211,7 +211,14 @@ pub fn hot_elision_from_environment() -> crate::checkpoint::HotElision {
         "micro" => (false, true),
         _ => (true, true),
     };
-    crate::checkpoint::HotElision { talker, micro }
+    crate::checkpoint::HotElision {
+        talker,
+        micro,
+        // Conservative until the head-elision policy lands: keep widening the
+        // per-depth heads (the pre-refactor behavior). The owner of the HotElision
+        // change wires the real gate.
+        micro_heads: false,
+    }
 }
 
 /// `FTTS_ARTIFACT_Q8=0` forces the widen-then-requantize hydration even when a canonical

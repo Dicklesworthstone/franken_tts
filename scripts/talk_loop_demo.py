@@ -158,6 +158,13 @@ def main():
     parser.add_argument("--llm-ttft-ms", type=int, default=300, help="simulated canned-LLM first-sentence latency")
     parser.add_argument("--session-dir", default="/tmp/ftts-talk-demo")
     parser.add_argument("--play", action="store_true", help="play PCM through sox/ffplay if present")
+    parser.add_argument(
+        "--preamble",
+        default=None,
+        help="start this agent reply BEFORE replaying — the barge_in fixture presumes "
+             "the agent is already mid-speech when the user interrupts (try it with a "
+             "long sentence)",
+    )
     args = parser.parse_args()
 
     fixture = [
@@ -174,12 +181,39 @@ def main():
     utterance = None
     speaking = False
 
-    # Replay the fixture on its own timeline (ts deltas), reacting as the orchestrator.
-    base_ts = None
+    def parse_ts(stamp):
+        # fw fixtures may carry RFC3339 strings or float seconds; accept both.
+        if isinstance(stamp, (int, float)):
+            return float(stamp)
+        from datetime import datetime
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+
+    def ensure_idle():
+        # Wait out the current reply's terminal receipt before the next turn.
+        nonlocal speaking
+        if speaking:
+            talk.wait(lambda e: e["event"] in ("speak_complete", "speak_cancelled"))
+            speaking = False
+
+    # Replay the fixture ON ITS OWN TIMELINE: the inter-event gaps are what create the
+    # overlap windows barge-in needs (an agent still speaking when speech_started
+    # arrives). Without the sleeps every event lands instantly and no overlap exists.
+    if args.preamble:
+        talk.send({"op": "say", "context": "demo", "text": args.preamble, "continue": False})
+        talk.wait(lambda e: e["event"] == "speak_start")
+        talk.wait(lambda e: e["event"] == "audio")
+        speaking = True
+        log({"note": "preamble speaking; the fixture timeline now runs against it"})
+
+    previous_ts = None
     for event in fixture:
         kind = event.get("event")
-        if base_ts is None and "ts" in event:
-            base_ts = event["ts"]
+        stamp = event.get("ts")
+        if stamp is not None:
+            if previous_ts is not None:
+                gap = min(max(parse_ts(stamp) - previous_ts, 0.0), 3.0)
+                time.sleep(gap)
+            previous_ts = parse_ts(stamp)
         if kind == "speech_started" and speaking:
             # Barge-in: the user talks over the agent. The fixtures place a transcript
             # event right behind the trigger, standing in for the >=0.5s evidence.
@@ -189,6 +223,7 @@ def main():
             log({"turn": "barge-in", "spoken_upper_bound": receipt["spoken_text"],
                  "frames_delivered": receipt["frames_delivered"]})
         if kind == "utterance_end" and event.get("text"):
+            ensure_idle()
             t_endpoint = time.monotonic()
             time.sleep(args.llm_ttft_ms / 1000.0)  # canned LLM "thinks"
             reply = CANNED_REPLIES[reply_index % len(CANNED_REPLIES)]
@@ -218,9 +253,10 @@ def main():
             }
             turns.append(turn)
             log(turn)
-            done = talk.wait(lambda e: e["event"] in ("speak_complete", "speak_cancelled"))
-            speaking = False
+            # Do NOT block for the receipt here: the reply keeps speaking while the
+            # fixture timeline advances, which is exactly the window a barge-in needs.
 
+    ensure_idle()
     talk.send({"op": "shutdown"})
     talk.wait(lambda e: e["event"] == "session_end")
     talk.proc.stdin.close()
