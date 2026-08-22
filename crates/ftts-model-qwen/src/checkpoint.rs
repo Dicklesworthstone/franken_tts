@@ -39,7 +39,9 @@ use crate::codec::{
     MaterializedCodebook, SplitResidualVectorQuantizer, decode_codec_offline,
 };
 use crate::generate::{FeedbackTables, TextEmbeddingWeights};
-use crate::microdecoder::{LayerWeights, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_DEPTHS};
+use crate::microdecoder::{
+    LayerWeights, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_DEPTHS, ResidualEmbeddings,
+};
 use crate::prompt::{HiddenState, PromptHeader, ROLE_PREFIX_IDS};
 use crate::talker::{TalkerLayerWeights, TalkerWeights};
 use ftts_artifacts::{
@@ -1493,7 +1495,7 @@ impl TalkerCheckpoint {
         MicrodecoderWeights {
             layers,
             talker_codec_embedding: &self.codec_embedding,
-            residual_embeddings: residual,
+            residual_embeddings: ResidualEmbeddings::Widened(residual),
             heads,
             final_norm: &self.micro_final_norm,
         }
