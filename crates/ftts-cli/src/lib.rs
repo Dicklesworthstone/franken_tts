@@ -290,7 +290,9 @@ struct SayArgs {
     #[arg(short = 'o', long, value_name = "PATH", conflicts_with = "stream")]
     output: Option<PathBuf>,
 
-    /// Stream raw PCM on stdout; robot events then use stderr.
+    /// Stream raw PCM on stdout; robot events then use stderr. Packets are written live,
+    /// during synthesis. Raw streaming bypasses the resident engine (whose reply is one
+    /// whole buffer after synthesis) and pays the in-process model load instead.
     #[arg(long, value_enum)]
     stream: Option<StreamMode>,
 
@@ -1663,7 +1665,13 @@ fn run_say_events(
     // process and this invocation skips its own hydration; the daemon's load happens
     // inside the synthesis stage on its first request. Any resident-path unavailability
     // falls back to the classic in-process load below, never to a failure.
-    let use_resident = resident::enabled(args.no_resident);
+    //
+    // `--stream raw` BYPASSES the resident: the daemon's frozen v1 wire protocol delivers
+    // one whole PCM blob after complete synthesis (resident.rs), so a resident-served run
+    // can never stream live — and a warm run silently regressing to buffered delivery
+    // while the cold run streams would be worse than either behavior alone. Raw streaming
+    // therefore pays the in-process load; the warm+streaming surface is the talk session.
+    let use_resident = resident::enabled(args.no_resident) && !raw_stream;
     let loaded = if use_resident {
         None
     } else {
@@ -1672,13 +1680,6 @@ fn run_say_events(
     emit_stage(run, emit, "load", "end", &mut seq)?;
 
     // --- synthesis -------------------------------------------------------------------------
-    // The engine's observer is not forwarded to the event stream here. Its events are lifecycle
-    // facts the robot contract already carries as `stage` events, and per-frame progress cannot be
-    // emitted from inside this call anyway: `emit` is borrowed for the duration. Progress becomes
-    // observable per packet once synthesis returns, and genuinely incremental frame events belong
-    // with the streaming decode path rather than being faked from a completed run.
-    let observer = |_event: ftts_core::SynthesisEvent| {};
-
     // Canonical greedy consumes no RNG state, so an absent `--seed` changes nothing today;
     // 0 is the documented default rather than a value picked per run, which would make a
     // future switch to the production sampler silently irreproducible.
@@ -1699,8 +1700,12 @@ fn run_say_events(
     } else {
         None
     };
+    // Whether the in-process live path already wrote PCM and emitted `audio_chunk` events
+    // during synthesis. The resident path cannot (its v1 wire reply is one whole blob), so
+    // it keeps the post-synthesis packetization below.
+    let mut live_output_began = false;
     let audio_result = match resident_audio {
-        Some(audio) => audio,
+        Some(audio) => (audio, false),
         None => {
             let loaded = match loaded {
                 Some(loaded) => loaded,
@@ -1710,27 +1715,161 @@ fn run_say_events(
             let engine = ftts_core::TtsEngine::from_process_environment()
                 .map_err(|error| FttsError::Generic(format!("cannot start the engine: {error}")))?;
             let cancellation = ftts_core::CancellationToken::new();
-            synth::synthesize(
-                &loaded,
-                &engine,
-                &request,
-                &speaker,
-                seed,
-                &cancellation,
-                &observer,
-                None,
-            )?
+
+            // In-process synthesis streams for real: the engine runs on a scoped thread with
+            // a channel-backed PcmPacketSink, and THIS thread — which owns `emit`, the audio
+            // sink, and the raw stream — consumes packets as they are decoded, writing PCM
+            // and emitting `audio_chunk` (and throttled `frame`) events while generation is
+            // still running. Backpressure is the bounded channel: a stalled consumer parks
+            // the codec worker, which parks the generator — synthesis slows to the consumer's
+            // pace instead of buffering unboundedly. Channel disconnect is the shutdown
+            // signal in both directions: the producer dropping its senders ends the consume
+            // loop, and the consumer dropping the receiver aborts the producer's next send.
+            enum Live {
+                Packet(Vec<f32>, usize),
+                Progress(u64, Option<u64>),
+            }
+            struct ChannelSink(std::sync::mpsc::SyncSender<Live>);
+            impl synth::PcmPacketSink for ChannelSink {
+                fn deliver(&mut self, samples: &[f32], frames: usize) -> Result<(), FttsError> {
+                    self.0
+                        .send(Live::Packet(samples.to_vec(), frames))
+                        .map_err(|_| {
+                            FttsError::Generic(
+                                "the live audio consumer stopped accepting packets".to_owned(),
+                            )
+                        })
+                }
+            }
+            let (live_tx, live_rx) = std::sync::mpsc::sync_channel::<Live>(64);
+            let produced = std::thread::scope(|scope| {
+                let handle = scope.spawn(|| {
+                    // The observer lives inside this closure so that EVERY sender is owned
+                    // by the producer side: when synthesis returns, sink and observer drop,
+                    // the channel disconnects, and the consume loop below terminates. An
+                    // observer outliving the scope would hold a sender forever and deadlock
+                    // the loop. Progress sends are try_send — lossy by design (progress
+                    // coalesces under pressure); audio uses blocking send and never drops.
+                    let progress = std::sync::Mutex::new((live_tx.clone(), None::<u64>));
+                    let observer = move |event: ftts_core::SynthesisEvent| {
+                        let Ok(mut guard) = progress.lock() else {
+                            return;
+                        };
+                        match event {
+                            ftts_core::SynthesisEvent::ResourceAdmission {
+                                admitted: true,
+                                predicted_max_frames,
+                                ..
+                            } => guard.1 = Some(predicted_max_frames),
+                            ftts_core::SynthesisEvent::FrameProgress { frame } => {
+                                let total = guard.1;
+                                let _ = guard.0.try_send(Live::Progress(frame, total));
+                            }
+                            _ => {}
+                        }
+                    };
+                    let mut sink = ChannelSink(live_tx);
+                    synth::synthesize(
+                        &loaded,
+                        &engine,
+                        &request,
+                        &speaker,
+                        seed,
+                        &cancellation,
+                        &observer,
+                        Some(&mut sink),
+                    )
+                });
+
+                let mut consumer_error: Option<FttsError> = None;
+                let mut last_frame_event: Option<std::time::Instant> = None;
+                while let Ok(message) = live_rx.recv() {
+                    let step = match message {
+                        Live::Packet(pcm, frames) => (|| -> Result<(), FttsError> {
+                            if !live_output_began {
+                                emit_stage(run, emit, "output", "begin", &mut seq)?;
+                                live_output_began = true;
+                            }
+                            let event = audio.write_packet(
+                                &pcm,
+                                raw_audio,
+                                run.run_id(),
+                                u8::try_from(frames).unwrap_or(u8::MAX),
+                            )?;
+                            emit(&event)?;
+                            if raw_stream {
+                                // Latency depends on flush discipline, not on the writer's
+                                // incidental buffering: one packet, one flush.
+                                raw_audio.flush().map_err(|error| {
+                                    FttsError::Generic(format!("cannot flush raw PCM: {error}"))
+                                })?;
+                            }
+                            Ok(())
+                        })(),
+                        Live::Progress(frame, total) => (|| -> Result<(), FttsError> {
+                            // The frozen catalogue pins `frame` as "throttled, never one
+                            // per frame": at most one per second, and never before the
+                            // first packet's `output` stage exists.
+                            let due = last_frame_event
+                                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
+                            if due {
+                                last_frame_event = Some(std::time::Instant::now());
+                                let mut event = run.event(robot::EventType::Frame);
+                                event.insert("index".to_owned(), json!(frame));
+                                event.insert(
+                                    "total_estimate".to_owned(),
+                                    total.map_or(Value::Null, |estimate| json!(estimate)),
+                                );
+                                event.insert("elapsed_ms".to_owned(), json!(run.elapsed_ms()));
+                                emit(&Value::Object(event))?;
+                            }
+                            Ok(())
+                        })(),
+                    };
+                    if let Err(error) = step {
+                        // Remember the true cause, then hang up: the producer's next sink
+                        // send fails, aborting synthesis promptly.
+                        consumer_error = Some(error);
+                        break;
+                    }
+                }
+                drop(live_rx);
+                let produced = match handle.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(FttsError::Generic(
+                        "the synthesis thread panicked".to_owned(),
+                    )),
+                };
+                match consumer_error {
+                    // The consumer's failure is the root cause; the producer's error is
+                    // the induced channel abort and would bury it.
+                    Some(error) => Err(error),
+                    None => produced,
+                }
+            })?;
+            (produced, true)
         }
     };
+    let (audio_result, live_streamed) = audio_result;
     emit_stage(run, emit, "synthesis", "end", &mut seq)?;
 
     // --- the output tail ---------------------------------------------------------------------
-    let packet_samples = settings.packet_frames.samples_per_packet();
-    let packet_frame_count = settings.packet_frames.frames_per_packet();
-    emit_stage(run, emit, "output", "begin", &mut seq)?;
-    for packet in audio_result.pcm.chunks(packet_samples) {
-        let event = audio.write_packet(packet, raw_audio, run.run_id(), packet_frame_count)?;
-        emit(&event)?;
+    // The live path already wrote every packet and opened the `output` stage at the first
+    // one; only the buffered (resident) path packetizes here, post hoc.
+    if live_streamed {
+        if !live_output_began {
+            // Zero-packet live runs are refused before this point today, but stage events
+            // come in pairs regardless of how the run evolves.
+            emit_stage(run, emit, "output", "begin", &mut seq)?;
+        }
+    } else {
+        let packet_samples = settings.packet_frames.samples_per_packet();
+        let packet_frame_count = settings.packet_frames.frames_per_packet();
+        emit_stage(run, emit, "output", "begin", &mut seq)?;
+        for packet in audio_result.pcm.chunks(packet_samples) {
+            let event = audio.write_packet(packet, raw_audio, run.run_id(), packet_frame_count)?;
+            emit(&event)?;
+        }
     }
     let streamed_bytes = audio.byte_offset();
     let samples = audio.finish()?;
