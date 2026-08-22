@@ -31,10 +31,24 @@ export const MODEL_FILES = [
   {
     asset: "speech_tokenizer_model.safetensors",
     key: "codec",
-    bytes: 682293092,
-    sha256: "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
+    // The DECODER-ONLY PREFIX of the upstream speech_tokenizer checkpoint, not the whole file.
+    //
+    // TTS inference consumes exactly the 271 `decoder.*` tensors; the 225 MB encoder half is
+    // enrollment-encoder weight this page never reads. In the pinned safetensors those decoder
+    // tensors happen to occupy one contiguous payload span [0, 457292548) — names sort
+    // `decoder.*` before `encoder.*` — so the prefix is byte-for-byte the leading
+    // 8 + headerLen + 457292548 bytes of the same upstream file, fetched through the ordinary
+    // Range path and verified by the ordinary digests below. engine-worker.js parses that header
+    // generically and streams the same decoder tensors it always did; nothing downstream knows
+    // or cares that the encoder bytes no longer exist client-side. The digests are computed from
+    // the pinned full file (sha256 836b7b35…, bytes 682293092 in model_manifest.json): a fresh
+    // download hashes the prefix as it streams; an interrupted older FULL download resumes
+    // seamlessly (same leading bytes); a complete stale one self-clears via the size check and
+    // re-downloads once at the smaller size.
+    bytes: 457355876,
+    sha256: "49fa6cc7af115ea007ee31ab2bde4673658371c76109c73efcad6d0e179c8eef",
     head: "75ea542e2ddc876b3e58c8216e27d30568776fd1bd5fa897113b3b88e191da75",
-    tail: "eb396bbf0d4356aeab926bdd64d2c2bb6f3124900bb48fd52d6eed7467bdbdeb",
+    tail: "3f963766f17f62fabb17a842efaa729f74a1d77936ce9bec70a65952b98a0279",
   },
   {
     asset: "vocab.json",
