@@ -1638,11 +1638,11 @@ pub fn synthesize(
                     // failing sink is the flow-control/abort contract on `PcmPacketSink`), then
                     // the whole-utterance buffer, then the TTFA mark — so with a sink attached
                     // `ttfa` is a DELIVERY time, not merely "the samples exist".
-                    let mut emit_packet = |sink: &mut Option<&mut dyn PcmPacketSink>,
-                                           pcm: &mut Vec<f32>,
-                                           packet_pcm: &[f32],
-                                           frames: usize,
-                                           first_audio_at: &mut Option<std::time::Duration>|
+                    let emit_packet = |sink: &mut Option<&mut dyn PcmPacketSink>,
+                                       pcm: &mut Vec<f32>,
+                                       packet_pcm: &[f32],
+                                       frames: usize,
+                                       first_audio_at: &mut Option<std::time::Duration>|
                      -> Result<(), FttsError> {
                         if let Some(sink) = sink.as_mut() {
                             sink.deliver(packet_pcm, frames)?;
