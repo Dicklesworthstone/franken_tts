@@ -122,7 +122,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "asupersync"
-version = "0.4.4"
+version = "0.4.9"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -671,7 +671,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "franken-decision"
-version = "0.4.4"
+version = "0.4.9"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.4.4"
+version = "0.4.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.4.4"
+version = "0.4.9"
 dependencies = [
  "serde",
 ]
