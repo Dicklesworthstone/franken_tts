@@ -175,6 +175,9 @@ Neither exists on a hosted runner, so CI cannot build without materializing them
 so an upstream force-push would otherwise change what we build against with no diff in this
 repository — the same reasoning that produced the truth pack. Bumping a pin is a deliberate,
 reviewable edit to `FRANKENTORCH_REF` / `ASUPERSYNC_REF` in the workflow env block.
+Tracking policy: a pin moves only to a sibling SHA that has just cleared this workspace's full
+local gate (`scripts/check.sh`, which compiles and tests against the sibling checkouts on disk);
+never bump blindly to a sibling HEAD that has not been through the gate.
 
 If either sibling repository is private, CI needs a `SIBLING_REPO_TOKEN` secret with read access.
 The workflow falls back to `github.token`, which only works while the repos are public — and it
