@@ -164,6 +164,21 @@ pub fn cli_main() -> ExitCode {
         }
     };
 
+    // `talk` owns the process's stdio from BACKGROUND threads (reader/writer), and the
+    // std lock guards are reentrant only on their own thread: holding them here for the
+    // whole dispatch would deadlock the session the moment its threads try to lock.
+    // Dispatch it before any lock exists.
+    if let Command::Talk(args) = &cli.command {
+        return match run_talk_command(&cli, args, environment()) {
+            Ok(()) => FttsExitCode::Success.as_exit_code(),
+            Err(error) => {
+                let mut stderr = io::stderr().lock();
+                let _ = writeln!(stderr, "error: {error}");
+                error.exit_code().as_exit_code()
+            }
+        };
+    }
+
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
@@ -803,7 +818,9 @@ fn dispatch(
         Command::Card(args) => run_card(args, stdout),
         Command::Convert(args) => run_convert(&cli, args, environment, stdout, stderr),
         Command::Pull(args) => run_pull(args, environment, stdout),
-        Command::Talk(args) => run_talk_command(&cli, args, environment),
+        // Talk is dispatched in `cli_main` BEFORE the stdio locks exist (see there); by
+        // this point it has already run and returned.
+        Command::Talk(_) => unreachable!("talk dispatches before the stdio locks are taken"),
         Command::Robot(args) => run_robot(args.command.clone(), environment, stdout),
         Command::Doctor(args) => run_doctor(args, environment, stdout),
         Command::ResidentDaemon(args) => resident::run_daemon(&args.bundle_root),
