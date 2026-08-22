@@ -284,7 +284,7 @@ fn raw_mode_streams_live_bypasses_resident_and_matches_file_output() {
     );
     assert!(!raw.stdout.is_empty(), "raw stdout carries PCM");
     assert!(
-        raw.stdout.len() % 2 == 0,
+        raw.stdout.len().is_multiple_of(2),
         "raw stream is whole s16le samples"
     );
 
