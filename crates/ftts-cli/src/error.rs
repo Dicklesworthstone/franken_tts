@@ -13,9 +13,9 @@ pub enum FttsExitCode {
     ModelNotFound = 3,
     Input = 4,
     BudgetTimeout = 5,
-    Cancelled = 6,
     ArtifactFormat = 7,
     EnrollmentQualityRefusal = 8,
+    SessionTransport = 9,
 }
 
 impl FttsExitCode {
@@ -31,6 +31,7 @@ impl FttsExitCode {
             Self::Cancelled => "cancelled",
             Self::ArtifactFormat => "artifact format or version mismatch",
             Self::EnrollmentQualityRefusal => "enrollment-quality refusal",
+            Self::SessionTransport => "talk-session transport failed",
         }
     }
 
@@ -53,6 +54,8 @@ pub enum FttsError {
     BudgetTimeout(String),
     ArtifactFormat(String),
     EnrollmentQualityRefusal(String),
+    /// A `ftts talk` transport death no op could cause and no op can recover from.
+    SessionTransport(String),
 }
 
 impl FttsError {
@@ -75,12 +78,13 @@ impl FttsError {
             Self::BudgetTimeout(_) => {
                 "raise the budget, shorten the text, or choose a faster profile"
             }
-            Self::ArtifactFormat(_) => {
-                "regenerate the artifact with a matching ftts version; `ftts robot health` reports the expected format"
-            }
             Self::EnrollmentQualityRefusal(_) => {
                 "supply a cleaner reference, or pass --force to accept the warned-about quality"
             }
+            Self::SessionTransport(_) => "the session process is exiting; restart `ftts talk`. If it \
+                                           recurs, check that the PCM consumer is still draining \
+                                           the audio channel - a wedged reader is the one failure \
+                                           the session cannot absorb"
         }
     }
 
@@ -91,8 +95,8 @@ impl FttsError {
             Self::ModelNotFound(_) => FttsExitCode::ModelNotFound,
             Self::Input(_) => FttsExitCode::Input,
             Self::BudgetTimeout(_) => FttsExitCode::BudgetTimeout,
-            Self::ArtifactFormat(_) => FttsExitCode::ArtifactFormat,
             Self::EnrollmentQualityRefusal(_) => FttsExitCode::EnrollmentQualityRefusal,
+            Self::SessionTransport(_) => FttsExitCode::SessionTransport,
         }
     }
 }
@@ -105,8 +109,8 @@ impl fmt::Display for FttsError {
             | Self::ModelNotFound(message)
             | Self::Input(message)
             | Self::BudgetTimeout(message)
-            | Self::ArtifactFormat(message)
-            | Self::EnrollmentQualityRefusal(message) => formatter.write_str(message),
+            | Self::EnrollmentQualityRefusal(message)
+            | Self::SessionTransport(message) => formatter.write_str(message),
         }
     }
 }
@@ -129,6 +133,7 @@ mod tests {
             (FttsExitCode::Cancelled, 6),
             (FttsExitCode::ArtifactFormat, 7),
             (FttsExitCode::EnrollmentQualityRefusal, 8),
+            (FttsExitCode::SessionTransport, 9),
         ];
 
         for (code, expected) in cases {

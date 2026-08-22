@@ -6,6 +6,7 @@ pub(crate) mod card;
 mod error;
 pub mod resident;
 pub mod robot;
+pub mod session_protocol;
 pub mod style;
 pub mod synth;
 
@@ -467,13 +468,25 @@ struct RobotArgs {
 #[derive(Clone, Debug, Subcommand)]
 enum RobotCommand {
     /// Print the versioned NDJSON event schema.
-    Schema,
-    /// Print a versioned machine-readable readiness event.
-    Health,
+    Schema {
+        /// Which contract to print: the one-shot run contract (v1, the default and the shape
+        /// every existing consumer validates) or the talk-session contract (v2).
+        #[arg(default_value = "run")]
+        contract: SchemaContract,
+    },
     /// Print available backend routes without probing model weights.
     Backends,
     /// Print the self-test state; no unavailable kernel is reported as passing.
     Selftest,
+}
+
+/// Which wire contract `ftts robot schema` prints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SchemaContract {
+    /// The one-shot run contract (schema v1), frozen by the conformance fixture.
+    Run,
+    /// The talk-session contract (schema v2).
+    Session,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1703,6 +1716,7 @@ fn run_say_events(
                 seed,
                 &cancellation,
                 &observer,
+                None,
             )?
         }
     };
@@ -3023,7 +3037,12 @@ fn run_robot(
     // schema_version cannot be forgotten, and the frozen contract test in ftts-conformance
     // fails if any of these stops matching the catalogue.
     let event = match command {
-        RobotCommand::Schema => robot::schema_document(robot::DOCUMENTED_ENVIRONMENT),
+        RobotCommand::Schema { contract } => match contract {
+            SchemaContract::Run => robot::schema_document(robot::DOCUMENTED_ENVIRONMENT),
+            SchemaContract::Session => {
+                session_protocol::session_schema_document(robot::DOCUMENTED_ENVIRONMENT)
+            }
+        },
         RobotCommand::Health => {
             let searched = model_search_paths(environment);
             let found = searched.iter().find(|path| looks_like_model_artifact(path));

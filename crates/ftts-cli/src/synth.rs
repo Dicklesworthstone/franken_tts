@@ -1484,13 +1484,38 @@ pub struct SynthesizedAudio {
     /// Mono 24 kHz samples in `[-1, 1]`.
     pub pcm: Vec<f32>,
     /// Time from synthesis start (prompt work + prefill + first frames) to the first decoded
-    /// packet of PCM existing. `None` when the run produced no audio. Time-to-first-audio and
-    /// real-time factor are different products (doctrine: report them separately); this is the
-    /// TTFA half, excluding model load, which the `load` stage event already bounds.
+    /// packet of PCM existing — and, when a [`PcmPacketSink`] is attached, to that packet
+    /// having been DELIVERED through it, so live callers get an honest delivery time. `None`
+    /// when the run produced no audio. Time-to-first-audio and real-time factor are different
+    /// products (doctrine: report them separately); this is the TTFA half, excluding model
+    /// load, which the `load` stage event already bounds.
     pub ttfa: Option<std::time::Duration>,
 }
 
+/// Receives each decoded PCM packet on the codec worker thread, the moment it exists.
+///
+/// `samples` are one packet's mono 24 kHz samples in `[-1, 1]` — `frames` × 1,920 of them,
+/// fewer never; only the final packet of an utterance may carry fewer than the configured
+/// packet's frames. Delivery happens before the packet joins the whole-utterance buffer, so
+/// a consumer that blocks in `deliver` backpressures the codec worker, which backpressures
+/// the generator through the bounded frame channel — that chain is the intended flow
+/// control for live consumers, not a hazard. A `deliver` error ends the run: the worker
+/// carries it to its join exactly like a codec failure, and the engine loop aborts on the
+/// closed frame channel.
+pub trait PcmPacketSink: Send {
+    /// Consumes one decoded packet.
+    ///
+    /// # Errors
+    ///
+    /// Any error aborts the synthesis run; the whole-utterance buffer is not returned.
+    fn deliver(&mut self, samples: &[f32], frames: usize) -> Result<(), FttsError>;
+}
+
 /// Run one utterance end to end: text, codes, PCM.
+///
+/// `pcm_sink`, when present, receives every decoded packet during synthesis (see
+/// [`PcmPacketSink`]); the completed [`SynthesizedAudio`] is returned identically either
+/// way, so the sink is purely additive observation with backpressure.
 ///
 /// # Errors
 ///
@@ -1505,6 +1530,7 @@ pub fn synthesize(
     seed: u64,
     cancellation: &CancellationToken,
     observer: &dyn SynthesisObserver,
+    pcm_sink: Option<&mut dyn PcmPacketSink>,
 ) -> Result<SynthesizedAudio, FttsError> {
     // 1. Text, once — see the module docs on ordering.
     let prepared_raw = model
@@ -1593,6 +1619,7 @@ pub fn synthesize(
             ),
             FttsError,
         > {
+            let mut pcm_sink = pcm_sink;
             let worker = scope.spawn(
                 move || -> Result<(Vec<f32>, Option<std::time::Duration>), FttsError> {
                     // Overlap for real: this thread's int8 ops run serially on a spare core
@@ -1607,6 +1634,23 @@ pub fn synthesize(
                     let mut packet: Vec<i32> = Vec::with_capacity(16 * PACKET_FRAMES);
                     let mut packet_frames = 0_usize;
                     let mut first_audio_at: Option<std::time::Duration> = None;
+                    // One decoded packet leaves the worker: live delivery first (a blocking or
+                    // failing sink is the flow-control/abort contract on `PcmPacketSink`), then
+                    // the whole-utterance buffer, then the TTFA mark — so with a sink attached
+                    // `ttfa` is a DELIVERY time, not merely "the samples exist".
+                    let mut emit_packet = |sink: &mut Option<&mut dyn PcmPacketSink>,
+                                           pcm: &mut Vec<f32>,
+                                           packet_pcm: &[f32],
+                                           frames: usize,
+                                           first_audio_at: &mut Option<std::time::Duration>|
+                     -> Result<(), FttsError> {
+                        if let Some(sink) = sink.as_mut() {
+                            sink.deliver(packet_pcm, frames)?;
+                        }
+                        pcm.extend_from_slice(packet_pcm);
+                        first_audio_at.get_or_insert_with(|| synthesis_started.elapsed());
+                        Ok(())
+                    };
                     while let Ok(frame) = frame_rx.recv() {
                         if frame.codes.len() != 16 {
                             return Err(FttsError::Generic(format!(
@@ -1626,8 +1670,13 @@ pub fn synthesize(
                             codec
                                 .stream_push(&mut state, &packet, packet_frames, &mut packet_pcm)
                                 .map_err(checkpoint_error)?;
-                            pcm.extend_from_slice(&packet_pcm);
-                            first_audio_at.get_or_insert_with(|| synthesis_started.elapsed());
+                            emit_packet(
+                                &mut pcm_sink,
+                                &mut pcm,
+                                &packet_pcm,
+                                packet_frames,
+                                &mut first_audio_at,
+                            )?;
                             packet.clear();
                             packet_frames = 0;
                         }
@@ -1636,8 +1685,13 @@ pub fn synthesize(
                         codec
                             .stream_push(&mut state, &packet, packet_frames, &mut packet_pcm)
                             .map_err(checkpoint_error)?;
-                        pcm.extend_from_slice(&packet_pcm);
-                        first_audio_at.get_or_insert_with(|| synthesis_started.elapsed());
+                        emit_packet(
+                            &mut pcm_sink,
+                            &mut pcm,
+                            &packet_pcm,
+                            packet_frames,
+                            &mut first_audio_at,
+                        )?;
                     }
                     Ok((pcm, first_audio_at))
                 },

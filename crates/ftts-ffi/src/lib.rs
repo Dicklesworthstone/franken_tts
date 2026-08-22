@@ -295,6 +295,7 @@ pub unsafe extern "C" fn ftts_synthesize(
             seed,
             &cancellation,
             &observer,
+            None,
         ) {
             Ok(audio) => {
                 let mut pcm = audio.pcm.into_boxed_slice();

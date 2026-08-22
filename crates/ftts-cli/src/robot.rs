@@ -936,37 +936,73 @@ fn matches_type(value: &Value, ty: &str) -> bool {
         "u8" => value.as_u64().is_some_and(|n| n <= u64::from(u8::MAX)),
         "u64" => value.as_u64().is_some(),
         "i64" => value.as_i64().is_some(),
+        // Any JSON number. Used for ratios (RTF) that are usually fractional but may be
+        // exactly 1, which serde parses as an integer — a narrower f64 check would reject
+        // the integral spelling of a legal value.
+        "number" => value.is_number(),
         _ => false,
     }
 }
 
-/// Check one emitted object against the catalogue. An empty result means it conforms.
+/// One versioned wire contract: the envelope fields every object carries, the field that
+/// names the object's kind, and the catalogue of allowed shapes. The validation walk is
+/// parameterized over this rather than forked per contract, so every vocabulary on the wire
+/// gets identical strict-closed behavior by construction and the walks cannot drift apart.
+pub(crate) struct WireContract {
+    /// Contract version each object's `schema_version` must equal, for versioned contracts.
+    /// Client-to-server vocabularies that predate a session (the talk ops) are unversioned
+    /// and pass [`None`].
+    pub(crate) version: Option<u8>,
+    /// The field whose string value selects the catalogue entry.
+    pub(crate) discriminator: &'static str,
+    /// Envelope fields validated on every object, before the per-entry fields.
+    pub(crate) common: &'static [FieldSpec],
+    pub(crate) catalogue: &'static [EventSpec],
+}
+
+/// The v1 run contract: `ftts say`/`ftts robot` events, frozen by the conformance fixture.
+pub(crate) fn run_contract() -> WireContract {
+    WireContract {
+        version: Some(SCHEMA_VERSION),
+        discriminator: "event",
+        common: COMMON_FIELDS,
+        catalogue: EVENTS,
+    }
+}
+
+/// Check one object against a contract. An empty result means it conforms.
 ///
 /// Unknown fields are violations, not warnings: a contract that only checks for absence lets
 /// the surface grow silently and breaks downstream parsers at their leisure.
-pub fn validate_event(value: &Value) -> Vec<String> {
+pub(crate) fn validate_object(value: &Value, contract: &WireContract) -> Vec<String> {
     let mut problems = Vec::new();
     let Some(object) = value.as_object() else {
         problems.push("emitted object is not a JSON object".to_owned());
         return problems;
     };
 
-    match object.get("schema_version").and_then(Value::as_u64) {
-        Some(version) if version == u64::from(SCHEMA_VERSION) => {}
-        Some(version) => problems.push(format!(
-            "schema_version {version} != contract version {SCHEMA_VERSION}"
-        )),
-        None => problems.push("missing schema_version".to_owned()),
+    if let Some(expected) = contract.version {
+        match object.get("schema_version").and_then(Value::as_u64) {
+            Some(version) if version == u64::from(expected) => {}
+            Some(version) => problems.push(format!(
+                "schema_version {version} != contract version {expected}"
+            )),
+            None => problems.push("missing schema_version".to_owned()),
+        }
     }
 
-    let Some(name) = object.get("event").and_then(Value::as_str) else {
-        problems.push("missing or non-string `event` discriminator".to_owned());
+    let discriminator = contract.discriminator;
+    let Some(name) = object.get(discriminator).and_then(Value::as_str) else {
+        problems.push(format!(
+            "missing or non-string `{discriminator}` discriminator"
+        ));
         return problems;
     };
-    let Some(spec) = event_spec(name) else {
+    let Some(spec) = contract.catalogue.iter().find(|spec| spec.name == name) else {
         problems.push(format!(
-            "unknown event {name:?}; the catalogue defines: {}",
-            EVENTS
+            "unknown {discriminator} {name:?}; the catalogue defines: {}",
+            contract
+                .catalogue
                 .iter()
                 .map(|spec| spec.name)
                 .collect::<Vec<_>>()
@@ -975,7 +1011,7 @@ pub fn validate_event(value: &Value) -> Vec<String> {
         return problems;
     };
 
-    for field in COMMON_FIELDS.iter().chain(spec.fields.iter()) {
+    for field in contract.common.iter().chain(spec.fields.iter()) {
         match object.get(field.name) {
             Some(value) => {
                 if !matches_type(value, field.ty) {
@@ -992,7 +1028,8 @@ pub fn validate_event(value: &Value) -> Vec<String> {
         }
     }
 
-    let known: Vec<&str> = COMMON_FIELDS
+    let known: Vec<&str> = contract
+        .common
         .iter()
         .chain(spec.fields.iter())
         .map(|field| field.name)
@@ -1009,47 +1046,11 @@ pub fn validate_event(value: &Value) -> Vec<String> {
     problems
 }
 
-/// Validate a whole NDJSON stream, reporting the line number of each violation.
-pub fn validate_ndjson(stream: &str) -> Vec<String> {
-    let mut problems = Vec::new();
-    for (index, line) in stream.lines().enumerate() {
-        let line_number = index + 1;
-        if line.trim().is_empty() {
-            problems.push(format!(
-                "line {line_number}: blank line in an NDJSON stream"
-            ));
-            continue;
-        }
-        match serde_json::from_str::<Value>(line) {
-            Ok(value) => problems.extend(
-                validate_event(&value)
-                    .into_iter()
-                    .map(|problem| format!("line {line_number}: {problem}")),
-            ),
-            Err(error) => problems.push(format!("line {line_number}: not valid JSON: {error}")),
-        }
-    }
-    problems
+/// Check one emitted run object against the v1 catalogue. An empty result means it conforms.
+pub fn validate_event(value: &Value) -> Vec<String> {
+    validate_object(value, &run_contract())
 }
 
-fn exit_codes_json() -> BTreeMap<String, String> {
-    [
-        FttsExitCode::Success,
-        FttsExitCode::Generic,
-        FttsExitCode::Usage,
-        FttsExitCode::ModelNotFound,
-        FttsExitCode::Input,
-        FttsExitCode::BudgetTimeout,
-        FttsExitCode::Cancelled,
-        FttsExitCode::ArtifactFormat,
-        FttsExitCode::EnrollmentQualityRefusal,
-    ]
-    .into_iter()
-    .map(|code| (code.as_u8().to_string(), code.description().to_owned()))
-    .collect()
-}
-
-/// The machine-readable self-description emitted by `ftts robot schema`.
 /// Render an engine health signal as its robot event.
 ///
 /// The single conversion point between `ftts_core::health` and the wire, so the two crates cannot

@@ -775,6 +775,7 @@ fn handle_connection(
         seed,
         &cancellation,
         &observer,
+        None,
     ) {
         Ok(audio) => {
             let header = json!({
