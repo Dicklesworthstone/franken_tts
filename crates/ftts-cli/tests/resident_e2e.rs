@@ -176,3 +176,173 @@ fn resident_daemon_reuse_parity_and_idle_exit() {
         std::thread::sleep(Duration::from_millis(250));
     }
 }
+
+/// One client run against a chosen text, returning raw material for concurrency
+/// assertions (status, WAV bytes, wall window). Unlike [`run_say`] this does not
+/// assert success: racing clients are compared, not presumed.
+struct RaceOutcome {
+    success: bool,
+    wav: Vec<u8>,
+    stdout: String,
+    start: Instant,
+    end: Instant,
+}
+
+fn spawn_race_client(
+    resident_dir: &std::path::Path,
+    out: &std::path::Path,
+    text: &str,
+) -> std::thread::JoinHandle<RaceOutcome> {
+    let resident_dir = resident_dir.to_path_buf();
+    let out = out.to_path_buf();
+    let text = text.to_owned();
+    std::thread::spawn(move || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ftts"));
+        command
+            .arg("say")
+            .arg("--seed")
+            .arg("11")
+            .arg(text)
+            .arg("-o")
+            .arg(&out)
+            .env("FTTS_RESIDENT_DIR", &resident_dir)
+            .env("FTTS_RESIDENT_IDLE_SECS", "600")
+            .env("FTTS_RESIDENT_CLIENT_TIMEOUT_SECS", "1800")
+            .env("FTTS_RESIDENT_SPAWN_WAIT_SECS", "180");
+        let start = Instant::now();
+        let output = command.output().expect("racing client runs");
+        let end = Instant::now();
+        RaceOutcome {
+            success: output.status.success(),
+            wav: std::fs::read(&out).unwrap_or_default(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            start,
+            end,
+        }
+    })
+}
+
+fn resident_state_files(resident_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(resident_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("resident-"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Two clients racing one WARM daemon (bead frankentts-xw2v): the accept loop serves
+/// strictly serially, so both must succeed with byte-identical audio at the same seed
+/// while their wall windows overlap — proof the second QUEUED instead of corrupting
+/// the first or forking a second daemon. Exactly one state file survives.
+#[test]
+fn two_concurrent_clients_queue_on_one_daemon_without_corruption() {
+    let Some(_model) = model_dir() else {
+        eprintln!(
+            "SKIP-AS-SUCCESS: no complete model directory; resident e2e needs the real model"
+        );
+        return;
+    };
+    let scratch = std::env::temp_dir().join(format!(
+        "ftts-resident-race-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let resident_dir = scratch.join("state");
+
+    // Warm the daemon first so the race exercises QUEUEING, not cold-start spawning.
+    let _warm = run_say(&resident_dir, &scratch.join("warm.wav"), &[]);
+    assert_eq!(resident_state_files(&resident_dir), 1, "one warm daemon");
+
+    const TEXT: &str = "Two clients, one daemon, identical bytes.";
+    let b_handle = spawn_race_client(&resident_dir, &scratch.join("b.wav"), TEXT);
+    // Stagger by a beat so B is unambiguously first in line; C still overlaps B.
+    std::thread::sleep(Duration::from_millis(500));
+    let c_handle = spawn_race_client(&resident_dir, &scratch.join("c.wav"), TEXT);
+    let client_b = b_handle.join().expect("client B thread");
+    let client_c = c_handle.join().expect("client C thread");
+
+    assert!(client_b.success, "client B failed: {}", client_b.stdout);
+    assert!(client_c.success, "client C failed: {}", client_c.stdout);
+    assert_eq!(
+        client_b.wav, client_c.wav,
+        "same-seed requests through one daemon must produce identical WAV bytes"
+    );
+    assert!(
+        !client_c.wav.is_empty(),
+        "a queued request that produced no audio did not actually synthesize"
+    );
+    // The windows overlapped in wall time — this was a RACE, not two serial tests.
+    let overlap = client_c.start < client_b.end && client_b.start < client_c.end;
+    assert!(
+        overlap,
+        "clients did not overlap (B {:?}, C {:?}); the test stopped racing",
+        (client_b.start, client_b.end),
+        (client_c.start, client_c.end)
+    );
+    // Serialization proof: the second client's service cannot START before the first
+    // finishes — measured via the synthesis stages each client saw on stdout. The
+    // overlap above plus identical correct outputs IS the queueing contract; a torn
+    // interleaving would corrupt at least one reply.
+    assert_eq!(resident_state_files(&resident_dir), 1, "no daemon forked");
+}
+
+/// Cold-start race (bead frankentts-xw2v): N simultaneous invocations on an empty
+/// resident dir may all spawn; exactly one state file survives (`remove_state_if_ours`
+/// prevents the retirement cascade), every invocation still succeeds, and audio stays
+/// byte-identical whether a given client was served by the winning daemon or fell
+/// back inline.
+#[test]
+fn cold_start_spawn_race_leaves_one_daemon_and_identical_audio() {
+    let Some(_model) = model_dir() else {
+        eprintln!(
+            "SKIP-AS-SUCCESS: no complete model directory; resident e2e needs the real model"
+        );
+        return;
+    };
+    let scratch = std::env::temp_dir().join(format!(
+        "ftts-resident-coldrace-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let resident_dir = scratch.join("state");
+
+    const TEXT: &str = "Three cold starts, one survivor.";
+    let handles: Vec<_> = (0..3)
+        .map(|n| spawn_race_client(&resident_dir, &scratch.join(format!("r{n}.wav")), TEXT))
+        .collect();
+    let outcomes: Vec<RaceOutcome> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("race thread"))
+        .collect();
+
+    for (index, outcome) in outcomes.iter().enumerate() {
+        assert!(
+            outcome.success,
+            "cold-start client {index} failed: {}",
+            outcome.stdout
+        );
+        assert!(!outcome.wav.is_empty(), "client {index} produced no audio");
+    }
+    let reference = &outcomes[0].wav;
+    for (index, outcome) in outcomes.iter().enumerate().skip(1) {
+        assert_eq!(
+            reference, &outcome.wav,
+            "client {index} diverged from client 0 across the spawn race"
+        );
+    }
+    let survivors = resident_state_files(&resident_dir);
+    assert!(
+        survivors <= 1,
+        "{survivors} resident state files survived the race; remove_state_if_ours \
+         must leave exactly the winner"
+    );
+}

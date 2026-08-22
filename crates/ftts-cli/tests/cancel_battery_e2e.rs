@@ -563,6 +563,12 @@ fn compressed_target_cancel_skips_the_encoder_and_keeps_the_staging_wav() {
         &parse_and_validate(&stderr_path, "compressed stderr"),
         "compressed",
     );
+    // The kept staging WAV must agree with what the client was told was delivered.
+    assert_eq!(
+        data_size,
+        chunk_bytes(&events),
+        "staging WAV data must equal sum(audio_chunk.bytes)"
+    );
     assert_eq!(terminal["kind"], "cancelled");
     let message = terminal["message"].as_str().expect("message present");
     assert!(
@@ -636,7 +642,13 @@ fn resident_client_cancel_discards_and_the_daemon_survives() {
         0,
         "a discarded resident reply must contain no audio samples"
     );
+    // A v1-wire client sees NO audio events before the whole blob arrives; a
+    // discarded reply therefore delivered zero packets to stdout.
     let events = parse_and_validate(&stdout_path, "resident cancel events");
+    assert!(
+        !events.iter().any(|event| event_name(event) == "audio_chunk"),
+        "a discarded resident run must not emit audio_chunk events"
+    );
     let terminal = terminal_event(
         &parse_and_validate(&stderr_path, "resident cancel stderr"),
         "resident cancel",
