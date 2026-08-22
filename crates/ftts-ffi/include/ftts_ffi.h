@@ -48,6 +48,26 @@ int32_t ftts_synthesize(FttsEngine *engine, const char *text, const float *speak
 /* Releases a buffer from ftts_synthesize. len must be the returned length. */
 void ftts_pcm_free(float *pcm, size_t len);
 
+/* Streaming synthesis: `on_packet` receives each decoded packet the moment it exists,
+ * ON THE ENGINE'S DECODE THREAD — return promptly, hand samples to your audio queue,
+ * and do not call back into this engine from inside it. `samples` are mono 24 kHz f32
+ * in [-1, 1] (f32 end to end: AVAudioEngine plays Float32 natively), valid only for
+ * the duration of the call — copy them out. `frame_index` counts 80 ms frames already
+ * delivered before this packet. `packet_frames` picks the cadence (1 = lowest first-
+ * audio latency, 4 = the whole-buffer call's historical cadence). Returning nonzero
+ * from `on_packet` requests cancellation: delivery stops within one packet and the
+ * call returns FTTS_SYNTH_CANCELLED. The callback must not throw/unwind (C contract).
+ * Returns 0 on success, FTTS_SYNTH_CANCELLED (6) when the callback cancelled,
+ * any other nonzero on failure (see ftts_last_error_message). The engine handle
+ * stays externally serialized, exactly as for ftts_synthesize. */
+#define FTTS_SYNTH_CANCELLED 6
+typedef int32_t (*FttsPacketFn)(void *ctx, const float *samples, size_t len,
+                                uint64_t frame_index);
+int32_t ftts_synthesize_streaming(FttsEngine *engine, const char *text,
+                                  const float *speaker, size_t speaker_len,
+                                  uint64_t seed, size_t packet_frames,
+                                  FttsPacketFn on_packet, void *ctx);
+
 /* Enrolls a voice from mono 24 kHz f32 PCM into out[FTTS_SPEAKER_WIDTH]. 0 on success. */
 int32_t ftts_enroll(FttsEngine *engine, const float *pcm, size_t len, float *out);
 
