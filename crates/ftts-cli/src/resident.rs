@@ -424,6 +424,10 @@ fn roundtrip(
                 .get("ttfa_ms")
                 .and_then(Value::as_u64)
                 .map(Duration::from_millis),
+            // The v1 wire reply carries one whole buffer after synthesis; an audible
+            // mark measured daemon-side would not be a client delivery time. Absent
+            // here, `run_complete.ttfa_ms` falls back to the raw mark above.
+            ttfa_audible: None,
         }));
     }
     // A synthesis error is real and final; anything transport-shaped means fallback.
@@ -775,6 +779,10 @@ fn handle_connection(
         seed,
         &cancellation,
         &observer,
+        // The v1 wire protocol has no per-request profile and replies with one whole
+        // buffer, so packet size is invisible to clients; 4 preserves the daemon's
+        // historical decode cadence.
+        4,
         None,
     ) {
         Ok(audio) => {

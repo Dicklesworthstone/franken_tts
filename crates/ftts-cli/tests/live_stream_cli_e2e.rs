@@ -356,3 +356,84 @@ fn raw_mode_streams_live_bypasses_resident_and_matches_file_output() {
         events.len()
     );
 }
+
+/// `--profile interactive` reaches the codec worker: the first audio_chunk is ONE frame
+/// (80 ms, packet_frames "1"), delivered during synthesis. This is the wiring the profile
+/// contract promised and the ~240 ms TTFA lever (frankentts-6xcf).
+#[test]
+fn interactive_profile_delivers_one_frame_packets() {
+    let Some(_root) = model_dir() else {
+        eprintln!(
+            "receipt: {{\"test\":\"interactive_profile\",\"outcome\":\"skipped\",\"reason\":\"model directory unavailable\"}}"
+        );
+        return;
+    };
+    let scratch = scratch_dir("interactive");
+    let out = scratch.join("interactive.wav");
+    let resident_dir = scratch.join("resident");
+    std::fs::create_dir_all(&resident_dir).expect("resident dir");
+    let run = run_ftts(
+        &[
+            "say",
+            "--robot",
+            "--seed",
+            "7",
+            "--no-resident",
+            "--profile",
+            "interactive",
+            TEXT,
+            out.to_str().expect("utf-8 path"),
+        ],
+        &[
+            ("FTTS_RESIDENT_DIR", resident_dir.to_str().expect("utf-8")),
+            ("FTTS_TRIM_TAIL", "0"),
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "interactive say failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let events = parse_and_validate(&run.stdout, "interactive stdout");
+    assert_single_terminal(&events, "interactive");
+    let chunks: Vec<_> = events
+        .iter()
+        .filter(|event| event_name(event) == "audio_chunk")
+        .collect();
+    let first = chunks.first().expect("audio chunks present");
+    assert_eq!(
+        first.get("duration_ms").and_then(serde_json::Value::as_u64),
+        Some(80),
+        "interactive first packet must be one 80 ms frame"
+    );
+    assert_eq!(
+        first
+            .get("packet_frames")
+            .and_then(serde_json::Value::as_str),
+        Some("1"),
+        "interactive packet_frames metadata"
+    );
+    // Every non-tail chunk is one frame; ordering proof as in the balanced case.
+    for chunk in &chunks[..chunks.len().saturating_sub(1)] {
+        assert_eq!(
+            chunk.get("duration_ms").and_then(serde_json::Value::as_u64),
+            Some(80)
+        );
+    }
+    let first_chunk = events
+        .iter()
+        .position(|event| event_name(event) == "audio_chunk")
+        .expect("chunk");
+    let synthesis_end = events
+        .iter()
+        .position(|event| is_stage(event, "synthesis", "end"))
+        .expect("synthesis end");
+    assert!(
+        first_chunk < synthesis_end,
+        "interactive chunks stream during synthesis"
+    );
+    eprintln!(
+        "receipt: {{\"test\":\"interactive_profile\",\"outcome\":\"passed\",\"chunks\":{},\"first_duration_ms\":80}}",
+        chunks.len()
+    );
+}

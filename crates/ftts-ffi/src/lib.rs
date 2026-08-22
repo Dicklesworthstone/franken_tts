@@ -295,6 +295,9 @@ pub unsafe extern "C" fn ftts_synthesize(
             seed,
             &cancellation,
             &observer,
+            // Whole-buffer ABI: packet size is unobservable to callers until the
+            // streaming FFI (chunk callback) exposes it; 4 is the historical cadence.
+            4,
             None,
         ) {
             Ok(audio) => {

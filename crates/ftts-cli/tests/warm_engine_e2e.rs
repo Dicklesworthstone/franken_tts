@@ -90,6 +90,7 @@ fn synthesize_utterance(
         seed,
         &cancellation,
         &observer,
+        4,
         None,
     )
     .expect("utterance synthesizes");

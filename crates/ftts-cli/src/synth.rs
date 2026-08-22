@@ -1514,6 +1514,12 @@ pub struct SynthesizedAudio {
     /// products (doctrine: report them separately); this is the TTFA half, excluding model
     /// load, which the `load` stage event already bounds.
     pub ttfa: Option<std::time::Duration>,
+    /// Time to the first AUDIBLE sample delivered: like `ttfa`, but marked at the first
+    /// delivered packet containing a sample above [`AUDIBLE_FLOOR`]. Vendors get caught
+    /// reporting time-to-first-byte while shipping leading silence; the product metric
+    /// (`run_complete.ttfa_ms`) prefers this value and falls back to `ttfa` only for
+    /// output that never crosses the floor. Measurement-only: no sample is altered.
+    pub ttfa_audible: Option<std::time::Duration>,
 }
 
 /// Receives each decoded PCM packet on the codec worker thread, the moment it exists.
@@ -1541,10 +1547,19 @@ pub trait PcmPacketSink: Send {
 /// [`PcmPacketSink`]); the completed [`SynthesizedAudio`] is returned identically either
 /// way, so the sink is purely additive observation with backpressure.
 ///
+/// `packet_frames` is the codec packet size in 80 ms frames — an execution-policy
+/// parameter (profiles: interactive→1, balanced/strict→4), never silently equated with
+/// the model frame. Streamed output is bit-identical to offline decode under EVERY
+/// packet schedule (the standing streaming==batch gate), so this dial trades only
+/// first-audio latency against per-packet overhead: 1-frame packets deliver ~240 ms
+/// sooner than 4-frame ones and cost one extra `stream_push` per frame (~noise at
+/// 12.5 Hz).
+///
 /// # Errors
 ///
 /// Engine refusals (admission, budget, cancellation) and model refusals are mapped to their CLI
 /// exit classes; a zero-frame generation is reported rather than written out as an empty file.
+/// A `packet_frames` of zero is refused as a usage error.
 #[allow(clippy::too_many_arguments)]
 pub fn synthesize(
     model: &LoadedModel,
@@ -1554,8 +1569,14 @@ pub fn synthesize(
     seed: u64,
     cancellation: &CancellationToken,
     observer: &dyn SynthesisObserver,
+    packet_frames: usize,
     pcm_sink: Option<&mut dyn PcmPacketSink>,
 ) -> Result<SynthesizedAudio, FttsError> {
+    if packet_frames == 0 {
+        return Err(FttsError::Usage(
+            "packet_frames must be at least 1 (one 80 ms codec frame)".to_owned(),
+        ));
+    }
     // 1. Text, once — see the module docs on ordering.
     let prepared_raw = model
         .tokenizer
@@ -1652,92 +1673,95 @@ pub fn synthesize(
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ftts_core::CodeFrame>(256);
     let codec = &model.codec;
     let synthesis_started = std::time::Instant::now();
-    let (result, pcm, ttfa) = std::thread::scope(
-        |scope| -> Result<
-            (
-                ftts_core::SynthesisResult,
-                Vec<f32>,
-                Option<std::time::Duration>,
-            ),
-            FttsError,
-        > {
+    let (result, decoded) = std::thread::scope(
+        |scope| -> Result<(ftts_core::SynthesisResult, DecodedAudio), FttsError> {
             let mut pcm_sink = pcm_sink;
-            let worker = scope.spawn(
-                move || -> Result<(Vec<f32>, Option<std::time::Duration>), FttsError> {
-                    // Overlap for real: this thread's int8 ops run serially on a spare core
-                    // instead of contending for the generator's worker team.
-                    ftts_kernels::team::bypass_team_on_this_thread();
-                    const PACKET_FRAMES: usize = 4;
-                    let mut state = codec.stream_state();
-                    let mut pcm = Vec::new();
-                    // `stream_push` REPLACES its output buffer with one packet's samples (see the
-                    // streaming==offline test), so packets decode into a scratch and append here.
-                    let mut packet_pcm = Vec::new();
-                    let mut packet: Vec<i32> = Vec::with_capacity(16 * PACKET_FRAMES);
-                    let mut packet_frames = 0_usize;
-                    let mut first_audio_at: Option<std::time::Duration> = None;
-                    // One decoded packet leaves the worker: live delivery first (a blocking or
-                    // failing sink is the flow-control/abort contract on `PcmPacketSink`), then
-                    // the whole-utterance buffer, then the TTFA mark — so with a sink attached
-                    // `ttfa` is a DELIVERY time, not merely "the samples exist".
-                    let emit_packet = |sink: &mut Option<&mut dyn PcmPacketSink>,
-                                       pcm: &mut Vec<f32>,
-                                       packet_pcm: &[f32],
-                                       frames: usize,
-                                       first_audio_at: &mut Option<std::time::Duration>|
-                     -> Result<(), FttsError> {
-                        if let Some(sink) = sink.as_mut() {
-                            sink.deliver(packet_pcm, frames)?;
-                        }
-                        pcm.extend_from_slice(packet_pcm);
-                        first_audio_at.get_or_insert_with(|| synthesis_started.elapsed());
-                        Ok(())
-                    };
-                    while let Ok(frame) = frame_rx.recv() {
-                        if frame.codes.len() != 16 {
-                            return Err(FttsError::Generic(format!(
-                                "generated frame carries {} codes, expected 16",
-                                frame.codes.len()
-                            )));
-                        }
-                        for code in &frame.codes {
-                            packet.push(i32::try_from(*code).map_err(|_| {
-                                FttsError::Generic(format!(
-                                    "generated code {code} does not fit the codec's i32"
-                                ))
-                            })?);
-                        }
-                        packet_frames += 1;
-                        if packet_frames == PACKET_FRAMES {
-                            codec
-                                .stream_push(&mut state, &packet, packet_frames, &mut packet_pcm)
-                                .map_err(checkpoint_error)?;
-                            emit_packet(
-                                &mut pcm_sink,
-                                &mut pcm,
-                                &packet_pcm,
-                                packet_frames,
-                                &mut first_audio_at,
-                            )?;
-                            packet.clear();
-                            packet_frames = 0;
-                        }
+            let worker = scope.spawn(move || -> Result<DecodedAudio, FttsError> {
+                // Overlap for real: this thread's int8 ops run serially on a spare core
+                // instead of contending for the generator's worker team.
+                ftts_kernels::team::bypass_team_on_this_thread();
+                let mut state = codec.stream_state();
+                let mut pcm = Vec::new();
+                // `stream_push` REPLACES its output buffer with one packet's samples (see the
+                // streaming==offline test), so packets decode into a scratch and append here.
+                let mut packet_pcm = Vec::new();
+                let mut packet: Vec<i32> = Vec::with_capacity(16 * packet_frames);
+                let mut buffered_frames = 0_usize;
+                let mut first_audio_at: Option<std::time::Duration> = None;
+                let mut first_audible_at: Option<std::time::Duration> = None;
+                // One decoded packet leaves the worker: live delivery first (a blocking or
+                // failing sink is the flow-control/abort contract on `PcmPacketSink`), then
+                // the whole-utterance buffer, then the TTFA marks — so with a sink attached
+                // both `ttfa`s are DELIVERY times, not merely "the samples exist".
+                let emit_packet = |sink: &mut Option<&mut dyn PcmPacketSink>,
+                                   pcm: &mut Vec<f32>,
+                                   packet_pcm: &[f32],
+                                   frames: usize,
+                                   first_audio_at: &mut Option<std::time::Duration>,
+                                   first_audible_at: &mut Option<std::time::Duration>|
+                 -> Result<(), FttsError> {
+                    if let Some(sink) = sink.as_mut() {
+                        sink.deliver(packet_pcm, frames)?;
                     }
-                    if packet_frames > 0 {
+                    pcm.extend_from_slice(packet_pcm);
+                    first_audio_at.get_or_insert_with(|| synthesis_started.elapsed());
+                    if first_audible_at.is_none()
+                        && packet_pcm.iter().any(|sample| sample.abs() > AUDIBLE_FLOOR)
+                    {
+                        *first_audible_at = Some(synthesis_started.elapsed());
+                    }
+                    Ok(())
+                };
+                while let Ok(frame) = frame_rx.recv() {
+                    if frame.codes.len() != 16 {
+                        return Err(FttsError::Generic(format!(
+                            "generated frame carries {} codes, expected 16",
+                            frame.codes.len()
+                        )));
+                    }
+                    for code in &frame.codes {
+                        packet.push(i32::try_from(*code).map_err(|_| {
+                            FttsError::Generic(format!(
+                                "generated code {code} does not fit the codec's i32"
+                            ))
+                        })?);
+                    }
+                    buffered_frames += 1;
+                    if buffered_frames == packet_frames {
                         codec
-                            .stream_push(&mut state, &packet, packet_frames, &mut packet_pcm)
+                            .stream_push(&mut state, &packet, buffered_frames, &mut packet_pcm)
                             .map_err(checkpoint_error)?;
                         emit_packet(
                             &mut pcm_sink,
                             &mut pcm,
                             &packet_pcm,
-                            packet_frames,
+                            buffered_frames,
                             &mut first_audio_at,
+                            &mut first_audible_at,
                         )?;
+                        packet.clear();
+                        buffered_frames = 0;
                     }
-                    Ok((pcm, first_audio_at))
-                },
-            );
+                }
+                if buffered_frames > 0 {
+                    codec
+                        .stream_push(&mut state, &packet, buffered_frames, &mut packet_pcm)
+                        .map_err(checkpoint_error)?;
+                    emit_packet(
+                        &mut pcm_sink,
+                        &mut pcm,
+                        &packet_pcm,
+                        buffered_frames,
+                        &mut first_audio_at,
+                        &mut first_audible_at,
+                    )?;
+                }
+                Ok(DecodedAudio {
+                    pcm,
+                    ttfa: first_audio_at,
+                    ttfa_audible: first_audible_at,
+                })
+            });
 
             let mut tee = TeeGenerator {
                 inner: &mut generator,
@@ -1764,7 +1788,7 @@ pub fn synthesize(
             match (result, worker_outcome) {
                 (_, Err(worker_error)) => Err(worker_error),
                 (Err(engine_failure), Ok(_)) => Err(engine_failure),
-                (Ok(result), Ok((pcm, ttfa))) => Ok((result, pcm, ttfa)),
+                (Ok(result), Ok(decoded)) => Ok((result, decoded)),
             }
         },
     )?;
@@ -1781,9 +1805,24 @@ pub fn synthesize(
     Ok(SynthesizedAudio {
         frames: result.generated_frames,
         prepared_token_count: result.prepared_token_count,
-        pcm,
-        ttfa,
+        pcm: decoded.pcm,
+        ttfa: decoded.ttfa,
+        ttfa_audible: decoded.ttfa_audible,
     })
+}
+
+/// The audibility floor for the `ttfa_audible` mark: −60 dBFS (10^(−60/20) = 0.001 in
+/// the codec's `[-1, 1]` range). Rationale: −60 dBFS is far below any speech onset the
+/// model produces and far above f32 noise, so the mark is insensitive to the exact
+/// choice within ±20 dB; it exists to stop leading SILENCE from flattering the metric,
+/// not to detect speech. Measurement-only — output samples are never altered.
+pub const AUDIBLE_FLOOR: f32 = 0.001;
+
+/// What the codec worker hands back at join.
+struct DecodedAudio {
+    pcm: Vec<f32>,
+    ttfa: Option<std::time::Duration>,
+    ttfa_audible: Option<std::time::Duration>,
 }
 
 /// Forwards a generator's frames unchanged while teeing each one to the codec worker.

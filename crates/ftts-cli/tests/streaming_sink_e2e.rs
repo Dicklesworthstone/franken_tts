@@ -92,6 +92,7 @@ fn run(
     text: &str,
     seed: u64,
     cancellation: &ftts_core::CancellationToken,
+    packet_frames: usize,
     sink: Option<&mut dyn PcmPacketSink>,
 ) -> Result<synth::SynthesizedAudio, ftts_cli::FttsError> {
     let request = ftts_core::SynthesisRequest::new(text.to_owned());
@@ -104,6 +105,7 @@ fn run(
         seed,
         cancellation,
         &observer,
+        packet_frames,
         sink,
     )
 }
@@ -146,7 +148,7 @@ fn sink_receives_exactly_the_returned_audio() {
     let loaded = load(&root);
     let mut sink = CollectingSink::default();
     let cancellation = ftts_core::CancellationToken::new();
-    let audio = run(&loaded, TEXT, SEED, &cancellation, Some(&mut sink)).expect("synthesis");
+    let audio = run(&loaded, TEXT, SEED, &cancellation, 4, Some(&mut sink)).expect("synthesis");
 
     assert_eq!(
         sink.samples.len(),
@@ -201,7 +203,7 @@ fn a_slow_sink_backpressures_without_deadlock_or_corruption() {
 
     // Reference run: no sink.
     let cancellation = ftts_core::CancellationToken::new();
-    let reference = run(&loaded, TEXT, SEED, &cancellation, None).expect("reference synthesis");
+    let reference = run(&loaded, TEXT, SEED, &cancellation, 4, None).expect("reference synthesis");
 
     // Slow-consumer run: 25 ms per packet is ~1/3 of a 4-frame packet's real-time budget —
     // enough to exercise the park path on a faster-than-real-time engine without making
@@ -212,7 +214,7 @@ fn a_slow_sink_backpressures_without_deadlock_or_corruption() {
     };
     let cancellation = ftts_core::CancellationToken::new();
     let started = Instant::now();
-    let audio = run(&loaded, TEXT, SEED, &cancellation, Some(&mut sink)).expect("slow-sink run");
+    let audio = run(&loaded, TEXT, SEED, &cancellation, 4, Some(&mut sink)).expect("slow-sink run");
     let elapsed = started.elapsed();
 
     assert_eq!(sink.samples.len(), audio.pcm.len());
@@ -267,7 +269,7 @@ fn a_failing_sink_aborts_the_run_with_an_error() {
     };
     let cancellation = ftts_core::CancellationToken::new();
     let started = Instant::now();
-    let result = run(&loaded, TEXT, SEED, &cancellation, Some(&mut sink));
+    let result = run(&loaded, TEXT, SEED, &cancellation, 4, Some(&mut sink));
     let elapsed = started.elapsed();
     assert!(result.is_err(), "a failing sink must abort the run");
     eprintln!(
@@ -288,7 +290,7 @@ fn cancelling_mid_run_stops_delivery_and_keeps_a_valid_prefix() {
 
     // Reference: the full utterance at the same seed.
     let cancellation = ftts_core::CancellationToken::new();
-    let reference = run(&loaded, TEXT, SEED, &cancellation, None).expect("reference synthesis");
+    let reference = run(&loaded, TEXT, SEED, &cancellation, 4, None).expect("reference synthesis");
 
     // Cancel as soon as the first packet has been delivered. The watcher thread owns the
     // token; the sink only counts deliveries.
@@ -327,7 +329,7 @@ fn cancelling_mid_run_stops_delivery_and_keeps_a_valid_prefix() {
         collected: Arc::clone(&collected),
     };
     let started = Instant::now();
-    let result = run(&loaded, TEXT, SEED, &cancellation, Some(&mut sink));
+    let result = run(&loaded, TEXT, SEED, &cancellation, 4, Some(&mut sink));
     let elapsed = started.elapsed();
     watcher.join().expect("watcher joins");
 
@@ -356,4 +358,83 @@ fn cancelling_mid_run_stops_delivery_and_keeps_a_valid_prefix() {
         reference.pcm.len(),
         elapsed.as_millis()
     );
+}
+
+/// The standing packet-parity gate on the LIVE path (plan §9: packet-1 == packet-4 for
+/// the same codec tokens): concatenated PCM is bit-identical across packet schedules
+/// 1/2/4 at the same seed, each schedule's packet accounting obeys its own size rule,
+/// and the receipt logs the raw-vs-audible TTFA pair per schedule — the measurement
+/// evidence the TTFA certification bead consumes (PROVISIONAL_LOCAL_WIN until ledgered).
+#[test]
+fn packet_schedules_are_bit_identical_and_smaller_packets_deliver_sooner() {
+    let Some(root) = model_dir() else {
+        eprintln!(
+            "receipt: {{\"test\":\"packet_parity\",\"outcome\":\"skipped\",\"reason\":\"model directory unavailable\"}}"
+        );
+        return;
+    };
+    let loaded = load(&root);
+
+    // (schedule, samples, packet frame counts, ttfa_ms, ttfa_audible_ms)
+    type ScheduleRun = (usize, Vec<f32>, Vec<usize>, Option<u128>, Option<u128>);
+    let mut outputs: Vec<ScheduleRun> = Vec::new();
+    for packet_frames in [1_usize, 2, 4] {
+        let mut sink = CollectingSink::default();
+        let cancellation = ftts_core::CancellationToken::new();
+        let audio = run(
+            &loaded,
+            TEXT,
+            SEED,
+            &cancellation,
+            packet_frames,
+            Some(&mut sink),
+        )
+        .expect("synthesis");
+        // Per-schedule packet rule: all but the tail carry exactly `packet_frames`.
+        if let Some((tail, body)) = sink.packet_frames.split_last() {
+            assert!(
+                body.iter().all(|frames| *frames == packet_frames),
+                "schedule {packet_frames}: non-tail packet not full"
+            );
+            assert!(
+                *tail >= 1 && *tail <= packet_frames,
+                "schedule {packet_frames}: tail out of range"
+            );
+        }
+        assert_eq!(
+            sink.packet_frames.iter().sum::<usize>() as u64,
+            audio.frames,
+            "schedule {packet_frames}: frame accounting"
+        );
+        outputs.push((
+            packet_frames,
+            sink.samples,
+            sink.packet_frames,
+            audio.ttfa.map(|d| d.as_millis()),
+            audio.ttfa_audible.map(|d| d.as_millis()),
+        ));
+    }
+
+    let (_, reference, ..) = &outputs[outputs.len() - 1];
+    for (schedule, samples, ..) in &outputs {
+        assert_eq!(
+            samples.len(),
+            reference.len(),
+            "schedule {schedule}: length diverges from packet-4"
+        );
+        for (index, (a, b)) in samples.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                a.to_bits() == b.to_bits(),
+                "schedule {schedule}: first divergent sample at {index}"
+            );
+        }
+    }
+    for (schedule, _, packets, ttfa, ttfa_audible) in &outputs {
+        eprintln!(
+            "receipt: {{\"test\":\"packet_parity\",\"outcome\":\"passed\",\"schedule\":{schedule},\"packets\":{},\"ttfa_ms\":{:?},\"ttfa_audible_ms\":{:?},\"claim_tier\":\"PROVISIONAL_LOCAL_WIN\"}}",
+            packets.len(),
+            ttfa,
+            ttfa_audible
+        );
+    }
 }

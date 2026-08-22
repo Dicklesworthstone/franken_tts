@@ -1781,6 +1781,7 @@ fn run_say_events(
                         seed,
                         &cancellation,
                         &observer,
+                        usize::from(settings.packet_frames.frames_per_packet()),
                         Some(&mut sink),
                     )
                 });
@@ -1906,7 +1907,11 @@ fn run_say_events(
         "prepared_token_count".to_owned(),
         json!(audio_result.prepared_token_count),
     );
-    if let Some(ttfa) = audio_result.ttfa {
+    // The product TTFA is time-to-first-AUDIBLE-sample (leading silence must not flatter
+    // the number); output that never crosses the audibility floor falls back to the raw
+    // first-delivery mark rather than claiming nothing was delivered. One field, one
+    // definition — the raw-vs-audible delta is test-receipt material, not event schema.
+    if let Some(ttfa) = audio_result.ttfa_audible.or(audio_result.ttfa) {
         complete.insert(
             "ttfa_ms".to_owned(),
             json!(u64::try_from(ttfa.as_millis()).unwrap_or(u64::MAX)),
