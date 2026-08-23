@@ -437,3 +437,88 @@ fn interactive_profile_delivers_one_frame_packets() {
         chunks.len()
     );
 }
+
+/// Metamorphic invariant (frankentts-v-metamorphic-0wq, golden artifacts): a full `say --robot`
+/// run's event stream is a stable, reviewable artifact once the volatile fields are removed.
+/// The scrub list is empirical (franken_tts stream captured 2026-08-22): `run_id` is per-process
+/// random; `elapsed_ms` and `ttfa_ms` are wall-clock; and `frame` events as a class are
+/// time-THROTTLED, so even their indices vary with machine speed — they are dropped whole.
+/// Everything that remains (stage names and sequence numbers, text shape, chunk byte geometry,
+/// run_complete's frames/samples/token counts/exit code) is deterministic for a pinned seed and
+/// must not drift when someone refactors the emitter. Regenerate deliberately with
+/// `UPDATE_GOLDENS=1 cargo test --release --test live_stream_cli_e2e robot_run_content_matches_its_scrubbed_golden`,
+/// which fails while writing the new fixture — a change must be seen by a human, never absorbed
+/// silently.
+#[test]
+fn robot_run_content_matches_its_scrubbed_golden() {
+    const GOLDEN: &str = "A golden run says hello.";
+    let Some(_root) = model_dir() else {
+        eprintln!("SKIP: no complete model directory");
+        return;
+    };
+    let scratch = scratch_dir("robot-golden");
+    let out = scratch.join("golden.wav");
+    let run = run_ftts(
+        &[
+            "say",
+            "--robot",
+            "--seed",
+            "305419896",
+            "--no-resident",
+            GOLDEN,
+            out.to_str().expect("utf-8 path"),
+        ],
+        &[
+            ("FTTS_TRIM_TAIL", "0"),
+            (
+                "FTTS_RESIDENT_DIR",
+                scratch.join("resident").to_str().expect("utf-8"),
+            let object = event.as_object_mut().expect("events are objects");
+            object.remove("run_id");
+            object.remove("elapsed_ms");
+            object.remove("ttfa_ms");
+            Some(serde_json::to_string(&event).expect("serializes"))
+        })
+        .collect();
+    assert!(
+        scrubbed.len() >= 5,
+        "a say run emits at least run_start, stages, chunks and run_complete"
+    );
+    assert_eq!(
+        scrubbed.first().map(String::as_str),
+        Some("run_start").map(|marker| {
+            serde_json::from_str::<serde_json::Value>(&scrubbed[0])
+                .expect("first event parses")
+                .get("event")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        }),
+        "the first event must be run_start"
+    );
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let fixture = std::path::Path::new(manifest_dir).join("tests/fixtures/robot_run_golden.ndjson");
+    let actual = scrubbed.join("\n") + "\n";
+    if std::env::var_os("UPDATE_GOLDENS").is_some_and(|value| value != "0") {
+        std::fs::create_dir_all(fixture.parent().expect("fixture parent")).expect("fixtures dir");
+        std::fs::write(&fixture, &actual).expect("golden written");
+        panic!(
+            "UPDATE_GOLDENS: new golden written to {}; diff it against HEAD and commit it — \
+             a changed robot stream must be reviewed, never absorbed",
+            fixture.display()
+        );
+    }
+    let Ok(expected) = std::fs::read_to_string(&fixture) else {
+        panic!(
+            "golden fixture {} does not exist yet; run once with UPDATE_GOLDENS=1 to write it, \
+             then commit the file",
+            fixture.display()
+        );
+    };
+    assert_eq!(
+        actual, expected,
+        "the robot event stream drifted from its frozen golden; either you changed what say \
+         EMITS (review + UPDATE_GOLDENS=1) or you broke determinism (fix the emitter)"
+    );
+}
