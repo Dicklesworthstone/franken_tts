@@ -351,7 +351,10 @@ fn packet_one_equals_packet_four_bit_for_bit() {
 
     let (frames_one, pcm_one) = (&by_packet[0].0, &by_packet[0].1);
     let (frames_four, pcm_four) = (&by_packet[1].0, &by_packet[1].1);
-    assert_eq!(frames_one, frames_four, "packet size changed the frame count");
+    assert_eq!(
+        frames_one, frames_four,
+        "packet size changed the frame count"
+    );
     assert_eq!(
         pcm_one, pcm_four,
         "packet size changed the samples: streaming arithmetic depends on the \
