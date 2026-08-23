@@ -8,7 +8,15 @@ per-turn latency breakdown. Two input modes:
                               crates/ftts-conformance/tests/fixtures/franken_whisper_replay/),
                               played on its own timeline. THE default proof mode: it needs
                               no microphone, no AEC, and no live fw build.
-  (live mic mode arrives with `fw robot listen` + the AEC spike, bead frankentts-8s0y.)
+  --listen '<command>'        LIVE mode: spawn the command (an `fw robot listen ...`
+                              invocation, schema 1.1.0) and consume its NDJSON events from
+                              stdout. Default policy is ARM 2 of the AEC spike (bead
+                              frankentts-8s0y): the mic is GATED while the agent speaks
+                              (plus --gate-hangover-ms), so the loop cannot trigger on its
+                              own output — deterministic, but no barge-in. Pass --barge-in
+                              only when the capture side runs through a proven echo
+                              canceller (VoiceProcessingIO, spike arm 1); it re-enables
+                              cancel-on-speech_started exactly as in replay mode.
 
 The LLM is canned by default (--llm canned): deterministic replies, so the latency table
 measures OUR loop, not a model's mood. Playback is optional (--play), via the first
@@ -34,6 +42,7 @@ Latency stamps per turn (NDJSON on stdout, aggregate table on exit):
 import argparse
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -154,6 +163,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ftts", default=os.environ.get("FTTS_BIN", "ftts"))
     parser.add_argument("--replay", default=str(FIXTURES / "normal_turn.ndjson"))
+    parser.add_argument(
+        "--listen",
+        default=None,
+        help="LIVE mode: shell command producing fw robot-listen NDJSON on stdout "
+             "(e.g. \"fw robot listen --source mic\"); overrides --replay",
+    )
+    parser.add_argument(
+        "--barge-in",
+        action="store_true",
+        help="live mode only: trust the capture side's echo cancellation (AEC spike "
+             "arm 1) and allow cancel-on-speech_started while the agent speaks; "
+             "WITHOUT this flag the mic is gated during agent speech (arm 2)",
+    )
+    parser.add_argument(
+        "--gate-hangover-ms",
+        type=int,
+        default=150,
+        help="arm-2 gate tail: fw events arriving this soon after the agent stops "
+             "speaking are still attributed to self-hearing and dropped",
+    )
     parser.add_argument("--voice", default="matt")
     parser.add_argument("--llm-ttft-ms", type=int, default=300, help="simulated canned-LLM first-sentence latency")
     parser.add_argument(
@@ -177,7 +206,8 @@ def main():
     )
     args = parser.parse_args()
 
-    fixture = [
+    live_mode = args.listen is not None
+    fixture = [] if live_mode else [
         json.loads(line)
         for line in Path(args.replay).read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")  # fixtures carry contract headers
@@ -188,9 +218,19 @@ def main():
 
     turns = []
     transcript = []
+    pending_deltas = []  # transcript.delta fallback when utterance_end carries no text
     reply_index = 0
     utterance = None
     speaking = False
+    # Barge-in is a policy, not a capability: replay fixtures presume it; live mode
+    # earns it only with proven echo cancellation on the capture side (spike arm 1).
+    allow_barge = (not live_mode) or args.barge_in
+    # Arm-2 gate state (live mode without --barge-in). One interval suffices: events
+    # are processed in arrival order and each agent reply opens exactly one gate.
+    gate_open = None
+    gate_close = float("-inf")
+    swallow_utterance = False  # an utterance that STARTED inside the gate is dropped whole
+    gated_drops = 0
 
     def parse_ts(stamp):
         # fw fixtures may carry RFC3339 strings or float seconds; accept both.
@@ -206,26 +246,51 @@ def main():
             talk.wait(lambda e: e["event"] in ("speak_complete", "speak_cancelled"))
             speaking = False
 
-    # Replay the fixture ON ITS OWN TIMELINE: the inter-event gaps are what create the
-    # overlap windows barge-in needs (an agent still speaking when speech_started
-    # arrives). Without the sleeps every event lands instantly and no overlap exists.
+    # In replay mode the fixture runs ON ITS OWN TIMELINE: the inter-event gaps are
+    # what create the overlap windows barge-in needs (an agent still speaking when
+    # speech_started arrives). Without the sleeps no overlap exists. The preamble
+    # serves both modes: it puts the agent mid-speech before the first user event.
     if args.preamble:
+        gate_open = time.monotonic()  # consulted only in live arm-2; harmless otherwise
         talk.send({"op": "say", "context": "demo", "text": args.preamble, "continue": False})
         talk.wait(lambda e: e["event"] == "speak_start")
         talk.wait(lambda e: e["event"] == "audio")
         speaking = True
         log({"note": "preamble speaking; the fixture timeline now runs against it"})
+        if live_mode and not args.barge_in:
+            # Arm 2 cannot let the mic hear the preamble either — hold, then release.
+            talk.wait(lambda e: e["event"] in ("speak_complete", "speak_cancelled"))
+            speaking = False
+            gate_close = time.monotonic() + args.gate_hangover_ms / 1000.0
 
-    previous_ts = None
-    for event in fixture:
+    def handle_fw_event(event, arrival):
+        """One fw event (replay or live), stamped with its LOCAL arrival time."""
+        nonlocal speaking, utterance, reply_index
+        nonlocal gate_open, gate_close, swallow_utterance, gated_drops
         kind = event.get("event")
-        stamp = event.get("ts")
-        if stamp is not None:
-            if previous_ts is not None:
-                gap = min(max(parse_ts(stamp) - previous_ts, 0.0), 3.0)
-                time.sleep(gap)
-            previous_ts = parse_ts(stamp)
-        if kind == "speech_started" and speaking:
+
+        # ARM-2 GATE (live mode, no proven AEC): anything the mic "heard" while the
+        # agent was speaking — or within the hangover after — is presumed to be the
+        # agent's own output and is dropped, INCLUDING the tail of an utterance that
+        # started inside the gate and ended after it (swallow_utterance).
+        if live_mode and not args.barge_in:
+            in_gate = gate_open is not None and gate_open <= arrival <= gate_close
+            if kind == "speech_started":
+                if in_gate:
+                    swallow_utterance = True
+                    gated_drops += 1
+                    log({"gated": kind, "reason": "agent was speaking (arm-2 mic gate)"})
+                    return
+                swallow_utterance = False
+            elif kind in ("transcript.delta", "utterance_end") and (in_gate or swallow_utterance):
+                if kind == "utterance_end":
+                    swallow_utterance = False
+                    pending_deltas.clear()
+                gated_drops += 1
+                log({"gated": kind, "reason": "utterance attributed to self-hearing"})
+                return
+
+        if kind == "speech_started" and speaking and allow_barge:
             # Barge-in: the user talks over the agent. The fixtures place a transcript
             # event right behind the trigger, standing in for the >=0.5s evidence.
             talk.send({"op": "cancel", "context": "demo", "id": f"cancel-{utterance}"})
@@ -237,13 +302,21 @@ def main():
                 transcript[-1] = ("assistant (interrupted)", receipt["spoken_text"])
             log({"turn": "barge-in", "spoken_upper_bound": receipt["spoken_text"],
                  "frames_delivered": receipt["frames_delivered"]})
-        if kind == "utterance_end" and event.get("text"):
+        if kind == "transcript.delta" and event.get("text"):
+            # Each delta carries the FULL committed prefix so far (append-only text,
+            # cumulative events) — so the latest one supersedes, never concatenates.
+            pending_deltas.append(event["text"])
+        if kind == "utterance_end":
+            user_text = event.get("text") or (pending_deltas[-1].strip() if pending_deltas else "")
+            pending_deltas.clear()
+            if not user_text:
+                return  # fw's empty-utterance pairing: endpoint with nothing committed
             ensure_idle()
-            t_endpoint = time.monotonic()
+            t_endpoint = arrival
             if args.llm.startswith("exec:"):
                 # A real model: its own latency, measured not simulated.
                 reply = subprocess.run(
-                    args.llm[5:], shell=True, input=event["text"],
+                    args.llm[5:], shell=True, input=user_text,
                     capture_output=True, text=True, timeout=120,
                 ).stdout.strip() or "I did not catch that."
             else:
@@ -252,6 +325,8 @@ def main():
                 reply_index += 1
             t_llm_first = time.monotonic()
             chunks = sentence_chunks(reply)
+            gate_open = time.monotonic()  # arm-2: the mic is suspect from here on
+            gate_close = float("inf")
             talk.send({"op": "say", "context": "demo", "text": chunks[0], "continue": True})
             t_say = time.monotonic()
             for chunk in chunks[1:]:
@@ -266,19 +341,81 @@ def main():
             t_audio = time.monotonic()
             turn = {
                 "turn": len(turns),
-                "user_text": event["text"],
+                "user_text": user_text,
                 "reply": reply,
                 "llm_ttft_ms": round((t_llm_first - t_endpoint) * 1000),
                 "say_to_first_audio_ms": round((t_audio - t_say) * 1000),
                 "voice_to_voice_ms": round((t_audio - t_endpoint) * 1000),
                 "ttfa_ms_reported": first_audio.get("ttfa_ms"),
             }
-            transcript.append(("user", event["text"]))
+            transcript.append(("user", user_text))
             transcript.append(("assistant", reply))
             turns.append(turn)
             log(turn)
-            # Do NOT block for the receipt here: the reply keeps speaking while the
-            # fixture timeline advances, which is exactly the window a barge-in needs.
+            if live_mode and not args.barge_in:
+                # Arm 2 is half-duplex BY DESIGN: hold until the reply finishes, then
+                # release the gate after the hangover. Events that arrived meanwhile
+                # keep their true arrival stamps, so the gate test above stays exact.
+                talk.wait(lambda e: e["event"] in ("speak_complete", "speak_cancelled"))
+                speaking = False
+                gate_close = time.monotonic() + args.gate_hangover_ms / 1000.0
+            # Otherwise do NOT block for the receipt: the reply keeps speaking while
+            # events keep arriving, which is exactly the window a barge-in needs.
+
+    if live_mode:
+        # LIVE: spawn the listen command, stamp each NDJSON line's arrival on the
+        # reader thread (so gate decisions survive any processing backlog), and run
+        # until the command exits (file-replay sources end themselves) or Ctrl-C.
+        fw_events = queue.Queue()
+        fw_proc = subprocess.Popen(
+            args.listen, shell=True, stdout=subprocess.PIPE, text=True,
+        )
+
+        def _fw_pump():
+            for line in fw_proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    fw_events.put((time.monotonic(), json.loads(line)))
+                except json.JSONDecodeError:
+                    log({"note": "non-JSON line from the listen command", "line": line[:200]})
+
+        threading.Thread(target=_fw_pump, daemon=True).start()
+        try:
+            while True:
+                try:
+                    arrival, event = fw_events.get(timeout=0.25)
+                except queue.Empty:
+                    if fw_proc.poll() is not None and fw_events.empty():
+                        break
+                    continue
+                kind = event.get("event")
+                if kind in ("session_start", "listen.session_start"):
+                    log({"note": "listen session started", "fw": event})
+                elif kind == "session_stats":
+                    log({"note": "listen session ended", "fw_stats": event})
+                else:
+                    handle_fw_event(event, arrival)
+        except KeyboardInterrupt:
+            log({"note": "interrupted; shutting the talk session down cleanly"})
+        finally:
+            if fw_proc.poll() is None:
+                fw_proc.terminate()
+            try:
+                fw_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                fw_proc.kill()
+    else:
+        previous_ts = None
+        for event in fixture:
+            stamp = event.get("ts")
+            if stamp is not None:
+                if previous_ts is not None:
+                    gap = min(max(parse_ts(stamp) - previous_ts, 0.0), 3.0)
+                    time.sleep(gap)
+                previous_ts = parse_ts(stamp)
+            handle_fw_event(event, time.monotonic())
 
     ensure_idle()
     talk.send({"op": "shutdown"})
@@ -290,14 +427,21 @@ def main():
         v2v = sorted(t["voice_to_voice_ms"] for t in turns)
         tts = sorted(t["say_to_first_audio_ms"] for t in turns)
         p95 = v2v[min(len(v2v) - 1, int(len(v2v) * 0.95))]
+        mode = (
+            "live-arm1-barge-in" if live_mode and args.barge_in
+            else "live-arm2-gated" if live_mode
+            else "replay"
+        )
         log({
             "summary": True,
+            "mode": mode,
             "turns": len(turns),
+            "gated_events_dropped": gated_drops if live_mode else None,
             "voice_to_voice_ms": {"p50": v2v[len(v2v) // 2], "p95": p95, "max": v2v[-1]},
             "say_to_first_audio_ms": {"p50": tts[len(tts) // 2], "max": tts[-1]},
             "host_load_avg": list(os.getloadavg()),
             "note": "one-shot run output; canned llm_ttft is simulated (--llm-ttft-ms); "
-                    "endpointing/finalization stages arrive with live fw mode",
+                    "fw-side endpointing latency is inside voice_to_voice in live mode",
         })
         log({"final_transcript": [f"{role}: {text}" for role, text in transcript]})
 
