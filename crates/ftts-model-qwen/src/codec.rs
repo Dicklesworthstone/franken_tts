@@ -701,11 +701,10 @@ fn codec_int8_route() -> Option<&'static CodecInt8Route> {
             // transformer seams). Quantizing the codec now costs speed AND fidelity; the arms
             // stay opt-in for A/B.
             let env_value = std::env::var("FTTS_INT8_CODEC").ok();
-            let Some((transformer, convnext)) =
-                codec_int8_route_decision(ftts_kernels::route::reference_pinned(), env_value.as_deref())
-            else {
-                return None;
-            };
+            let (transformer, convnext) = codec_int8_route_decision(
+                ftts_kernels::route::reference_pinned(),
+                env_value.as_deref(),
+            )?;
             Some(CodecInt8Route {
                 plan: autotuned_plan(),
                 transformer,
