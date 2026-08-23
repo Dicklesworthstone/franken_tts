@@ -45,8 +45,6 @@ const VAD_CLOSE_RATIO: f64 = 1.0; // 0 dB over floor
 /// Spectral flatness under which a frame is TONAL (music beds, sustained vowels). Speech
 /// consonants and breaths sit far above; chord beds sit far below.
 const TONAL_FLATNESS_MAX: f64 = 0.02;
-/// Fraction of active frames that are tonal AND low-modulation for MUSIC_BED_WARN.
-const MUSIC_BED_FRACTION_WARN: f64 = 0.5;
 
 fn frame_rms(pcm: &[f32], start: usize) -> f64 {
     let end = (start + FRAME_LEN).min(pcm.len());
@@ -58,13 +56,23 @@ fn frame_rms(pcm: &[f32], start: usize) -> f64 {
     (sum / len).sqrt()
 }
 
-fn percentile(values: &mut [f64], quantile: f64) -> f64 {
+fn percentile(mut values: Vec<f64>, quantile: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
     values.sort_by(|a, b| a.total_cmp(b));
     let index = ((values.len() - 1) as f64 * quantile).round() as usize;
     values[index]
+}
+
+fn frame_energies(pcm: &[f32]) -> Vec<f64> {
+    let mut energies = Vec::new();
+    let mut start = 0;
+    while start + FRAME_LEN <= pcm.len() {
+        energies.push(frame_rms(pcm, start));
+        start += HOP;
+    }
+    energies
 }
 
 /// Voice-activity regions as `(start_sample, end_sample)` pairs, exclusive end.
@@ -74,22 +82,17 @@ fn percentile(values: &mut [f64], quantile: f64) -> f64 {
 /// from shattering words.
 #[must_use]
 pub fn voice_activity_regions(pcm: &[f32]) -> Vec<(usize, usize)> {
-    let mut floors: Vec<f64> = Vec::new();
-    let mut start = 0;
-    while start + FRAME_LEN <= pcm.len() {
-        floors.push(frame_rms(pcm, start));
-        start += HOP;
-    }
-    if floors.is_empty() {
+    let energies = frame_energies(pcm);
+    if energies.is_empty() {
         return Vec::new();
     }
-    let floor = percentile(&mut floors.clone(), FLOOR_QUANTILE);
+    let floor = percentile(energies.clone(), FLOOR_QUANTILE);
     let open = floor * VAD_OPEN_RATIO;
     let close = floor * VAD_CLOSE_RATIO;
 
     let mut regions = Vec::new();
     let mut region_start: Option<usize> = None;
-    for (index, &energy) in floors.iter().enumerate() {
+    for (index, &energy) in energies.iter().enumerate() {
         match (region_start, energy >= open, energy >= close) {
             (None, true, _) => region_start = Some(index * HOP),
             (Some(_), _, false) => {
@@ -130,6 +133,10 @@ pub fn clipping_diagnostics(pcm: &[f32]) -> (f64, usize, f64) {
         }
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "loop indices over a 4-step interpolation; exactness is irrelevant here"
+    )]
     let digital_peak = pcm.iter().fold(0.0_f32, |max, &value| max.max(value.abs()));
     let mut true_peak = f64::from(digital_peak);
     for window in pcm.windows(4) {
@@ -139,7 +146,7 @@ pub fn clipping_diagnostics(pcm: &[f32]) -> (f64, usize, f64) {
         if b.abs() < c.abs() || c.abs() < CLIP_LEVEL * 0.5 {
             continue;
         }
-        for step in 1..4 {
+        for step in 1..4_u32 {
             let t = step as f32 / 4.0;
             // Catmull-Rom through (a, b, c, d) evaluated between b and c.
             let interpolated = 0.5
@@ -155,23 +162,20 @@ pub fn clipping_diagnostics(pcm: &[f32]) -> (f64, usize, f64) {
     } else {
         0.0
     };
+    let _ = CLIP_RUN_SAMPLES; // documented alongside longest_clip_run for consumers
     (fraction, longest_run, overshoot_db)
 }
 
 /// Envelope-domain SNR: mean active-frame power (inside VAD regions) versus the noise
-/// floor power, in dB. `None` when the reference has no detectable speech at all.
+/// floor power, in dB. Returns `(estimate, pause_floor_rms)`; the estimate is `None` when
+/// the reference has no detectable speech at all.
 #[must_use]
 pub fn snr_estimate_db(pcm: &[f32]) -> (Option<f64>, f64) {
-    let mut energies: Vec<f64> = Vec::new();
-    let mut start = 0;
-    while start + FRAME_LEN <= pcm.len() {
-        energies.push(frame_rms(pcm, start));
-        start += HOP;
-    }
+    let energies = frame_energies(pcm);
     if energies.is_empty() {
         return (None, 0.0);
     }
-    let floor_rms = percentile(&mut energies.clone(), FLOOR_QUANTILE);
+    let floor_rms = percentile(energies.clone(), FLOOR_QUANTILE);
     let regions = voice_activity_regions(pcm);
     let mut active_power_sum = 0.0_f64;
     let mut active_frames = 0_usize;
@@ -185,12 +189,12 @@ pub fn snr_estimate_db(pcm: &[f32]) -> (Option<f64>, f64) {
         }
     }
     if active_frames == 0 || floor_rms <= 0.0 {
-        return (None, f64::from(floor_rms));
+        return (None, floor_rms);
     }
     let active_rms = (active_power_sum / active_frames as f64).sqrt();
     (
         Some(20.0 * (active_rms / floor_rms).log10()),
-        f64::from(floor_rms),
+        floor_rms,
     )
 }
 
@@ -233,11 +237,14 @@ pub fn music_bed_likelihood(pcm: &[f32]) -> f64 {
         let log_mean: f64 = band.iter().map(|value| value.ln()).sum::<f64>() / band.len() as f64;
         let linear_mean: f64 = band.iter().sum::<f64>() / band.len() as f64;
         frame_flatness.push(if linear_mean > 0.0 {
-            (log_mean.exp()) / linear_mean
+            log_mean.exp() / linear_mean
         } else {
             1.0
         });
-        frame_rms_values.push(frame_rms(pcm, offset.min(pcm.len().saturating_sub(FRAME_LEN))));
+        frame_rms_values.push(frame_rms(
+            pcm,
+            offset.min(pcm.len().saturating_sub(FRAME_LEN)),
+        ));
         offset += HOP;
     }
     if frame_flatness.len() < 4 {
@@ -256,12 +263,8 @@ pub fn music_bed_likelihood(pcm: &[f32]) -> f64 {
             continue;
         }
         considered += 1;
-        let modulation = if frame_rms_values[index - 1] > 0.0
-            && frame_rms_values[index] > 0.0
-        {
-            (frame_rms_values[index] / frame_rms_values[index - 1])
-                .abs()
-                .ln()
+        let modulation = if frame_rms_values[index - 1] > 0.0 && frame_rms_values[index] > 0.0 {
+            (frame_rms_values[index] / frame_rms_values[index - 1]).abs().ln()
         } else {
             f64::INFINITY
         };
@@ -281,21 +284,16 @@ pub fn music_bed_likelihood(pcm: &[f32]) -> f64 {
 /// score near zero regardless of loudness; healthy speech with pauses does not.
 #[must_use]
 pub fn stationarity_drift(pcm: &[f32]) -> f64 {
-    let mut energies: Vec<f64> = Vec::new();
-    let mut start = 0;
-    while start + FRAME_LEN <= pcm.len() {
-        energies.push(frame_rms(pcm, start));
-        start += HOP;
-    }
+    let energies = frame_energies(pcm);
     if energies.len() < 8 {
         return 0.0;
     }
     let quarter = energies.len() / 4;
     let medians: [f64; 4] = [
-        percentile(&mut energies[..quarter].to_vec(), 0.5),
-        percentile(&mut energies[quarter..2 * quarter].to_vec(), 0.5),
-        percentile(&mut energies[2 * quarter..3 * quarter].to_vec(), 0.5),
-        percentile(&mut energies[3 * quarter..].to_vec(), 0.5),
+        percentile(energies[..quarter].to_vec(), 0.5),
+        percentile(energies[quarter..2 * quarter].to_vec(), 0.5),
+        percentile(energies[2 * quarter..3 * quarter].to_vec(), 0.5),
+        percentile(energies[3 * quarter..].to_vec(), 0.5),
     ];
     let min = medians.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = medians.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -305,7 +303,7 @@ pub fn stationarity_drift(pcm: &[f32]) -> f64 {
     (max - min) / max
 }
 
-/// Everything [`crate::diagnostics`] measures about one reference, ready to print.
+/// Everything this module measures about one reference, ready to print.
 #[derive(Debug)]
 pub struct AudioDiagnostics {
     /// Fraction of samples railed at or over [`CLIP_LEVEL`].
@@ -324,7 +322,7 @@ pub struct AudioDiagnostics {
     pub music_bed_likelihood: f64,
     /// Quarter-to-quarter energy spread, relative.
     pub stationarity_drift: f64,
-    /// Whole-file RMS, dBFS (an loudness approximation, explicitly NOT LUFS).
+    /// Whole-file RMS, dBFS (a loudness approximation, explicitly NOT LUFS).
     pub loudness_rms_dbfs: f64,
     /// Fraction of the timeline inside a voice-activity region.
     pub voice_activity_ratio: f64,
