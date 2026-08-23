@@ -82,8 +82,7 @@ fn open_engine(root: &std::path::Path) -> *mut FttsEngine {
     engine
 }
 
-fn preset(engine_dummy: ()) -> Vec<f32> {
-    let _ = engine_dummy;
+fn preset() -> Vec<f32> {
     let mut speaker = vec![0.0_f32; SPEAKER_WIDTH];
     let name = CString::new("matt").expect("no NUL");
     // SAFETY: name is NUL-terminated; the buffer holds SPEAKER_WIDTH floats.
@@ -102,7 +101,7 @@ fn streamed_packets_concatenate_to_the_whole_buffer_bit_for_bit() {
         return;
     };
     let engine = open_engine(&root);
-    let speaker = preset(());
+    let speaker = preset();
     let text = CString::new(TEXT).expect("no NUL");
 
     // Whole-buffer reference.
@@ -188,7 +187,7 @@ fn a_nonzero_callback_return_cancels_with_the_distinct_status() {
         return;
     };
     let engine = open_engine(&root);
-    let speaker = preset(());
+    let speaker = preset();
     let text = CString::new(TEXT).expect("no NUL");
 
     let mut collector = Collector {
