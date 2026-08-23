@@ -180,12 +180,211 @@ impl QuantizedMatrixQ4 {
 /// If `packed` is too short for `k` values.
 #[must_use]
 pub fn dot_i32_q4(x: &[i8], packed: &[u8], k: usize) -> i32 {
+    dot_i32_q4_tier(x, packed, k, Q4Tier::dispatch())
+}
+
+/// [`linear_q4`] through an explicit tier, for interleaved A/B measurement.
+pub fn linear_q4_tier(
+    x_q: &[i8],
+    x_scales: &[f32],
+    weight: &QuantizedMatrixQ4,
+    bias: Option<&[f32]>,
+    m: usize,
+    out: &mut [f32],
+    tier: Q4Tier,
+) {
+    let (n, k) = (weight.n, weight.k);
+    assert_eq!(x_q.len(), m * k, "activations must be [m, k]");
+    assert_eq!(out.len(), m * n, "out must be [m, n]");
+    let packed_row = k.div_ceil(PER_BYTE);
+    for row in 0..m {
+        let x_row = &x_q[row * k..row * k + k];
+        for column in 0..n {
+            let w_row = &weight.data[column * packed_row..(column + 1) * packed_row];
+            let accumulated = dot_i32_q4_tier(x_row, w_row, k, tier);
+            #[allow(clippy::cast_precision_loss)]
+            let value = accumulated as f32 * (x_scales[row] * weight.scales[column]);
+            out[row * n + column] = bias.map_or(value, |values| value + values[column]);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon-dotprod"))]
+mod neon_q4 {
+    //! The audited in-register unpack island for W4A8 — NE-INH-004's escape clause and
+    //! NE-005's sole retry predicate. One 16-byte load per packed block; nibbles split by
+    //! shift/mask INSIDE the vector registers; both lanes feed SDOT against the signed
+    //! activations. The +8 storage bias cancels exactly as in the scalar path (nibbles
+    //! accumulate unsigned; one `8*sum(x)` correction at the end), so the result is
+    //! bit-identical to [`super::dot_i32_q4_scalar_from`] by integer exactness.
+    //!
+    //! # The deinterleave that makes it correct
+    //!
+    //! Packed byte j holds elements (2j, 2j+1): low nibbles are the EVEN activations of a
+    //! block's 32-element span, high nibbles the ODD ones. A contiguous activation load
+    //! would therefore mispair every element with its neighbor's nibble. Two loads plus a
+    //! `vuzp1q`/`vuzp2q` deinterleave produce exactly the even and odd lanes SDOT needs;
+    //! the final horizontal add makes lane grouping irrelevant to the exact total.
+
+    use super::{BIAS, PER_BYTE};
+    use core::arch::aarch64::{
+        vaddlvq_s8, vaddvq_s32, vandq_u8, vdotq_s32, vdupq_n_s32, vdupq_n_u8, vld1q_s8, vld1q_u8,
+        vreinterpretq_s8_u8, vshrq_n_u8, vuzp1q_s8, vuzp2q_s8,
+    };
+    /// Whether the running CPU reports FEAT_DotProd (SDOT is this island's MAC).
+    #[must_use]
+    pub fn available() -> bool {
+        std::arch::is_aarch64_feature_detected!("dotprod")
+    }
+
+    /// Exact i32 biased-nibble dot via in-register unpack + SDOT.
+    ///
+    /// # Panics
+    ///
+    /// Panics (in the caller) unless [`available`] returned true; length relations are
+    /// asserted by [`super::dot_i32_q4_tier`].
+    #[must_use]
+    pub fn dot_i32(x: &[i8], packed: &[u8], k: usize) -> i32 {
+        debug_assert!(available(), "q4 neon island entered without FEAT_DotProd");
+        // SAFETY: `dot_i32_sdot` requires NEON + FEAT_DotProd, which `available()` has
+        // confirmed on this CPU at the dispatch site (asserted in the caller).
+        unsafe { dot_i32_sdot(x, packed, k) }
+    }
+
+    // SAFETY: callers must have confirmed FEAT_DotProd via `available()`. All loads are
+    // bounded by loop structure: packed blocks run while `block*16 + 16 <= pairs` where
+    // `pairs <= packed.len()`, and each block's two x loads touch `[base, base+32)` with
+    // `base + 32 = block*32 + 32 <= pairs*2 <= k <= x.len()`; the scalar tail touches
+    // nothing past `k`. No read passes either slice's end.
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn dot_i32_sdot(x: &[i8], packed: &[u8], k: usize) -> i32 {
+        let pairs = k / PER_BYTE;
+        let blocks = pairs / 16;
+        let low_mask = vdupq_n_u8(0x0F);
+        let mut unsigned_acc = vdupq_n_s32(0);
+        let mut activation_sum = 0_i32;
+
+        let x_ptr = x.as_ptr();
+        let packed_ptr = packed.as_ptr();
+        let mut block = 0_usize;
+        while block < blocks {
+            let byte_base = block * 16;
+            let x_base = block * 32;
+            // SAFETY: see the function-level note — both loads are bounded by the loop
+            // condition and the caller's length assertions; NEON loads need no alignment.
+            unsafe {
+                let bytes = vld1q_u8(packed_ptr.add(byte_base));
+                let low_nibbles = vandq_u8(bytes, low_mask);
+                let high_nibbles = vshrq_n_u8(bytes, 4);
+                let x_first = vld1q_s8(x_ptr.add(x_base));
+                let x_second = vld1q_s8(x_ptr.add(x_base + 16));
+                let evens = vuzp1q_s8(x_first, x_second);
+                let odds = vuzp2q_s8(x_first, x_second);
+                unsigned_acc = vdotq_s32(unsigned_acc, evens, vreinterpretq_s8_u8(low_nibbles));
+                unsigned_acc = vdotq_s32(unsigned_acc, odds, vreinterpretq_s8_u8(high_nibbles));
+                activation_sum += i32::from(vaddlvq_s8(evens)) + i32::from(vaddlvq_s8(odds));
+            }
+            block += 1;
+        }
+
+        let mut unsigned_total = vaddvq_s32(unsigned_acc);
+        for pair in blocks * 16..pairs {
+            let byte = packed[pair];
+            let low = i32::from(byte & 0x0F);
+            let high = i32::from(byte >> 4);
+            let first = i32::from(x[pair * PER_BYTE]);
+            let second = i32::from(x[pair * PER_BYTE + 1]);
+            unsigned_total += first * low + second * high;
+            activation_sum += first + second;
+        }
+        if k % PER_BYTE == 1 {
+            let byte = packed[pairs];
+            let value = i32::from(x[k - 1]);
+            unsigned_total += value * i32::from(byte & 0x0F);
+            activation_sum += value;
+        }
+
+        unsigned_total - BIAS * activation_sum
+    }
+}
+
+/// Dispatchable implementations of [`dot_i32_q4`]'s arithmetic, for interleaved gate
+/// measurement and so the SIMD island can be exercised independently of autodetection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Q4Tier {
+    /// The plain mask/shift/MAC loop; LLVM's autovectorizer provably cannot fold it
+    /// (NE-005 measured it 22x under SDOT int8 at microdecoder shapes).
+    Scalar,
+    /// In-register unpack on FEAT_DotProd hardware: one 16-byte load per packed block,
+    /// nibbles split by shift/mask inside the vector registers, fed straight to SDOT.
+    NeonSdot,
+}
+
+impl Q4Tier {
+    /// Human-readable route name, matching the Int8Tier reporting convention.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::NeonSdot => "neon-sdot",
+        }
+    }
+
+    /// Every tier this build can execute on this machine.
+    #[must_use]
+    pub fn available() -> Vec<Self> {
+        let mut tiers = vec![Self::Scalar];
+        #[cfg(all(target_arch = "aarch64", feature = "neon-dotprod"))]
+        if neon_q4::available() {
+            tiers.push(Self::NeonSdot);
+        }
+        tiers
+    }
+
+    /// The fastest available tier. Auto-routing inside this module changes nothing about
+    /// doctrine #2's routing gate: nothing outside the module constructs a
+    /// [`QuantizedMatrixQ4`], so production selection remains gated exactly as before.
+    #[must_use]
+    pub fn dispatch() -> Self {
+        #[cfg(all(target_arch = "aarch64", feature = "neon-dotprod"))]
+        if neon_q4::available() {
+            return Self::NeonSdot;
+        }
+        Self::Scalar
+    }
+}
+
+/// [`dot_i32_q4`] through an explicit tier, for interleaved A/B measurement.
+///
+/// # Panics
+///
+/// Panics when the selected tier is unavailable on this machine.
+#[must_use]
+pub fn dot_i32_q4_tier(x: &[i8], packed: &[u8], k: usize, tier: Q4Tier) -> i32 {
     assert!(
         packed.len() >= k.div_ceil(PER_BYTE),
         "packed row shorter than k nibbles"
     );
     assert!(x.len() >= k, "activation row shorter than k");
+    match tier {
+        Q4Tier::Scalar => dot_i32_q4_scalar_from(x, packed, k),
+        #[cfg(all(target_arch = "aarch64", feature = "neon-dotprod"))]
+        Q4Tier::NeonSdot => {
+            assert!(
+                neon_q4::available(),
+                "neon-sdot q4 route selected without FEAT_DotProd"
+            );
+            neon_q4::dot_i32(x, packed, k)
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "neon-dotprod")))]
+        Q4Tier::NeonSdot => unreachable!("neon-sdot q4 tier not built into this target"),
+    }
+}
 
+/// The scalar reference every other tier must reproduce bit-for-bit: the original
+/// mask/shift/MAC loop with the single end-of-row bias correction.
+#[must_use]
+fn dot_i32_q4_scalar_from(x: &[i8], packed: &[u8], k: usize) -> i32 {
     let mut unsigned_accumulator = 0_i32;
     let mut activation_sum = 0_i32;
 
@@ -446,6 +645,63 @@ mod tests {
                 (original - back).abs() <= scale * 0.5 + f32::EPSILON * 8.0,
                 "position {position}: |{original} - {back}| exceeds half a level ({scale})"
             );
+        }
+    }
+
+    /// Every dispatchable tier must reproduce the scalar dot bit-for-bit — across whole
+    /// blocks (k a multiple of 32), block remainders (16-byte pairs), odd nibbles, and
+    /// combinations of all three. The SIMD island reads the odd-row pad's byte freely by
+    /// design only when k is even; these shapes pin the tail arithmetic either way.
+    #[test]
+    fn every_available_q4_tier_reproduces_the_scalar_dot_bit_for_bit() {
+        let tiers = Q4Tier::available();
+        assert!(tiers.contains(&Q4Tier::Scalar));
+        for (index, &(m, n, k)) in [
+            (1_usize, 3_usize, 1_usize),
+            (1, 4, 15),
+            (1, 4, 16),
+            (1, 4, 17),
+            (1, 4, 31),
+            (1, 4, 32),
+            (1, 4, 33),
+            (2, 5, 63),
+            (1, 2048, 1024),
+            (1, 3072, 1024),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let weight = deterministic(n * k, 0x51ED_0000 + index as u64);
+            let activation = deterministic(m * k, 0xA0C7_0000 + index as u64);
+            let mut x_q = vec![0_i8; m * k];
+            // quantize_row_q8 scales ONE row; multi-row activations get one scale each by
+            // quantizing per row, exactly what production's dynamic quantization does.
+            let mut scales = vec![0.0_f32; m];
+            for row in 0..m {
+                scales[row] = quantize_row_q8(
+                    &activation[row * k..(row + 1) * k],
+                    &mut x_q[row * k..(row + 1) * k],
+                );
+            }
+            let matrix = QuantizedMatrixQ4::quantize(&weight, n, k);
+            for tier in &tiers {
+                let mut out = vec![0.0_f32; m * n];
+                linear_q4_tier(&x_q, &scales, &matrix, None, m, &mut out, *tier);
+                let mut reference = vec![0.0_f32; m * n];
+                linear_q4_tier(
+                    &x_q,
+                    &scales,
+                    &matrix,
+                    None,
+                    m,
+                    &mut reference,
+                    Q4Tier::Scalar,
+                );
+                assert_eq!(
+                    out, reference,
+                    "tier {tier:?} diverged from scalar at m={m} n={n} k={k}"
+                );
+            }
         }
     }
 }

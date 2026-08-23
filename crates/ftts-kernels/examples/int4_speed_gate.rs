@@ -25,7 +25,7 @@
 
 use std::time::Instant;
 
-use ftts_kernels::int4::{QuantizedMatrixQ4, linear_q4};
+use ftts_kernels::int4::{Q4Tier, QuantizedMatrixQ4, linear_q4, linear_q4_tier};
 use ftts_kernels::int8::{Int8Tier, QuantizedMatrix, linear_q8, quantize_row_q8};
 
 /// Deterministic operands spanning the representable range, so neither side is flattered by a
@@ -73,7 +73,9 @@ fn main() {
     let mut total_q8_scalar = 0.0_f64;
     let mut total_q4 = 0.0_f64;
     let mut total_q8_route = 0.0_f64;
-
+    let mut total_q4_neon = 0.0_f64;
+    let q4_neon_dispatched = Q4Tier::dispatch();
+    println!("dispatched int4 route: {}", q4_neon_dispatched.as_str());
     for &(label, n, k) in projections {
         let weight = deterministic(n * k, 0x51ED_0000 + n as u64);
         let activation = deterministic(k, 0xA0C7_0000 + k as u64);
@@ -100,6 +102,7 @@ fn main() {
         let mut q8_scalar = f64::MAX;
         let mut q4_ms = f64::MAX;
         let mut q8_route = f64::MAX;
+        let mut q4_neon = f64::MAX;
         for _ in 0..REPEATS {
             let started = Instant::now();
             for _ in 0..ROUNDS {
@@ -118,41 +121,58 @@ fn main() {
                 linear_q8(&x_q, &[scale], &q8, None, 1, &mut out, dispatched);
             }
             q8_route = q8_route.min(started.elapsed().as_secs_f64() * 1000.0);
+
+            if q4_neon_dispatched == Q4Tier::NeonSdot {
+                let started = Instant::now();
+                for _ in 0..ROUNDS {
+                    linear_q4_tier(&x_q, &[scale], &q4, None, 1, &mut out, Q4Tier::NeonSdot);
+                }
+                q4_neon = q4_neon.min(started.elapsed().as_secs_f64() * 1000.0);
+            }
         }
 
         total_q8_scalar += q8_scalar;
         total_q4 += q4_ms;
         total_q8_route += q8_route;
+        if q4_neon_dispatched == Q4Tier::NeonSdot {
+            total_q4_neon += q4_neon;
+        }
 
-        println!(
-            "{label:<10} {n:>6} {k:>6} {q8_scalar:>9.2}m {q4_ms:>9.2}m {q8_route:>9.2}m {:>8.2}x {:>8.2}x",
-            q8_scalar / q4_ms,
-            q8_route / q4_ms
-        );
+        if q4_neon_dispatched == Q4Tier::NeonSdot {
+            println!(
+                "{label:<10} {n:>6} {k:>6} {q8_scalar:>9.2}m {q4_ms:>9.2}m {q8_route:>9.2}m \
+                 {q4_neon:>9.2}m {:>8.2}x {:>8.2}x {:>8.2}x",
+                q8_scalar / q4_ms,
+                q8_route / q4_ms,
+                q8_route / q4_neon
+            );
+        } else {
+            println!(
+                "{label:<10} {n:>6} {k:>6} {q8_scalar:>9.2}m {q4_ms:>9.2}m {q8_route:>9.2}m \
+                 {:>8.2}x {:>8.2}x",
+                q8_scalar / q4_ms,
+                q8_route / q4_ms
+            );
+        }
     }
 
     println!(
         "\ntotals (one layer, {ROUNDS} rounds): q8-scalar {total_q8_scalar:.1} ms, \
          q4-scalar {total_q4:.1} ms, q8-route {total_q8_route:.1} ms"
     );
-    println!(
-        "int4 vs scalar int8 : {:.2}x  ({})",
-        total_q8_scalar / total_q4,
-        if total_q4 < total_q8_scalar {
-            "FASTER - the halved-bytes thesis holds at equal implementation quality"
-        } else {
-            "SLOWER - unpack cost exceeds the traffic saving even against scalar"
-        }
-    );
-    println!(
-        "int4 vs shipping int8: {:.2}x  ({})",
-        total_q8_route / total_q4,
-        if total_q4 < total_q8_route {
-            "FASTER - gate (a) PASSES; the listening gate is now worth running"
-        } else {
-            "SLOWER - gate (a) FAILS as built; int4 needs an in-register SIMD unpack to compete"
-        }
-    );
+    if q4_neon_dispatched == Q4Tier::NeonSdot {
+        println!(
+            "int4-neon vs shipping int8: {:.2}x  ({})",
+            total_q8_route / total_q4_neon,
+            if total_q4_neon < total_q8_route {
+                "FASTER - gate (a) PASSES for the in-register unpack; the listening gate is \
+                 now worth running"
+            } else {
+                "SLOWER - gate (a) FAILS even with the in-register unpack; NE-005 records a \
+                 second strike"
+            }
+        );
+    }
 
     // Bytes are the thesis; report them so the ratio can be read against the traffic it saves.
     let q8_bytes: usize = projections.iter().map(|(_, n, k)| n * k).sum();

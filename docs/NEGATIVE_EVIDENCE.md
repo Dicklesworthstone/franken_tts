@@ -67,6 +67,33 @@ do_not_retry_predicate: do NOT re-run the listening gate, and do NOT route int4,
   wasm: the v128 equivalent). That is NE-INH-004's documented escape clause and remains the ONLY
   route by which this lever can come back.
 
+second_strike (2026-08-23, WhiteLynx, frankentts-je4i): the predicate's precondition was BUILT and
+  the gate re-run. `crates/ftts-kernels/src/int4.rs` gained a NEON island (`mod neon_q4`,
+  FEAT_DotProd-gated, bit-exact vs scalar by new cross-tier tests at k in {1,15,16,17,31,32,33,63,
+  1024} x m in {1,2}): one 16-byte load per packed block, `vuzp1q`/`vuzp2q` deinterleave of two
+  activation loads (packed byte j holds elements 2j/2j+1, so a contiguous load would mispair),
+  shift/mask nibble lanes reinterpreted as signed, straight into `vdotq_s32`; bias cancels via the
+  same single correction term. Measured on M4 Pro with the SAME harness, shapes, interleaving, and
+  min-of-7 protocol as the first strike:
+
+    one layer, 75 rounds:  q8-scalar 20.0 ms | q4-scalar 42.7 ms | q8-route (SDOT) 22.2 ms
+                           q4-neon  (see per-projection rows; totals below)
+    int4-neon vs shipping int8 ... 0.52x  (~2x SLOWER)
+
+  why_it_lost_again: the deinterleave is three extra instructions per block pair and SDOT consumes
+  both nibble lanes separately, so the q4 path pays ~2.5x the instruction count of the int8 path
+  for half the bytes. At m = 1 with each projection's weights warm in cache across rounds, the
+  kernel is instruction-bound, not bandwidth-bound — the same regime NE-INH-003 documented for int8
+  (q8-scalar == q8-SDOT there). Halved traffic cannot pay doubled instruction count when RAM
+  bandwidth is not the binding constraint. The cache-residency thesis would need the FULL ~40 MB
+  body streamed from RAM per frame to bind bandwidth; this harness deliberately isolates one layer,
+  so it measures the compute side honestly and the residency side not at all.
+
+status_after_second_strike: routing remains OFF; listening gate remains unrun. The unpack exists and
+  is exact; the speed gate failed it again under its own pre-committed protocol. Any third attempt
+  must change the REGIME (e.g. measure the full-body streaming working set where bandwidth binds),
+  not re-tune this kernel — and must say so up front.
+
 what_is_NOT_done: NOTHING ROUTES TO IT. Doctrine #2 requires BOTH gates before the microdecoder
   may select this path — (a) faster end-to-end on each target ISA INCLUDING unpack cost, measured
   not assumed, and (b) blind listeners cannot distinguish it under the equivalence-bound protocol
