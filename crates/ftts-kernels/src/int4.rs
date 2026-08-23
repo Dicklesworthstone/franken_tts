@@ -333,6 +333,9 @@ impl Q4Tier {
     /// Every tier this build can execute on this machine.
     #[must_use]
     pub fn available() -> Vec<Self> {
+        // The mut is structural: the vector extends only under the aarch64+dotprod cfg,
+        // so scalar-only targets would otherwise flag it.
+        #[allow(unused_mut)]
         let mut tiers = vec![Self::Scalar];
         #[cfg(all(target_arch = "aarch64", feature = "neon-dotprod"))]
         if neon_q4::available() {
