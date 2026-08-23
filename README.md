@@ -6,7 +6,7 @@
 
 [![License: MIT + rider](https://img.shields.io/badge/license-MIT%20%2B%20rider-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-0.1.4-green.svg)](https://github.com/Dicklesworthstone/franken_tts/releases)
+[![Version](https://img.shields.io/badge/version-0.1.5-green.svg)](https://github.com/Dicklesworthstone/franken_tts/releases)
 
 ```bash
 # macOS / Linux
@@ -107,11 +107,11 @@ on A18-class hardware.
 
 ## Try it in your browser
 
-**[frankentts.com](https://frankentts.com)** (also [frankentts.pages.dev](https://frankentts.pages.dev)) runs the whole pipeline as WebAssembly — type, pick a voice, clone your own by reading a half-minute script into the mic, listen, download. Nothing you type or record leaves the tab: the model downloads once (~1.77 GB — the artifact plus only the decoder half of the codec checkpoint; the encoder side is enrollment weight the browser never reads), resumable and SHA-256-verified into browser storage, and inference is local. Honest speed note: the single-threaded wasm build runs ~0.2–0.3× real time (measured 258 ms per 80 ms frame for the talker+microdecoder schedule) — a five-second line takes twenty-odd seconds with a progress bar; browser threads + relaxed SIMD are the tracked path to real time. Desktop browsers only (~3.5 GB peak memory). The site lives in `site/`; the bindings in `cra…
+**[frankentts.com](https://frankentts.com)** (also [frankentts.pages.dev](https://frankentts.pages.dev)) runs the whole pipeline as WebAssembly — type, pick a voice, clone your own by reading a half-minute script into the mic, listen, download. Nothing you type or record leaves the tab: the model downloads once (~1.77 GB — the artifact plus only the decoder half of the codec checkpoint; the encoder side is enrollment weight the browser never reads), resumable and SHA-256-verified into browser storage, and inference is local. Honest speed note: the single-threaded wasm build ran ~0.2–0.3× real time; with codec decode fanned across a worker team it measures ~0.39× (receipt in `frankentts-kkuq`) — a five-second line takes about thirteen seconds with a progress bar. Browser threads everywhere + relaxed-SIMD int8 dot are the tracked path to real time. Desktop browsers only (~3.5 GB peak memory). The site lives in `site/`; the bindings in `cra…
 
-## Status: v0.1.4, faster than real time
+## Status: v0.1.5, faster than real time — and now realtime-capable end to end
 
-Five releases in, all on 2026-08-08/09 (see [CHANGELOG](CHANGELOG.md)): v0.1.0 shipped the f32 reference engine, v0.1.1 made the model a one-command download, v0.1.2 moved that download to a pre-quantized artifact, v0.1.3 made the optimized int8 route the library-wide default, and v0.1.4 crossed real time and shipped seven built-in voices. What works now:
+Six releases in: v0.1.0 shipped the f32 reference engine, v0.1.1 made the model a one-command download, v0.1.2 moved that download to a pre-quantized artifact, v0.1.3 made the optimized int8 route the library-wide default, v0.1.4 crossed real time and shipped seven built-in voices, and v0.1.5 landed the realtime conversation layer — `ftts talk` streaming sessions with continuation, live PCM emission during synthesis, and a proven cancellation contract (SIGINT yields a valid partial artifact, a `run_error{kind:"cancelled"}` terminal event, and exit code 6; second signal force-exits). What works now:
 
 - **Real speech out.** `ftts say` synthesizes complete utterances on Apple Silicon with the production sampling stack matching upstream runtime defaults: do_sample, temperature 0.9, top-k 50, repetition penalty 1.05, sampled subtalker.
 - **Parity receipts.**
