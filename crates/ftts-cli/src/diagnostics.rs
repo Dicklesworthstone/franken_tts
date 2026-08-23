@@ -42,6 +42,11 @@ const VAD_OPEN_RATIO: f64 = 3.16; // +10 dB
 /// VAD close threshold (hysteresis): speech REGIONS stay open until energy drops under
 /// half the open level, so intra-word dips do not shatter them.
 const VAD_CLOSE_RATIO: f64 = 1.0; // 0 dB over floor
+/// Lower bound for the ADAPTIVE noise floor: digitally silent pauses quantize to an
+/// exact-zero floor, which would make every VAD threshold zero and mark the whole file
+/// as speech (caught by the paused-speech fixture). -80 dBFS sits above that zero and
+/// below any real room tone.
+const VAD_MIN_FLOOR_RMS: f64 = 1e-4;
 /// Spectral flatness under which a frame is TONAL (music beds, sustained vowels). Speech
 /// consonants and breaths sit far above; chord beds sit far below.
 const TONAL_FLATNESS_MAX: f64 = 0.02;
@@ -86,7 +91,7 @@ pub fn voice_activity_regions(pcm: &[f32]) -> Vec<(usize, usize)> {
     if energies.is_empty() {
         return Vec::new();
     }
-    let floor = percentile(energies.clone(), FLOOR_QUANTILE);
+    let floor = percentile(energies.clone(), FLOOR_QUANTILE).max(VAD_MIN_FLOOR_RMS);
     let open = floor * VAD_OPEN_RATIO;
     let close = floor * VAD_CLOSE_RATIO;
 
