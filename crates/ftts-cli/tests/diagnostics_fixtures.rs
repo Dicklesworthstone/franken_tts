@@ -19,10 +19,9 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use ftts_cli::diagnostics::{
-    clipping_diagnostics, diagnose, music_bed_likelihood, snr_estimate_db,
-    stationarity_drift, voice_activity_regions,
+    clipping_diagnostics, diagnose, music_bed_likelihood, snr_estimate_db, stationarity_drift,
+    voice_activity_regions,
 };
-use ftts_core::audio::WavWriter;
 
 const SAMPLE_RATE: usize = 24_000;
 
@@ -89,7 +88,7 @@ fn with_noise(clean: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
     let mut state = seed | 1;
     clean
         .iter()
-        .map(|&value| value + (rng(&mut state) * 2.0 - 0.5) * 2.0 * noise_rms)
+        .map(|&value| value + (rng(&mut state) * 2.0 - 1.0).clamp(-1.0, 1.0) * noise_rms)
         .collect()
 }
 
@@ -121,7 +120,7 @@ fn reverberant(clean: &[f32], rt60: f32, seed: u64) -> Vec<f32> {
                 sum += value * coefficient;
             }
         }
-        out[index] = sum.max(-4.0).min(4.0);
+        out[index] = sum.clamp(-4.0, 4.0);
     }
     let dry_peak = clean.iter().fold(0.0_f32, |max, &v| max.max(v.abs()));
     let wet_peak = out.iter().fold(0.0_f32, |max, &v| max.max(v.abs()));
@@ -133,13 +132,11 @@ fn reverberant(clean: &[f32], rt60: f32, seed: u64) -> Vec<f32> {
     out
 }
 
-fn music_bed(seconds: usize, seed: u64) -> Vec<f32> {
+fn music_bed(seconds: usize) -> Vec<f32> {
     // Steady triad with slow tremolo: tonal, sustained, no pauses — the anti-speech.
     let len = seconds * SAMPLE_RATE;
-    let mut state = seed | 1;
     (0..len)
         .map(|index| {
-            let _ = index;
             let t = index as f32 / SAMPLE_RATE as f32;
             let tremolo = 0.85 + 0.15 * (2.0 * std::f32::consts::PI * 0.3 * t).sin();
             let a = (2.0 * std::f32::consts::PI * 220.0 * t).sin();
@@ -172,10 +169,7 @@ fn vad_snr_clipping_music_detectors_separate_the_fixture_worlds() {
     const TEST: &str = "diagnostics_fixtures_separate_the_fixture_worlds";
     let dir = scratch("worlds");
 
-    let clean = write_and_read(
-        &speech_like(6, 0xBEAD, true),
-        &dir.join("clean.wav"),
-    );
+    let clean = write_and_read(&speech_like(6, 0xBEAD, true), &dir.join("clean.wav"));
     let noisy = write_and_read(
         &with_noise(&speech_like(6, 0xBEAD, true), 18.0, 0xFEED),
         &dir.join("noisy.wav"),
@@ -184,7 +178,7 @@ fn vad_snr_clipping_music_detectors_separate_the_fixture_worlds() {
         &clipped_from(&speech_like(6, 0xBEAD, false)),
         &dir.join("clipped.wav"),
     );
-    let bed = write_and_read(&music_bed(6, 0xC0DE), &dir.join("bed.wav"));
+    let bed = write_and_read(&music_bed(6), &dir.join("bed.wav"));
 
     // --- VAD: the paused reference must have real silence and real speech regions.
     let regions = voice_activity_regions(&clean);
@@ -202,7 +196,7 @@ fn vad_snr_clipping_music_detectors_separate_the_fixture_worlds() {
     );
 
     // --- Clipping: driven+railed fixture vs its own clean source.
-    let (clip_fraction_clean, clip_run_clean, _) = clipping_diagnostics(&clean);
+    let (clip_fraction_clean, _, _) = clipping_diagnostics(&clean);
     let (clip_fraction, clip_run, overshoot) = clipping_diagnostics(&clipped);
     assert!(
         clip_fraction > 0.01 && clip_fraction > clip_fraction_clean * 10.0,
@@ -225,10 +219,15 @@ fn vad_snr_clipping_music_detectors_separate_the_fixture_worlds() {
     // --- SNR: white noise at a constructed 18 dB envelope SNR lands within +-8 dB.
     let (snr_noisy, _) = snr_estimate_db(&noisy);
     let snr_value = snr_noisy.expect("noise fixture must contain speech");
-    assert!((10.0..=26.0).contains(&snr_value),
+    assert!(
+        (10.0..=26.0).contains(&snr_value),
         "envelope SNR {snr_value:.2} dB outside [10, 26] for a constructed 18 dB fixture \
-         (documented pessimism band)");
-    receipt(TEST, &format!(",\"check\":\"snr\",\"constructed_db\":18,\"measured_db\":{snr_value:.2}"));
+         (documented pessimism band)"
+    );
+    receipt(
+        TEST,
+        &format!(",\"check\":\"snr\",\"constructed_db\":18,\"measured_db\":{snr_value:.2}"),
+    );
 
     // --- Music bed: sustained triad scores high, paused speech low.
     let bed_likelihood = music_bed_likelihood(&bed);
@@ -261,7 +260,10 @@ fn vad_snr_clipping_music_detectors_separate_the_fixture_worlds() {
     // --- Full diagnose() over a written+decoded fixture stays finite and consistent.
     let diagnostics = diagnose(&noisy, None);
     assert!(diagnostics.clipping_fraction >= 0.0);
-    assert!(diagnostics.pause_floor_dbfs.is_finite() || diagnostics.pause_floor_dbfs == f64::NEG_INFINITY);
+    assert!(
+        diagnostics.pause_floor_dbfs.is_finite()
+            || diagnostics.pause_floor_dbfs == f64::NEG_INFINITY
+    );
     assert!(diagnostics.music_bed_likelihood <= 1.0);
     assert!(diagnostics.voice_activity_ratio <= 1.0);
 }

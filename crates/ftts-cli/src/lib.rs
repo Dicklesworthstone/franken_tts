@@ -2745,6 +2745,20 @@ fn run_enroll(
     } else {
         args.denoise || bundle.root.join(synth::DENOISE_ARTIFACT_RELPATH).is_file()
     };
+    // Signal-quality advisories (bead frankentts-p1-audio-diagnostics-8t9): state what
+    // was measured BEFORE the user hears the defect in their clone. Only audio sources
+    // carry a recording to judge; .spk vectors and voice cards skip by construction. The
+    // reverb figure comes from the same estimator the dereverb path reports.
+    if let Ok(reference_pcm) = synth::decode_reference_audio_any(Path::new(&args.reference_audio)) {
+        let dx = diagnostics::diagnose(
+            &reference_pcm,
+            synth::reverb_time_s(&reference_pcm).map(f64::from),
+        );
+        for warning in dx.warnings() {
+            style::warn(stdout, &warning)
+                .map_err(|error| FttsError::Generic(format!("cannot write warning: {error}")))?;
+        }
+    }
     let speaker = synth::speaker_from_voice(
         &bundle,
         &args.reference_audio,

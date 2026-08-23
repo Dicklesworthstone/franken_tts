@@ -19,7 +19,7 @@
 //!   thing continuation-style cloners reproduce as background singing. A dry solo voice
 //!   scores near zero even when pitched.
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 
 /// Frame length for all envelope statistics: 30 ms at the pinned 24 kHz rate.
 const FRAME_LEN: usize = 720;
@@ -197,16 +197,16 @@ pub fn snr_estimate_db(pcm: &[f32]) -> (Option<f64>, f64) {
         return (None, floor_rms);
     }
     let active_rms = (active_power_sum / active_frames as f64).sqrt();
-    (
-        Some(20.0 * (active_rms / floor_rms).log10()),
-        floor_rms,
-    )
+    (Some(20.0 * (active_rms / floor_rms).log10()), floor_rms)
 }
 
-/// Music-bed likelihood in `[0, 1]`: the fraction of ACTIVE frames that are simultaneously
-/// tonal (spectral flatness under [`TONAL_FLATNESS_MAX`]) and part of a low-modulation
-/// span (neighbor-frame RMS ratio near 1 — beds sustain; speech syllables pump). Uses a
-/// Hann-windowed 1,024-point spectrum via the workspace's `rustfft`.
+/// Music-bed likelihood in `[0, 1]`: the fraction of NON-SILENT frames whose spectrum is
+/// tonal (spectral flatness under [`TONAL_FLATNESS_MAX`]). Deliberately NOT gated on voice
+/// activity — a steady bed never crosses a speech VAD's open threshold precisely because
+/// it is constant, which is the signature being detected. Speech stays low-scoring because
+/// its unvoiced spans (consonants, breaths, the encoder noise floor) are broadband and
+/// fail the flatness test; calibration receipts in the fixture test pin both worlds'
+/// measured fractions so the threshold is evidence-based.
 #[must_use]
 pub fn music_bed_likelihood(pcm: &[f32]) -> f64 {
     const FFT_LEN: usize = 1024;
@@ -217,23 +217,31 @@ pub fn music_bed_likelihood(pcm: &[f32]) -> f64 {
     let fft = planner.plan_fft_forward(FFT_LEN);
     let hann: Vec<f32> = (0..FFT_LEN)
         .map(|index| {
-            0.5_f32
-                * (1.0
-                    - (2.0 * std::f32::consts::PI * index as f32 / FFT_LEN as f32).cos())
+            0.5_f32 * (1.0 - (2.0 * std::f32::consts::PI * index as f32 / FFT_LEN as f32).cos())
         })
         .collect();
 
-    let mut frame_flatness: Vec<f64> = Vec::new();
-    let mut frame_rms_values: Vec<f64> = Vec::new();
+    // Silence gate: any frame whose total magnitude energy sits at digital-zero (or below
+    // the i16 LSB after decode) carries no tonality information and must not vote.
+    const SILENCE_ENERGY: f32 = 1e-8;
+    let mut tonal_frames = 0_u32;
+    let mut considered = 0_u32;
     let mut offset = 0;
     while offset + FFT_LEN <= pcm.len() {
-        let mut buffer: Vec<Complex<f32>> = pcm[offset..offset + FFT_LEN]
+        let window_slice = &pcm[offset..offset + FFT_LEN];
+        let energy: f32 = window_slice.iter().map(|&value| value * value).sum();
+        offset += HOP;
+        if energy < SILENCE_ENERGY {
+            continue;
+        }
+        considered += 1;
+        let mut buffer: Vec<Complex<f32>> = window_slice
             .iter()
             .zip(&hann)
             .map(|(&sample, &window)| Complex::new(sample * window, 0.0))
             .collect();
         fft.process(&mut buffer);
-        // Flatness over the voiced band (~100 Hz .. 5 kHz): geometric vs arithmetic mean
+        // Flatness over the voiced band (~94 Hz .. 4.7 kHz): geometric vs arithmetic mean
         // of magnitudes. Pure tones → near zero; broadband → near one.
         let band: Vec<f64> = buffer[FFT_LEN / 240..FFT_LEN / 5]
             .iter()
@@ -241,47 +249,19 @@ pub fn music_bed_likelihood(pcm: &[f32]) -> f64 {
             .collect();
         let log_mean: f64 = band.iter().map(|value| value.ln()).sum::<f64>() / band.len() as f64;
         let linear_mean: f64 = band.iter().sum::<f64>() / band.len() as f64;
-        frame_flatness.push(if linear_mean > 0.0 {
+        let flatness = if linear_mean > 0.0 {
             log_mean.exp() / linear_mean
         } else {
             1.0
-        });
-        frame_rms_values.push(frame_rms(
-            pcm,
-            offset.min(pcm.len().saturating_sub(FRAME_LEN)),
-        ));
-        offset += HOP;
-    }
-    if frame_flatness.len() < 4 {
-        return 0.0;
-    }
-
-    let active = voice_activity_regions(pcm);
-    let mut tonal_low_modulation = 0_u32;
-    let mut considered = 0_u32;
-    for index in 1..frame_flatness.len() {
-        let frame_start = index * HOP;
-        let in_speech = active
-            .iter()
-            .any(|&(start, end)| frame_start >= start && frame_start + FFT_LEN <= end);
-        if !in_speech {
-            continue;
-        }
-        considered += 1;
-        let modulation = if frame_rms_values[index - 1] > 0.0 && frame_rms_values[index] > 0.0 {
-            (frame_rms_values[index] / frame_rms_values[index - 1]).abs().ln()
-        } else {
-            f64::INFINITY
         };
-        // Beds hold level (|log ratio| tiny across a 10 ms hop); syllables do not.
-        if frame_flatness[index] < TONAL_FLATNESS_MAX && modulation < 0.10 {
-            tonal_low_modulation += 1;
+        if flatness < TONAL_FLATNESS_MAX {
+            tonal_frames += 1;
         }
     }
     if considered == 0 {
         return 0.0;
     }
-    f64::from(tonal_low_modulation) / f64::from(considered)
+    f64::from(tonal_frames) / f64::from(considered)
 }
 
 /// Stationarity drift: the relative spread between the quietest and loudest QUARTER of the
@@ -333,19 +313,66 @@ pub struct AudioDiagnostics {
     pub voice_activity_ratio: f64,
 }
 
+impl AudioDiagnostics {
+    /// Human-readable quality warnings at documented, tunable thresholds.
+    ///
+    /// These are ADVISORIES for the enrollment console — the tool states what it measured
+    /// and never refuses (the refusal gate needs owner-validated listening thresholds).
+    /// Each bound cites its detector constant so retuning is a one-line diff.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        const CLIP_WARN_FRACTION: f64 = 1e-3;
+        const SNR_WARN_DB_MAX: f64 = 15.0;
+        const MUSIC_WARN_FRACTION: f64 = 0.5;
+        const REVERB_WARN_SECONDS: f64 = 0.8;
+        let mut warnings = Vec::new();
+        if self.clipping_fraction > CLIP_WARN_FRACTION {
+            warnings.push(format!(
+                "reference is hard-clipped ({:.2}% of samples at rail; longest run {}                  samples) - clipping survives cleanup and clones as distortion",
+                self.clipping_fraction * 100.0,
+                self.longest_clip_run
+            ));
+        }
+        if let Some(snr) = self.snr_estimate_db
+            && snr < SNR_WARN_DB_MAX
+        {
+            warnings.push(format!(
+                "noisy reference (envelope SNR ~{snr:.0} dB < {SNR_WARN_DB_MAX:.0} dB) - \
+                 denoising helps, but a quieter room helps more"
+            ));
+        }
+        if self.music_bed_likelihood > MUSIC_WARN_FRACTION {
+            warnings.push(format!(
+                "sustained tonal background detected ({:.0}% of frames) - background music                  reproduces in the clone under continuation-style conditioning",
+                self.music_bed_likelihood * 100.0
+            ));
+        }
+        if let Some(rt60) = self.reverb_time_s
+            && rt60 > REVERB_WARN_SECONDS
+        {
+            warnings.push(format!(
+                "reverberant reference (RT60-equivalent {rt60:.2} s > \
+                 {REVERB_WARN_SECONDS:.2} s) - consider --dereverb or a drier recording"
+            ));
+        }
+        warnings
+    }
+}
+
 /// Runs every detector over one mono 24 kHz reference. `reverb_time_s` comes from the
 /// existing enrollment estimator so there is one definition of that quantity.
 #[must_use]
 pub fn diagnose(pcm: &[f32], reverb_time_s: Option<f64>) -> AudioDiagnostics {
-    let (clipping_fraction, longest_clip_run, intersample_overshoot_db) =
-        clipping_diagnostics(pcm);
+    let (clipping_fraction, longest_clip_run, intersample_overshoot_db) = clipping_diagnostics(pcm);
     let (snr_estimate_db, floor_rms) = snr_estimate_db(pcm);
     let regions = voice_activity_regions(pcm);
     let voiced_samples: usize = regions.iter().map(|(start, end)| end - start).sum();
     let total_rms = if pcm.is_empty() {
         0.0
     } else {
-        (pcm.iter().map(|&value| f64::from(value) * f64::from(value)).sum::<f64>()
+        (pcm.iter()
+            .map(|&value| f64::from(value) * f64::from(value))
+            .sum::<f64>()
             / pcm.len() as f64)
             .sqrt()
     };
