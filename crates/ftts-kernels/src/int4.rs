@@ -256,6 +256,7 @@ mod neon_q4 {
     // `pairs <= packed.len()`, and each block's two x loads touch `[base, base+32)` with
     // `base + 32 = block*32 + 32 <= pairs*2 <= k <= x.len()`; the scalar tail touches
     // nothing past `k`. No read passes either slice's end.
+    // SAFETY: summary of the full note above — DotProd confirmed by `available()`, all loads bounded.
     #[target_feature(enable = "neon,dotprod")]
     unsafe fn dot_i32_sdot(x: &[i8], packed: &[u8], k: usize) -> i32 {
         let pairs = k / PER_BYTE;
