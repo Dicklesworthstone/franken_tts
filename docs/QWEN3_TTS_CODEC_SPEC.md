@@ -350,12 +350,36 @@ The encoder transformer is architecturally *different* from the decoder's (Layer
 RMSNorm, 8 vs 16 heads, window 250 vs 72, GELU vs SiLU). They are two separate kernels; the
 enrollment build cannot reuse the decode-path transformer.
 
-**[UNVERIFIED]** The encoder's exact forward (conv ordering, ELU vs GELU placement inside SEANet
-residual units, per-stage padding) comes from `transformers` `MimiModel`, whose source is **not** in
-the truth pack — only its config is. Shapes above are from `WT` and are solid; the *operator order*
-must be re-asserted against the pinned `transformers` (4.57.3, per `CFG`) when the oracle env stands
-up. Filed as a dependency note on `frankentts-oq15-oracle-pins-wjc`, and the reason the encoder rows
-here are enrollment-build-only and not yet a kernel contract.
+**[VERIFIED 2026-08-23]** The exact forward was re-asserted against the PINNED runtime source —
+`transformers==4.57.3`, `models/mimi/modeling_mimi.py` (the exact version the oracle venv pins).
+Operator order, top to bottom:
+
+1. **SEANet conv stack** (`MimiEncoder`): stem Conv1d `[64,1,7]` with **no following activation**;
+   then per ratio in reversed(`upsampling_ratios`) → `num_residual_layers` × `MimiResnetBlock`,
+   then **ELU**, then the stage downsample Conv1d (k=2·ratio, stride=ratio).
+2. **ResnetBlock internals are PRE-ACTIVATION**: `ELU → Conv1d(k=3, d=growthʳ)` then
+   `ELU → Conv1d(k=1)`; hidden = dim/compress (=2); shortcut = **Identity** (config
+   `use_conv_shortcut` defaults False); output = `shortcut(x) + block(x)` — additive residual,
+   **no trailing activation**.
+3. After the conv stack: `encoder_transformer` (8 layers — the GELU/LayerNorm-with-bias/window-250
+   transformer in the table above), channels transposed for attention and back.
+4. **Model-level `downsample` comes AFTER the transformer** (this ordering is the classic port
+   trap): Conv1d `[512,512,4]`, stride 2, **bias=False**, `pad_mode="replicate"` — unlike every
+   stack conv, which uses the config pad mode with the asymmetric arithmetic below.
+5. `quantizer.encode` (first 16 of 32 codebooks) → codes transposed to frames-major.
+
+Padding arithmetic (every `MimiConv1d`, weight-normed): effective kernel `k̂=(k−1)·d+1`;
+`padding_total=k̂−stride`; `padding_right=total//2`; `padding_left=total−right`; plus
+ceil-to-frame extra input padding trimmed after the conv (`_get_extra_padding_for_conv1d`), with
+an optional streaming `padding_cache` carrying per-layer left-context state — the hook an
+incremental encoder port must implement.
+
+Source citations: `modeling_mimi.py@v4.57.3` — SEANet construction `L444-470`, resnet block
+`L409-441`, conv padding `L227-246`, extra-padding `L262-272`, model assembly + `_encode_frame`
+order `L1400-1469`. Shapes above were already solid from `WT`; the operator order is now pinned
+too. This resolves the dependency note on `frankentts-oq15-oracle-pins-wjc` and lifts the
+enrollment-build-only restriction on these rows: they may graduate to a kernel contract once the
+encoder port (snt) lands its roundtrip gate.
 
 ---
 
@@ -374,9 +398,10 @@ here are enrollment-build-only and not yet a kernel contract.
 | 7 | Codec weights assumed bf16 | **[CORRECTED]** — shipped F32 |
 
 ### Filed as follow-ups (not guessed)
-
+- **[VERIFIED]** §8 — Mimi encoder operator order asserted against pinned `transformers==4.57.3`
+  (see §8 verification block); ELU pre-activation in SEANet, GELU only in the transformer,
+  transformer-then-downsample ordering confirmed.
 - **[OPEN]** §5.3 — whether the ICL proportional waveform cut can be inexact under chunking.
-- **[UNVERIFIED]** §8 — Mimi encoder operator order pending the pinned `transformers` source.
 - **[DISC required]** §5.2 — our whole-sequence-exact streaming vs the official 25-frame-context
   chunker beyond 300 frames.
 
