@@ -327,6 +327,13 @@ fn armed_native() -> Option<&'static Team> {
         for worker in 1..partitions {
             std::thread::Builder::new()
                 .name(format!("ftts-int8-{worker}"))
+                // Debug builds inline the kernel dispatch chains deeply enough to
+                // overflow the 2 MiB default worker stack non-deterministically (the
+                // startup autotuner picks tiers under memory pressure), which surfaced
+                // as spontaneous aborts in the metamorphic invariants. Release builds
+                // have headroom either way; 16 MiB is cheap for long-lived parked
+                // threads and removes the entire failure class.
+                .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
                     // On Apple platforms a thread without an elevated QoS class is fair
                     // game for the efficiency cores. The team barrier waits for its

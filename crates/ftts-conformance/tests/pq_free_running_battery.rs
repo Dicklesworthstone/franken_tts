@@ -305,7 +305,7 @@ fn production_quality_free_running_objective_battery() {
             &model,
             &engine,
             &request,
-            &speaker,
+            &ftts_cli::synth::VoiceConditioning::XVector(speaker.clone()),
             1_000 + index as u64,
             &cancellation,
             &observer,
