@@ -700,23 +700,11 @@ fn codec_int8_route() -> Option<&'static CodecInt8Route> {
             // arithmetic more closely (the codec_decode_l2 ratchet tightened at all eight
             // transformer seams). Quantizing the codec now costs speed AND fidelity; the arms
             // stay opt-in for A/B.
-            let (transformer, convnext) = match std::env::var("FTTS_INT8_CODEC").as_deref() {
-                Ok("1" | "all") => (true, true),
-                Ok("transformer") => (true, false),
-                Ok("convnext") => (false, true),
-                // ONE default on every target: no codec int8 unless asked for.
-                //
-                // wasm used to arm the convnext arm by default, on the reasoning that wasm has no
-                // BLAS so its f32 dense fall-through is the slow path. That premise expired when
-                // the packed SIMD128 GEMM landed, and the cost was never only speed: it made the
-                // browser's codec arithmetic differ from the CLI's, which is measurable as a
-                // 29.9 dB frame-0 SNR between the two for the same text, voice and seed.
-                //
-                // A small delta is not a small problem here. The talker SAMPLES (16 draws/frame),
-                // so any epsilon that reaches the logits flips a draw and the two renderings
-                // diverge completely from the next frame on — frame 1 measured 0.6 dB. "Transparent
-                // on a spectral gate" is the wrong bar when the output is a sampling process.
-                _ => return None,
+            let env_value = std::env::var("FTTS_INT8_CODEC").ok();
+            let Some((transformer, convnext)) =
+                codec_int8_route_decision(ftts_kernels::route::reference_pinned(), env_value.as_deref())
+            else {
+                return None;
             };
             Some(CodecInt8Route {
                 plan: autotuned_plan(),
@@ -726,6 +714,29 @@ fn codec_int8_route() -> Option<&'static CodecInt8Route> {
             })
         })
         .as_ref()
+}
+
+/// The `FTTS_INT8_CODEC` arming decision, as a pure function so its full matrix is testable.
+///
+/// A pinned reference route (every conformance entry point pins before synthesizing — see
+/// [`ftts_kernels::route::pin_reference`]) always disarms the codec: the oracle comparison must
+/// never measure the optimized arithmetic it exists to certify against (frankentts-7ozx: this
+/// used to read the variable raw, so an exported `FTTS_INT8_CODEC` silently armed the codec
+/// inside oracle-pinned suites and moved the ratchet's seams). One default on every target:
+/// no codec int8 unless asked for.
+fn codec_int8_route_decision(
+    reference_pinned: bool,
+    env_value: Option<&str>,
+) -> Option<(bool, bool)> {
+    if reference_pinned {
+        return None;
+    }
+    match env_value {
+        Some("1" | "all") => Some((true, true)),
+        Some("transformer") => Some((true, false)),
+        Some("convnext") => Some((false, true)),
+        _ => None,
+    }
 }
 
 /// Every dense (non-convolution) codec projection goes through here.
