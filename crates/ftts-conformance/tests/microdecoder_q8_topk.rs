@@ -44,6 +44,20 @@ fn checkpoint_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/truth-pack/snapshots/hf/model.safetensors")
 }
+fn fixtures_pack() -> Result<OracleFixtures, String> {
+    // The canonical home (~/.cache/frankentts/...) wherever it exists; otherwise an
+    // in-tree staging copy under docs/truth-pack/snapshots (git-ignored bytes, rsynced
+    // to workers), so fixture-bearing measurement is not tied to one machine's home.
+    match OracleFixtures::open_default() {
+        Ok(fixtures) => Ok(fixtures),
+        Err(home_error) => {
+            let staged = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/truth-pack/snapshots/ft7-cpu-fp32-r1");
+            OracleFixtures::open(&staged)
+                .map_err(|error| format!("oracle fixtures unavailable: {home_error}; staged copy at {} also unusable: {error}", staged.display()))
+        }
+    }
+}
 
 fn skip(test: &str, reason: &str) {
     Receipt::new(test, Outcome::Skipped)
@@ -131,8 +145,7 @@ struct DepthGate {
 }
 
 fn run_all() -> Result<Vec<DepthGate>, String> {
-    let fixtures = OracleFixtures::open_default()
-        .map_err(|error| format!("oracle fixtures unavailable: {error}"))?;
+    let fixtures = fixtures_pack()?;
     fixtures
         .require_oracle_class(CPU_FP32_ORACLE_CLASS)
         .map_err(|error| format!("fixture pack is not the CPU-fp32 tier: {error}"))?;
