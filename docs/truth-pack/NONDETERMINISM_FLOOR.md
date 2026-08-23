@@ -32,3 +32,28 @@ repeatability, CPU-vs-CUDA divergence, or a cross-device tolerance; those measur
 The value zero is a measurement result, not permission to widen a comparator later. Any non-zero
 CPU-tier tolerance must be produced by a new repeatability capture, recorded in a new envelope, and
 reviewed as a deliberate gate change.
+
+## Native-CUDA floor and CPU-vs-CUDA divergence (frankentts-u8s, 2026-08-23)
+
+Captured on an RTX 4090 (`device_provenance` in the r1 provenance) at the exact source/weights
+pins, same synthetic one-case corpus (`max_new_tokens = 2`), three fresh captures: two native-CUDA
+runs and one `--device cpu` run, each 5,440 `.npy` stage arrays across all four prompt/cloning
+modes.
+
+**Native-CUDA repeatability: `5440/5440` arrays bit-identical across the two CUDA runs.**
+The native-tier Contract-A policy is therefore **exact compare (tolerance 0)** at every ladder
+rung on a pinned device — no epsilon band is needed or permitted without a new capture.
+
+**CPU-vs-CUDA divergence: `1401/5440` arrays bit-identical; exactly 4 divergent**, all
+`codec.generated_waveform` outputs (final audio). Every upstream seam — prompt build, speaker
+encoder blocks, talker layers, microdecoder depths, teacher-forced logits, codec codes — is
+bit-exact cross-device. The waveform-only divergence is conv-arithmetic selection inside the codec
+decoder's transposed convolutions on NVIDIA hardware; pointwise max-abs reached `9.3e-2` on
+near-zero-crossing samples of a 2-frame utterance, so the honest statement is *waveform-level
+pointwise equality does not hold cross-device* — waveform comparisons must use the spectral or
+envelope metric, never raw sample diff. Whether TF32 conv paths contributed is un-investigated;
+a follow-up capture with `torch.backends.cudnn.allow_tf32 = False` would separate algorithm
+selection from precision loss.
+
+Scope boundary: still the synthetic one-case corpus. Multi-frame/long-form expansion belongs to
+the frozen golden corpus decision (t-golden-corpus-881 lineage), not this measurement.
