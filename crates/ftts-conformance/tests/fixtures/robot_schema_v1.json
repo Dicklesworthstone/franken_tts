@@ -842,7 +842,73 @@
         {
           "name": "status",
           "required": true,
-          "summary": "inspection outcome",
+          "summary": "inspection outcome (`ok`, `legacy_speaker_vector`)",
+          "type": "string"
+        },
+        {
+          "name": "profile",
+          "required": false,
+          "summary": ".ftvoice privacy profile (portable/private/minimal)",
+          "type": "string"
+        },
+        {
+          "name": "consent_attested",
+          "required": false,
+          "summary": "whether enrollment recorded a consent affirmation",
+          "type": "bool"
+        },
+        {
+          "name": "consent_method",
+          "required": false,
+          "summary": "how consent was captured (interactive/flag/imported)",
+          "type": "string"
+        },
+        {
+          "name": "language",
+          "required": false,
+          "summary": "transcript language tag, when present",
+          "type": "string|null"
+        },
+        {
+          "name": "transcript_present",
+          "required": false,
+          "summary": "whether the pack carries a reference transcript",
+          "type": "bool"
+        },
+        {
+          "name": "codec_codes_present",
+          "required": false,
+          "summary": "whether the pack carries ICL reference codec tokens",
+          "type": "bool"
+        },
+        {
+          "name": "reference_audio_present",
+          "required": false,
+          "summary": "whether the pack embeds its normalized reference recording",
+          "type": "bool"
+        },
+        {
+          "name": "diagnostics",
+          "required": false,
+          "summary": "signal-quality measurements taken at enrollment",
+          "type": "object|null"
+        },
+        {
+          "name": "recipe_hash",
+          "required": false,
+          "summary": "stable content hash of the voice recipe (cache-key anchor)",
+          "type": "string"
+        },
+        {
+          "name": "embedding_sha256",
+          "required": false,
+          "summary": "digest of the speaker embedding payload",
+          "type": "string"
+        },
+        {
+          "name": "provenance_engine",
+          "required": false,
+          "summary": "engine name/version that performed the enrollment",
           "type": "string"
         }
       ],

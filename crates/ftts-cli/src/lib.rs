@@ -122,6 +122,22 @@ fn preset_names() -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+/// Materializes a built-in preset voice as an `.spk` path, so evaluation harnesses can
+/// condition synthesis on a real speech x-vector without handling voice bytes themselves.
+///
+/// # Errors
+///
+/// Unknown preset name, or the staging directory/file could not be written.
+pub fn preset_voice_path(name: &str) -> Result<PathBuf, FttsError> {
+    match materialize_preset_voice(name) {
+        Some(result) => result,
+        None => Err(FttsError::Usage(format!(
+            "unknown preset voice {name:?}; available presets: {}",
+            preset_names()
+        ))),
+    }
+}
 const PINNED_MAIN_WEIGHTS_FILENAME: &str = "model.safetensors";
 const PINNED_MAIN_WEIGHTS_SHA256: &str =
     "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6";
@@ -3466,15 +3482,129 @@ fn run_card(args: &CardArgs, stdout: &mut dyn Write) -> Result<(), FttsError> {
 
 fn run_voice_inspect(path: &Path, stdout: &mut dyn Write) -> Result<(), FttsError> {
     let path = resolve_existing_file(path, "voice pack")?;
-    write_json_line(
-        stdout,
-        &json!({
-            "schema_version": ROBOT_SCHEMA_VERSION,
-            "event": "voice_inspect",
-            "path": path.display().to_string(),
-            "status": "header_inspection_pending_artifact_reader",
-        }),
-    )
+    let bytes = std::fs::read(path)
+        .map_err(|error| FttsError::Input(format!("cannot read {}: {error}", path.display())))?;
+    if bytes.starts_with(ftts_artifacts::voice::VOICE_MAGIC) {
+        let pack = ftts_artifacts::voice::parse_voice_pack(&bytes).map_err(|error| {
+            FttsError::Input(format!(
+                "{} is not a valid voice pack: {error}",
+                path.display()
+            ))
+        })?;
+        style::ok(
+            stdout,
+            &format!(
+                "{} — {} voice pack",
+                style::emphasis(&path.display().to_string()),
+                pack.profile.as_str(),
+            ),
+        )
+        .map_err(|error| FttsError::Generic(error.to_string()))?;
+        let consent = if pack.consent.attested {
+            format!("attested ({})", pack.consent.method.as_str())
+        } else {
+            "NOT ATTESTED".to_owned()
+        };
+        style::info(
+            stdout,
+            &format!(
+                "consent {consent} · embedding {} f32 · transcript {} · codec tokens {} · audio {}",
+                pack.embedding.len(),
+                if pack.transcript.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                },
+                match pack.codec_codes.as_deref() {
+                    Some(codes) => format!("{} frames", codes.len()),
+                    None => "none".to_owned(),
+                },
+                if pack.reference_audio.is_some() {
+                    "embedded"
+                } else {
+                    "absent"
+                },
+            ),
+        )
+        .map_err(|error| FttsError::Generic(error.to_string()))?;
+        if let Some(dx) = &pack.diagnostics {
+            for warning in dx_warnings(dx) {
+                style::warn(stdout, &warning)
+                    .map_err(|error| FttsError::Generic(error.to_string()))?;
+            }
+        }
+        write_json_line(
+            stdout,
+            &json!({
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "event": "voice_inspect",
+                "path": path.display().to_string(),
+                "status": "ok",
+                "profile": pack.profile.as_str(),
+                "consent_attested": pack.consent.attested,
+                "consent_method": pack.consent.method.as_str(),
+                "language": pack.language,
+                "transcript_present": pack.transcript.is_some(),
+                "codec_codes_present": pack.codec_codes.is_some(),
+                "reference_audio_present": pack.reference_audio.is_some(),
+                "diagnostics": pack.diagnostics
+                    .as_ref()
+                    .map(|dx| json!({
+                        "clipping_fraction": dx.clipping_fraction,
+                        "longest_clip_run": dx.longest_clip_run,
+                        "intersample_overshoot_db": dx.intersample_overshoot_db,
+                        "snr_estimate_db": dx.snr_estimate_db,
+                        "pause_floor_dbfs": dx.pause_floor_dbfs,
+                        "reverb_time_s": dx.reverb_time_s,
+                        "music_bed_likelihood": dx.music_bed_likelihood,
+                        "stationarity_drift": dx.stationarity_drift,
+                        "loudness_rms_dbfs": dx.loudness_rms_dbfs,
+                        "voice_activity_ratio": dx.voice_activity_ratio,
+                    })),
+                "recipe_hash": pack.recipe_hash().ok(),
+                "embedding_sha256": ftts_artifacts::sha256::hex_digest(
+                    &ftts_artifacts::sha256::digest(&{
+                        let mut b = Vec::with_capacity(pack.embedding.len() * 4);
+                        for v in &pack.embedding { b.extend_from_slice(&v.to_le_bytes()); }
+                        b
+                    })),
+                "provenance_engine": pack.provenance.engine,
+            }),
+        )
+    } else if bytes.len() == synth::SPEAKER_VECTOR_BYTES {
+        write_json_line(
+            stdout,
+            &json!({
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "event": "voice_inspect",
+                "path": path.display().to_string(),
+                "status": "legacy_speaker_vector",
+            }),
+        )
+    } else {
+        Err(FttsError::Input(format!(
+            "{} is neither a .ftvoice pack nor a raw .spk vector; re-enroll to produce a pack",
+            path.display()
+        )))
+    }
+}
+
+/// Re-renders a stored diagnostics record through the live advisory thresholds, so an old pack
+/// speaks with the same voice the enrollment console used.
+fn dx_warnings(dx: &ftts_artifacts::voice::EnrollmentDiagnostics) -> Vec<String> {
+    let audio = crate::diagnostics::AudioDiagnostics {
+        clipping_fraction: dx.clipping_fraction,
+        longest_clip_run: dx.longest_clip_run,
+        intersample_overshoot_db: dx.intersample_overshoot_db,
+        snr_estimate_db: dx.snr_estimate_db,
+        pause_floor_dbfs: dx.pause_floor_dbfs,
+        reverb_time_s: dx.reverb_time_s,
+        music_bed_likelihood: dx.music_bed_likelihood,
+        stationarity_drift: dx.stationarity_drift,
+        loudness_rms_dbfs: dx.loudness_rms_dbfs,
+        voice_activity_ratio: dx.voice_activity_ratio,
+    };
+    audio.warnings()
 }
 
 fn run_robot(
@@ -3768,10 +3898,11 @@ mod tests {
         );
     }
 
-    // Updated 2026-08-10 for the `make-video` subcommand, which landed without re-baselining this
-    // snapshot. The snapshot exists to make CLI-surface changes deliberate rather than accidental,
-    // so it is re-baselined only alongside a real, intended command — never widened to stop failing.
-    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,make-video,enroll,voice,card,convert,pull,robot,doctor,resident-daemon\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check,robot,no-resident\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
+    // Re-baselined for the `talk` subcommand (bead frankentts-edz0), which landed without
+    // updating this snapshot. The snapshot exists to make CLI-surface changes deliberate rather
+    // than accidental, so it is re-baselined only alongside a real, intended command — never
+    // widened to stop failing.
+    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,make-video,enroll,voice,card,convert,pull,talk,robot,doctor,resident-daemon\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check,robot,no-resident\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
 
     #[test]
     fn clap_surface_matches_snapshot() {
@@ -4876,5 +5007,99 @@ mod tests {
         let header = std::fs::read(&empty_plan.final_path).expect("finalized wav");
         assert!(header.len() >= 44, "RIFF header present: {}", header.len());
         assert_eq!(&header[..4], b"RIFF", "must be a parseable RIFF file");
+    }
+
+    #[test]
+    fn voice_inspect_renders_a_real_pack_through_dispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "ftts-inspect-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let embedding: Vec<f32> = (0..1024).map(|i| i as f32 * 0.001).collect();
+        let pack = ftts_artifacts::voice::VoicePack {
+            profile: ftts_artifacts::voice::VoiceProfile::Portable,
+            consent: ftts_artifacts::voice::ConsentAttestation {
+                attested: true,
+                method: ftts_artifacts::voice::ConsentMethod::Flag,
+            },
+            language: Some("en".to_owned()),
+            transcript: Some("Please call Stella.".to_owned()),
+            speech_regions: vec![(0, 24_000)],
+            diagnostics: None,
+            preprocessing: None,
+            provenance: Default::default(),
+            embedding,
+            codec_codes: Some(vec![7, 9]),
+            reference_audio: None,
+            section_digests: Default::default(),
+        };
+        let bytes = ftts_artifacts::voice::serialize_voice_pack(&pack).expect("serialize pack");
+        let path = dir.join("inspect.ftvoice");
+        std::fs::write(&path, &bytes).expect("write pack");
+
+        let cli = Cli::parse_from([
+            "ftts",
+            "voice",
+            "inspect",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut stdin: &[u8] = &[];
+        dispatch(cli, environment(), &mut stdin, &mut stdout, &mut stderr)
+            .expect("inspect succeeds");
+        let text = String::from_utf8(stdout).expect("utf-8 output");
+        let event_line = text.lines().last().expect("at least one output line");
+        let event: serde_json::Value = serde_json::from_str(event_line).expect("json event");
+        assert_eq!(event["event"], "voice_inspect");
+        assert_eq!(event["status"], "ok");
+        assert_eq!(event["profile"], "portable");
+        assert_eq!(event["consent_attested"], true);
+        assert_eq!(event["consent_method"], "flag");
+        assert_eq!(event["transcript_present"], true);
+        assert_eq!(event["codec_codes_present"], true);
+        assert_eq!(event["reference_audio_present"], false);
+        assert!(
+            event["recipe_hash"].as_str().is_some_and(|h| h.len() == 64),
+            "recipe hash must be a sha256 hex digest"
+        );
+    }
+
+    #[test]
+    fn voice_inspect_reports_legacy_speaker_vectors() {
+        let dir = std::env::temp_dir().join(format!("ftts-inspect-spk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("legacy.spk");
+        let vector: Vec<u8> = (0..synth::SPEAKER_VECTOR_BYTES)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        // A finite f32 vector, not arbitrary noise: encode like the enrollment writer.
+        let mut bytes = Vec::with_capacity(synth::SPEAKER_VECTOR_BYTES);
+        for i in 0..1024usize {
+            bytes.extend_from_slice(&(i as f32 * 0.001).to_le_bytes());
+        }
+        drop(vector);
+        std::fs::write(&path, &bytes).expect("write vector");
+
+        let cli = Cli::parse_from([
+            "ftts",
+            "voice",
+            "inspect",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut stdin: &[u8] = &[];
+        dispatch(cli, environment(), &mut stdin, &mut stdout, &mut stderr)
+            .expect("inspect of a legacy vector still succeeds");
+        let text = String::from_utf8(stdout).expect("utf-8 output");
+        let event: serde_json::Value =
+            serde_json::from_str(text.lines().last().expect("line")).expect("json");
+        assert_eq!(event["status"], "legacy_speaker_vector");
     }
 }

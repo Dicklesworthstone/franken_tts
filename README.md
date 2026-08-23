@@ -233,6 +233,13 @@ text ──► 28-layer talker (runs once per 80 ms frame)
 
 Workspace crates: `ftts-core` (engine), `ftts-model-qwen` (model graph), `ftts-kernels` (compute kernels), `ftts-artifacts` (weight/artifact handling), `ftts-conformance` (oracle parity suites), `ftts-cli` (the `ftts` binary).
 
+## Documentation
+
+- [`docs/VOICE_COMPILER_DESIGN.md`](docs/VOICE_COMPILER_DESIGN.md) — how enrollment becomes a
+  voice: the `.ftvoice` pack, its privacy profiles, and the derived `.ftvoice-cache`.
+- [`docs/truth-pack/`](docs/truth-pack/) — pinned sources, oracle provenance, and the
+  nondeterminism-floor measurements behind every conformance claim.
+
 ## Known limitations
 
 - **Real time is load-dependent.** The default optimized route runs faster than real time on an unloaded Mac Mini M4 Pro; on the same machine saturated with concurrent build jobs it measured 0.66–1.05× real time. The f32 reference route (`FTTS_INT8=0`) runs 6–7× slower than real time by design.

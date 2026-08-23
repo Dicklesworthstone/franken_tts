@@ -326,6 +326,8 @@ fn frame_boundary_cancel_loses_nothing_across_the_boundary() {
 /// Real SIGINT in file mode, mid-generation: exit 6, single cancelled terminal event,
 /// and a parseable partial WAV whose data size equals the streamed accounting.
 /// Also asserts the 2 s SIGINT-to-exit latency bound and logs the measured value.
+// SIGINT semantics are unix-only; the Windows cancel path is bead frankentts-37hv.
+#[cfg(unix)]
 #[test]
 fn file_mode_sigint_leaves_a_valid_partial_wav_and_exits_promptly() {
     if model_dir().is_none() {
@@ -396,6 +398,8 @@ fn file_mode_sigint_leaves_a_valid_partial_wav_and_exits_promptly() {
 
 /// Prefill-phase cancel (signal during model load / before the first frame): pinned
 /// behavior is an EMPTY-but-valid WAV, exit 6, kind "cancelled" — never a torn file.
+// SIGINT semantics are unix-only; the Windows cancel path is bead frankentts-37hv.
+#[cfg(unix)]
 #[test]
 fn prefill_phase_sigint_pins_the_zero_sample_artifact() {
     if model_dir().is_none() {
@@ -452,6 +456,8 @@ fn prefill_phase_sigint_pins_the_zero_sample_artifact() {
 
 /// Raw-mode cancel: PCM on stdout ends at a packet boundary, byte count equals the
 /// stderr event accounting, every event survives the validator, exit 6.
+// SIGINT semantics are unix-only; the Windows cancel path is bead frankentts-37hv.
+#[cfg(unix)]
 #[test]
 fn raw_mode_sigint_stops_at_a_packet_boundary_with_exact_accounting() {
     if model_dir().is_none() {
@@ -516,6 +522,8 @@ fn raw_mode_sigint_stops_at_a_packet_boundary_with_exact_accounting() {
 /// Compressed-format cancel: `.m4a` requested, run cancelled mid-synthesis — no
 /// encoder invocation (no `.m4a` ever exists), the staging WAV is kept and named in
 /// the terminal event, exit 6.
+// SIGINT semantics are unix-only; the Windows cancel path is bead frankentts-37hv.
+#[cfg(unix)]
 #[test]
 fn compressed_target_cancel_skips_the_encoder_and_keeps_the_staging_wav() {
     if model_dir().is_none() {
@@ -586,6 +594,8 @@ fn compressed_target_cancel_skips_the_encoder_and_keeps_the_staging_wav() {
 /// client exits 6 with the documented discard wording, and the daemon survives to
 /// serve the next request warm (its serial loop finishing the orphaned request is
 /// the pinned v1 behavior — the wire has no cancel op).
+// SIGINT semantics are unix-only; the Windows cancel path is bead frankentts-37hv.
+#[cfg(unix)]
 #[test]
 fn resident_client_cancel_discards_and_the_daemon_survives() {
     if model_dir().is_none() {

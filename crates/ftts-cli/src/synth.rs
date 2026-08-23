@@ -345,6 +345,18 @@ pub fn speaker_from_voice(
         let (_, vector) = crate::card::decode_card(&bytes)?;
         return Ok(vector);
     }
+    // A `.ftvoice` voice pack IS a voice: its validated embedding section is the x-vector,
+    // and the reader has already refused truncation, corruption, and privacy-profile lies.
+    // Checked before the raw-vector size sniff: magic beats size, same as audio and images.
+    if bytes.starts_with(ftts_artifacts::voice::VOICE_MAGIC) {
+        let pack = ftts_artifacts::voice::parse_voice_pack(&bytes).map_err(|error| {
+            FttsError::Input(format!(
+                "voice pack {} cannot be used: {error}",
+                path.display()
+            ))
+        })?;
+        return Ok(pack.embedding);
+    }
     if bytes.len() == SPEAKER_VECTOR_BYTES && !looks_like_audio {
         return decode_speaker_vector(path, &bytes);
     }

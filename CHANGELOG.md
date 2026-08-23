@@ -26,6 +26,18 @@ individual commits are intentionally not cited.
 | 0.1.0 | 2026-08-08 | first release | f32 reference engine, CLI, conformance ladder, artifact groundwork |
 
 ## [Unreleased]
+### Added
+
+- **`.ftvoice` and `.ftvoice-cache` voice artifacts** (bead
+  `frankentts-p4-ftvoice-format-x0p`): the two-layer voice format — a portable pack carrying the
+  speaker embedding, consent attestation, transcript, reference codec tokens, enrollment
+  diagnostics, and the reproducible preprocessing recipe under three privacy profiles
+  (portable/private/minimal, enforced at read time), plus a derived-state cache keyed by the full
+  OQ-10 §5.1 tuple. Hardened like `.fttsq` (digest-verified sections, checked arithmetic, named
+  refusals) and byte-idempotent by construction — no timestamps enter the encoding.
+  `ftts voice inspect` now renders real pack contents (human summary + full `voice_inspect`
+  robot event), and `ftts say --voice pack.ftvoice` consumes packs directly.
+  Design rationale in `docs/VOICE_COMPILER_DESIGN.md`.
 
 ## [0.1.8] - 2026-08-12
 

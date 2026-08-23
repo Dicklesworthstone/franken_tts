@@ -352,6 +352,7 @@ struct CallbackSink {
 // THREAD"): `on_packet` and `ctx` must therefore be safe to invoke from that thread,
 // which is the caller's obligation, stated in the header. The struct's own fields
 // carry no Rust-side aliasing: the pointers are only passed back to C.
+// SAFETY: summary of the full note above — caller-owned thread contract, no Rust-side aliasing.
 #[allow(unsafe_code)]
 unsafe impl Send for CallbackSink {}
 
