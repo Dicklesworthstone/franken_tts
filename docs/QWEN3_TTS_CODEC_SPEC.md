@@ -230,7 +230,7 @@ Consequences, all load-bearing:
 RoPE position restart across chunks is *not* a source of divergence (attention scores depend only on
 relative offsets), so the truncated context is the sole mechanism.
 
-### 5.3 [OPEN] the ICL reference-prefix decode
+### 5.3 the ICL reference-prefix decode — [RESOLVED for this decoder; upstream chunked path stays OPEN]
 
 `INF:612-631`: when a voice-clone reference is present, the reference codec codes are **prepended**
 to the generated codes, the concatenation is decoded as one sequence, and the leading portion is cut
@@ -254,6 +254,15 @@ Two things follow, and both need a decision before the codec streaming contract 
   drop the first `ref_len * 1920` samples of the prefixed decode and remain identical to the
   reference's proportional rule. This argument covers only OUR causal full-retention path; the
   upstream CHUNKED path keeps its own [OPEN] status above.
+- **[LANDED 2026-08-23, frankentts-5yl]** The primitive shipped as
+  `CodecStreamingState::prime_reference` (+ `CodecCheckpoint::stream_prime_reference`): decode the
+  reference through the streaming state, discard exactly `ref_len * 1920` samples, push generated
+  frames as the continuation. Gate `ftts-conformance/tests/icl_prefix_decode.rs` proved both the
+  §5.3 identity (primed stream == concatenated decode's tail, BIT-exact over uneven packets) and
+  the `.ftvoice-cache` seam (clones of one primed snapshot == freshly primed decodes) against the
+  pinned checkpoint. The reference-conditioning consequence stands: ICL codec output is NOT a pure
+  function of the generated tokens — the primed state is part of the voice, which is exactly what
+  the snapshot captures.
 
 
 ---
