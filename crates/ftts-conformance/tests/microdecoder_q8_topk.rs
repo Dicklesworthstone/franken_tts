@@ -227,6 +227,8 @@ fn run_all() -> Result<Vec<DepthGate>, String> {
             } else {
                 0.0
             };
+            let boundary_margin_relative =
+                f64::from((comparison[last_kept] - comparison[first_dropped]).abs()) / scale;
             gates.push(DepthGate {
                 mode,
                 depth,

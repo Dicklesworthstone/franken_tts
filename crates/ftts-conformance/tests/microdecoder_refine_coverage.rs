@@ -93,9 +93,27 @@ struct Coverage {
     worst_rank_in_window: usize,
 }
 
+fn fixtures_pack() -> Result<OracleFixtures, String> {
+    // Canonical home first, then the git-ignored in-tree staging copy (rsynced to
+    // workers) — same resolution order as microdecoder_q8_topk.
+    match OracleFixtures::open_default() {
+        Ok(fixtures) => Ok(fixtures),
+        Err(home_error) => {
+            let staged = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/truth-pack/snapshots/ft7-cpu-fp32-r1");
+            OracleFixtures::open(&staged).map_err(|error| {
+                format!(
+                    "oracle fixtures unavailable: {home_error}; staged copy at {} also \
+                     unusable: {error}",
+                    staged.display()
+                )
+            })
+        }
+    }
+}
+
 fn run_all() -> Result<Vec<Coverage>, String> {
-    let fixtures = OracleFixtures::open_default()
-        .map_err(|error| format!("oracle fixtures unavailable: {error}"))?;
+    let fixtures = fixtures_pack()?;
     fixtures
         .require_oracle_class(CPU_FP32_ORACLE_CLASS)
         .map_err(|error| format!("fixture pack is not the CPU-fp32 tier: {error}"))?;
