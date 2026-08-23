@@ -473,6 +473,22 @@ fn robot_run_content_matches_its_scrubbed_golden() {
             (
                 "FTTS_RESIDENT_DIR",
                 scratch.join("resident").to_str().expect("utf-8"),
+            ),
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "say failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let scrubbed: Vec<String> = String::from_utf8_lossy(&run.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut event: serde_json::Value = serde_json::from_str(line).expect("valid NDJSON");
+            if event["event"] == "frame" {
+                return None; // time-throttled: count and indices are machine-speed artifacts
+            }
             let object = event.as_object_mut().expect("events are objects");
             object.remove("run_id");
             object.remove("elapsed_ms");
@@ -484,17 +500,11 @@ fn robot_run_content_matches_its_scrubbed_golden() {
         scrubbed.len() >= 5,
         "a say run emits at least run_start, stages, chunks and run_complete"
     );
+    let first: serde_json::Value =
+        serde_json::from_str(&scrubbed[0]).expect("first event parses");
     assert_eq!(
-        scrubbed.first().map(String::as_str),
-        Some("run_start").map(|marker| {
-            serde_json::from_str::<serde_json::Value>(&scrubbed[0])
-                .expect("first event parses")
-                .get("event")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_owned()
-        }),
-        "the first event must be run_start"
+        first["event"], "run_start",
+        "the stream must open with run_start"
     );
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
