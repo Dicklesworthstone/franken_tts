@@ -2607,3 +2607,45 @@ mod tests {
         assert_eq!(packet, waveform);
     }
 }
+
+    #[test]
+    fn int8_codec_route_decision_matrix() {
+        // The pin always wins: an exported FTTS_INT8_CODEC must never arm the codec inside an
+        // oracle-pinned run (frankentts-7ozx — the raw env read used to leak exactly there).
+        for env in [
+            None,
+            Some("0"),
+            Some("1"),
+            Some("all"),
+            Some("transformer"),
+            Some("convnext"),
+            Some("yes"),
+        ] {
+            assert_eq!(
+                codec_int8_route_decision(true, env),
+                None,
+                "env {env:?}: a pinned reference route must disarm the codec"
+            );
+        }
+        // Unpinned: the documented opt-in values, and everything else disarmed.
+        assert_eq!(codec_int8_route_decision(false, None), None);
+        assert_eq!(codec_int8_route_decision(false, Some("0")), None);
+        assert_eq!(codec_int8_route_decision(false, Some("garbage")), None);
+        assert_eq!(
+            codec_int8_route_decision(false, Some("1")),
+            Some((true, true))
+        );
+        assert_eq!(
+            codec_int8_route_decision(false, Some("all")),
+            Some((true, true))
+        );
+        assert_eq!(
+            codec_int8_route_decision(false, Some("transformer")),
+            Some((true, false))
+        );
+        assert_eq!(
+            codec_int8_route_decision(false, Some("convnext")),
+            Some((false, true))
+        );
+    }
+}
