@@ -30,6 +30,25 @@ tally_w_l_n: <wins/losses/neutrals for this lever>
 ## Local entries
 
 ```text
+PERF-007
+claim_id: warm-interactive-ttfa-certification
+evidence_id: cargo test -p ftts-cli --locked --release --test warm_engine_e2e ttfa_certification -- --ignored --nocapture (frankentts-dcfn bench; per-run JSONL receipts ttfa_cert + ttfa_summary); run 2026-08-22 ~21:06-21:16 local
+status: PROVISIONAL_LOCAL_WIN — INDICATIVE ONLY until a calm-window rerun (host loadavg 24-36 throughout, cv gate exceeded; see cv_percent)
+model_source_commit: pinned Qwen/Qwen3-TTS-12Hz-0.6B-Base@022e286b98fbec7e1e916cb940cdf532cd9f488e; tree HEAD 1633dff at measurement
+fixture_sha256: not-applicable (end-to-end synthesis timing, not a fixture seam)
+artifact_sha256: qwen3-tts-12hz-0.6b-base.fttsq=597f7eb3314a2fe5be74fa10a6a3a28ace9e10e582c641deccd37348a0ccd824
+cpu_features: Apple M4 Pro native; int8 W8A8 route with 6-worker KernelTeam; interactive profile (packet_frames = 1)
+command_env: seed 0x5EED_0001 pinned; corpus SHORT = "Please call Stella." / LONG = full Stella elicitation paragraph + Rainbow Passage opener (pinned verbatim in the bench source); 1 discarded warmup per class then n = 24 measured runs per class; model dir ~/.cache/franken_tts/model with default.spk
+kill_switch: none — this row certifies a number, it does not route a lever
+incumbent: NONE QUOTED. This is an absolute certification against the plan's <=200 ms warm target, not a ratio. Upstream's claimed 97 ms first packet remains [NO ADMISSIBLE RATIO] (docs/QWEN3_TTS_STREAMING_CONTRACT.md section 4.2: internal vLLM V0, no hardware named). No pre-RT0 interleaved A/B was run, so no "improved from X to Y" claim is made here either.
+results: SHORT ttfa_audible mean 200.069 ms (cv 16.04%) — statistically AT the 200 ms target under load; LONG ttfa_audible mean 225.570 ms (cv 18.74%) — a 25.6 ms miss on the long paragraph. First-byte means equaled audible means to sub-ms precision in both classes (the interactive first packet already carries above-floor samples). Every run produced identical frame counts per class (pinned seed).
+cv_percent: 16.04 (short) / 18.74 (long) — both exceed the 5% quiet-window gate because the host carried load average 24-36 with dozens of active agents during measurement. Per the BASELINE rule these rows are INDICATIVE ONLY: they may not be quoted as certified targets or ratios until re-measured in a calm window with the same one-line command.
+equivalence: PARITY-QUALIFIED on this tree — streaming_sink_e2e 3/3 and live_stream_cli_e2e 5/5 green at HEAD immediately before the ledger write (streaming==offline bit-identity, packet accounting, live-vs-file byte identity at the same seed). Warm-process repeat identity is separately pinned by warm_engine_e2e's contract test.
+disposition: KEEP as the protocol definition and first honest measurement of the RT0/RT1 delivery chain; where remaining time goes is NOT yet instrumented natively (per-stage prefill/first-frame/codec/delivery splits exist only in the wasm timing line) — a native stage-split receipt is the named follow-up if the calm-window rerun misses. Rerun command is the evidence_id line verbatim; admission upgrades automatically once cv <= 5%.
+tally_w_l_n: 0/0/1
+```
+
+```text
 PERF-006
 claim_id: wasm-browser-resident-set-reduction
 evidence_id: site/harness/browser.mjs (real Chromium and real WebKit, persistent profiles, real 1.86 GB model over byte-Range); the engine's own per-stage `memoryBytes()` readouts and the in-wasm `linear_memory_bytes()` milestones

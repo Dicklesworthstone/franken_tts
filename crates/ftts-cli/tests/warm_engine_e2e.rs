@@ -196,3 +196,110 @@ fn soaked_hundred_utterances_hold_rss_flat() {
          leaking"
     );
 }
+
+/// The dcfn certification bench: warm in-process TTFA under the interactive profile.
+///
+/// Protocol per frankentts-dcfn (doctrine 8): WARM means utterance N >= 2 in one process with
+/// the int8 route already built — the first utterance of each class is a discarded warmup. The
+/// interactive profile is one 80 ms frame per packet (`packet_frames = 1`). The product metric
+/// is `ttfa_audible` (first delivered packet whose samples cross AUDIBLE_FLOOR); `ttfa` (first
+/// byte) is reported alongside because the two definitions can differ by leading silence. A
+/// pinned seed keeps every run's frame count identical, so the only varying quantity is time.
+/// The corpus is a short first clause and a long paragraph, reported SEPARATELY: TTFA and RTF
+/// are different products and short-utterance numbers must never be averaged into long-form
+/// ones. This test asserts nothing about the absolute number — the 200 ms figure is a target,
+/// not a gate; it exists to produce the receipts the PERF_LEDGER entry cites.
+#[test]
+#[ignore = "ttfa certification: cargo test --release --test warm_engine_e2e ttfa_certification -- --ignored; ~50 warm utterances"]
+fn ttfa_certification_warm_interactive_produces_the_dcfn_receipts() {
+    const RUNS_PER_CLASS: usize = 24;
+    const SEED: u64 = 0x5EED_0001;
+    const SHORT: &str = "Please call Stella.";
+    const LONG: &str = "Please call Stella. Ask her to bring these things with her from the store: \
+six spoons of fresh snow peas, five thick slabs of blue cheese, and maybe a snack for her brother \
+Bob. We also need a small plastic snake and a big toy frog for the kids. She can scoop these \
+things into three red bags, and we will go meet her Wednesday at the train station. When the \
+sunlight strikes raindrops in the air, they act as a prism and form a rainbow.";
+
+    let Some(root) = model_dir() else {
+        eprintln!("SKIP: no complete model directory");
+        return;
+    };
+    let Some(speaker) = default_speaker(&root) else {
+        eprintln!("SKIP: no default.spk speaker vector beside the model");
+        return;
+    };
+    let bundle = ModelBundle::resolve(&root).expect("bundle resolves");
+    let model = LoadedModel::load(&bundle).expect("model loads");
+    let engine = TtsEngine::from_process_environment().expect("engine starts");
+
+    let cancellation = CancellationToken::new();
+    let observer = |event: SynthesisEvent| {
+        let _ = event;
+    };
+
+    for (class, text) in [("short", SHORT), ("long", LONG)] {
+        // Discarded warmup: builds the int8 route on first use and warms allocator paths, so
+        // every measured run is utterance N >= 2 in this process.
+        synth::synthesize(
+            &model,
+            &engine,
+            &SynthesisRequest::new(text),
+            &speaker,
+            SEED,
+            &cancellation,
+            &observer,
+            1,
+            None,
+            None,
+        )
+        .expect("warmup utterance synthesizes");
+
+        let mut audible_ms: Vec<f64> = Vec::with_capacity(RUNS_PER_CLASS);
+        let mut raw_ms: Vec<f64> = Vec::with_capacity(RUNS_PER_CLASS);
+        for run in 0..RUNS_PER_CLASS {
+            let started = Instant::now();
+            let audio = synth::synthesize(
+                &model,
+                &engine,
+                &SynthesisRequest::new(text),
+                &speaker,
+                SEED,
+                &cancellation,
+                &observer,
+                1,
+                None,
+                None,
+            )
+            .expect("measured utterance synthesizes");
+            let wall = started.elapsed().as_secs_f64() * 1000.0;
+            let audible = audio
+                .ttfa_audible
+                .expect("interactive packets deliver audible audio")
+                .as_secs_f64()
+                * 1000.0;
+            let raw = audio.ttfa.map_or(f64::NAN, |d| d.as_secs_f64() * 1000.0);
+            audible_ms.push(audible);
+            raw_ms.push(raw);
+            println!(
+                "{{\"receipt\":\"ttfa_cert\",\"class\":\"{class}\",\"run\":{run},\"seed\":{SEED},\
+\"frames\":{},\"ttfa_audible_ms\":{audible:.3},\"ttfa_first_byte_ms\":{raw:.3},\"wall_ms\":{wall:.3}}}",
+                audio.frames
+            );
+        }
+
+        let mean = audible_ms.iter().sum::<f64>() / RUNS_PER_CLASS as f64;
+        let variance = audible_ms
+            .iter()
+            .map(|value| (value - mean) * (value - mean))
+            .sum::<f64>()
+            / (RUNS_PER_CLASS - 1) as f64;
+        let cv_pct = variance.sqrt() / mean * 100.0;
+        let raw_mean = raw_ms.iter().sum::<f64>() / RUNS_PER_CLASS as f64;
+        println!(
+            "{{\"receipt\":\"ttfa_summary\",\"class\":\"{class}\",\"runs\":{RUNS_PER_CLASS},\
+\"packet_frames\":1,\"ttfa_audible_mean_ms\":{mean:.3},\"ttfa_audible_cv_pct\":{cv_pct:.2},\
+\"ttfa_first_byte_mean_ms\":{raw_mean:.3}}}"
+        );
+    }
+}
