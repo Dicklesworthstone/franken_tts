@@ -11,7 +11,11 @@
 #                                     barge-in trigger input to the orchestrator
 #     transcript.partial            — speculative fast-model hypothesis; MUTABLE, may be followed
 #                                     by transcript.retract; NEVER pipe to the LLM
-#     transcript.delta              — append-only COMMITTED text; pipe deltas or utterance_end.text
+#     transcript.delta              — append-only COMMITTED text as FRESH SPANS: no delta ever
+#                                     repeats earlier text; utterance text == space-joined deltas
+#                                     (fw correction 2026-08-23: the growing-prefix shape earlier
+#                                     copies of these fixtures carried was the pre-6589686e leak
+#                                     bug, not the contract). Pipe deltas or utterance_end.text
 #                                     to the LLM, nothing else
 #     utterance_end                 — explicit conversational end-of-turn, distinct from VAD
 #                                     segmentation; {utterance_id, reason: endpoint|timeout|
@@ -28,5 +32,5 @@
 {"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-normal-1","seq":3,"ts":0.560,"text":"What's the weather","start_sec":0.020,"end_sec":0.550,"confidence":0.88,"speaker":"user"}
 {"schema_version":"1.1.0","event":"transcript.delta","run_id":"fw-replay-normal-1","seq":4,"ts":0.610,"text":"What's the weather","utterance_id":"u1"}
 {"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-normal-1","seq":5,"ts":0.940,"text":"What's the weather tomorrow","start_sec":0.020,"end_sec":0.930,"confidence":0.93,"speaker":"user"}
-{"schema_version":"1.1.0","event":"transcript.delta","run_id":"fw-replay-normal-1","seq":6,"ts":1.010,"text":"What's the weather tomorrow","utterance_id":"u1"}
+{"schema_version":"1.1.0","event":"transcript.delta","run_id":"fw-replay-normal-1","seq":6,"ts":1.010,"text":"tomorrow","utterance_id":"u1"}
 {"schema_version":"1.1.0","event":"utterance_end","run_id":"fw-replay-normal-1","seq":7,"ts":1.340,"utterance_id":"u1","reason":"endpoint","text":"What's the weather tomorrow?"}

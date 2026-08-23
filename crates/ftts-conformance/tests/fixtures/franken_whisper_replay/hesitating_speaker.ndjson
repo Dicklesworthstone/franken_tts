@@ -12,6 +12,6 @@
 {"schema_version":"1.1.0","event":"transcript.retract","run_id":"fw-replay-hesitant-1","seq":3,"ts":20.610,"text":"Um"}
 {"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-hesitant-1","seq":4,"ts":21.180,"text":"Maybe we could","start_sec":20.900,"end_sec":21.150,"confidence":0.62,"speaker":"user"}
 {"schema_version":"1.1.0","event":"transcript.delta","run_id":"fw-replay-hesitant-1","seq":5,"ts":21.400,"text":"Maybe we could","utterance_id":"u1"}
-{"schema_version":"1.1.0","event":"transcript.delta","run_id":"fw-replay-hesitant-1","seq":6,"ts":22.350,"text":"Maybe we could ship the release Friday","utterance_id":"u1"}
+{"schema_version":"1.1.0","event":"transcript.delta","run_id":"fw-replay-hesitant-1","seq":6,"ts":22.350,"text":"ship the release Friday","utterance_id":"u1"}
 {"schema_version":"1.1.0","event":"transcript.partial","run_id":"fw-replay-hesitant-1","seq":7,"ts":22.500,"text":"Maybe we could ship the release Friday if QA passes","start_sec":20.900,"end_sec":22.480,"confidence":0.83,"speaker":"user"}
 {"schema_version":"1.1.0","event":"utterance_end","run_id":"fw-replay-hesitant-1","seq":8,"ts":23.380,"utterance_id":"u1","reason":"endpoint","text":"Maybe we could ship the release Friday if QA passes."}

@@ -303,16 +303,15 @@ def main():
             log({"turn": "barge-in", "spoken_upper_bound": receipt["spoken_text"],
                  "frames_delivered": receipt["frames_delivered"]})
         if kind == "transcript.delta" and event.get("text"):
-            # Two delta shapes exist across fw policies, both append-only committed
-            # text: endpoint-commit fixtures carry the FULL prefix so far (a longer
-            # delta supersedes), alignatt carries each FRESH span (space-joined
-            # equals the utterance). Detect which by prefix, so both reconstruct.
+            # fw contract (both policies): each delta is a FRESH committed span; the
+            # utterance text equals the space-joined spans. A delta that repeats the
+            # accumulated text is the pre-6589686e leak bug — fw wants it reported,
+            # not accommodated, so it is flagged loudly and still joined as-is.
             fresh = event["text"]
-            if fresh.startswith(pending_deltas[0] if pending_deltas else ""):
-                pending_deltas.clear()
-                pending_deltas.append(fresh)
-            else:
-                pending_deltas.append(fresh)
+            if pending_deltas and fresh.startswith(" ".join(pending_deltas)):
+                log({"warning": "cumulative-shaped delta — fw contract violation, "
+                                "report to the fw agent", "text": fresh[:120]})
+            pending_deltas.append(fresh)
         if kind == "utterance_end":
             user_text = event.get("text") or " ".join(pending_deltas).strip()
             pending_deltas.clear()

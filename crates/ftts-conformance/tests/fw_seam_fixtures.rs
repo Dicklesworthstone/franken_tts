@@ -127,42 +127,48 @@ fn every_line_satisfies_the_pinned_envelope_and_vocabulary() {
 }
 
 #[test]
-fn deltas_are_append_only_within_an_utterance() {
+fn deltas_are_fresh_spans_that_join_into_the_finalized_text() {
+    // fw contract correction (2026-08-23, fw agent, post-6589686e): a delta carries only its
+    // FRESH committed span under EVERY policy — endpoint-commit is the degenerate one-span
+    // case, alignatt the multi-span case. No delta ever repeats earlier committed text, and
+    // the utterance text equals the space-joined spans. The growing-prefix shape this test
+    // previously REQUIRED was the pre-fix utterance-leak bug; per the fw agent, a modern
+    // stream that looks cumulative is a bug report, not a shape to accommodate.
     for scenario in SCENARIOS {
         let path = fixture_dir().join(scenario);
-        let mut committed: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let mut last_delta_per_utterance: std::collections::HashMap<String, String> =
+        let mut joined: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for (line_number, value) in lines(&path) {
             match value["event"].as_str().expect("event") {
                 "transcript.delta" => {
                     let id = value["utterance_id"].as_str().expect("id");
                     let text = value["text"].as_str().expect("text");
-                    if let Some(previous) = committed.get(id) {
+                    assert!(!text.is_empty(), "{scenario}:{line_number}: empty delta span");
+                    let accumulated = joined.entry(id.to_owned()).or_default();
+                    if !accumulated.is_empty() {
                         assert!(
-                            text.starts_with(previous.as_str()) && text.len() > previous.len(),
-                            "{scenario}:{line_number}: delta is not an extension of the \
-                             committed text for {id}"
+                            !text.starts_with(accumulated.as_str()),
+                            "{scenario}:{line_number}: delta repeats already-committed text \
+                             for {id} — the pre-6589686e cumulative bug shape"
                         );
+                        accumulated.push(' ');
                     }
-                    committed.insert(id.to_owned(), text.to_owned());
-                    last_delta_per_utterance.insert(id.to_owned(), text.to_owned());
+                    accumulated.push_str(text);
                 }
                 "utterance_end" => {
                     let id = value["utterance_id"].as_str().expect("id");
-                    // The finalized text must CONTAIN everything committed so far — the
+                    // Space-joined spans must survive into the finalized text — the
                     // finalizer may adjust punctuation but never drop committed words.
-                    if let Some(last) = last_delta_per_utterance.get(id) {
+                    if let Some(spans) = joined.remove(id) {
                         let normalize =
                             |s: &str| s.trim_end_matches(['.', '?', '!']).to_lowercase();
                         assert!(
                             normalize(value["text"].as_str().expect("text"))
-                                .contains(&normalize(last)),
-                            "{scenario}:{line_number}: finalized text dropped committed words"
+                                .contains(&normalize(&spans)),
+                            "{scenario}:{line_number}: finalized text dropped committed words \
+                             (joined spans: {spans:?})"
                         );
                     }
-                    committed.remove(id);
                 }
                 _ => {}
             }
