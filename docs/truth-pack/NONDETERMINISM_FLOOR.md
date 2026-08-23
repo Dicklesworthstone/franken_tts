@@ -53,7 +53,12 @@ near-zero-crossing samples of a 2-frame utterance, so the honest statement is *w
 pointwise equality does not hold cross-device* — waveform comparisons must use the spectral or
 envelope metric, never raw sample diff. Whether TF32 conv paths contributed is un-investigated;
 a follow-up capture with `torch.backends.cudnn.allow_tf32 = False` would separate algorithm
-selection from precision loss.
+
+**TF32 attribution settled (same session):** a third CUDA capture with
+`cudnn.allow_tf32 = False` and `cuda.matmul.allow_tf32 = False` reproduced the r1 capture
+`5440/5440` bit-identical. TF32 plays no role on this stack; the CPU-vs-CUDA waveform divergence
+above is conv **algorithm selection** (cuDNN kernel choice), not precision loss, and the r1
+fixtures are full-FP32 clean.
 
 Scope boundary: still the synthetic one-case corpus. Multi-frame/long-form expansion belongs to
 the frozen golden corpus decision (t-golden-corpus-881 lineage), not this measurement.
