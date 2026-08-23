@@ -2284,6 +2284,31 @@ impl CodecCheckpoint {
         crate::codec::CodecStreamingState::new(self.config, &weights)
     }
 
+    /// Primes a streaming state with an ICL reference's codec codes, discarding their waveform.
+    ///
+    /// See [`crate::codec::CodecStreamingState::prime_reference`] for the §5.3 contract: on this
+    /// decoder the official proportional waveform cut is exactly the samples discarded here, so
+    /// generated frames pushed afterwards ARE the official ICL waveform. Returns the discarded
+    /// sample count (`frames * 1920`). The primed state is `Clone` — snapshot it per voice to
+    /// keep the reference decode out of TTFA.
+    ///
+    /// # Errors
+    ///
+    /// If the reference's code layout is malformed.
+    pub fn stream_prime_reference(
+        &self,
+        state: &mut crate::codec::CodecStreamingState,
+        codes: &[i32],
+        frames: usize,
+    ) -> Result<usize, CheckpointError> {
+        let layers: Vec<CodecTransformerLayerWeights<'_>> =
+            self.layers.iter().map(OwnedCodecLayer::borrow).collect();
+        let weights = self.decoder_weights(&layers);
+        state
+            .prime_reference(self.quantizer(), &weights, codes, frames)
+            .map_err(CheckpointError::Codec)
+    }
+
     /// Decodes one nonempty packet of `frames` code rows, appending finalized PCM to `output`.
     ///
     /// # Errors
