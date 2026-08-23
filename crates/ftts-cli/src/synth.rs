@@ -542,7 +542,7 @@ pub(crate) fn private_staging_dir() -> std::io::Result<PathBuf> {
 /// WAV and FLAC decode through the embedded pure-Rust path. Compressed containers (m4a, mp3, …)
 /// are first transcoded to a temporary WAV by the first system decoder found — `afconvert` on
 /// macOS, then `ffmpeg` — with a clear error naming both tools when neither exists.
-fn decode_reference_audio_any(path: &Path) -> Result<Vec<f32>, FttsError> {
+pub(crate) fn decode_reference_audio_any(path: &Path) -> Result<Vec<f32>, FttsError> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
