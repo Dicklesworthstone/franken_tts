@@ -285,7 +285,7 @@ fn frame_boundary_cancel_loses_nothing_across_the_boundary() {
         &loaded,
         &engine,
         &request,
-        &speaker,
+        &synth::VoiceConditioning::XVector(speaker.clone()),
         0,
         &token,
         &observer,

@@ -775,7 +775,8 @@ fn handle_connection(
         loaded,
         engine,
         &synthesis_request,
-        &speaker,
+        // v1 wire carries vectors only; the daemon is x-vector by construction.
+        &crate::synth::VoiceConditioning::XVector(speaker),
         seed,
         &cancellation,
         &observer,

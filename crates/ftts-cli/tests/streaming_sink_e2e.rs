@@ -101,7 +101,7 @@ fn run(
         &loaded.model,
         &loaded.engine,
         &request,
-        &synthetic_speaker(),
+        &synth::VoiceConditioning::XVector(synthetic_speaker()),
         seed,
         cancellation,
         &observer,

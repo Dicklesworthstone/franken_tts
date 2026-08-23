@@ -1979,13 +1979,12 @@ fn run_say_events(
     // never enter the cleanup code.
     let mut say_denoise_report = None;
     let denoise_ephemeral = bundle.root.join(synth::DENOISE_ARTIFACT_RELPATH).is_file();
-    let speaker = synth::speaker_from_voice(
+    // Ephemeral audio sources keep the automatic denoise here (same rationale as enroll);
+    // pack sources already carry their cleaned-audio identity, so no second cleanup runs.
+    let voice_conditioning = synth::say_voice_conditioning(
         &bundle,
         &voice_path,
-        synth::ReferenceCleanup {
-            denoise: denoise_ephemeral.then_some(&mut say_denoise_report),
-            dereverb: None,
-        },
+        (denoise_ephemeral).then_some(&mut say_denoise_report),
     )?;
     // With the resident engine (the default), the model stays loaded in a background
     // process and this invocation skips its own hydration; the daemon's load happens
@@ -1997,7 +1996,11 @@ fn run_say_events(
     // can never stream live — and a warm run silently regressing to buffered delivery
     // while the cold run streams would be worse than either behavior alone. Raw streaming
     // therefore pays the in-process load; the warm+streaming surface is the talk session.
-    let use_resident = resident::enabled(args.no_resident) && !raw_stream;
+    // ICL conditioning cannot ride the resident wire protocol (v1 carries vectors only);
+    // serving it through the daemon would silently strip the transcript+tokens quality
+    // path, so those runs pay the in-process load instead.
+    let use_resident =
+        resident::enabled(args.no_resident) && !raw_stream && voice_conditioning.is_xvector();
     let loaded = if use_resident {
         None
     } else {
@@ -2026,7 +2029,7 @@ fn run_say_events(
                 text: &request.text,
                 normalize: settings.normalize.as_str(),
                 trace: request.trace_normalization,
-                speaker: &speaker,
+                speaker: voice_conditioning.embedding(),
                 seed,
             },
         )?;
@@ -2140,7 +2143,7 @@ fn run_say_events(
                         &loaded,
                         &engine,
                         &request,
-                        &speaker,
+                        &voice_conditioning,
                         seed,
                         cancellation,
                         &observer,

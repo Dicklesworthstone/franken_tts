@@ -33,7 +33,7 @@ use ftts_model_qwen::checkpoint::{
     CODEC_LANGUAGE_ENGLISH_ID, CheckpointError, CodecCheckpoint, TALKER_HIDDEN, TalkerCheckpoint,
 };
 use ftts_model_qwen::generate::{
-    Int8Route, QwenGenerator, QwenGeneratorConfig, prepare_int8_route,
+    Int8Route, QwenGenerator, QwenGeneratorConfig, ReferencePrompt, prepare_int8_route,
 };
 use ftts_model_qwen::microdecoder::MicrodecoderConfig;
 use ftts_model_qwen::prompt::{CloneMode, PromptMode};
@@ -302,6 +302,49 @@ pub struct ReferenceCleanup<'a> {
     pub dereverb: Option<&'a mut Option<DereverbReport>>,
 }
 
+/// How one synthesis run conditions on a voice.
+///
+/// `say` resolves a `--voice` source to this enum BEFORE synthesis so an ICL-capable pack
+/// takes its quality path instead of silently degrading to embedding-only conditioning
+/// (bead frankentts-6hdc). The resident-daemon wire protocol carries only vectors, so ICL
+/// runs must bypass that fast path — callers decide via [`VoiceConditioning::is_xvector`].
+#[derive(Clone, Debug)]
+pub enum VoiceConditioning {
+    /// Embedding-only conditioning (legacy `.spk`, presets, cards, audio sources, and packs
+    /// without an identity block).
+    XVector(Vec<f32>),
+    /// Transcript-backed ICL from a QUALITY-mode pack: verbatim transcript (wrapped +
+    /// tokenized at synthesis time through the loaded tokenizer — OQ-10 §0.1 wrapper) plus
+    /// the codec tokens cut from the same cleaned audio as the embedding.
+    Icl {
+        /// The pack's transcript, byte-for-byte.
+        transcript: String,
+        /// 16 codes per frame, from the pack's identity block.
+        codec_codes: Vec<u16>,
+        /// The x-vector from the same enrollment; label logic reads it even though
+        /// synthesis conditions through the reference continuation instead.
+        embedding: Vec<f32>,
+    },
+}
+
+impl VoiceConditioning {
+    /// True when this conditioning can ride the resident-daemon wire protocol.
+    #[must_use]
+    pub fn is_xvector(&self) -> bool {
+        matches!(self, Self::XVector(_))
+    }
+
+    /// The embedding half, whichever variant holds it. ICL still enrolls through the same
+    /// speaker encoder; non-synthesis consumers (label text, card export) read it here.
+    #[must_use]
+    pub fn embedding(&self) -> &[f32] {
+        match self {
+            Self::XVector(vector) => vector,
+            Self::Icl { embedding, .. } => embedding,
+        }
+    }
+}
+
 /// Derive a speaker vector from a voice source: a raw x-vector file, or reference audio.
 ///
 /// Passing `Some` for a cleanup slot opts the reference into that stage and fills the slot with
@@ -380,6 +423,60 @@ pub fn speaker_from_reference_pcm(
     cleanup: ReferenceCleanup<'_>,
 ) -> Result<Vec<f32>, FttsError> {
     enroll_outputs_from_reference_pcm(bundle, pcm, cleanup).map(|(vector, _)| vector)
+}
+
+/// Resolves a `say`-style voice source into full synthesis conditioning: a QUALITY-mode
+/// `.ftvoice` pack becomes [`VoiceConditioning::Icl`] (transcript carried verbatim; the
+/// loaded tokenizer wraps and encodes it inside `synthesize`); every other source — packs
+/// without an identity block, raw vectors, cards, audio — stays embedding-only. Audio
+/// sources keep the automatic denoise here, exactly as the raw-vector path always did.
+///
+/// # Errors
+///
+/// Propagates read/parse failures from the underlying voice loaders; a corrupt pack is a
+/// named refusal, never a silent downgrade.
+pub fn say_voice_conditioning(
+    bundle: &ModelBundle,
+    path: &Path,
+    denoise_report: Option<&mut Option<DenoiseReport>>,
+) -> Result<VoiceConditioning, FttsError> {
+    let bytes = fs::read(path).map_err(|error| {
+        FttsError::Input(format!(
+            "cannot read voice source {}: {error}",
+            path.display()
+        ))
+    })?;
+    if bytes.starts_with(ftts_artifacts::voice::VOICE_MAGIC) {
+        let pack = ftts_artifacts::voice::parse_voice_pack(&bytes).map_err(|error| {
+            FttsError::Input(format!(
+                "voice pack {} cannot be used: {error}",
+                path.display()
+            ))
+        })?;
+        if let (Some(codes), Some(transcript)) = (&pack.codec_codes, &pack.transcript) {
+            let codec_codes = codes
+                .iter()
+                .map(|&code| u16::try_from(code))
+                .collect::<Result<Vec<u16>, _>>()
+                .map_err(|error| {
+                    FttsError::ArtifactFormat(format!("pack codec code out of u16 range: {error}"))
+                })?;
+            return Ok(VoiceConditioning::Icl {
+                transcript: transcript.clone(),
+                codec_codes,
+                embedding: pack.embedding.clone(),
+            });
+        }
+        return Ok(VoiceConditioning::XVector(pack.embedding));
+    }
+    Ok(VoiceConditioning::XVector(speaker_from_voice(
+        bundle,
+        path,
+        ReferenceCleanup {
+            denoise: denoise_report,
+            dereverb: None,
+        },
+    )?))
 }
 
 /// The enrollment half of [`speaker_from_reference_pcm`], also returning the CLEANED pcm the
@@ -1601,7 +1698,7 @@ pub fn synthesize(
     model: &LoadedModel,
     engine: &TtsEngine,
     request: &SynthesisRequest,
-    speaker: &[f32],
+    voice: &VoiceConditioning,
     seed: u64,
     cancellation: &CancellationToken,
     observer: &dyn SynthesisObserver,
@@ -1623,18 +1720,89 @@ pub fn synthesize(
     let prepared = PreparedText::new(wrapped.clone(), prepared_raw.normalization_trace);
 
     // 2. The cold-embedding rows this utterance can reach, and nothing else.
-    let ids = TalkerCheckpoint::utterance_text_ids(&wrapped);
+    let reference_inner_ids: Vec<u32> = match voice {
+        VoiceConditioning::Icl {
+            transcript,
+            codec_codes: _,
+            embedding: _,
+        } => {
+            // The same wrap the prompt build will apply; slicing mirrors
+            // `extract_prompt_text_ids`'s `ref_ids[:, 3:-2]` contract.
+            let wrapped_reference = ftts_model_qwen::prompt::wrap_reference_transcript(transcript);
+            let wrapped_ids = model
+                .tokenizer
+                .encode(&wrapped_reference)
+                .map_err(|error| {
+                    FttsError::Input(format!(
+                        "cannot tokenize pack transcript for ICL conditioning: {error}"
+                    ))
+                })?;
+            wrapped_ids[3..wrapped_ids.len().saturating_sub(2)].to_vec()
+        }
+        VoiceConditioning::XVector(_) => Vec::new(),
+    };
+    let ids = TalkerCheckpoint::utterance_text_ids_with_reference(&wrapped, &reference_inner_ids);
     let table = model
         .talker
         .gather_text_rows(&ids)
         .map_err(checkpoint_error)?;
 
-    // 3. The prompt header, derived from checkpoint tensors and the caller's speaker vector.
-    let header = model
-        .talker
-        .xvector_header(&table, speaker, CODEC_LANGUAGE_ENGLISH_ID)
-        .map_err(checkpoint_error)?;
+    // 3. The prompt header and reference block, per the resolved conditioning. ICL swaps the
+    // speaker slot for a reference continuation (OQ-10 §1: S=0 in ICL headers) and enters
+    // streaming mode — the only streaming-compatible ICL assembly. The wrapper is
+    // added-token delimited, so encoding the WRAPPED transcript and using it whole is the
+    // official path; `extract_prompt_text_ids` slices `[3..-2]` itself.
+    let (header, prompt_mode, reference) = match voice {
+        VoiceConditioning::XVector(speaker) => (
+            model
+                .talker
+                .xvector_header(&table, speaker, CODEC_LANGUAGE_ENGLISH_ID)
+                .map_err(checkpoint_error)?,
+            PromptMode {
+                clone_mode: CloneMode::XVector,
+                non_streaming_mode: false,
+            },
+            None,
+        ),
+        VoiceConditioning::Icl { codec_codes, .. } => {
+            let wrapped_ids = {
+                // The FULL wrapped encoding: ReferencePrompt carries it whole and the
+                // prompt assembly slices [3..-2] itself (one contract, one slice).
+                let wrapped_reference =
+                    ftts_model_qwen::prompt::wrap_reference_transcript(&match voice {
+                        VoiceConditioning::Icl { transcript, .. } => transcript.clone(),
+                        _ => unreachable!("matched Icl arm"),
+                    });
+                model
+                    .tokenizer
+                    .encode(&wrapped_reference)
+                    .map_err(|error| {
+                        FttsError::Input(format!(
+                            "cannot tokenize pack transcript for ICL conditioning: {error}"
+                        ))
+                    })?
+            };
+            let codec = model
+                .talker
+                .icl_reference_codec_frames(codec_codes)
+                .map_err(checkpoint_error)?;
+            (
+                model
+                    .talker
+                    .icl_header(&table, CODEC_LANGUAGE_ENGLISH_ID)
+                    .map_err(checkpoint_error)?,
+                PromptMode {
+                    clone_mode: CloneMode::Icl,
+                    non_streaming_mode: false,
+                },
+                Some(ReferencePrompt { wrapped_ids, codec }),
+            )
+        }
+    };
     let tts_eos = model.talker.tts_eos(&table);
+    if std::env::var_os("FTTS_ICL_DEBUG").is_some() {
+        eprintln!("[icl-dbg] header/mode/reference resolved");
+    }
 
     // 4. Borrowed weights for the generator.
     let talker_layers = model.talker.talker_layer_weights();
@@ -1663,13 +1831,10 @@ pub fn synthesize(
             micro_residual,
             &heads,
         ),
-        prompt_mode: PromptMode {
-            clone_mode: CloneMode::XVector,
-            non_streaming_mode: false,
-        },
+        prompt_mode,
         header,
         tts_eos,
-        reference: None,
+        reference,
         // The PRODUCT samples, exactly as the pinned upstream runtime does
         // (generation_config.json: do_sample=true, T=0.9, top_k=50, repetition_penalty=1.05,
         // subtalker likewise); canonical greedy remains the conformance decoder only. The p7r
@@ -1698,6 +1863,12 @@ pub fn synthesize(
             .map(std::sync::Arc::new)
     });
     let mut generator = QwenGenerator::new_with_prepared_int8(generator_config, int8.clone());
+    if std::env::var_os("FTTS_ICL_DEBUG").is_some() {
+        eprintln!(
+            "[icl-dbg] generator built; cached_positions={}",
+            generator.cached_positions()
+        );
+    }
 
     // 5. The engine owns admission, the budget, cancellation, and the frame loop — and the
     // codec decodes IN PARALLEL with it: a tee on the generator feeds every produced frame

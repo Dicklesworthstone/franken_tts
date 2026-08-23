@@ -476,7 +476,10 @@ pub fn run_talk(
                     loaded_ref,
                     engine_ref,
                     &request,
-                    &job.speaker,
+                    // Talk continuations require streaming x-vector assembly; ICL packs
+                    // would be rejected by the generator mid-session, so talk stays on the
+                    // embedding path until a continuation-capable ICL design lands.
+                    &crate::synth::VoiceConditioning::XVector(job.speaker.clone()),
                     job.effective_seed,
                     &job.cancellation,
                     &observer,

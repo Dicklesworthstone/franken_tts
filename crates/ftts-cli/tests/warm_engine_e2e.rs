@@ -73,7 +73,7 @@ fn synthesize_utterance(
     label: &str,
     model: &LoadedModel,
     engine: &TtsEngine,
-    speaker: &[f32],
+    speaker: &synth::VoiceConditioning,
     text: &str,
     seed: u64,
 ) -> ftts_cli::synth::SynthesizedAudio {
@@ -131,11 +131,32 @@ fn warm_reuse_is_bit_identical_to_a_fresh_model() {
     let fresh = LoadedModel::load(&bundle).expect("fresh model loads");
     assert!(!warm.int8_route_ready(), "route must start unbuilt");
 
-    let first = synthesize_utterance("warm_first_a", &warm, &engine, &speaker, TEXT_A, 0);
+    let first = synthesize_utterance(
+        "warm_first_a",
+        &warm,
+        &engine,
+        &synth::VoiceConditioning::XVector(speaker.clone()),
+        TEXT_A,
+        0,
+    );
     assert!(warm.int8_route_ready(), "first utterance builds the route");
 
-    let _interleaved = synthesize_utterance("warm_b", &warm, &engine, &speaker, TEXT_B, 0);
-    let repeat = synthesize_utterance("warm_repeat_a", &warm, &engine, &speaker, TEXT_A, 0);
+    let _interleaved = synthesize_utterance(
+        "warm_b",
+        &warm,
+        &engine,
+        &synth::VoiceConditioning::XVector(speaker.clone()),
+        TEXT_B,
+        0,
+    );
+    let repeat = synthesize_utterance(
+        "warm_repeat_a",
+        &warm,
+        &engine,
+        &synth::VoiceConditioning::XVector(speaker.clone()),
+        TEXT_A,
+        0,
+    );
     assert_eq!(repeat.frames, first.frames, "same text+seed, same frames");
     assert!(
         same_samples(&repeat.pcm, &first.pcm),
@@ -145,7 +166,14 @@ fn warm_reuse_is_bit_identical_to_a_fresh_model() {
 
     // The heart of the bead: a brand-new model (its own route build, own codec state) produces
     // byte-identical audio for the same text and seed.
-    let cold = synthesize_utterance("fresh_a", &fresh, &engine, &speaker, TEXT_A, 0);
+    let cold = synthesize_utterance(
+        "fresh_a",
+        &fresh,
+        &engine,
+        &synth::VoiceConditioning::XVector(speaker.clone()),
+        TEXT_A,
+        0,
+    );
     assert!(
         same_samples(&cold.pcm, &first.pcm),
         "fresh-model synthesis diverged from warmed-process synthesis of the same text+seed"
@@ -171,7 +199,14 @@ fn soaked_hundred_utterances_hold_rss_flat() {
     let mut rss_samples: Vec<u64> = Vec::new();
     for utterance in 0..100u64 {
         let text = if utterance % 2 == 0 { TEXT_A } else { TEXT_B };
-        synthesize_utterance("soak", &model, &engine, &speaker, text, utterance % 7);
+        synthesize_utterance(
+            "soak",
+            &model,
+            &engine,
+            &synth::VoiceConditioning::XVector(speaker.clone()),
+            text,
+            utterance % 7,
+        );
         if utterance % 10 == 9 {
             let output = std::process::Command::new("ps")
                 .args(["-o", "rss=", "-p", &pid.to_string()])
@@ -245,7 +280,7 @@ sunlight strikes raindrops in the air, they act as a prism and form a rainbow.";
             &model,
             &engine,
             &SynthesisRequest::new(text),
-            &speaker,
+            &synth::VoiceConditioning::XVector(speaker.to_vec()),
             SEED,
             &cancellation,
             &observer,
@@ -263,7 +298,7 @@ sunlight strikes raindrops in the air, they act as a prism and form a rainbow.";
                 &model,
                 &engine,
                 &SynthesisRequest::new(text),
-                &speaker,
+                &synth::VoiceConditioning::XVector(speaker.clone()),
                 SEED,
                 &cancellation,
                 &observer,
@@ -334,7 +369,7 @@ fn packet_one_equals_packet_four_bit_for_bit() {
             &model,
             &engine,
             &SynthesisRequest::new(TEXT),
-            &speaker,
+            &synth::VoiceConditioning::XVector(speaker.to_vec()),
             0x5EED_0002,
             &cancellation,
             &observer,
