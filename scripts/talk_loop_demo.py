@@ -303,11 +303,18 @@ def main():
             log({"turn": "barge-in", "spoken_upper_bound": receipt["spoken_text"],
                  "frames_delivered": receipt["frames_delivered"]})
         if kind == "transcript.delta" and event.get("text"):
-            # Each delta carries the FULL committed prefix so far (append-only text,
-            # cumulative events) — so the latest one supersedes, never concatenates.
-            pending_deltas.append(event["text"])
+            # Two delta shapes exist across fw policies, both append-only committed
+            # text: endpoint-commit fixtures carry the FULL prefix so far (a longer
+            # delta supersedes), alignatt carries each FRESH span (space-joined
+            # equals the utterance). Detect which by prefix, so both reconstruct.
+            fresh = event["text"]
+            if fresh.startswith(pending_deltas[0] if pending_deltas else ""):
+                pending_deltas.clear()
+                pending_deltas.append(fresh)
+            else:
+                pending_deltas.append(fresh)
         if kind == "utterance_end":
-            user_text = event.get("text") or (pending_deltas[-1].strip() if pending_deltas else "")
+            user_text = event.get("text") or " ".join(pending_deltas).strip()
             pending_deltas.clear()
             if not user_text:
                 return  # fw's empty-utterance pairing: endpoint with nothing committed
