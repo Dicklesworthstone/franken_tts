@@ -1396,7 +1396,7 @@ fn solve_complex_system(
 /// every stop. Measuring the median decay slope across offsets is what separates "the room rings"
 /// from "the microphone hisses", two problems whose fixes have nothing in common. Returns `None`
 /// when the audio has no clear offsets to measure.
-fn reverb_time_s(pcm: &[f32]) -> Option<f32> {
+pub(crate) fn reverb_time_s(pcm: &[f32]) -> Option<f32> {
     let hop = (SPEAKER_SAMPLE_RATE_HZ as usize) / 100; // 10 ms
     if pcm.len() < hop * 32 {
         return None;
