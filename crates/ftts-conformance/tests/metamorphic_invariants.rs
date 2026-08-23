@@ -17,7 +17,7 @@
 //!
 //! Model-gated; each absence reports an honest skip.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ftts_cli::preset_voice_path;
 use ftts_cli::synth::{
@@ -36,12 +36,15 @@ const SEED_A: u64 = 42;
 const SEED_B: u64 = 43;
 
 fn skip(test: &str, reason: &str) {
-    Receipt::new(test, Outcome::Skipped).contract(CONTRACT).seam("metamorphic").reason(reason).emit();
+    Receipt::new(test, Outcome::Skipped)
+        .contract(CONTRACT)
+        .seam("metamorphic")
+        .reason(reason)
+        .emit();
 }
 
 struct Bench {
     model: LoadedModel,
-    bundle: ModelBundle,
     speaker: Vec<f32>,
 }
 
@@ -52,7 +55,7 @@ fn bench() -> Result<Bench, String> {
     let model = LoadedModel::load(&bundle).map_err(|e| format!("checkpoint: {e}"))?;
     let voice_path = preset_voice_path(VOICE).map_err(|e| format!("preset voice: {e}"))?;
     let speaker = read_speaker_vector(&voice_path).map_err(|e| format!("speaker: {e}"))?;
-    Ok(Bench { model, bundle, speaker })
+    Ok(Bench { model, speaker })
 }
 
 fn render(
@@ -118,7 +121,10 @@ fn same_seed_and_inputs_are_byte_identical() {
             return;
         }
     };
-    assert_eq!(first.frames, second.frames, "frame counts diverge under identical inputs");
+    assert_eq!(
+        first.frames, second.frames,
+        "frame counts diverge under identical inputs"
+    );
     assert_eq!(first.pcm.len(), second.pcm.len(), "sample counts diverge");
     let divergent = first
         .pcm
@@ -133,7 +139,11 @@ fn same_seed_and_inputs_are_byte_identical() {
     Receipt::new(TEST, Outcome::Passed)
         .contract(CONTRACT)
         .seam("metamorphic.determinism")
-        .reason(format!("seed {SEED_A} twice → {} frames, pcm sha {}", first.frames, pcm_sha256(&first.pcm)))
+        .reason(format!(
+            "seed {SEED_A} twice → {} frames, pcm sha {}",
+            first.frames,
+            pcm_sha256(&first.pcm)
+        ))
         .emit();
 }
 
@@ -163,7 +173,10 @@ fn different_seed_changes_the_rendering() {
     };
     let identical_len = a.frames == b.frames && a.pcm.len() == b.pcm.len();
     let identical_bits = identical_len
-        && a.pcm.iter().zip(&b.pcm).all(|(x, y)| x.to_bits() == y.to_bits());
+        && a.pcm
+            .iter()
+            .zip(&b.pcm)
+            .all(|(x, y)| x.to_bits() == y.to_bits());
     assert!(
         !identical_bits,
         "seeds {SEED_A} and {SEED_B} produced identical audio: the sampler consumed no \
@@ -204,7 +217,9 @@ fn packet_schedule_does_not_change_delivered_samples() {
 
     let mut rendered: Vec<(usize, Vec<f32>)> = Vec::new();
     for packet_frames in [1_usize, 4, 7] {
-        let mut sink = CollectingSink { samples: Vec::new() };
+        let mut sink = CollectingSink {
+            samples: Vec::new(),
+        };
         let audio = match render(&bench, SEED_A, packet_frames, Some(&mut sink)) {
             Ok(audio) => audio,
             Err(reason) => {
@@ -259,7 +274,10 @@ fn reference_route_pcm_matches_golden_hash() {
     };
     let speaker = fixture_speaker(&fixtures);
     let Some(speaker) = speaker else {
-        skip(TEST, "captured speaker embedding absent from the fixture pack");
+        skip(
+            TEST,
+            "captured speaker embedding absent from the fixture pack",
+        );
         return;
     };
     let bundle_root =
@@ -334,7 +352,10 @@ fn reference_route_pcm_matches_golden_hash() {
         Receipt::new(TEST, Outcome::Passed)
             .contract(CONTRACT)
             .seam("metamorphic.golden")
-            .reason(format!("golden rewritten: frames {}, sha {hash}", audio.frames))
+            .reason(format!(
+                "golden rewritten: frames {}, sha {hash}",
+                audio.frames
+            ))
             .emit();
         return;
     }
@@ -359,8 +380,7 @@ fn reference_route_pcm_matches_golden_hash() {
     };
     let stored = golden["pcm_f32_bits_sha256"].as_str().unwrap_or("");
     assert_eq!(
-        stored,
-        hash,
+        stored, hash,
         "reference-route PCM drifted from the pinned golden.\n  golden: {stored}\n  actual:  \
          {hash}\nIf this drift is INTENDED (an accepted numeric change), re-pin with review: \
          UPDATE_GOLDENS=1 cargo test -p ftts-conformance --test metamorphic_invariants\nIf it \

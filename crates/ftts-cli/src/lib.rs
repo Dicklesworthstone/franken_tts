@@ -403,6 +403,64 @@ struct MakeVideoArgs {
 }
 
 #[derive(Debug, clap::Args)]
+/// How enrollment chooses its conditioning path (bead frankentts-p4-enrollment-en6).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum EnrollMode {
+    /// Transcript-backed ICL: verified transcript + codec-encoder tokens land in the pack.
+    Quality,
+    /// x-vector embedding only; upstream documents possible quality reduction and this CLI
+    /// says so in the enrollment output.
+    Quick,
+    /// QUALITY when a transcript is supplied and verifies, else QUICK with a loud warning.
+    #[default]
+    Auto,
+}
+
+impl EnrollMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quality => "quality",
+            Self::Quick => "quick",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// The mode enrollment actually ran, decided from [`EnrollMode`] plus what the input allows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedEnrollMode {
+    Quality,
+    Quick {
+        /// Why QUICK was chosen despite an AUTO/QUALITY request — printed loudly.
+        reason: String,
+    },
+}
+
+/// Pure mode resolution so the fallback policy is unit-testable without audio or models.
+///
+/// QUALITY demands a transcript; AUTO degrades to QUICK (loudly) without one; an explicit
+/// QUICK never silently upgrades.
+fn resolve_enroll_mode(requested: EnrollMode, transcript: Option<&str>) -> ResolvedEnrollMode {
+    let verified = transcript.is_some_and(|text| !text.trim().is_empty());
+    match requested {
+        EnrollMode::Quality if verified => ResolvedEnrollMode::Quality,
+        EnrollMode::Quality => ResolvedEnrollMode::Quick {
+            reason: "--mode quality needs --transcript-text/--transcript-file; enrolled \
+                     x-vector only"
+                .to_owned(),
+        },
+        EnrollMode::Auto if verified => ResolvedEnrollMode::Quality,
+        EnrollMode::Auto => ResolvedEnrollMode::Quick {
+            reason: "no transcript supplied; AUTO fell back to QUICK (x-vector only)"
+                .to_owned(),
+        },
+        EnrollMode::Quick => ResolvedEnrollMode::Quick {
+            reason: "--mode quick enrolls the x-vector only".to_owned(),
+        },
+    }
+}
+
+#[derive(Debug, clap::Args)]
 struct EnrollArgs {
     /// Reference audio: WAV/FLAC decode natively; m4a/mp3/aac/ogg/opus route through the first
     /// system decoder found (afconvert on macOS, ffmpeg).
@@ -460,6 +518,27 @@ struct EnrollArgs {
     /// Enroll the recording exactly as given, with no noise cleanup.
     #[arg(long, overrides_with = "denoise")]
     no_denoise: bool,
+    /// Conditioning path: quality (transcript-backed ICL), quick (x-vector only), or auto
+    /// (quality when a usable transcript is supplied, else quick with a loud warning).
+    /// The modes are NOT interchangeable equals: continuation-style cloning reproduces
+    /// prompt-recording defects, so the quick path says what it skipped.
+    #[arg(long, value_enum, default_value_t = EnrollMode::Auto)]
+    mode: EnrollMode,
+
+    /// Reference transcript text, verbatim (quality path / AUTO input). The ICL prompt
+    /// conditions on exactly these words, so they must match the recording word for word.
+    #[arg(long, conflicts_with = "transcript_file", value_name = "TEXT")]
+    transcript_text: Option<String>,
+
+    /// Read the reference transcript from a UTF-8 file (one alternative to --transcript-text).
+    #[arg(long, value_name = "PATH")]
+    transcript_file: Option<PathBuf>,
+
+    /// Affirm recording consent non-interactively; interactive runs are asked instead. The
+    /// answer — yes or no — is recorded in the pack either way, because a pack that cannot
+    /// state its own consent status is worse than one that states `false`.
+    #[arg(long)]
+    consent_attest: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1585,7 +1664,10 @@ fn run_make_video(
         let enrolled_default = resolve_model(args.model.as_deref(), environment)
             .ok()
             .and_then(|model| synth::ModelBundle::resolve(Path::new(&model)).ok())
-            .is_some_and(|bundle| bundle.root.join("default.spk").is_file());
+            let root = synth::ModelBundle::resolve(Path::new(&model)).ok().map(|bundle| bundle.root);
+            let enrolled_default = root.is_some_and(|root| {
+                root.join("default.ftvoice").is_file() || root.join("default.spk").is_file()
+            });
         if enrolled_default {
             "My voice".to_owned()
         } else {
@@ -1885,8 +1967,11 @@ fn run_say_events(
     emit_stage(run, emit, "load", "begin", &mut seq)?;
     let bundle = synth::ModelBundle::resolve(Path::new(&model))?;
     let voice_path = match voice.as_deref().map(PathBuf::from).or_else(|| {
-        let candidate = bundle.root.join("default.spk");
-        candidate.is_file().then_some(candidate)
+        // Packs outrank raw vectors when both exist; a pack is what modern enrollment writes.
+        ["default.ftvoice", "default.spk"]
+            .iter()
+            .map(|name| bundle.root.join(name))
+            .find(|candidate| candidate.is_file())
     }) {
         Some(path) => path,
         // Out-of-box: no --voice, no FTTS_DEFAULT_VOICE, no enrollment — speak with the built-in
@@ -2735,14 +2820,12 @@ fn run_enroll(
     environment: &Environment,
     stdout: &mut dyn Write,
 ) -> Result<(), FttsError> {
-    // Reserved (see the flag's help): consumed here so the gate, when it ships with
-    // validated thresholds, changes behavior without changing the CLI surface.
-    let _ = args.force;
+    let started = std::time::Instant::now();
     let model = resolve_model(args.model.as_deref(), environment)?;
     let bundle = synth::ModelBundle::resolve(Path::new(&model))?;
     let output = match (&args.output, args.default) {
         (Some(path), false) => path.clone(),
-        (None, true) => bundle.root.join("default.spk"),
+        (None, true) => bundle.root.join("default.ftvoice"),
         (None, false) => {
             return Err(FttsError::Usage(
                 "`ftts enroll` needs -o PATH or --default; enrollment never overwrites a voice source"
@@ -2751,40 +2834,63 @@ fn run_enroll(
         }
         (Some(_), true) => unreachable!("clap enforces the conflict"),
     };
+
+    // Transcript source: inline text or a UTF-8 file. Read BEFORE any heavy work so a typo in
+    // the path fails fast rather than after a full decode + embed.
+    let transcript: Option<String> = match (&args.transcript_text, &args.transcript_file) {
+        (Some(text), _) => Some(text.clone()),
+        (None, Some(path)) => Some(std::fs::read_to_string(path).map_err(|error| {
+            FttsError::Input(format!("cannot read transcript {}: {error}", path.display()))
+        })?),
+        (None, None) => None,
+    };
+    let resolved = resolve_enroll_mode(args.mode, transcript.as_deref());
+
     let mut denoise_report = None;
     let mut dereverb_report = None;
-    // Denoise resolution: --no-denoise wins, --denoise forces (including the classic engine
-    // when the weights are absent), and the default is neural-when-pulled — never a silent
-    // fallback to a different engine than the one the default advertises.
     let denoise = if args.no_denoise {
         false
     } else {
         args.denoise || bundle.root.join(synth::DENOISE_ARTIFACT_RELPATH).is_file()
     };
-    // Signal-quality advisories (bead frankentts-p1-audio-diagnostics-8t9): state what
-    // was measured BEFORE the user hears the defect in their clone. Only audio sources
-    // carry a recording to judge; .spk vectors and voice cards skip by construction. The
-    // reverb figure comes from the same estimator the dereverb path reports.
-    if let Ok(reference_pcm) = synth::decode_reference_audio_any(Path::new(&args.reference_audio)) {
-        let dx = diagnostics::diagnose(
-            &reference_pcm,
-            synth::reverb_time_s(&reference_pcm).map(f64::from),
-        );
-        for warning in dx.warnings() {
-            style::warn(stdout, &warning)
-                .map_err(|error| FttsError::Generic(format!("cannot write warning: {error}")))?;
+
+    // Decode once. Diagnostics state what was measured BEFORE the user hears any defect in
+    // their clone; the usability gate refuses structurally unusable input (no speech at all)
+    // with exit 8 unless --force says otherwise.
+    let raw_pcm = synth::decode_reference_audio_any(Path::new(&args.reference_audio))?;
+    let dx = diagnostics::diagnose(&raw_pcm, synth::reverb_time_s(&raw_pcm).map(f64::from));
+    for warning in dx.warnings() {
+        style::warn(stdout, &warning)
+            .map_err(|error| FttsError::Generic(format!("cannot write warning: {error}")))?;
+    }
+    if let Some(reason) = unusable_reference_reason(&dx, raw_pcm.len()) {
+        if args.force {
+            style::warn(
+                stdout,
+                &format!("forcing enrollment of unusable reference: {reason}"),
+            )
+            .map_err(|error| FttsError::Generic(format!("cannot write warning: {error}")))?;
+        } else {
+            return Err(FttsError::EnrollmentQualityRefusal(format!(
+                "{reason}; pass --force to enroll it anyway"
+            )));
         }
     }
-    let speaker = synth::speaker_from_voice(
+
+    let source_bytes = std::fs::read(&args.reference_audio).map_err(|error| {
+        FttsError::Input(format!(
+            "cannot read reference {}: {error}",
+            args.reference_audio.display()
+        ))
+    })?;
+    let (speaker, cleaned_pcm) = synth::enroll_outputs_from_reference_pcm(
         &bundle,
-        &args.reference_audio,
+        raw_pcm,
         synth::ReferenceCleanup {
             denoise: denoise.then_some(&mut denoise_report),
             dereverb: args.dereverb.then_some(&mut dereverb_report),
         },
     )?;
-    // Same reporting discipline as the denoise below: state what was measured. A reference whose
-    // reverb time barely moves was not the problem, and a better recording beats more filtering.
     if let Some(report) = dereverb_report {
         style::ok(
             stdout,
@@ -2798,8 +2904,6 @@ fn run_enroll(
         )
         .map_err(|error| FttsError::Generic(format!("cannot write dereverb report: {error}")))?;
     }
-    // Report what the denoise measured rather than asserting it helped: a reference whose floor
-    // barely moves was not noisy, and the user should reach for a better recording instead.
     if let Some(report) = denoise_report {
         let moved = report.before_dbfs - report.after_dbfs;
         style::ok(
@@ -2815,10 +2919,111 @@ fn run_enroll(
         .map_err(|error| FttsError::Generic(format!("cannot write denoise report: {error}")))?;
     }
 
-    // Enrollment is cheap to redo; the recording behind an existing voice may not still exist. So
-    // an occupied destination asks rather than refuses — but only when somebody is there to ask.
-    // A pipe, a CI job, or an agent gets the explicit error it can act on instead of a prompt that
-    // would hang forever, and says `--overwrite` when it means it.
+    // The fallback notice is LOUD on purpose: continuation-style cloners reproduce
+    // prompt-recording defects, and a quiet downgrade is how users end up with a worse
+    // clone than they thought they enrolled.
+    if let ResolvedEnrollMode::Quick { reason } = resolved {
+        style::warn(
+            stdout,
+            &format!("QUICK mode — x-vector only, no ICL conditioning ({reason})"),
+        )
+        .map_err(|error| FttsError::Generic(format!("cannot write warning: {error}")))?;
+    }
+
+    // Consent: affirmed via flag or interactively; either way the ANSWER is what the pack
+    // records. A silent default would make every pack lie by omission.
+    let consent_method = if args.consent_attest {
+        ftts_artifacts::voice::ConsentMethod::Flag
+    } else {
+        ftts_artifacts::voice::ConsentMethod::Interactive
+    };
+    let consent_attested = args.consent_attest
+        || match style::confirm(
+            stdout,
+            "Do you have the right to clone this voice? (recorded in the pack)",
+        )
+        .map_err(|error| FttsError::Generic(format!("cannot read a reply: {error}")))?
+        {
+            Some(reply) => reply,
+            None => false,
+        };
+    if !consent_attested {
+        style::warn(stdout, "pack will record consent: NOT ATTESTED")
+            .map_err(|error| FttsError::Generic(format!("cannot write warning: {error}")))?;
+    }
+
+    // QUALITY adds the ICL identity block: codec tokens cut from the SAME cleaned audio the
+    // embedding came from, so one pack conditions one voice, not two.
+    let (profile, codec_codes, pack_transcript) = match resolved {
+        ResolvedEnrollMode::Quality => {
+            let encoder = ftts_model_qwen::speech_encoder::SpeechEncoder::load(
+                &bundle.root.join("speech_tokenizer/model.safetensors"),
+            )
+            .map_err(|error| {
+                FttsError::Input(format!(
+                    "quality-mode enrollment needs the codec encoder \
+                     (speech_tokenizer/model.safetensors): {error}"
+                ))
+            })?;
+            let codes = encoder.encode_24khz_pcm(&cleaned_pcm).map_err(|error| {
+                FttsError::Input(format!("cannot encode reference to codec tokens: {error}"))
+            })?;
+            (
+                ftts_artifacts::voice::VoiceProfile::Portable,
+                Some(codes),
+                transcript,
+            )
+        }
+        ResolvedEnrollMode::Quick { .. } => {
+            (ftts_artifacts::voice::VoiceProfile::Private, None, None)
+        }
+    };
+
+    let speech_regions = crate::diagnostics::voice_activity_regions(&cleaned_pcm)
+        .into_iter()
+        .map(|(start, end)| (start as u64, end as u64))
+        .collect();
+    let pack = assemble_enrollment_pack(AssemblePackInput {
+        profile,
+        consent: ftts_artifacts::voice::ConsentAttestation {
+            attested: consent_attested,
+            method: consent_method,
+        },
+        transcript: pack_transcript,
+        speech_regions,
+        diagnostics: mirror_diagnostics(&dx),
+        preprocessing: ftts_artifacts::voice::PreprocessingRecipe {
+            target_sample_rate_hz: 24_000,
+            resampler: "lanczos6".to_owned(),
+            denoise: denoise_report.map(|report| ftts_artifacts::voice::CleanupRecord {
+                engine: if bundle.root.join(synth::DENOISE_ARTIFACT_RELPATH).is_file() && !args.no_denoise {
+                    "fastenhancer-s".to_owned()
+                } else {
+                    "omlsa".to_owned()
+                },
+                before: report.before_dbfs,
+                after: report.after_dbfs,
+            }),
+            dereverb: dereverb_report.map(|report| ftts_artifacts::voice::CleanupRecord {
+                engine: "spectral-dereverb".to_owned(),
+                before: report.before_rt60_s,
+                after: report.after_rt60_s,
+            }),
+        },
+        provenance: ftts_artifacts::voice::Provenance {
+            engine: format!("ftts {}", env!("CARGO_PKG_VERSION")),
+            source_audio_sha256: Some(ftts_artifacts::sha256::hex_digest(
+                &ftts_artifacts::sha256::digest(&source_bytes),
+            )),
+            source_frames: None,
+        },
+        embedding: speaker,
+        codec_codes,
+    });
+    let bytes = ftts_artifacts::voice::serialize_voice_pack(&pack)?;
+
+    // Occupied destination asks rather than refuses — but only when somebody is there to ask
+    // (same contract as the raw-vector writer always had).
     let backup = if output.exists() {
         let consented = if args.overwrite {
             true
@@ -2852,18 +3057,34 @@ fn run_enroll(
                 .map_err(|error| FttsError::Generic(format!("cannot write result: {error}")))?;
             return Ok(());
         }
-        Some(synth::replace_speaker_vector(&output, &speaker)?)
+        Some(replace_voice_pack(&output, &bytes)?)
     } else {
-        synth::write_speaker_vector_new(&output, &speaker)?;
+        write_voice_pack_new(&output, &bytes)?;
         None
     };
 
+    let elapsed_ms = started.elapsed().as_millis();
+    let detail = match &pack.codec_codes {
+        Some(codes) => format!(
+            "{} · {} · quality · {} codec frames · consent {} · {elapsed_ms} ms",
+            pack.profile.as_str(),
+            style::detail("ICL"),
+            codes.len(),
+            if pack.consent.attested { "attested" } else { "NOT ATTESTED" },
+        ),
+        None => format!(
+            "{} · quick · x-vector only · consent {} · {elapsed_ms} ms",
+            pack.profile.as_str(),
+            if pack.consent.attested { "attested" } else { "NOT ATTESTED" },
+        ),
+    };
     style::ok(
         stdout,
         &format!(
-            "enrolled {} → {}",
+            "enrolled {} → {} {}",
             style::emphasis(&args.reference_audio.display().to_string()),
             style::emphasis(&output.display().to_string()),
+            style::detail(&detail),
         ),
     )
     .map_err(|error| FttsError::Generic(format!("cannot write enrollment result: {error}")))?;
@@ -2888,6 +3109,103 @@ fn run_enroll(
         .map_err(|error| FttsError::Generic(format!("cannot write result: {error}")))?;
     }
     Ok(())
+}
+
+/// Structurally unusable references get exit 8, not a warning: there is no voice in this
+/// recording to enroll, and everything downstream of a silent pack is noise. Threshold-based
+/// quality refusals stay reserved until owner-validated listening thresholds exist.
+fn unusable_reference_reason(
+    dx: &crate::diagnostics::AudioDiagnostics,
+    pcm_len: usize,
+) -> Option<String> {
+    if pcm_len == 0 {
+        return Some("reference decoded to zero samples".to_owned());
+    }
+    if dx.voice_activity_ratio <= 0.0 {
+        return Some("no speech detected anywhere in the reference".to_owned());
+    }
+    None
+}
+
+fn mirror_diagnostics(
+    dx: &crate::diagnostics::AudioDiagnostics,
+) -> ftts_artifacts::voice::EnrollmentDiagnostics {
+    ftts_artifacts::voice::EnrollmentDiagnostics {
+        clipping_fraction: dx.clipping_fraction,
+        longest_clip_run: dx.longest_clip_run,
+        intersample_overshoot_db: dx.intersample_overshoot_db,
+        snr_estimate_db: dx.snr_estimate_db,
+        pause_floor_dbfs: dx.pause_floor_dbfs,
+        reverb_time_s: dx.reverb_time_s,
+        music_bed_likelihood: dx.music_bed_likelihood,
+        stationarity_drift: dx.stationarity_drift,
+        loudness_rms_dbfs: dx.loudness_rms_dbfs,
+        voice_activity_ratio: dx.voice_activity_ratio,
+    }
+}
+
+/// Everything `run_enroll` hands to pack construction; a named struct keeps the constructor
+/// callable from tests without audio fixtures or a model bundle.
+struct AssemblePackInput {
+    profile: ftts_artifacts::voice::VoiceProfile,
+    consent: ftts_artifacts::voice::ConsentAttestation,
+    transcript: Option<String>,
+    speech_regions: Vec<(u64, u64)>,
+    diagnostics: ftts_artifacts::voice::EnrollmentDiagnostics,
+    preprocessing: ftts_artifacts::voice::PreprocessingRecipe,
+    provenance: ftts_artifacts::voice::Provenance,
+    embedding: Vec<f32>,
+    codec_codes: Option<Vec<u32>>,
+}
+
+fn assemble_enrollment_pack(
+    input: AssemblePackInput,
+) -> ftts_artifacts::voice::VoicePack {
+    ftts_artifacts::voice::VoicePack {
+        profile: input.profile,
+        consent: input.consent,
+        language: None,
+        transcript: input.transcript,
+        speech_regions: input.speech_regions,
+        diagnostics: Some(input.diagnostics),
+        preprocessing: Some(input.preprocessing),
+        provenance: input.provenance,
+        embedding: input.embedding,
+        codec_codes: input.codec_codes,
+        reference_audio: None,
+        section_digests: Default::default(),
+    }
+}
+
+/// Writes a `.ftvoice` pack without replacing an existing file (staged temp + rename, so a
+/// crash cannot leave a half-written voice).
+fn write_voice_pack_new(path: &Path, bytes: &[u8]) -> Result<(), FttsError> {
+    let staged = path.with_extension("ftvoice.partial");
+    std::fs::write(&staged, bytes).map_err(|error| {
+        FttsError::Input(format!(
+            "cannot stage enrolled voice {}: {error}",
+            staged.display()
+        ))
+    })?;
+    std::fs::rename(&staged, path).map_err(|error| {
+        FttsError::Input(format!(
+            "cannot finalize enrolled voice {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Replaces an existing `.ftvoice`, keeping the displaced pack alongside it as `<path>.bak`.
+fn replace_voice_pack(path: &Path, bytes: &[u8]) -> Result<PathBuf, FttsError> {
+    let backup = path.with_extension("bak");
+    std::fs::copy(path, &backup).map_err(|error| {
+        FttsError::Input(format!(
+            "cannot back up displaced voice {}: {error}",
+            path.display()
+        ))
+    })?;
+    write_voice_pack_new(path, bytes)?;
+    Ok(backup)
 }
 
 /// One downloadable model file from the embedded manifest.

@@ -379,6 +379,22 @@ pub fn speaker_from_reference_pcm(
     pcm: Vec<f32>,
     cleanup: ReferenceCleanup<'_>,
 ) -> Result<Vec<f32>, FttsError> {
+    enroll_outputs_from_reference_pcm(bundle, pcm, cleanup).map(|(vector, _)| vector)
+}
+
+/// The enrollment half of [`speaker_from_reference_pcm`], also returning the CLEANED pcm the
+/// embedding was computed from. The ICL path (bead frankentts-p4-enrollment-en6) needs that same
+/// audio for codec-token extraction: conditioning tokens cut from a different signal than the
+/// embedding would enroll two slightly different voices in one pack.
+///
+/// # Errors
+///
+/// When feature extraction or encoding fails, or the encoder yields a non-finite vector.
+pub fn enroll_outputs_from_reference_pcm(
+    bundle: &ModelBundle,
+    pcm: Vec<f32>,
+    cleanup: ReferenceCleanup<'_>,
+) -> Result<(Vec<f32>, Vec<f32>), FttsError> {
     let ReferenceCleanup { denoise, dereverb } = cleanup;
     let pcm = match dereverb {
         Some(report) => {
@@ -419,7 +435,7 @@ pub fn speaker_from_reference_pcm(
     .map_err(checkpoint_error)?;
     let vector = encoder.encode(&mel.values, mel.frames);
     if vector.iter().all(|value| value.is_finite()) {
-        Ok(vector)
+        Ok((vector, pcm))
     } else {
         Err(FttsError::Input(
             "speaker encoder produced a non-finite x-vector; refusing to condition synthesis"
