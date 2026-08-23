@@ -381,6 +381,16 @@ too. This resolves the dependency note on `frankentts-oq15-oracle-pins-wjc` and 
 enrollment-build-only restriction on these rows: they may graduate to a kernel contract once the
 encoder port (snt) lands its roundtrip gate.
 
+**[LANDED 2026-08-23]** The encoder port shipped as `ftts-model-qwen/src/speech_encoder.rs` with a
+gate STRONGER than the roundtrip: `ftts-conformance/tests/speech_encoder_oracle.rs` compares our
+codes EXACTLY (944/944 ids, two synthetic corpora incl. a ceil-padding case) against a pinned
+CPU-fp32 reference capture (`scripts/capture_speech_encoder_oracle.py`). Two source findings the
+port added to this section's record: (a) with `use_causal_conv: true` every conv pads LEFT-only
+(`padding_total` left, ceil-to-frame extra right) — the asymmetric split described above is the
+dead non-causal branch; (b) the encoder transformer's sliding window 250 is INERT on the
+eager/SDPA oracle path (`create_causal_mask` never consults it; only flash attention applies it) —
+the exact contract is plain causal.
+
 ---
 
 ## 9. Dispositions and follow-ups

@@ -10,6 +10,7 @@ pub mod microdecoder;
 pub mod prompt;
 pub mod sampler;
 pub mod speaker;
+pub mod speech_encoder;
 pub mod talker;
 pub mod tokenizer;
 

@@ -143,7 +143,10 @@ fn deltas_are_fresh_spans_that_join_into_the_finalized_text() {
                 "transcript.delta" => {
                     let id = value["utterance_id"].as_str().expect("id");
                     let text = value["text"].as_str().expect("text");
-                    assert!(!text.is_empty(), "{scenario}:{line_number}: empty delta span");
+                    assert!(
+                        !text.is_empty(),
+                        "{scenario}:{line_number}: empty delta span"
+                    );
                     let accumulated = joined.entry(id.to_owned()).or_default();
                     if !accumulated.is_empty() {
                         assert!(
