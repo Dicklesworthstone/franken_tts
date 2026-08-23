@@ -139,7 +139,7 @@ fn music_bed(seconds: usize, seed: u64) -> Vec<f32> {
     let mut state = seed | 1;
     (0..len)
         .map(|index| {
-            let _ = state.fetch_add(index as u64 % 3);
+            let _ = index;
             let t = index as f32 / SAMPLE_RATE as f32;
             let tremolo = 0.85 + 0.15 * (2.0 * std::f32::consts::PI * 0.3 * t).sin();
             let a = (2.0 * std::f32::consts::PI * 220.0 * t).sin();
