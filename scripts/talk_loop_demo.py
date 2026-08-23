@@ -398,7 +398,21 @@ def main():
                 else:
                     handle_fw_event(event, arrival)
         except KeyboardInterrupt:
-            log({"note": "interrupted; shutting the talk session down cleanly"})
+            # fw flushes the open utterance's decoded words on SIGINT (exit 130) — a
+            # terminal Ctrl-C reaches the whole process group, so that final text is
+            # already in flight. Capture it for the transcript; do NOT speak a reply.
+            log({"note": "interrupted; draining fw's final flush, then shutting down"})
+            drain_deadline = time.monotonic() + 2.0
+            while time.monotonic() < drain_deadline:
+                try:
+                    _, event = fw_events.get(timeout=0.2)
+                except queue.Empty:
+                    if fw_proc.poll() is not None:
+                        break
+                    continue
+                if event.get("event") == "utterance_end" and event.get("text"):
+                    transcript.append(("user (final, unanswered)", event["text"]))
+                    log({"note": "final flushed utterance captured", "text": event["text"]})
         finally:
             if fw_proc.poll() is None:
                 fw_proc.terminate()
