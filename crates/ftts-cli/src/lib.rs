@@ -82,7 +82,8 @@ const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
     ),
 ];
 
-/// The preset used when `--voice`, `FTTS_DEFAULT_VOICE`, and MODEL_DIR/default.spk are all
+/// The preset used when `--voice`, `FTTS_DEFAULT_VOICE`, and an enrolled default voice
+/// (MODEL_DIR/default.ftvoice or legacy default.spk) are all
 /// absent, so a fresh install speaks out of the box.
 const DEFAULT_PRESET_VOICE: &str = "matt";
 
@@ -325,7 +326,8 @@ struct SayArgs {
     /// Voice source: a .spk vector, a voice-card image (PNG/JPEG), reference
     /// audio, or a built-in voice name
     /// (matt, james, leo, robert, judy, aria, ember).
-    /// Default: MODEL_DIR/default.spk when enrolled, else the built-in "matt".
+    /// Default: the enrolled default voice (MODEL_DIR/default.ftvoice, else legacy
+    /// default.spk), else the built-in "matt".
     #[arg(long, value_name = "PATH|NAME")]
     voice: Option<PathBuf>,
 
@@ -402,7 +404,6 @@ struct MakeVideoArgs {
     no_resident: bool,
 }
 
-#[derive(Debug, clap::Args)]
 /// How enrollment chooses its conditioning path (bead frankentts-p4-enrollment-en6).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 enum EnrollMode {
@@ -416,18 +417,8 @@ enum EnrollMode {
     Auto,
 }
 
-impl EnrollMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Quality => "quality",
-            Self::Quick => "quick",
-            Self::Auto => "auto",
-        }
-    }
-}
-
 /// The mode enrollment actually ran, decided from [`EnrollMode`] plus what the input allows.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ResolvedEnrollMode {
     Quality,
     Quick {
@@ -451,8 +442,7 @@ fn resolve_enroll_mode(requested: EnrollMode, transcript: Option<&str>) -> Resol
         },
         EnrollMode::Auto if verified => ResolvedEnrollMode::Quality,
         EnrollMode::Auto => ResolvedEnrollMode::Quick {
-            reason: "no transcript supplied; AUTO fell back to QUICK (x-vector only)"
-                .to_owned(),
+            reason: "no transcript supplied; AUTO fell back to QUICK (x-vector only)".to_owned(),
         },
         EnrollMode::Quick => ResolvedEnrollMode::Quick {
             reason: "--mode quick enrolls the x-vector only".to_owned(),
@@ -475,7 +465,8 @@ struct EnrollArgs {
     #[arg(short = 'o', long, value_name = "PATH", conflicts_with = "default")]
     output: Option<PathBuf>,
 
-    /// Write MODEL_DIR/default.spk, which `ftts say` uses when `--voice` is absent.
+    /// Write MODEL_DIR/default.ftvoice — the enrolled default `ftts say` uses when
+    /// `--voice` is absent.
     #[arg(long, conflicts_with = "output")]
     default: bool,
 
@@ -1630,7 +1621,7 @@ fn run_make_video(
     // The voice pill needs a human name: an explicit --label wins, a preset
     // keeps its capitalized name, a custom voice shows its file stem. With
     // no voice given, the label follows the same default chain `say` uses
-    // (FTTS_DEFAULT_VOICE, then an enrolled default.spk, then built-in matt)
+    // (FTTS_DEFAULT_VOICE, then an enrolled default voice, then built-in matt)
     // rather than claiming "Matt" over someone's enrolled voice.
     let capitalize = |raw: &str| {
         let mut chars = raw.chars();
@@ -1664,9 +1655,9 @@ fn run_make_video(
         let enrolled_default = resolve_model(args.model.as_deref(), environment)
             .ok()
             .and_then(|model| synth::ModelBundle::resolve(Path::new(&model)).ok())
-            let root = synth::ModelBundle::resolve(Path::new(&model)).ok().map(|bundle| bundle.root);
-            let enrolled_default = root.is_some_and(|root| {
-                root.join("default.ftvoice").is_file() || root.join("default.spk").is_file()
+            .is_some_and(|bundle| {
+                bundle.root.join("default.ftvoice").is_file()
+                    || bundle.root.join("default.spk").is_file()
             });
         if enrolled_default {
             "My voice".to_owned()
@@ -2840,7 +2831,10 @@ fn run_enroll(
     let transcript: Option<String> = match (&args.transcript_text, &args.transcript_file) {
         (Some(text), _) => Some(text.clone()),
         (None, Some(path)) => Some(std::fs::read_to_string(path).map_err(|error| {
-            FttsError::Input(format!("cannot read transcript {}: {error}", path.display()))
+            FttsError::Input(format!(
+                "cannot read transcript {}: {error}",
+                path.display()
+            ))
         })?),
         (None, None) => None,
     };
@@ -2922,7 +2916,7 @@ fn run_enroll(
     // The fallback notice is LOUD on purpose: continuation-style cloners reproduce
     // prompt-recording defects, and a quiet downgrade is how users end up with a worse
     // clone than they thought they enrolled.
-    if let ResolvedEnrollMode::Quick { reason } = resolved {
+    if let ResolvedEnrollMode::Quick { reason } = &resolved {
         style::warn(
             stdout,
             &format!("QUICK mode — x-vector only, no ICL conditioning ({reason})"),
@@ -2938,15 +2932,12 @@ fn run_enroll(
         ftts_artifacts::voice::ConsentMethod::Interactive
     };
     let consent_attested = args.consent_attest
-        || match style::confirm(
+        || style::confirm(
             stdout,
             "Do you have the right to clone this voice? (recorded in the pack)",
         )
         .map_err(|error| FttsError::Generic(format!("cannot read a reply: {error}")))?
-        {
-            Some(reply) => reply,
-            None => false,
-        };
+        .unwrap_or_default();
     if !consent_attested {
         style::warn(stdout, "pack will record consent: NOT ATTESTED")
             .map_err(|error| FttsError::Generic(format!("cannot write warning: {error}")))?;
@@ -2996,18 +2987,20 @@ fn run_enroll(
             target_sample_rate_hz: 24_000,
             resampler: "lanczos6".to_owned(),
             denoise: denoise_report.map(|report| ftts_artifacts::voice::CleanupRecord {
-                engine: if bundle.root.join(synth::DENOISE_ARTIFACT_RELPATH).is_file() && !args.no_denoise {
+                engine: if bundle.root.join(synth::DENOISE_ARTIFACT_RELPATH).is_file()
+                    && !args.no_denoise
+                {
                     "fastenhancer-s".to_owned()
                 } else {
                     "omlsa".to_owned()
                 },
-                before: report.before_dbfs,
-                after: report.after_dbfs,
+                before: f64::from(report.before_dbfs),
+                after: f64::from(report.after_dbfs),
             }),
             dereverb: dereverb_report.map(|report| ftts_artifacts::voice::CleanupRecord {
                 engine: "spectral-dereverb".to_owned(),
-                before: report.before_rt60_s,
-                after: report.after_rt60_s,
+                before: f64::from(report.before_rt60_s),
+                after: f64::from(report.after_rt60_s),
             }),
         },
         provenance: ftts_artifacts::voice::Provenance {
@@ -3020,7 +3013,8 @@ fn run_enroll(
         embedding: speaker,
         codec_codes,
     });
-    let bytes = ftts_artifacts::voice::serialize_voice_pack(&pack)?;
+    let bytes = ftts_artifacts::voice::serialize_voice_pack(&pack)
+        .map_err(|error| FttsError::ArtifactFormat(error.to_string()))?;
 
     // Occupied destination asks rather than refuses — but only when somebody is there to ask
     // (same contract as the raw-vector writer always had).
@@ -3070,12 +3064,20 @@ fn run_enroll(
             pack.profile.as_str(),
             style::detail("ICL"),
             codes.len(),
-            if pack.consent.attested { "attested" } else { "NOT ATTESTED" },
+            if pack.consent.attested {
+                "attested"
+            } else {
+                "NOT ATTESTED"
+            },
         ),
         None => format!(
             "{} · quick · x-vector only · consent {} · {elapsed_ms} ms",
             pack.profile.as_str(),
-            if pack.consent.attested { "attested" } else { "NOT ATTESTED" },
+            if pack.consent.attested {
+                "attested"
+            } else {
+                "NOT ATTESTED"
+            },
         ),
     };
     style::ok(
@@ -3158,9 +3160,7 @@ struct AssemblePackInput {
     codec_codes: Option<Vec<u32>>,
 }
 
-fn assemble_enrollment_pack(
-    input: AssemblePackInput,
-) -> ftts_artifacts::voice::VoicePack {
+fn assemble_enrollment_pack(input: AssemblePackInput) -> ftts_artifacts::voice::VoicePack {
     ftts_artifacts::voice::VoicePack {
         profile: input.profile,
         consent: input.consent,
@@ -5419,5 +5419,142 @@ mod tests {
         let event: serde_json::Value =
             serde_json::from_str(text.lines().last().expect("line")).expect("json");
         assert_eq!(event["status"], "legacy_speaker_vector");
+    }
+
+    #[test]
+    fn enroll_mode_resolution_follows_the_documented_policy() {
+        use EnrollMode::*;
+        // QUALITY demands a transcript; without one it refuses to pretend.
+        assert_eq!(
+            resolve_enroll_mode(Quality, Some("Please call Stella.")),
+            ResolvedEnrollMode::Quality
+        );
+        let missing = resolve_enroll_mode(Quality, None);
+        assert!(matches!(missing, ResolvedEnrollMode::Quick { .. }));
+        // Blank transcripts are not transcripts.
+        assert!(matches!(
+            resolve_enroll_mode(Auto, Some("   ")),
+            ResolvedEnrollMode::Quick { .. }
+        ));
+        // AUTO degrades loudly; explicit QUICK never upgrades silently.
+        assert!(matches!(
+            resolve_enroll_mode(Auto, None),
+            ResolvedEnrollMode::Quick { .. }
+        ));
+        assert!(matches!(
+            resolve_enroll_mode(Quick, Some("words")),
+            ResolvedEnrollMode::Quick { .. }
+        ));
+        assert_eq!(
+            resolve_enroll_mode(Quality, Some("Please call Stella.")),
+            ResolvedEnrollMode::Quality
+        );
+    }
+
+    #[test]
+    fn unusable_references_name_their_reason() {
+        let silent = crate::diagnostics::AudioDiagnostics {
+            clipping_fraction: 0.0,
+            longest_clip_run: 0,
+            intersample_overshoot_db: 0.0,
+            snr_estimate_db: None,
+            pause_floor_dbfs: -120.0,
+            reverb_time_s: None,
+            music_bed_likelihood: 0.0,
+            stationarity_drift: 0.0,
+            loudness_rms_dbfs: -120.0,
+            voice_activity_ratio: 0.0,
+        };
+        let reason = unusable_reference_reason(&silent, 48_000).expect("silent is unusable");
+        assert!(reason.contains("no speech"), "{reason}");
+        assert!(unusable_reference_reason(&silent, 0).is_some());
+        let healthy = crate::diagnostics::AudioDiagnostics {
+            voice_activity_ratio: 0.8,
+            ..silent
+        };
+        assert!(unusable_reference_reason(&healthy, 48_000).is_none());
+    }
+
+    #[test]
+    fn quick_pack_roundtrips_and_quality_pack_carries_identity() {
+        let embedding: Vec<f32> = (0..1024).map(|i| i as f32 * 0.001).collect();
+        let dx = ftts_artifacts::voice::EnrollmentDiagnostics {
+            clipping_fraction: 0.0,
+            longest_clip_run: 0,
+            intersample_overshoot_db: 0.2,
+            snr_estimate_db: Some(30.0),
+            pause_floor_dbfs: -55.0,
+            reverb_time_s: Some(0.3),
+            music_bed_likelihood: 0.01,
+            stationarity_drift: 0.1,
+            loudness_rms_dbfs: -20.0,
+            voice_activity_ratio: 0.9,
+        };
+        let quick = assemble_enrollment_pack(AssemblePackInput {
+            profile: ftts_artifacts::voice::VoiceProfile::Private,
+            consent: ftts_artifacts::voice::ConsentAttestation {
+                attested: true,
+                method: ftts_artifacts::voice::ConsentMethod::Flag,
+            },
+            transcript: None,
+            speech_regions: vec![(0, 24_000)],
+            diagnostics: dx.clone(),
+            preprocessing: ftts_artifacts::voice::PreprocessingRecipe {
+                target_sample_rate_hz: 24_000,
+                resampler: "lanczos6".to_owned(),
+                denoise: None,
+                dereverb: None,
+            },
+            provenance: Default::default(),
+            embedding: embedding.clone(),
+            codec_codes: None,
+        });
+        assert_eq!(quick.profile.as_str(), "private");
+        let parsed = parse_pack_ok(&quick);
+        assert!(parsed.transcript.is_none());
+
+        let quality = assemble_enrollment_pack(AssemblePackInput {
+            profile: ftts_artifacts::voice::VoiceProfile::Portable,
+            transcript: Some("Please call Stella.".to_owned()),
+            codec_codes: Some(vec![3, 1, 4]),
+            ..AssemblePackInput {
+                profile: quick.profile,
+                consent: quick.consent,
+                transcript: None,
+                speech_regions: quick.speech_regions.clone(),
+                diagnostics: dx,
+                preprocessing: quick.preprocessing.clone().unwrap(),
+                provenance: Default::default(),
+                embedding,
+                codec_codes: None,
+            }
+        });
+        let parsed_q = parse_pack_ok(&quality);
+        assert_eq!(parsed_q.transcript.as_deref(), Some("Please call Stella."));
+        assert_eq!(parsed_q.codec_codes.as_deref(), Some(&[3u32, 1, 4][..]));
+        assert_eq!(parsed_q.profile.as_str(), "portable");
+    }
+
+    fn parse_pack_ok(pack: &ftts_artifacts::voice::VoicePack) -> ftts_artifacts::voice::VoicePack {
+        let bytes = ftts_artifacts::voice::serialize_voice_pack(pack)
+            .map_err(|e| e.to_string())
+            .expect("serialize");
+        ftts_artifacts::voice::parse_voice_pack(&bytes)
+            .map_err(|e| e.to_string())
+            .expect("parse")
+    }
+
+    #[test]
+    fn pack_writers_stage_and_back_up_like_the_vector_writers() {
+        let dir = std::env::temp_dir().join(format!("enroll-writer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("w.ftvoice");
+        write_voice_pack_new(&path, b"first").expect("first write");
+        let backup = replace_voice_pack(&path, b"second").expect("replace");
+        assert_eq!(backup, dir.join("w.bak"));
+        assert_eq!(std::fs::read(&backup).unwrap(), b"first");
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        // No partial staging files left behind.
+        assert!(!dir.join("w.ftvoice.partial").exists());
     }
 }
