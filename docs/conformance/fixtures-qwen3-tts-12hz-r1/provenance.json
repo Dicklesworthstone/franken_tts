@@ -1,0 +1,77 @@
+{
+  "attn_implementation": "eager",
+  "command": [
+    "repo/scripts/gen_reference_fixtures.py",
+    "--source-dir",
+    "/data/oracle/Qwen3-TTS",
+    "--model-dir",
+    "/data/oracle/model-5d839924",
+    "--corpus",
+    "/data/oracle/repo/docs/conformance/oracle_corpus.json",
+    "--output",
+    "/data/oracle/fixtures-qwen3-tts-12hz-r1"
+  ],
+  "corpus_sha256": "ae54f608fecdfe9dff8f8549c426c368c4c54e8107ccb317b59db6ff61916c46",
+  "device_provenance": {
+    "device_map": "cuda:0",
+    "parameter_devices": [
+      "cuda:0"
+    ],
+    "parameter_dtypes": [
+      "bfloat16"
+    ],
+    "requested_device": "cuda",
+    "torch_interop_threads": 64,
+    "torch_intraop_threads": 64,
+    "torch_version": "2.7.1+cu126",
+    "wrapper_device": "cuda:0"
+  },
+  "dtype": "bfloat16",
+  "generation": {
+    "algorithm": "canonical_greedy",
+    "max_new_tokens_override": null,
+    "max_new_tokens_source": "corpus_case",
+    "microdecoder": {
+      "do_sample": false,
+      "selection": "raw_argmax"
+    },
+    "talker": {
+      "do_sample": false,
+      "min_new_tokens": 2,
+      "repetition_penalty": 1.05,
+      "suppress_tokens": "2048..3071 except 2150",
+      "temperature": 1.0,
+      "top_k": 1,
+      "top_p": 1.0
+    }
+  },
+  "generation_config": {
+    "do_sample": true,
+    "max_new_tokens": 8192,
+    "repetition_penalty": 1.05,
+    "subtalker_dosample": true,
+    "subtalker_temperature": 0.9,
+    "subtalker_top_k": 50,
+    "subtalker_top_p": 1.0,
+    "temperature": 0.9,
+    "top_k": 50,
+    "top_p": 1.0
+  },
+  "oracle_class": "native_cuda",
+  "runtime": {
+    "accelerate": "1.12.0",
+    "librosa": "0.11.0",
+    "qwen-tts": "0.1.1",
+    "soundfile": "0.13.1",
+    "torch": "2.7.1",
+    "torchaudio": "2.7.1",
+    "transformers": "4.57.3"
+  },
+  "schema_version": 2,
+  "source_pin": "022e286b98fbec7e1e916cb940cdf532cd9f488e",
+  "weight_hashes": {
+    "model.safetensors": "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6",
+    "speech_tokenizer/model.safetensors": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258"
+  },
+  "weights_pin": "5d83992436eae1d760afd27aff78a71d676296fc"
+}

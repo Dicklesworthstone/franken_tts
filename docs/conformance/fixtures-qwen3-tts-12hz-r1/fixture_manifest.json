@@ -1,0 +1,31 @@
+{
+  "capture_device": "cuda:0",
+  "capture_dtype": "bfloat16",
+  "cases": [
+    {
+      "id": "synthetic-tone-en",
+      "modes": [
+        {
+          "manifest_sha256": "1f9a0c641c9031128e89f2ac8f528dbc3653dbd6dda3c7df4d99a17599c55a9a",
+          "mode": "xvector_non_streaming"
+        },
+        {
+          "manifest_sha256": "8ef019ba7f9725f7d8d43d2206964546656d264a014d26342acfa890d37fa46a",
+          "mode": "xvector_streaming"
+        },
+        {
+          "manifest_sha256": "8dd6a1d5ee9ac3f3a62aa1a2c6c936a11ab0d792d9964246a7aa8e9444bd0a8b",
+          "mode": "icl_non_streaming"
+        },
+        {
+          "manifest_sha256": "66fab7cde43cab3c43d78e3feeec0000b39c8f0207f30a3358cb59b7b988a279",
+          "mode": "icl_streaming"
+        }
+      ],
+      "reference_audio_sha256": "0e155bd9a90647119bf0d1e03755fefcbb61662fb9f42010479c9ba4b154f0a4"
+    }
+  ],
+  "oracle_class": "native_cuda",
+  "provenance_sha256": "a146a81081be5145d626c4e5982bbf6d6fa29058a2dab621d210bb205be803f3",
+  "schema_version": 2
+}
