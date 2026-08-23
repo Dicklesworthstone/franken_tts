@@ -51,8 +51,7 @@ bit-exact cross-device. The waveform-only divergence is conv-arithmetic selectio
 decoder's transposed convolutions on NVIDIA hardware; pointwise max-abs reached `9.3e-2` on
 near-zero-crossing samples of a 2-frame utterance, so the honest statement is *waveform-level
 pointwise equality does not hold cross-device* — waveform comparisons must use the spectral or
-envelope metric, never raw sample diff. Whether TF32 conv paths contributed is un-investigated;
-a follow-up capture with `torch.backends.cudnn.allow_tf32 = False` would separate algorithm
+envelope metric, never raw sample diff.
 
 **TF32 attribution settled (same session):** a third CUDA capture with
 `cudnn.allow_tf32 = False` and `cuda.matmul.allow_tf32 = False` reproduced the r1 capture
