@@ -157,10 +157,7 @@ pub enum CheckpointError {
         vocab: usize,
     },
     /// The ICL reference code stream is not a multiple of one frame (16 groups).
-    IclCodecFrameLength {
-        len: usize,
-        group_count: usize,
-    },
+    IclCodecFrameLength { len: usize, group_count: usize },
     /// A speaker vector was supplied at the wrong width.
     SpeakerWidth { expected: usize, actual: usize },
     /// The codec refused to decode.
@@ -1571,14 +1568,8 @@ impl TalkerCheckpoint {
         &self,
         codes: &[u16],
     ) -> Result<Vec<HiddenState>, CheckpointError> {
-        let residual: Vec<&[f32]> =
-            self.residual_embeddings.iter().map(Vec::as_slice).collect();
-        icl_reference_codec_frames(
-            &self.codec_embedding,
-            &residual,
-            codes,
-            TALKER_HIDDEN,
-        )
+        let residual: Vec<&[f32]> = self.residual_embeddings.iter().map(Vec::as_slice).collect();
+        icl_reference_codec_frames(&self.codec_embedding, &residual, codes, TALKER_HIDDEN)
     }
 
     /// The fifteen per-depth 2,048-way heads.
@@ -1715,7 +1706,6 @@ impl TalkerCheckpoint {
             tts_pad: self.project_text_id(table, TTS_PAD_TOKEN_ID),
         })
     }
-
 
     /// Build the ICL-mode prompt header: the same `H` composition the x-vector header builds
     /// (OQ-10 §1: identical across all four modes, `M:2126-2186`) minus the speaker slot —
@@ -2420,6 +2410,79 @@ impl CodecCheckpoint {
     }
 }
 
+/// Per-frame ICL reference-code embeddings: group 0 through the talker's 3,072-way table,
+/// groups 1..15 through the code predictor's per-depth tables, summed per OQ-10 §2
+/// (`M:1983-1998`). Free on purpose so tests can drive it with tiny tables.
+///
+/// # Errors
+///
+/// [`CheckpointError::IclCodecFrameLength`] for a partial frame;
+/// [`CheckpointError::IclCodecCode`] for out-of-vocab codes.
+pub fn icl_reference_codec_frames(
+    talker_codec: &[f32],
+    residual_tables: &[&[f32]],
+    codes: &[u16],
+    hidden: usize,
+) -> Result<Vec<HiddenState>, CheckpointError> {
+    if !codes.len().is_multiple_of(CODE_GROUP_COUNT) {
+        return Err(CheckpointError::IclCodecFrameLength {
+            len: codes.len(),
+            group_count: CODE_GROUP_COUNT,
+        });
+    }
+    if !talker_codec.len().is_multiple_of(PRIMARY_CODE_VOCAB_SIZE)
+        || talker_codec.len() / PRIMARY_CODE_VOCAB_SIZE != hidden
+    {
+        return Err(CheckpointError::TensorShape {
+            tensor: "talker_codec_embedding".to_owned(),
+            expected: PRIMARY_CODE_VOCAB_SIZE * hidden,
+            actual: talker_codec.len(),
+        });
+    }
+    if residual_tables.len() != CODE_GROUP_COUNT - 1 {
+        return Err(CheckpointError::TensorShape {
+            tensor: "residual embedding tables".to_owned(),
+            expected: (CODE_GROUP_COUNT - 1) * RESIDUAL_VOCAB * hidden,
+            actual: residual_tables.iter().map(|t| t.len()).sum(),
+        });
+    }
+    let mut frames = Vec::with_capacity(codes.len() / CODE_GROUP_COUNT);
+    for frame in codes.as_chunks::<CODE_GROUP_COUNT>().0 {
+        let c0 = usize::from(frame[0]);
+        if c0 >= PRIMARY_CODE_VOCAB_SIZE {
+            return Err(CheckpointError::IclCodecCode {
+                index: 0,
+                code: c0,
+                vocab: PRIMARY_CODE_VOCAB_SIZE,
+            });
+        }
+        let mut acc = talker_codec[c0 * hidden..(c0 + 1) * hidden].to_vec();
+        for (group, &code) in frame[1..].iter().enumerate() {
+            let code = usize::from(code);
+            if code >= RESIDUAL_VOCAB {
+                return Err(CheckpointError::IclCodecCode {
+                    index: group + 1,
+                    code,
+                    vocab: RESIDUAL_VOCAB,
+                });
+            }
+            let table = residual_tables[group];
+            if !table.len().is_multiple_of(RESIDUAL_VOCAB) || table.len() / RESIDUAL_VOCAB != hidden
+            {
+                return Err(CheckpointError::TensorShape {
+                    tensor: format!("residual_embedding[{group}]"),
+                    expected: RESIDUAL_VOCAB * hidden,
+                    actual: table.len(),
+                });
+            }
+            for (slot, value) in acc.iter_mut().enumerate() {
+                *value += table[code * hidden + slot];
+            }
+        }
+        frames.push(acc);
+    }
+    Ok(frames)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2761,68 +2824,4 @@ mod tests {
             vec![-0.5, 0.25, 31.75, 1.5, -2.0, 0.0]
         );
     }
-}
-
-
-/// Per-frame ICL reference-code embeddings: group 0 through the talker's 3,072-way table,
-/// groups 1..15 through the code predictor's per-depth tables, summed per OQ-10 §2
-/// (`M:1983-1998`). Free on purpose so tests can drive it with tiny tables.
-///
-/// # Errors
-///
-/// [`CheckpointError::IclCodecFrameLength`] for a partial frame;
-/// [`CheckpointError::IclCodecCode`] for out-of-vocab codes.
-pub fn icl_reference_codec_frames(
-    talker_codec: &[f32],
-    residual_tables: &[&[f32]],
-    codes: &[u16],
-    hidden: usize,
-) -> Result<Vec<HiddenState>, CheckpointError> {
-    if codes.len() % CODE_GROUP_COUNT != 0 {
-        return Err(CheckpointError::IclCodecFrameLength {
-            len: codes.len(),
-            group_count: CODE_GROUP_COUNT,
-        });
-    }
-    if talker_codec.len() % PRIMARY_CODE_VOCAB_SIZE != 0 || talker_codec.len() / PRIMARY_CODE_VOCAB_SIZE != hidden {
-        return Err(CheckpointError::TensorShape {
-            tensor: "talker_codec_embedding".to_owned(),
-            expected: PRIMARY_CODE_VOCAB_SIZE * hidden,
-            actual: talker_codec.len(),
-        });
-    }
-    if residual_tables.len() != CODE_GROUP_COUNT - 1 {
-        return Err(CheckpointError::TensorShape {
-            tensor: "residual embedding tables".to_owned(),
-            expected: (CODE_GROUP_COUNT - 1) * RESIDUAL_VOCAB * hidden,
-            actual: residual_tables.iter().map(|t| t.len()).sum(),
-        });
-    }
-    let mut frames = Vec::with_capacity(codes.len() / CODE_GROUP_COUNT);
-    for frame in codes.chunks_exact(CODE_GROUP_COUNT) {
-        let c0 = usize::from(frame[0]);
-        if c0 >= PRIMARY_CODE_VOCAB_SIZE {
-            return Err(CheckpointError::IclCodecCode { index: 0, code: c0, vocab: PRIMARY_CODE_VOCAB_SIZE });
-        }
-        let mut acc = talker_codec[c0 * hidden..(c0 + 1) * hidden].to_vec();
-        for (group, &code) in frame[1..].iter().enumerate() {
-            let code = usize::from(code);
-            if code >= RESIDUAL_VOCAB {
-                return Err(CheckpointError::IclCodecCode { index: group + 1, code, vocab: RESIDUAL_VOCAB });
-            }
-            let table = residual_tables[group];
-            if table.len() % RESIDUAL_VOCAB != 0 || table.len() / RESIDUAL_VOCAB != hidden {
-                return Err(CheckpointError::TensorShape {
-                    tensor: format!("residual_embedding[{group}]"),
-                    expected: RESIDUAL_VOCAB * hidden,
-                    actual: table.len(),
-                });
-            }
-            for (slot, value) in acc.iter_mut().enumerate() {
-                *value += table[code * hidden + slot];
-            }
-        }
-        frames.push(acc);
-    }
-    Ok(frames)
 }
