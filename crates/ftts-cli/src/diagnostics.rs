@@ -140,7 +140,7 @@ pub fn clipping_diagnostics(pcm: &[f32]) -> (f64, usize, f64) {
             continue;
         }
         for step in 1..4 {
-            let t = f32::from(step) / 4.0;
+            let t = step as f32 / 4.0;
             // Catmull-Rom through (a, b, c, d) evaluated between b and c.
             let interpolated = 0.5
                 * ((2.0 * c)
@@ -204,7 +204,7 @@ pub fn music_bed_likelihood(pcm: &[f32]) -> f64 {
     if pcm.len() < FFT_LEN * 2 {
         return 0.0;
     }
-    let planner = FftPlanner::<f32>::new();
+    let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(FFT_LEN);
     let hann: Vec<f32> = (0..FFT_LEN)
         .map(|index| {
