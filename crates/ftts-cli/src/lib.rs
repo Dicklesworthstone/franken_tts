@@ -3,6 +3,7 @@
 //! Shared, stateless command-line dispatch for both FrankenTTS binaries.
 
 pub(crate) mod card;
+pub mod diagnostics;
 mod error;
 pub mod resident;
 pub mod robot;
