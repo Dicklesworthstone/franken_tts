@@ -939,13 +939,19 @@ pub struct MicroQuantRoute<'a> {
     pub mode: QuantLinearMode,
 }
 
-/// Candidates recomputed exactly in f32 after int8 head scoring.
+/// How many candidates the refined scoring window keeps, per scored position.
 ///
-/// The production sampler draws from the top 50; 96 leaves a wide margin for int8 rank noise
-/// around the cut, so the true f32 top-50 lands inside the refined set in practice (a corpus
-/// diagnostic, not a per-frame guarantee — this route only arms with the optimized product
-/// path, never under a reference pin).
-const HEAD_REFINE_CANDIDATES: usize = 96;
+/// The production sampler draws from its own top [`crate::sampler::TOP_K`] of the FULL
+/// logit row; anything outside this window is `-inf` and unpickable. The compile-time
+/// assertion below welds the two together: raising the sampler's k past this window is a
+/// build error, not silent vocabulary starvation (bead frankentts-0ged).
+pub const HEAD_REFINE_CANDIDATES: usize = 96;
+
+const _: () = assert!(
+    crate::sampler::TOP_K <= HEAD_REFINE_CANDIDATES,
+    "the sampler's top-k must fit inside the head-refine window, or refined positions \
+     become unpickable",
+);
 
 /// Scores one residual head via the int8 kernel, then rebuilds an exact-f32 logit row for
 /// the top candidates.

@@ -22,7 +22,7 @@ pub const MICRODECODER_MAX_NEW_TOKENS: usize = 15;
 
 const REPETITION_PENALTY: f32 = 1.05;
 const TEMPERATURE: f32 = 0.9;
-const TOP_K: usize = 50;
+pub const TOP_K: usize = 50;
 
 /// Selects either the Contract-A canonical decoder or the production distribution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
