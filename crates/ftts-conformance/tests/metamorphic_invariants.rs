@@ -51,10 +51,16 @@ struct Bench {
 fn bench() -> Result<Bench, String> {
     let bundle_root =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/truth-pack/snapshots/hf");
-    let bundle = ModelBundle::resolve(&bundle_root).map_err(|e| format!("bundle: {e}"))?;
+    let bundle = {
+        eprintln!("[pq-diag] resolving bundle");
+        ModelBundle::resolve(&bundle_root).map_err(|e| format!("bundle: {e}"))?
+    };
+    eprintln!("[pq-diag] loading model");
     let model = LoadedModel::load(&bundle).map_err(|e| format!("checkpoint: {e}"))?;
+    eprintln!("[pq-diag] model loaded");
     let voice_path = preset_voice_path(VOICE).map_err(|e| format!("preset voice: {e}"))?;
     let speaker = read_speaker_vector(&voice_path).map_err(|e| format!("speaker: {e}"))?;
+    eprintln!("[pq-diag] speaker ready");
     Ok(Bench { model, speaker })
 }
 
@@ -64,27 +70,44 @@ fn render(
     packet_frames: usize,
     sink: Option<&mut dyn PcmPacketSink>,
 ) -> Result<SynthesizedAudio, String> {
+    eprintln!("[pq-diag] constructing engine");
     let engine = TtsEngine::new(ftts_core::EngineConfig {
         synthesis_stage_budget: std::time::Duration::from_secs(3_600),
         admission: ftts_core::admission::AdmissionPolicy {
-            max_new_tokens: FRAME_CAP,
             ..ftts_core::admission::AdmissionPolicy::default()
         },
         ..ftts_core::EngineConfig::default()
     })
     .map_err(|e| format!("engine: {e}"))?;
-    synthesize(
-        &bench.model,
-        &engine,
-        &SynthesisRequest::new(TEXT),
-        &bench.speaker,
-        seed,
-        &CancellationToken::new(),
-        &|_event: ftts_core::SynthesisEvent| {},
-        packet_frames,
-        None,
-        sink,
-    )
+    // Debug builds recurse through deeply-inlined kernel dispatch and overflow
+    // libtest's 2 MiB test-thread stack mid-synthesis; run the call on a fat scoped
+    // thread so the test passes regardless of how it was launched.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                eprintln!("[pq-diag] synthesis thread entered");
+                let outcome = synthesize(
+                    &bench.model,
+                    &engine,
+                    &SynthesisRequest::new(TEXT),
+                    &ftts_cli::synth::VoiceConditioning::XVector(bench.speaker.clone()),
+                    seed,
+                    &CancellationToken::new(),
+                    &|event: ftts_core::SynthesisEvent| {
+                        eprintln!("[pq-diag] event: {:?}", std::mem::discriminant(&event));
+                    },
+                    packet_frames,
+                    None,
+                    sink,
+                );
+                eprintln!("[pq-diag] synthesis returned");
+                outcome
+            })
+            .expect("spawn synthesis thread")
+            .join()
+            .expect("synthesis thread panicked")
+    })
     .map_err(|e| format!("synthesis: {e}"))
 }
 
@@ -96,9 +119,26 @@ fn pcm_sha256(pcm: &[f32]) -> String {
     }
     format!("{:x}", hasher.finalize())
 }
-
+/// Runs a synthesis-backed test body on a 64 MiB stack.
+///
+/// Debug builds recurse through deeply-inlined kernel dispatch AND model hydration;
+/// both can blow libtest's 2 MiB default test-thread stack non-deterministically (the
+/// startup autotuner picks different tiers under memory pressure), so the ENTIRE body
+/// runs on the fat thread rather than only the synthesize call.
+fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn big-stack test thread")
+        .join()
+        .expect("test body panicked")
+}
 #[test]
 fn same_seed_and_inputs_are_byte_identical() {
+    with_big_stack(same_seed_and_inputs_are_byte_identical_body)
+}
+
+fn same_seed_and_inputs_are_byte_identical_body() {
     const TEST: &str = "metamorphic_same_seed_is_byte_identical";
     let bench = match bench() {
         Ok(bench) => bench,
@@ -149,6 +189,10 @@ fn same_seed_and_inputs_are_byte_identical() {
 
 #[test]
 fn different_seed_changes_the_rendering() {
+    with_big_stack(different_seed_changes_the_rendering_body)
+}
+
+fn different_seed_changes_the_rendering_body() {
     const TEST: &str = "metamorphic_different_seed_varies_output";
     let bench = match bench() {
         Ok(bench) => bench,
@@ -206,6 +250,10 @@ impl PcmPacketSink for CollectingSink {
 
 #[test]
 fn packet_schedule_does_not_change_delivered_samples() {
+    with_big_stack(packet_schedule_does_not_change_delivered_samples_body)
+}
+
+fn packet_schedule_does_not_change_delivered_samples_body() {
     const TEST: &str = "metamorphic_packet_schedule_content_invariance";
     let bench = match bench() {
         Ok(bench) => bench,
@@ -261,6 +309,10 @@ fn packet_schedule_does_not_change_delivered_samples() {
 /// human diff review. CI never updates; a mismatch fails with the exact command.
 #[test]
 fn reference_route_pcm_matches_golden_hash() {
+    with_big_stack(reference_route_pcm_matches_golden_hash_body)
+}
+
+fn reference_route_pcm_matches_golden_hash_body() {
     const TEST: &str = "metamorphic_reference_route_golden_pcm";
     ftts_conformance::pin_reference_route();
 
@@ -310,18 +362,29 @@ fn reference_route_pcm_matches_golden_hash() {
             return;
         }
     };
-    let audio = match synthesize(
-        &model,
-        &engine,
-        &SynthesisRequest::new(TEXT),
-        &speaker,
-        0,
-        &CancellationToken::new(),
-        &|_event: ftts_core::SynthesisEvent| {},
-        4,
-        None,
-        None,
-    ) {
+    // Same debug-stack rationale as render(): the f32 reference route is the deepest
+    // call chain in the codebase, so it gets the fat thread explicitly.
+    let audio = match std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                synthesize(
+                    &model,
+                    &engine,
+                    &SynthesisRequest::new(TEXT),
+                    &ftts_cli::synth::VoiceConditioning::XVector(speaker.clone()),
+                    0,
+                    &CancellationToken::new(),
+                    &|_event: ftts_core::SynthesisEvent| {},
+                    4,
+                    None,
+                    None,
+                )
+            })
+            .expect("spawn golden synthesis thread")
+            .join()
+            .expect("golden synthesis thread panicked")
+    }) {
         Ok(audio) => audio,
         Err(reason) => {
             skip(TEST, &format!("synthesis: {reason}"));
