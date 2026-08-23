@@ -338,7 +338,7 @@ fn file_mode_sigint_leaves_a_valid_partial_wav_and_exits_promptly() {
     let out = dir.join("partial.wav");
     let stdout_path = dir.join("events.ndjson");
     let stderr_path = dir.join("noise.txt");
-    let mut child = spawn_to_files(
+    let child = spawn_to_files(
         &[
             "say",
             "--no-resident",
@@ -408,7 +408,7 @@ fn prefill_phase_sigint_pins_the_zero_sample_artifact() {
     let out = dir.join("prefill.wav");
     let stdout_path = dir.join("events.ndjson");
     let stderr_path = dir.join("noise.txt");
-    let mut child = spawn_to_files(
+    let child = spawn_to_files(
         &[
             "say",
             "--no-resident",
@@ -463,7 +463,7 @@ fn raw_mode_sigint_stops_at_a_packet_boundary_with_exact_accounting() {
     let dir = scratch_dir("raw-mode");
     let pcm_path = dir.join("stream.pcm");
     let events_path = dir.join("events.ndjson");
-    let mut child = spawn_to_files(
+    let child = spawn_to_files(
         &["say", "--no-resident", "--stream", "raw", LONG_TEXT],
         &[],
         &pcm_path,
@@ -528,7 +528,7 @@ fn compressed_target_cancel_skips_the_encoder_and_keeps_the_staging_wav() {
     let out = dir.join("cancelled.m4a");
     let stdout_path = dir.join("events.ndjson");
     let stderr_path = dir.join("noise.txt");
-    let mut child = spawn_to_files(
+    let child = spawn_to_files(
         &[
             "say",
             "--no-resident",
@@ -613,6 +613,17 @@ fn resident_client_cancel_discards_and_the_daemon_survives() {
     );
     let warm_ms = started.elapsed().as_millis();
     assert_eq!(warm.code().unwrap_or(-1), 0, "warmup run must succeed");
+    let daemon_pid = |label: &str| -> u64 {
+        std::fs::read_dir(&dir)
+            .expect("resident dir exists")
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("resident-"))
+            .and_then(|entry| std::fs::read_to_string(entry.path()).ok())
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|value| value.get("pid").and_then(|v| v.as_u64()))
+            .unwrap_or_else(|| panic!("state file with pid missing after {label}"))
+    };
+    let pid_after_warm = daemon_pid("warmup");
 
     // B: long run, cancelled WHILE THE DAEMON SYNTHESIZES. On the v1 wire the client
     // sees no events until the whole blob arrives (the post-synthesis packetizer
@@ -625,7 +636,7 @@ fn resident_client_cancel_discards_and_the_daemon_survives() {
     let long_out = dir.join("never.wav");
     let stdout_path = dir.join("b-events.ndjson");
     let stderr_path = dir.join("b-noise.txt");
-    let mut child = spawn_to_files(
+    let child = spawn_to_files(
         &["say", LONG_TEXT, long_out.to_str().expect("utf8")],
         &resident_env,
         &stdout_path,
@@ -662,8 +673,11 @@ fn resident_client_cancel_discards_and_the_daemon_survives() {
         "terminal event must carry the discard disposition: {message}"
     );
 
-    // C: the daemon must have survived B and serve warm — strictly faster than the
-    // cold A run, which paid the spawn and the model load.
+    // C: the daemon must have survived B and serve warm. Survival is a PID fact,
+    // not a speed fact: the daemon that served the warmup must be the one serving
+    // after the cancelled request. A wall-clock ratio flaked on a loaded machine
+    // (warm measured in a load dip, hot in a spike); timing stays in the receipt as
+    // measurement, never as a gate.
     let hot_out = dir.join("hot.wav");
     let started = Instant::now();
     let hot = ftts_cli_run(
@@ -676,9 +690,10 @@ fn resident_client_cancel_discards_and_the_daemon_survives() {
     );
     let hot_ms = started.elapsed().as_millis();
     assert_eq!(hot.code().unwrap_or(-1), 0, "post-cancel run must succeed");
-    assert!(
-        hot_ms * 2 < warm_ms,
-        "post-cancel serve ({hot_ms} ms) must be a WARM hit versus cold start ({warm_ms} ms)"
+    let pid_after_cancel = daemon_pid("post-cancel serve");
+    assert_eq!(
+        pid_after_warm, pid_after_cancel,
+        "the daemon must survive a client cancel and keep serving"
     );
     eprintln!(
         "receipt: {{\"test\":\"resident_cancel\",\"outcome\":\"passed\",\"cold_ms\":{warm_ms},\"client_cancel_to_exit_ms\":{},\"warm_serve_ms\":{hot_ms}}}",
