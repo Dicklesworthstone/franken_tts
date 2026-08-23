@@ -2016,6 +2016,38 @@ impl CodecStreamingState {
         self.final_conv.clear();
     }
 
+    /// Prime this state with an ICL reference's codec codes, discarding their waveform.
+    ///
+    /// The official ICL path (`INF:612-631`, spec §5.3) PREPENDS the reference codes to the
+    /// generated codes, decodes the concatenation as one sequence, and cuts the leading
+    /// `round(ref_len / total_len * wav_len)` samples in the waveform domain. On this decoder the
+    /// proportional rule collapses to exactness (§5.3's derived paragraph): every frame emits
+    /// exactly 1,920 samples with full-context causal state, so `wav_len == total_len * 1920` and
+    /// the cut is `ref_len * 1920` — precisely the samples this method decodes and drops. Pushing
+    /// the generated frames afterwards therefore produces the official ICL waveform, bit for bit,
+    /// with no concatenation buffer and no post-hoc trim.
+    ///
+    /// The primed state is the `.ftvoice-cache` seam: [`CodecStreamingState`] is `Clone`, so a
+    /// caller may prime once per voice, keep the clone, and start every utterance from it —
+    /// skipping the reference re-decode that would otherwise sit inside TTFA.
+    ///
+    /// Returns the number of reference samples discarded (`frames * 1920`).
+    ///
+    /// # Errors
+    ///
+    /// As [`CodecStreamingState::push`], on an invalid code id.
+    pub fn prime_reference(
+        &mut self,
+        quantizer: SplitResidualVectorQuantizer<'_>,
+        weights: &CodecDecoderWeights<'_>,
+        codes: &[i32],
+        frames: usize,
+    ) -> Result<usize, CodecError> {
+        let mut discarded = Vec::new();
+        self.push(quantizer, weights, codes, frames, &mut discarded)?;
+        Ok(discarded.len())
+    }
+
     /// Decode a nonempty packet of `frames` code rows and write its finalized PCM to `output`.
     pub fn push(
         &mut self,
