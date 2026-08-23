@@ -136,7 +136,7 @@ fn say_pipeline_writes_audible_wav() {
         &model,
         &engine,
         &request,
-        &speaker,
+        &ftts_cli::synth::VoiceConditioning::XVector(speaker.clone()),
         0,
         &cancellation,
         &observer,

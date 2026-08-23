@@ -1499,7 +1499,10 @@ impl TalkerCheckpoint {
     /// Every text id one utterance can reach: the wrapped target plus the TTS specials.
     #[must_use]
     pub fn utterance_text_ids(wrapped_target: &[u32]) -> Vec<u32> {
-        Self::utterance_text_ids_with_reference(wrapped_target, &[])
+        let mut ids = wrapped_target.to_vec();
+        ids.extend([TTS_PAD_TOKEN_ID, TTS_BOS_TOKEN_ID, TTS_EOS_TOKEN_ID]);
+        ids.extend(ROLE_PREFIX_IDS);
+        ids
     }
 
     /// [`Self::utterance_text_ids`] plus an ICL reference transcript's INNER token ids
