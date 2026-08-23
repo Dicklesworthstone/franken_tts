@@ -1574,7 +1574,7 @@ impl TalkerCheckpoint {
         let residual: Vec<&[f32]> =
             self.residual_embeddings.iter().map(Vec::as_slice).collect();
         icl_reference_codec_frames(
-            &self.talker_codec_embedding,
+            &self.codec_embedding,
             &residual,
             codes,
             TALKER_HIDDEN,
