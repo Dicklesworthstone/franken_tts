@@ -500,8 +500,7 @@ fn robot_run_content_matches_its_scrubbed_golden() {
         scrubbed.len() >= 5,
         "a say run emits at least run_start, stages, chunks and run_complete"
     );
-    let first: serde_json::Value =
-        serde_json::from_str(&scrubbed[0]).expect("first event parses");
+    let first: serde_json::Value = serde_json::from_str(&scrubbed[0]).expect("first event parses");
     assert_eq!(
         first["event"], "run_start",
         "the stream must open with run_start"
