@@ -332,6 +332,113 @@ pub fn duration_per_word_ms(samples: usize, sample_rate: u32, words: usize) -> O
     )
 }
 
+/// Prosody contour of one utterance, from frame-wise fundamental-frequency estimates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PitchContour {
+    /// Median voiced f0 in Hz.
+    pub median_f0_hz: f64,
+    /// 12·log2(p95 / p5) over voiced frames — the utterance's pitch excursion.
+    pub range_semitones: Option<f64>,
+    /// `median(late third) − median(early third)` of voiced f0, in semitones — the
+    /// pitch analog of [`DriftStats::decline_db`]; strongly negative is a sagging tail.
+    pub late_early_drift_semitones: Option<f64>,
+    /// Voiced frames over analyzed frames — how much of the utterance carried pitch.
+    pub voicing_ratio: f64,
+}
+
+/// Estimates the pitch contour by normalized autocorrelation per 40 ms window, 13.3 ms
+/// hop, lag range 60–400 Hz.
+///
+/// A frame counts as voiced when its autocorrelation clarity exceeds 0.5 and its RMS
+/// clears `silence_floor` linear amplitude; unvoiced frames are skipped, not zeroed.
+#[must_use]
+pub fn pitch_contour(pcm: &[f32], sample_rate: u32, silence_floor: f64) -> Option<PitchContour> {
+    if sample_rate == 0 || pcm.is_empty() {
+        return None;
+    }
+    let rate = f64::from(sample_rate);
+    let window = (rate * 0.04).round() as usize; // two periods at the low end
+    let hop = (rate / 75.0).round() as usize; // ~13.3 ms
+    let min_lag = (rate / 400.0).floor() as usize;
+    let max_lag = (rate / 60.0).ceil() as usize;
+    if pcm.len() < window + max_lag {
+        return None;
+    }
+
+    let mut voiced_f0: Vec<f64> = Vec::new();
+    let mut frame_index = 0_usize;
+    while frame_index * hop + window <= pcm.len() {
+        let frame = &pcm[frame_index * hop..frame_index * hop + window];
+        let mean: f64 = frame.iter().map(|&s| f64::from(s)).sum::<f64>() / frame.len() as f64;
+        let centered: Vec<f64> = frame.iter().map(|&s| f64::from(s) - mean).collect();
+        let energy: f64 = centered.iter().map(|s| s * s).sum();
+        let rms = (energy / frame.len() as f64).sqrt();
+        if rms >= silence_floor && energy > 0.0 {
+            // Normalized autocorrelation over the lag search range; the denominator
+            // shortens with lag so long lags are not structurally penalized.
+            let mut best_clarity = 0.0;
+            let mut best_lag = 0_usize;
+            for lag in min_lag..=max_lag.min(window - 1) {
+                let mut dot = 0.0;
+                let mut tail_energy = 0.0;
+                for index in 0..window - lag {
+                    dot += centered[index] * centered[index + lag];
+                    tail_energy += centered[index + lag] * centered[index + lag];
+                }
+                if tail_energy == 0.0 {
+                    continue;
+                }
+                let clarity = dot / tail_energy.sqrt();
+                if clarity > best_clarity {
+                    best_clarity = clarity;
+                    best_lag = lag;
+                }
+            }
+            if best_clarity > 0.5 && best_lag > 0 {
+                voiced_f0.push(rate / f64::from(best_lag as u32));
+            }
+        }
+        frame_index += 1;
+    }
+
+    if voiced_f0.is_empty() {
+        return None;
+    }
+    let mut sorted = voiced_f0.clone();
+    sorted.sort_by(f64::total_cmp);
+    let median = |values: &[f64]| -> f64 {
+        let mid = values.len() / 2;
+        if values.len().is_multiple_of(2) {
+            (values[mid - 1] + values[mid]) / 2.0
+        } else {
+            values[mid]
+        }
+    };
+    let percentile = |values: &[f64], fraction: f64| -> f64 {
+        let index = ((values.len() - 1) as f64 * fraction)
+            .round()
+            .clamp(0.0, (values.len() - 1) as f64);
+        values[index as usize]
+    };
+    let p5 = percentile(&sorted, 0.05);
+    let p95 = percentile(&sorted, 0.95);
+    let third = sorted.len() / 3;
+    let drift = if third > 0 && sorted.len() >= 3 {
+        let early = median(&sorted[..third]);
+        let late = median(&sorted[sorted.len() - third..]);
+        Some(12.0 * (late / early).log2())
+    } else {
+        None
+    };
+    Some(PitchContour {
+        median_f0_hz: median(&sorted),
+        range_semitones: Some(12.0 * (p95 / p5).log2()),
+        late_early_drift_semitones: drift,
+        voicing_ratio: f64::from(u32::try_from(voiced_f0.len()).unwrap_or(u32::MAX))
+            / f64::from(u32::try_from(frame_index).unwrap_or(1)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +610,58 @@ mod tests {
             250.0
         ));
         assert_eq!(duration_per_word_ms(24_000, 24_000, 0), None);
+    }
+
+    fn sine(f0_hz: f64, seconds: f64, rate: u32, amplitude: f32) -> Vec<f32> {
+        let count = (rate as f64 * seconds) as usize;
+        (0..count)
+            .map(|n| {
+                amplitude
+                    * (2.0 * std::f64::consts::PI * f0_hz * n as f64 / f64::from(rate)).sin() as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pitch_contour_tracks_a_pure_tone() {
+        let contour = pitch_contour(&sine(200.0, 1.5, 24_000, 0.4), 24_000, 0.01).expect("voiced");
+        assert!(
+            (contour.median_f0_hz - 200.0).abs() < 4.0,
+            "200 Hz tone must land within one lag step: {}",
+            contour.median_f0_hz
+        );
+        assert!(
+            contour.voicing_ratio > 0.9,
+            "a pure tone is voiced throughout"
+        );
+        assert!(
+            contour.range_semitones.expect("range") < 2.0,
+            "constant pitch has negligible excursion"
+        );
+    }
+
+    #[test]
+    fn pitch_contour_refuses_silence() {
+        let silence = vec![0.0_f32; 48_000];
+        assert!(pitch_contour(&silence, 24_000, 0.01).is_none());
+    }
+
+    #[test]
+    fn pitch_contour_measures_a_pitch_step_in_semitones() {
+        let mut pcm = sine(150.0, 0.75, 24_000, 0.4);
+        pcm.extend(sine(300.0, 0.75, 24_000, 0.4));
+        let contour = pitch_contour(&pcm, 24_000, 0.01).expect("voiced");
+        let drift = contour
+            .late_early_drift_semitones
+            .expect("two thirds of frames exist");
+        assert!(
+            (drift - 12.0).abs() < 1.0,
+            "150→300 Hz is exactly +12 semitones: {drift}"
+        );
+    }
+
+    #[test]
+    fn pitch_contour_needs_enough_audio() {
+        assert!(pitch_contour(&sine(200.0, 0.01, 24_000, 0.4), 24_000, 0.01).is_none());
     }
 }

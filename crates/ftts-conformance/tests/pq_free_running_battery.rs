@@ -37,8 +37,8 @@ use ftts_cli::synth::{
     speaker_from_reference_pcm, synthesize,
 };
 use ftts_conformance::production::{
-    DriftStats, WordEditStats, duration_per_word_ms, immediate_repetitions, longform_drift,
-    normalize_words, word_edit_stats,
+    DriftStats, PitchContour, WordEditStats, duration_per_word_ms, immediate_repetitions,
+    longform_drift, normalize_words, pitch_contour, word_edit_stats,
 };
 use ftts_conformance::report::{Outcome, Receipt};
 use ftts_core::audio::{SAMPLE_RATE_HZ, SAMPLES_PER_FRAME, WavWriter};
@@ -142,6 +142,9 @@ fn transcribe(fw: &Path, wav: &Path) -> Result<String, String> {
         .args(["transcribe", "--input"])
         .arg(wav)
         .arg("--json")
+        // fw keeps its SQLite state in the process working directory; pin that to the
+        // system temp dir so runs never scatter state dirs into the checkout.
+        .current_dir(std::env::temp_dir())
         .output()
         .map_err(|error| format!("cannot spawn {}: {error}", fw.display()))?;
     if !output.status.success() {
@@ -211,6 +214,7 @@ struct Rendered {
     audio: SynthesizedAudio,
     hit_cap: bool,
     drift: Option<DriftStats>,
+    prosody: Option<PitchContour>,
     ms_per_word: Option<f64>,
     identity_cosine: Option<f64>,
     wav_path: PathBuf,
@@ -317,6 +321,7 @@ fn production_quality_free_running_objective_battery() {
         };
 
         let drift = longform_drift(&audio.pcm, SAMPLES_PER_FRAME);
+        let prosody = pitch_contour(&audio.pcm, SAMPLE_RATE_HZ, 0.01);
         let ms_per_word = duration_per_word_ms(
             audio.pcm.len(),
             SAMPLE_RATE_HZ,
@@ -349,6 +354,7 @@ fn production_quality_free_running_objective_battery() {
             axis: case.axis,
             hit_cap: audio.frames >= cap,
             drift,
+            prosody,
             ms_per_word,
             identity_cosine,
             audio,
@@ -438,14 +444,22 @@ fn production_quality_free_running_objective_battery() {
             .contract(CONTRACT)
             .seam(format!("production.free_running.{}", item.name))
             .reason(format!(
-                "{} [{}]: {} frames (cap-hit: {}), {:.1} ms/word, drift {:?}, identity cosine {}, wer {:?}",
+                "{} [{}]: {} frames (cap-hit: {}), {:.1} ms/word, drift {:?}, median f0 {}, \
+                 pitch range {}, identity cosine {}, wer {:?}",
                 item.name,
                 item.axis,
                 item.audio.frames,
                 item.hit_cap,
                 item.ms_per_word.unwrap_or(f64::NAN),
                 item.drift.map(|drift| drift.decline_db),
-                item.identity_cosine.map_or("-".to_owned(), |value| format!("{value:.4}")),
+                item.prosody
+                    .map(|p| format!("{:.0} Hz", p.median_f0_hz))
+                    .unwrap_or_else(|| "-".to_owned()),
+                item.prosody
+                    .and_then(|p| p.range_semitones)
+                    .map_or("-".to_owned(), |value| format!("{value:.1} st")),
+                item.identity_cosine
+                    .map_or("-".to_owned(), |value| format!("{value:.4}")),
                 words.and_then(|words| words.wer),
             ))
             .detail(serde_json::json!({
@@ -458,6 +472,12 @@ fn production_quality_free_running_objective_battery() {
                     "decline_db": drift.decline_db,
                 })),
                 "ms_per_word": item.ms_per_word,
+                "prosody": item.prosody.map(|p| serde_json::json!({
+                    "median_f0_hz": p.median_f0_hz,
+                    "range_semitones": p.range_semitones,
+                    "late_early_drift_semitones": p.late_early_drift_semitones,
+                    "voicing_ratio": p.voicing_ratio,
+                })),
                 "identity_cosine": item.identity_cosine,
                 "word_stats": words.and_then(|words| words.stats).map(|stats| serde_json::json!({
                     "distance": stats.distance,
@@ -537,6 +557,10 @@ fn write_scorecard(rendered: &[Rendered], scored: &[ScoredWords], mean_identity:
                 "hit_cap": item.hit_cap,
                 "drift_decline_db": item.drift.map(|drift| drift.decline_db),
                 "ms_per_word": item.ms_per_word,
+                "median_f0_hz": item.prosody.map(|p| p.median_f0_hz),
+                "pitch_range_semitones": item.prosody.and_then(|p| p.range_semitones),
+                "pitch_drift_semitones": item.prosody.and_then(|p| p.late_early_drift_semitones),
+                "voicing_ratio": item.prosody.map(|p| p.voicing_ratio),
                 "identity_cosine": item.identity_cosine,
                 "wer": scored.iter().find(|scored| scored.case_index == index).and_then(|scored| scored.wer),
                 "skipped_words": scored.iter().find(|scored| scored.case_index == index).and_then(|scored| scored.stats).map(|stats| stats.deletions),
