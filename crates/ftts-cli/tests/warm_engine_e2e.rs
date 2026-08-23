@@ -303,3 +303,58 @@ sunlight strikes raindrops in the air, they act as a prism and form a rainbow.";
         );
     }
 }
+
+/// Metamorphic invariant (frankentts-v-metamorphic-0wq #2): the packet size is a delivery
+/// dial, not an arithmetic one. The same text and seed decoded one frame at a time must be
+/// bit-identical to the same stream decoded in four-frame packets — codec state is carried
+/// across `stream_push` calls, so a packet boundary that leaked into the arithmetic would show
+/// up here as divergent samples rather than as a failed accounting assert.
+#[test]
+fn packet_one_equals_packet_four_bit_for_bit() {
+    const TEXT: &str = "Please call Stella. Ask her to bring these things with her.";
+    let Some(root) = model_dir() else {
+        eprintln!("SKIP: no complete model directory");
+        return;
+    };
+    let Some(speaker) = default_speaker(&root) else {
+        eprintln!("SKIP: no default.spk speaker vector beside the model");
+        return;
+    };
+    let bundle = ModelBundle::resolve(&root).expect("bundle resolves");
+    let model = LoadedModel::load(&bundle).expect("model loads");
+    let engine = TtsEngine::from_process_environment().expect("engine starts");
+    let cancellation = CancellationToken::new();
+    let observer = |event: SynthesisEvent| {
+        let _ = event;
+    };
+
+    let mut by_packet: Vec<(usize, Vec<u32>)> = Vec::new();
+    for packet_frames in [1usize, 4] {
+        let audio = synth::synthesize(
+            &model,
+            &engine,
+            &SynthesisRequest::new(TEXT),
+            &speaker,
+            0x5EED_0002,
+            &cancellation,
+            &observer,
+            packet_frames,
+            None,
+            None,
+        )
+        .expect("utterance synthesizes");
+        by_packet.push((
+            audio.frames as usize,
+            audio.pcm.iter().map(|value| value.to_bits()).collect(),
+        ));
+    }
+
+    let (frames_one, pcm_one) = (&by_packet[0].0, &by_packet[0].1);
+    let (frames_four, pcm_four) = (&by_packet[1].0, &by_packet[1].1);
+    assert_eq!(frames_one, frames_four, "packet size changed the frame count");
+    assert_eq!(
+        pcm_one, pcm_four,
+        "packet size changed the samples: streaming arithmetic depends on the \
+         packet boundary, which breaks the streaming==batch contract"
+    );
+}
