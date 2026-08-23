@@ -322,6 +322,144 @@ pub unsafe extern "C" fn ftts_synthesize(
     })
 }
 
+/// One decoded packet callback, C-shaped. See the header's contract comment.
+pub type FttsPacketFn = unsafe extern "C" fn(
+    ctx: *mut std::ffi::c_void,
+    samples: *const f32,
+    len: usize,
+    frame_index: u64,
+) -> i32;
+
+/// The distinct status for a callback-requested cancellation (mirrors the CLI's
+/// exit-code-6 semantics).
+pub const FTTS_SYNTH_CANCELLED: i32 = 6;
+
+/// Bridges the engine's packet sink onto the C callback: f32 end to end (the engine's
+/// native output and AVAudioEngine's native input — an s16 ABI would force a pointless
+/// f32->s16->f32 round trip on the phone; s16 is the CLI raw-stdout pipe contract, a
+/// different reader). A nonzero callback return cancels via the token, so the engine
+/// stops at its next frame checkpoint and the run reports Cancelled rather than error.
+struct CallbackSink {
+    on_packet: FttsPacketFn,
+    ctx: *mut std::ffi::c_void,
+    cancellation: CancellationToken,
+    frames_delivered: u64,
+    cancelled_by_callback: bool,
+}
+
+// SAFETY: the sink crosses onto the engine's decode thread — exactly what the header
+// contract promises the caller ("on_packet receives each packet ON THE ENGINE'S DECODE
+// THREAD"): `on_packet` and `ctx` must therefore be safe to invoke from that thread,
+// which is the caller's obligation, stated in the header. The struct's own fields
+// carry no Rust-side aliasing: the pointers are only passed back to C.
+#[allow(unsafe_code)]
+unsafe impl Send for CallbackSink {}
+
+impl ftts_cli::synth::PcmPacketSink for CallbackSink {
+    fn deliver(&mut self, samples: &[f32], frames: usize) -> Result<(), ftts_cli::FttsError> {
+        // SAFETY: `on_packet` and `ctx` are the caller's pair per the header contract;
+        // the samples pointer/len describe this packet's slice, valid for the call.
+        #[allow(unsafe_code)]
+        let verdict = unsafe {
+            (self.on_packet)(
+                self.ctx,
+                samples.as_ptr(),
+                samples.len(),
+                self.frames_delivered,
+            )
+        };
+        self.frames_delivered += frames as u64;
+        if verdict != 0 {
+            self.cancelled_by_callback = true;
+            self.cancellation.cancel();
+            // Not an error: the engine notices the token at the next frame boundary and
+            // winds down as a cancellation; erroring here would misreport the outcome.
+        }
+        Ok(())
+    }
+}
+
+/// Streaming synthesis: each decoded packet reaches `on_packet` the moment it exists.
+/// 0 on success; [`FTTS_SYNTH_CANCELLED`] when the callback cancelled; other nonzero on
+/// failure with [`ftts_last_error_message`] set.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+/// # Safety
+/// As [`ftts_synthesize`], plus: `on_packet` must be a valid function pointer following
+/// the header's contract (prompt return, no unwinding, samples copied out), and `ctx`
+/// must be whatever that callback expects.
+pub unsafe extern "C" fn ftts_synthesize_streaming(
+    engine: *mut FttsEngine,
+    text: *const c_char,
+    speaker: *const f32,
+    speaker_len: usize,
+    seed: u64,
+    packet_frames: usize,
+    on_packet: FttsPacketFn,
+    ctx: *mut std::ffi::c_void,
+) -> i32 {
+    guarded(1, || {
+        if engine.is_null() || text.is_null() || speaker.is_null() {
+            set_error("null pointer to ftts_synthesize_streaming");
+            return 1;
+        }
+        if speaker_len != SPEAKER_WIDTH {
+            set_error(format!(
+                "speaker vector must be {SPEAKER_WIDTH} floats, got {speaker_len}"
+            ));
+            return 1;
+        }
+        if packet_frames == 0 {
+            set_error("packet_frames must be at least 1");
+            return 1;
+        }
+        // SAFETY: as ftts_synthesize — unique engine borrow under the caller's
+        // serialization; NUL-terminated text; speaker_len floats behind speaker.
+        #[allow(unsafe_code)]
+        let (engine, text, speaker) = unsafe {
+            (
+                &mut *engine,
+                CStr::from_ptr(text),
+                std::slice::from_raw_parts(speaker, speaker_len),
+            )
+        };
+        let Ok(text) = text.to_str() else {
+            set_error("text is not UTF-8");
+            return 1;
+        };
+        let request = SynthesisRequest::new(text.to_owned());
+        let cancellation = CancellationToken::new();
+        let observer = |_event: ftts_core::SynthesisEvent| {};
+        let mut sink = CallbackSink {
+            on_packet,
+            ctx,
+            cancellation: cancellation.clone(),
+            frames_delivered: 0,
+            cancelled_by_callback: false,
+        };
+        let result = synthesize(
+            &engine.loaded,
+            &engine.engine,
+            &request,
+            speaker,
+            seed,
+            &cancellation,
+            &observer,
+            packet_frames,
+            None,
+            Some(&mut sink),
+        );
+        match result {
+            Ok(_) => 0,
+            Err(_) if sink.cancelled_by_callback => FTTS_SYNTH_CANCELLED,
+            Err(error) => {
+                set_error(error.to_string());
+                1
+            }
+        }
+    })
+}
+
 /// Releases a PCM buffer from [`ftts_synthesize`]. `len` must be the returned length.
 #[allow(unsafe_code)] // audited export, part of the C ABI surface
 #[unsafe(no_mangle)]
