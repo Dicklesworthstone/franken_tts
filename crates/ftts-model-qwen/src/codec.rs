@@ -2606,7 +2606,6 @@ mod tests {
             .expect("reset codec stream");
         assert_eq!(packet, waveform);
     }
-}
 
     #[test]
     fn int8_codec_route_decision_matrix() {
