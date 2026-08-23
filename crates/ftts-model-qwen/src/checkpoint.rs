@@ -44,6 +44,7 @@ use crate::microdecoder::{
     ResidualEmbeddings,
 };
 use crate::prompt::{HiddenState, PromptHeader, ROLE_PREFIX_IDS};
+use crate::talker::PRIMARY_CODE_VOCAB_SIZE;
 use crate::talker::{TalkerLayerWeights, TalkerWeights};
 use ftts_artifacts::{
     fttsq::{MappedFttsq, StoredDtype},
@@ -148,6 +149,18 @@ pub enum CheckpointError {
         tensor: String,
         detail: String,
     },
+    /// An ICL reference codec code is outside its group's vocabulary, or the code slice is
+    /// not a whole number of 16-group frames.
+    IclCodecCode {
+        index: usize,
+        code: usize,
+        vocab: usize,
+    },
+    /// The ICL reference code stream is not a multiple of one frame (16 groups).
+    IclCodecFrameLength {
+        len: usize,
+        group_count: usize,
+    },
     /// A speaker vector was supplied at the wrong width.
     SpeakerWidth { expected: usize, actual: usize },
     /// The codec refused to decode.
@@ -194,6 +207,15 @@ impl fmt::Display for CheckpointError {
                 formatter,
                 "canonical artifact {} cannot hydrate tensor `{tensor}`: {detail}",
                 path.display()
+            ),
+            Self::IclCodecCode { index, code, vocab } => write!(
+                formatter,
+                "reference codec code[{index}] = {code} is outside this group's vocab of {vocab}"
+            ),
+            Self::IclCodecFrameLength { len, group_count } => write!(
+                formatter,
+                "reference codec stream length {len} is not a multiple of one frame \
+                 ({group_count} groups)"
             ),
             Self::SpeakerWidth { expected, actual } => write!(
                 formatter,
@@ -1534,6 +1556,31 @@ impl TalkerCheckpoint {
         self.residual_embeddings.iter().map(Vec::as_slice).collect()
     }
 
+    /// Per-frame reference-code embeddings for the ICL codec stream (bead frankentts-6hdc).
+    ///
+    /// OQ-10 §2, quoting the pinned source `M:1983-1998`: each 80 ms frame is ONE vector —
+    /// group 0 embedded by the talker's 3,072-way table, groups 1..15 by the code predictor's
+    /// fifteen per-depth 2,048-way tables, summed. The same operation as decode-time feedback,
+    /// which is why one helper serves both.
+    ///
+    /// # Errors
+    ///
+    /// [`CheckpointError::IclCodecFrameLength`] / [`CheckpointError::IclCodecCode`]:
+    /// a partial frame or any out-of-vocab code is refused, never clamped.
+    pub fn icl_reference_codec_frames(
+        &self,
+        codes: &[u16],
+    ) -> Result<Vec<HiddenState>, CheckpointError> {
+        let residual: Vec<&[f32]> =
+            self.residual_embeddings.iter().map(Vec::as_slice).collect();
+        icl_reference_codec_frames(
+            &self.talker_codec_embedding,
+            &residual,
+            codes,
+            TALKER_HIDDEN,
+        )
+    }
+
     /// The fifteen per-depth 2,048-way heads.
     #[must_use]
     pub fn microdecoder_head_slices(&self) -> Vec<&[f32]> {
@@ -1669,6 +1716,36 @@ impl TalkerCheckpoint {
         })
     }
 
+
+    /// Build the ICL-mode prompt header: the same `H` composition the x-vector header builds
+    /// (OQ-10 §1: identical across all four modes, `M:2126-2186`) minus the speaker slot —
+    /// ICL conditioning carries no speaker embedding — and holding `codec_bos` BACK, because
+    /// ICL's codec stream starts with it instead ([`crate::prompt`] documents the split).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::xvector_header`]'s width checks on the shared slots.
+    pub fn icl_header(
+        &self,
+        table: &TextEmbeddingTable,
+        language_id: usize,
+    ) -> Result<PromptHeader, CheckpointError> {
+        Ok(PromptHeader {
+            role: ROLE_PREFIX_IDS
+                .iter()
+                .map(|id| self.project_text_id(table, *id))
+                .collect(),
+            codec_prefill: vec![
+                self.codec_row(CODEC_THINK_ID),
+                self.codec_row(CODEC_THINK_BOS_ID),
+                self.codec_row(language_id),
+                self.codec_row(CODEC_THINK_EOS_ID),
+                self.codec_row(CODEC_PAD_ID),
+            ],
+            tts_bos: self.project_text_id(table, TTS_BOS_TOKEN_ID),
+            tts_pad: self.project_text_id(table, TTS_PAD_TOKEN_ID),
+        })
+    }
     /// Cold rows for continuation appends: the same gather the utterance setup uses,
     /// exposed through the generator's [`crate::generate::ColdTextRows`] seam so text
     /// appended mid-utterance can reach ids outside the initial gather.
@@ -2684,4 +2761,68 @@ mod tests {
             vec![-0.5, 0.25, 31.75, 1.5, -2.0, 0.0]
         );
     }
+}
+
+
+/// Per-frame ICL reference-code embeddings: group 0 through the talker's 3,072-way table,
+/// groups 1..15 through the code predictor's per-depth tables, summed per OQ-10 §2
+/// (`M:1983-1998`). Free on purpose so tests can drive it with tiny tables.
+///
+/// # Errors
+///
+/// [`CheckpointError::IclCodecFrameLength`] for a partial frame;
+/// [`CheckpointError::IclCodecCode`] for out-of-vocab codes.
+pub fn icl_reference_codec_frames(
+    talker_codec: &[f32],
+    residual_tables: &[&[f32]],
+    codes: &[u16],
+    hidden: usize,
+) -> Result<Vec<HiddenState>, CheckpointError> {
+    if codes.len() % CODE_GROUP_COUNT != 0 {
+        return Err(CheckpointError::IclCodecFrameLength {
+            len: codes.len(),
+            group_count: CODE_GROUP_COUNT,
+        });
+    }
+    if talker_codec.len() % PRIMARY_CODE_VOCAB_SIZE != 0 || talker_codec.len() / PRIMARY_CODE_VOCAB_SIZE != hidden {
+        return Err(CheckpointError::TensorShape {
+            tensor: "talker_codec_embedding".to_owned(),
+            expected: PRIMARY_CODE_VOCAB_SIZE * hidden,
+            actual: talker_codec.len(),
+        });
+    }
+    if residual_tables.len() != CODE_GROUP_COUNT - 1 {
+        return Err(CheckpointError::TensorShape {
+            tensor: "residual embedding tables".to_owned(),
+            expected: (CODE_GROUP_COUNT - 1) * RESIDUAL_VOCAB * hidden,
+            actual: residual_tables.iter().map(|t| t.len()).sum(),
+        });
+    }
+    let mut frames = Vec::with_capacity(codes.len() / CODE_GROUP_COUNT);
+    for frame in codes.chunks_exact(CODE_GROUP_COUNT) {
+        let c0 = usize::from(frame[0]);
+        if c0 >= PRIMARY_CODE_VOCAB_SIZE {
+            return Err(CheckpointError::IclCodecCode { index: 0, code: c0, vocab: PRIMARY_CODE_VOCAB_SIZE });
+        }
+        let mut acc = talker_codec[c0 * hidden..(c0 + 1) * hidden].to_vec();
+        for (group, &code) in frame[1..].iter().enumerate() {
+            let code = usize::from(code);
+            if code >= RESIDUAL_VOCAB {
+                return Err(CheckpointError::IclCodecCode { index: group + 1, code, vocab: RESIDUAL_VOCAB });
+            }
+            let table = residual_tables[group];
+            if table.len() % RESIDUAL_VOCAB != 0 || table.len() / RESIDUAL_VOCAB != hidden {
+                return Err(CheckpointError::TensorShape {
+                    tensor: format!("residual_embedding[{group}]"),
+                    expected: RESIDUAL_VOCAB * hidden,
+                    actual: table.len(),
+                });
+            }
+            for (slot, value) in acc.iter_mut().enumerate() {
+                *value += table[code * hidden + slot];
+            }
+        }
+        frames.push(acc);
+    }
+    Ok(frames)
 }

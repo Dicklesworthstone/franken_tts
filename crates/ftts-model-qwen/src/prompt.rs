@@ -56,6 +56,19 @@ pub struct PromptTextIds {
 /// OQ-10 originally marked this asymmetric slicing as an inference.  The oracle-fixture L0 test
 /// confirms the wrappers before this function is used; keep that test named after Trap 3 rather
 /// than folding the rule into an untraceable convenience slice.
+/// The official reference-transcript wrapper (`I:` `_build_ref_text`, OQ-10 §0.1):
+/// `<|im_start|>assistant\n{text}<|im_end|>\n`. Encoding this string with the pinned tokenizer
+/// and slicing `[3..-2]` yields exactly the inner transcript ids — verified against the oracle
+/// for ASCII, CJK, digits, empty text, embedded newlines, and emoji (7/7 classes), because the
+/// wrapper boundary is added-token splitting, regex-independent.
+///
+/// Downstream, [`extract_prompt_text_ids`] consumes the FULL wrapped encoding via
+/// `ReferencePrompt.wrapped_ids` and slices `ref_ids[:, 3:-2]` itself; do not pre-slice.
+#[must_use]
+pub fn wrap_reference_transcript(text: &str) -> String {
+    format!("<|im_start|>assistant\n{text}<|im_end|>\n")
+}
+
 pub fn extract_prompt_text_ids(
     target_wrapped: &[u32],
     reference_wrapped: Option<&[u32]>,
@@ -526,4 +539,13 @@ mod tests {
             Err(PromptError::InvalidWrapper { kind: "target" })
         ));
     }
+}
+
+#[test]
+fn wrapped_reference_transcript_has_the_measured_shape() {
+    let wrapped = wrap_reference_transcript("This is the reference recording.");
+    assert_eq!(
+        wrapped,
+        "<|im_start|>assistant\nThis is the reference recording.<|im_end|>\n"
+    );
 }
