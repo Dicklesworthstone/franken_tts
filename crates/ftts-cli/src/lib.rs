@@ -4167,22 +4167,37 @@ fn run_doctor(
     environment: &Environment,
     stdout: &mut dyn Write,
 ) -> Result<(), FttsError> {
+    let model_present = model_search_paths(environment)
+        .iter()
+        .find(|path| looks_like_model_artifact(path))
+        .map(|path| path.display().to_string());
     let report = json!({
         "schema_version": ROBOT_SCHEMA_VERSION,
-        "status": "phase0_skeleton",
+        "status": if model_present.is_some() { "ready" } else { "model_missing" },
         "stateless_default": true,
         "persistent_history": false,
+        "model_present": model_present,
         "environment": environment.documented_values(),
-        "recommended_command": "ftts robot schema",
+        "recommended_command": if model_present.is_some() {
+            "ftts say \"hello\" -o hello.wav"
+        } else {
+            "ftts pull"
+        },
     });
     if args.json {
         write_json_line(stdout, &report)
     } else {
-        writeln!(stdout, "FrankenTTS Phase-0 CLI skeleton")
-            .and_then(|_| writeln!(stdout, "stateless default: yes"))
-            .and_then(|_| writeln!(stdout, "model loaded: no"))
-            .and_then(|_| writeln!(stdout, "next: ftts robot schema"))
-            .map_err(output_error)
+        let human = format!(
+            "FrankenTTS ftts — local readiness\nstateless default: yes\nmodel: {}\nnext: {}\n",
+            model_present.as_deref().map_or_else(
+                || "missing — run `ftts pull`".to_owned(),
+                |p| format!("present ({p})")
+            ),
+            report["recommended_command"]
+                .as_str()
+                .unwrap_or("ftts robot schema"),
+        );
+        write!(stdout, "{human}").map_err(output_error)
     }
 }
 
