@@ -239,16 +239,35 @@ pub fn try_synthesize(
     bundle: &ModelBundle,
     request: &WireRequest<'_>,
 ) -> Result<Option<SynthesizedAudio>, FttsError> {
+    try_synthesize_interruptible(bundle, request, &|| false)
+}
+
+/// [`try_synthesize`], but the reply wait honors `tripped`: the v1 wire has no
+/// cancel op, so the daemon finishes and discards server-side by its own contract —
+/// the CLIENT must not sit deaf on a blocking read while a SIGINT has already been
+/// consumed (bead frankentts-say-sigint-latency-resident-g4zq). The reply-phase read
+/// therefore polls in short slices and returns `Cancelled` as soon as the predicate
+/// fires; connect/spawn phases stay best-effort exactly as before.
+pub fn try_synthesize_interruptible(
+    bundle: &ModelBundle,
+    request: &WireRequest<'_>,
+    tripped: &dyn Fn() -> bool,
+) -> Result<Option<SynthesizedAudio>, FttsError> {
     // JSON cannot carry NaN or infinity (serde_json writes null), so a speaker vector
     // containing one would silently shrink in transit. The inline path passes such a
     // vector through verbatim; parity therefore requires skipping the wire entirely.
     if request.speaker.iter().any(|value| !value.is_finite()) {
         return Ok(None);
     }
-    match connect(bundle) {
-        Some(stream) => roundtrip(stream, bundle, request),
-        None => Ok(None),
-    }
+    let stream = match connect(bundle) {
+        Some(stream) => stream,
+        None => return Ok(None),
+    };
+    // Reply-phase poll slice: small enough that a strike lands well inside any sane
+    // exit-latency budget, large enough to never matter for a healthy daemon.
+    const REPLY_POLL: Duration = Duration::from_millis(100);
+    stream.set_read_timeout(Some(REPLY_POLL)).ok();
+    roundtrip(stream, bundle, request, tripped)
 }
 
 /// Why one connect attempt did not produce a stream — the removal decision needs the kind.
@@ -352,13 +371,14 @@ fn spawn_daemon(root: &Path) -> Option<()> {
         // DETACHED_PROCESS | CREATE_NO_WINDOW: outlive the console, show nothing.
         command.creation_flags(0x0000_0008 | 0x0800_0000);
     }
-    command.spawn().ok().map(|_child| ())
+    command.spawn().map(|_| ()).ok()
 }
 
 fn roundtrip(
     mut stream: TcpStream,
     bundle: &ModelBundle,
     request: &WireRequest<'_>,
+    tripped: &dyn Fn() -> bool,
 ) -> Result<Option<SynthesizedAudio>, FttsError> {
     let state = match read_state(&bundle.root) {
         Some(state) => state,
@@ -384,9 +404,30 @@ fn roundtrip(
         return Ok(None);
     }
 
+    // The daemon replies only after the whole utterance is rendered, so this read is
+    // the long pole. The stream's timeout is the poll slice: each TimedOut/WouldBlock
+    // is one chance to honor a consumed SIGINT instead of sitting deaf for the rest of
+    // the render (partial bytes across polls are fine — read_line appends until '\n').
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+    loop {
+        match reader.read_line(&mut line) {
+            Ok(0) if line.is_empty() => return Ok(None), // EOF before any reply
+            Ok(_) => break,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return Ok(None),
+        }
+        if tripped() {
+            return Err(FttsError::Cancelled(
+                "cancelled while the resident engine was serving the request; its \
+                 completed audio was discarded"
+                    .to_owned(),
+            ));
+        }
+    }
+    if line.trim().is_empty() {
         return Ok(None);
     }
     let Ok(reply) = serde_json::from_str::<Value>(&line) else {

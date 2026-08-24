@@ -2050,7 +2050,7 @@ fn run_say_events(
 
     emit_stage(run, emit, "synthesis", "begin", &mut seq)?;
     let resident_audio = if use_resident {
-        let audio = resident::try_synthesize(
+        let audio = resident::try_synthesize_interruptible(
             &bundle,
             &resident::WireRequest {
                 text: &request.text,
@@ -2059,6 +2059,10 @@ fn run_say_events(
                 speaker: voice_conditioning.embedding(),
                 seed,
             },
+            // Strike-one must land while the daemon still renders: the poll slice
+            // turns the consumed SIGINT into Cancelled within ~100 ms instead of
+            // whenever the whole utterance happens to finish (g4zq).
+            &|| cancel.was_tripped(),
         )?;
         // The daemon finished anyway — v1 has no cancel op — but honoring the request
         // means discarding the reply, not shipping audio the user asked us to stop
