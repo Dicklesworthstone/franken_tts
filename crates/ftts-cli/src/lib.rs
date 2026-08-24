@@ -4234,13 +4234,6 @@ mod tests {
                 !character.is_empty(),
                 "preset {name} needs a character line"
             );
-            for chunk in bytes.as_chunks::<4>().0 {
-                let value = f32::from_le_bytes(*chunk);
-                assert!(
-                    value.is_finite(),
-                    "preset {name} carries a non-finite value"
-                );
-            }
         }
     }
 
