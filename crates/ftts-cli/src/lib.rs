@@ -470,12 +470,9 @@ struct EnrollArgs {
     #[arg(long, conflicts_with = "output")]
     default: bool,
 
-    /// Reserved: will accept a warned-about enrollment quality once the quality gate ships.
-    ///
-    /// No gate fires today — enrollment currently measures its cleanup stages but refuses
-    /// nothing — so this flag is accepted for script compatibility and does nothing. Exit
-    /// code 8 (enrollment-quality refusal) is likewise reserved. Building the real gate
-    /// needs owner-validated thresholds (listening protocol), not a guessed dBFS cutoff.
+    /// Proceed past a REFUSED enrollment: a reference diagnosed as structurally unusable
+    /// (no speech, wall-to-wall clipping) otherwise exits 8 (`enrollment-quality
+    /// refusal`). Mere quality WARNINGS never refuse on their own.
     #[arg(long)]
     force: bool,
 
