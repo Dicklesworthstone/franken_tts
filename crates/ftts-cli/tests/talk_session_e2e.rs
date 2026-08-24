@@ -588,3 +588,75 @@ fn per_utterance_seeds_behave_as_the_contract_says() {
     );
     eprintln!("receipt: {{\"test\":\"talk_seeds\",\"outcome\":\"passed\",\"seeds\":{starts:?}}}");
 }
+
+/// SIGINT strike one: the in-flight utterance settles with its `speak_cancelled`
+/// receipt, the session still reaches `session_end`, and the process exits 6 — the
+/// same two-strike contract `say` serves (bead frankentts-rc-talk-sigint-63sq).
+/// Strike two never reaches the router: the shared handler force-exits, covered by
+/// `next_strike_action` unit tests. Unix-only: delivery is kill(2). Model-gated,
+/// skip-honest like the rest of this battery.
+#[test]
+#[cfg(unix)]
+fn sigint_cancels_the_utterance_settles_the_receipt_and_exits_6() {
+    let Some(_model) = model_dir() else {
+        eprintln!(
+            "receipt: {{\"test\":\"talk_sigint\",\"outcome\":\"skipped\",\"reason\":\"no model directory\"}}"
+        );
+        return;
+    };
+    let mut session = Session::spawn("sigint");
+    session.wait_for("session_start", |event| event["event"] == "session_start");
+    session.send(
+        json!({"op":"speak","context":"a","text":"The quick brown fox jumps over the lazy dog while the interrupt arrives midstream."}),
+    );
+    // Land the strike while audio is actually flowing, so the cancelled utterance
+    // has delivered bytes to account for in the audit.
+    session.wait_for("first audio packet", |event| event["event"] == "audio");
+
+    let sent_kill =
+        unsafe { libc::kill(session.child.id().try_into().expect("pid"), libc::SIGINT) };
+    assert_eq!(sent_kill, 0, "SIGINT delivered");
+
+    let mut saw_cancel = false;
+    let mut saw_end = false;
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match session.events.recv_timeout(remaining) {
+            Ok(event) => {
+                session.seen.push(event.clone());
+                match event["event"].as_str() {
+                    "speak_cancelled" => saw_cancel = true,
+                    "session_end" => {
+                        saw_end = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("timed out after SIGINT; cancel receipt seen: {saw_cancel}")
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let status = session.child.wait().expect("talk exits after SIGINT");
+    use std::os::unix::process::ExitStatusExt as _;
+    assert_eq!(
+        status.code(),
+        Some(6),
+        "SIGINT must exit with the cancelled code (signal-raw exit would be None/128+2)"
+    );
+    assert!(saw_cancel, "speak_cancelled receipt must be emitted");
+    assert!(saw_end, "session_end must close the stream cleanly");
+    while let Ok(event) = session.events.try_recv() {
+        session.seen.push(event);
+    }
+    let pcm = std::fs::read(&session.pcm_path).unwrap_or_default();
+    assert!(
+        !pcm.is_empty(),
+        "partial audio already delivered before the strike"
+    );
+    audit("sigint", &session.seen, &pcm);
+    eprintln!("receipt: {{\"test\":\"talk_sigint\",\"outcome\":\"passed\"}}");
+}

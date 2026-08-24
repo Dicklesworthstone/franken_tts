@@ -36,3 +36,6 @@ path = "src/bin/ftts.rs"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+libc = "0.2"

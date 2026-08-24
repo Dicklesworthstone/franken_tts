@@ -109,7 +109,7 @@ struct ActiveUtterance {
 }
 
 /// What the synthesis thread reports back to the router when an utterance ends.
-enum UtteranceOutcome {
+pub(crate) enum UtteranceOutcome {
     Complete {
         frames: u64,
         ttfa_ms: Option<u64>,
@@ -119,10 +119,15 @@ enum UtteranceOutcome {
     Failed(String),
 }
 
-/// Router inbox: stdin ops and synthesis-thread completions share one queue.
-enum RouterIn {
+/// Router inbox: stdin ops, synthesis-thread completions, and SIGINT strikes share one
+/// queue.
+pub(crate) enum RouterIn {
     Line(String),
     StdinClosed,
+    /// First SIGINT strike, delivered by the shared signal bridge
+    /// ([`crate::TALK_SIGNAL_INBOX`]): cancel in flight, settle its receipt, end the
+    /// session with the cancelled exit code. A second strike force-exits in the handler.
+    Sigint,
     Done {
         context: String,
         utterance: u64,
@@ -316,6 +321,21 @@ pub fn run_talk(
     let (router_tx, router_rx) = sync_channel::<RouterIn>(EVENT_QUEUE_LINES);
     let (pcm_tx, pcm_rx) = sync_channel::<PcmJob>(PCM_QUEUE_PACKETS);
     let (job_tx, job_rx) = sync_channel::<SpeakJob>(1);
+    // SIGINT bridge: while this session lives, strikes arrive as RouterIn::Sigint
+    // (cancel current utterance, settle receipt, exit 6). Disarmed on drop so a late
+    // strike after teardown force-exits instead of messaging a dead router.
+    *crate::TALK_SIGNAL_INBOX
+        .lock()
+        .expect("talk signal inbox mutex") = Some(router_tx.clone());
+    struct DisarmTalkSignals;
+    impl Drop for DisarmTalkSignals {
+        fn drop(&mut self) {
+            if let Ok(mut armed) = crate::TALK_SIGNAL_INBOX.lock() {
+                *armed = None;
+            }
+        }
+    }
+    let _disarm_talk_signals = DisarmTalkSignals;
     let ledger = DeliveryLedger::default();
     let seq = AtomicU64::new(0);
     let next_seq = || seq.fetch_add(1, Ordering::Relaxed);
@@ -596,6 +616,9 @@ fn route(
         object
     };
 
+    // Set when a SIGINT strike ends the session: the loop exits through the same
+    // SessionEnd path as EOF, but the caller must surface exit code 6.
+    let mut sigint_exit = false;
     while let Ok(message) = inbox.recv() {
         match message {
             RouterIn::StdinClosed => {
@@ -604,6 +627,18 @@ fn route(
                     state.cancellation.cancel();
                     settle_utterance(sid, loaded, &state, inbox, events, ledger, next_seq)?;
                 }
+                break;
+            }
+            RouterIn::Sigint => {
+                // Strike one: the `cancel`-op contract plus session end — partial audio
+                // stays delivered, the cancelled utterance gets its speak_cancelled
+                // receipt, and the process exits 6 (strike two never reaches the router;
+                // the handler force-exits). Mirrors the `say` SIGINT contract.
+                if let Some(state) = active.take() {
+                    state.cancellation.cancel();
+                    settle_utterance(sid, loaded, &state, inbox, events, ledger, next_seq)?;
+                }
+                sigint_exit = true;
                 break;
             }
             RouterIn::Done {
@@ -1052,6 +1087,11 @@ fn route(
 
     let end = SessionEvent::SessionEnd.object(sid, next_seq());
     emit(events, end, false)?;
+    if sigint_exit {
+        return Err(FttsError::Cancelled(
+            "SIGINT ended the talk session; delivered audio is already on the wire".to_owned(),
+        ));
+    }
     Ok(())
 }
 

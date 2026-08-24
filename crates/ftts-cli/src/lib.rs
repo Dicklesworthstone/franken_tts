@@ -1437,6 +1437,25 @@ static SIGNAL_HOOK: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| {
             return;
         };
         let Some(state) = guard.as_ref() else {
+            drop(guard);
+            // No `say` run is served: the strike belongs to a live `ftts talk`
+            // session. Strike one cancels cooperatively through the router; any
+            // later strike force-exits with the cancelled code.
+            let seen = TALK_STRIKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if next_strike_action(seen) == StrikeAction::ForceExit {
+                std::process::exit(i32::from(FttsExitCode::Cancelled.as_u8()));
+            }
+            let talk_inbox = TALK_SIGNAL_INBOX
+                .lock()
+                .ok()
+                .and_then(|armed| armed.clone());
+            match talk_inbox {
+                Some(inbox) => {
+                    let _ = inbox.send(crate::talk::RouterIn::Sigint);
+                }
+                // The bridge is armed but the router is gone; honour the strike.
+                None => std::process::exit(i32::from(FttsExitCode::Cancelled.as_u8())),
+            }
             return;
         };
         let seen = state
@@ -1455,6 +1474,17 @@ static SIGNAL_HOOK: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| {
 
 static ACTIVE_CANCEL: std::sync::Mutex<Option<std::sync::Arc<CancelState>>> =
     std::sync::Mutex::new(None);
+
+/// Armed by a live `ftts talk` session so SIGINT strikes reach its router
+/// ([`crate::talk::RouterIn::Sigint`]: cancel the current utterance, settle its
+/// receipt, exit 6). Disarmed when the session ends; strikes with no live session
+/// force-exit with the cancelled code, matching the two-strike contract.
+static TALK_SIGNAL_INBOX: std::sync::Mutex<
+    Option<std::sync::mpsc::SyncSender<crate::talk::RouterIn>>,
+> = std::sync::Mutex::new(None);
+
+/// SIGINT strikes seen while no `say` run is served (i.e. during `ftts talk`).
+static TALK_STRIKES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Make `state` the run the signal bridge serves.
 fn install_cancel_handler(state: std::sync::Arc<CancelState>) {
