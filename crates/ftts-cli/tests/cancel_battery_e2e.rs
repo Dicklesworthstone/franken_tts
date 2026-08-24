@@ -353,11 +353,16 @@ fn file_mode_sigint_leaves_a_valid_partial_wav_and_exits_promptly() {
         &stdout_path,
         &stderr_path,
     );
+    // Abort guard, NOT the contract: the 2 s bound below is what asserts prompt
+    // cancellation. This marker wait only decides whether a cancel point exists to
+    // test at all, and on slow or shared hosts (8-core EPYC, debug-route kernels,
+    // artifact digest verification) the first packet legitimately lands minutes in —
+    // 20 minutes absorbs that without weakening anything the battery pins.
     assert!(
         wait_for_marker(
             &stdout_path,
             "\"event\":\"audio_chunk\"",
-            Duration::from_secs(300)
+            Duration::from_secs(1200)
         ),
         "first packet never arrived; aborting the cancel point"
     );

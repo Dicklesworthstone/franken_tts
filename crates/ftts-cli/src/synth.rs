@@ -1980,8 +1980,9 @@ pub fn synthesize(
             });
 
             let mut tee = TeeGenerator {
-                inner: &mut generator,
+                inner: generator,
                 frames: frame_tx,
+                printed: 0,
             };
             let result = engine
                 .synthesize(
@@ -2057,6 +2058,7 @@ struct DecodedAudio {
 struct TeeGenerator<'a> {
     inner: &'a mut dyn FrameGenerator,
     frames: std::sync::mpsc::SyncSender<ftts_core::CodeFrame>,
+    printed: usize,
 }
 
 impl FrameGenerator for TeeGenerator<'_> {
@@ -2078,12 +2080,21 @@ impl FrameGenerator for TeeGenerator<'_> {
 
     fn next_frame(&mut self) -> Result<ftts_core::FrameStep, GenerationError> {
         let step = self.inner.next_frame()?;
-        if let ftts_core::FrameStep::Frame(frame) = &step
-            && self.frames.send(frame.clone()).is_err()
-        {
-            return Err(GenerationError::new(
-                "the codec worker stopped accepting frames; its error follows at join",
-            ));
+        if let ftts_core::FrameStep::Frame(frame) = &step {
+            // Cross-target seam hunting (DISC-006): the wasm engine prints its first three
+            // frames' codes to the worker console (`ftts-wasm codes[N]`), and this is the
+            // native twin, so a divergence can be located upstream of the codec (codes
+            // differ) or inside it (codes agree, PCM differs). Gated off by default: normal
+            // runs neither pay nor print anything.
+            if self.printed < 3 && std::env::var_os("FTTS_DEBUG_CODES").is_some() {
+                eprintln!("ftts-cli codes[{}]: {:?}", self.printed, frame.codes);
+                self.printed += 1;
+            }
+            if self.frames.send(frame.clone()).is_err() {
+                return Err(GenerationError::new(
+                    "the codec worker stopped accepting frames; its error follows at join",
+                ));
+            }
         }
         Ok(step)
     }
