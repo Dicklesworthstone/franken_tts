@@ -30,8 +30,6 @@ use sha2::{Digest, Sha256};
 const CONTRACT: &str = "ProductionQuality/metamorphic";
 const VOICE: &str = "matt";
 const TEXT: &str = "Hello.";
-/// Bounds each rendering to ~3 s of audio so five syntheses stay minutes, not tens.
-const FRAME_CAP: u64 = 36;
 const SEED_A: u64 = 42;
 const SEED_B: u64 = 43;
 
@@ -464,14 +462,12 @@ fn reference_route_pcm_matches_golden_hash_body() {
             return;
         }
     };
+    // A v1 file predates platform keys and has no entry to fall back to: a miss here
+    // simply requires regenerating the golden on this platform (the skip path below).
     let entry = golden
         .get("platforms")
         .and_then(|platforms| platforms.get(&platform))
-        .or_else(|| {
-            // A v1 file predates platform keys; its single entry belongs to whichever
-            // platform generated it, which we cannot prove — require regeneration.
-            None
-        });
+        .or(None);
     let Some(entry) = entry else {
         skip(
             TEST,
