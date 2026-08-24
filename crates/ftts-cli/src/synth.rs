@@ -1980,7 +1980,7 @@ pub fn synthesize(
             });
 
             let mut tee = TeeGenerator {
-                inner: generator,
+                inner: &mut generator,
                 frames: frame_tx,
                 printed: 0,
             };
