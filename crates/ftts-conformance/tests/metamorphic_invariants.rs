@@ -395,15 +395,35 @@ fn reference_route_pcm_matches_golden_hash_body() {
     let hash = pcm_sha256(&audio.pcm);
     let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/metamorphic/golden_reference_pcm.json");
+    // Per-platform pins BY DESIGN: the reference route's codec backend differs across
+    // platforms (Accelerate on macOS, pure-Rust elsewhere), so byte hashes are stable
+    // only within one platform. Cross-platform equality is a content-metric question
+    // the paired gates own, never a byte comparison.
+    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
 
     if std::env::var("UPDATE_GOLDENS").as_deref() == Ok("1") {
+        let mut platforms = std::fs::read_to_string(&golden_path)
+            .ok()
+            .and_then(|existing| serde_json::from_str::<serde_json::Value>(&existing).ok())
+            .and_then(|value| {
+                value.get("platforms").cloned().or_else(|| {
+                    // Migrate a v1 single-platform file under the platform it was made on.
+                    let frames = value.get("frames")?.as_u64()?;
+                    let sha = value.get("pcm_f32_bits_sha256")?.as_str()?.to_owned();
+                    Some(serde_json::json!({ platform.clone(): { "frames": frames, "pcm_f32_bits_sha256": sha } }))
+                })
+            })
+            .unwrap_or_else(|| serde_json::json!({}));
+        platforms[&platform] = serde_json::json!({
+            "frames": audio.frames,
+            "pcm_f32_bits_sha256": hash,
+        });
         let entry = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "route": "cpu_fp32_reference",
             "text": TEXT,
             "voice": "fixture_synthetic_tone",
-            "frames": audio.frames,
-            "pcm_f32_bits_sha256": hash,
+            "platforms": platforms,
         });
         std::fs::create_dir_all(golden_path.parent().expect("parent")).expect("mkdir");
         std::fs::write(
@@ -411,12 +431,15 @@ fn reference_route_pcm_matches_golden_hash_body() {
             serde_json::to_string_pretty(&entry).expect("json") + "\n",
         )
         .expect("write golden");
-        println!("GOLDEN UPDATED: pcm sha {hash}");
+        println!(
+            "GOLDEN UPDATED [{platform}]: frames {}, pcm sha {hash}",
+            audio.frames
+        );
         Receipt::new(TEST, Outcome::Passed)
             .contract(CONTRACT)
             .seam("metamorphic.golden")
             .reason(format!(
-                "golden rewritten: frames {}, sha {hash}",
+                "[{platform}] golden rewritten: frames {}, sha {hash}",
                 audio.frames
             ))
             .emit();
@@ -441,24 +464,43 @@ fn reference_route_pcm_matches_golden_hash_body() {
             return;
         }
     };
-    let stored = golden["pcm_f32_bits_sha256"].as_str().unwrap_or("");
+    let entry = golden
+        .get("platforms")
+        .and_then(|platforms| platforms.get(&platform))
+        .or_else(|| {
+            // A v1 file predates platform keys; its single entry belongs to whichever
+            // platform generated it, which we cannot prove — require regeneration.
+            None
+        });
+    let Some(entry) = entry else {
+        skip(
+            TEST,
+            &format!(
+                "no golden entry for platform {platform} — pin this machine deliberately: \
+                 UPDATE_GOLDENS=1 cargo test -p ftts-conformance --test metamorphic_invariants"
+            ),
+        );
+        return;
+    };
+    let stored = entry["pcm_f32_bits_sha256"].as_str().unwrap_or("");
     assert_eq!(
         stored, hash,
-        "reference-route PCM drifted from the pinned golden.\n  golden: {stored}\n  actual:  \
-         {hash}\nIf this drift is INTENDED (an accepted numeric change), re-pin with review: \
-         UPDATE_GOLDENS=1 cargo test -p ftts-conformance --test metamorphic_invariants\nIf it \
-         is NOT intended, treat as a numerics regression before anything else ships."
+        "reference-route PCM drifted from the [{platform}] golden.\n  golden: {stored}\n  \
+         actual:  {hash}\nIf this drift is INTENDED (an accepted numeric change), re-pin with \
+         review: UPDATE_GOLDENS=1 cargo test -p ftts-conformance --test \
+         metamorphic_invariants\nIf it is NOT intended, treat as a numerics regression before \
+         anything else ships."
     );
     assert_eq!(
-        golden["frames"].as_u64(),
+        entry["frames"].as_u64(),
         Some(audio.frames),
-        "frame count drifted from the golden"
+        "frame count drifted from the [{platform}] golden"
     );
     Receipt::new(TEST, Outcome::Passed)
         .contract(CONTRACT)
         .seam("metamorphic.golden")
         .reason(format!(
-            "{} frames, pcm sha {hash} matches golden",
+            "[{platform}] {} frames, pcm sha {hash} matches golden",
             audio.frames
         ))
         .emit();
