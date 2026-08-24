@@ -32,8 +32,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use ftts_cli::synth::{
-    DENOISE_ARTIFACT_RELPATH, LoadedModel, ModelBundle, ReferenceCleanup, denoise_pcm_24k,
-    speaker_from_reference_pcm, synthesize,
+    DENOISE_ARTIFACT_RELPATH, LoadedModel, ModelBundle, ReferenceCleanup,
+    VoiceConditioning, denoise_pcm_24k, speaker_from_reference_pcm, synthesize,
 };
 use ftts_core::{CancellationToken, SynthesisRequest, TtsEngine};
 
@@ -291,7 +291,9 @@ pub unsafe extern "C" fn ftts_synthesize(
             &engine.loaded,
             &engine.engine,
             &request,
-            speaker,
+            // The v1 wire surface carries x-vectors only; ICL packs bypass the FFI
+            // fast path by contract (`VoiceConditioning::is_xvector`).
+            &VoiceConditioning::XVector(speaker.to_vec()),
             seed,
             &cancellation,
             &observer,
@@ -442,7 +444,7 @@ pub unsafe extern "C" fn ftts_synthesize_streaming(
             &engine.loaded,
             &engine.engine,
             &request,
-            speaker,
+            &VoiceConditioning::XVector(speaker.to_vec()),
             seed,
             &cancellation,
             &observer,
