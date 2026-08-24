@@ -32,8 +32,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use ftts_cli::synth::{
-    DENOISE_ARTIFACT_RELPATH, LoadedModel, ModelBundle, ReferenceCleanup,
-    VoiceConditioning, denoise_pcm_24k, speaker_from_reference_pcm, synthesize,
+    DENOISE_ARTIFACT_RELPATH, LoadedModel, ModelBundle, ReferenceCleanup, VoiceConditioning,
+    denoise_pcm_24k, speaker_from_reference_pcm, synthesize,
 };
 use ftts_core::{CancellationToken, SynthesisRequest, TtsEngine};
 
