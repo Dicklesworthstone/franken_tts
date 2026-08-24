@@ -613,9 +613,13 @@ fn sigint_cancels_the_utterance_settles_the_receipt_and_exits_6() {
     // has delivered bytes to account for in the audit.
     session.wait_for("first audio packet", |event| event["event"] == "audio");
 
-    let sent_kill =
-        unsafe { libc::kill(session.child.id().try_into().expect("pid"), libc::SIGINT) };
-    assert_eq!(sent_kill, 0, "SIGINT delivered");
+    // The workspace forbids `unsafe`, so no direct kill(2): /bin/kill is the boring,
+    // dependency-free way to deliver SIGINT on every unix CI lane.
+    let delivered = std::process::Command::new("kill")
+        .args(["-INT", &session.child.id().to_string()])
+        .status()
+        .expect("/bin/kill runs");
+    assert!(delivered.success(), "SIGINT delivered");
 
     let mut saw_cancel = false;
     let mut saw_end = false;
@@ -626,8 +630,8 @@ fn sigint_cancels_the_utterance_settles_the_receipt_and_exits_6() {
             Ok(event) => {
                 session.seen.push(event.clone());
                 match event["event"].as_str() {
-                    "speak_cancelled" => saw_cancel = true,
-                    "session_end" => {
+                    Some("speak_cancelled") => saw_cancel = true,
+                    Some("session_end") => {
                         saw_end = true;
                         break;
                     }
@@ -641,7 +645,6 @@ fn sigint_cancels_the_utterance_settles_the_receipt_and_exits_6() {
         }
     }
     let status = session.child.wait().expect("talk exits after SIGINT");
-    use std::os::unix::process::ExitStatusExt as _;
     assert_eq!(
         status.code(),
         Some(6),

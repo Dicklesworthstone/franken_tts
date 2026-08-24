@@ -746,7 +746,6 @@ dependencies = [
  "ftts-model-qwen",
  "ftts-video",
  "ftts-voicecard",
- "libc",
  "png",
  "rustfft",
  "serde_json",
