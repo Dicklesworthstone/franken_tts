@@ -1922,6 +1922,13 @@ pub fn synthesize(
                     Ok(())
                 };
                 while let Ok(frame) = frame_rx.recv() {
+                    // A strike during generation or the end-of-stream drain must not leave
+                    // the client parked while this worker grinds through the queued backlog
+                    // (bead frankentts-say-sigint-latency-resident-g4zq): stop decoding where
+                    // we are and keep only what was already delivered through the sink.
+                    if cancellation.is_cancelled() {
+                        break;
+                    }
                     if frame.codes.len() != 16 {
                         return Err(FttsError::Generic(format!(
                             "generated frame carries {} codes, expected 16",
@@ -1988,6 +1995,13 @@ pub fn synthesize(
                 .map_err(engine_error);
             drop(tee); // closes the channel; the worker drains the tail packet and exits
             let worker_outcome = worker.join().expect("codec worker must not panic");
+            // A signal that landed mid-generation or mid-drain outranks every other
+            // outcome: same terminal shape as an engine-loop cancel, keeping only the
+            // audio already delivered through the sink (the CLI's cancelled disposition
+            // finalizes that partial artifact).
+            if cancellation.is_cancelled() {
+                return Err(FttsError::Cancelled("synthesis cancelled".to_owned()));
+            }
             // Error precedence: a worker `Err` is always the ROOT cause. A worker merely
             // starved by an engine failure does not error — its recv loop ends on the
             // disconnect and it returns the partial PCM it decoded — so the only way the
