@@ -21,7 +21,7 @@
 //! preference is decided by measurement (`FTTS_INT8_TIER` forces a route for A/B), never by
 //! assumption.
 
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 /// Largest absolute Q8 byte the canonical symmetric recipe emits.
 pub const Q8_MAX_ABS: i8 = 127;
@@ -374,47 +374,76 @@ impl KernelPlanV0 {
     }
 }
 
+/// Where the active [`KernelPlanV0`] came from — `ftts robot backends` reports it as
+/// `kernel_plan.persisted`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanSource {
+    /// Honored the on-disk v0 cache (the key matched this machine + build).
+    PersistedCache,
+    /// No valid cache: measured fresh this process and persisted the winner.
+    FreshMeasurement,
+    /// Pinned without measuring (`FTTS_INT8_TIER`, or the wasm32 build where measurement
+    /// is impossible — see `autotuned_plan`).
+    Pinned,
+}
+
 /// Measures each available tier at the two live regimes and returns the winners.
 ///
 /// Decided once per process and cached. `FTTS_INT8_TIER` overrides both regimes — the A/B
 /// override must pin the route it names, not merely suggest it. Cost: a few milliseconds of
 /// synthetic dots at the model's real reduction lengths.
 pub fn autotuned_plan() -> KernelPlanV0 {
-    static PLAN: OnceLock<KernelPlanV0> = OnceLock::new();
-    *PLAN.get_or_init(|| {
-        // wasm32 is pinned, never measured: `Instant::now` panics as `unreachable` there (no
-        // monotonic clock in std — exactly how the browser playground's first synthesize died),
-        // and there is nothing to choose between anyway. `dispatch()` names the SIMD128 island
-        // when it is compiled in, which it is for every browser build; an earlier revision of
-        // this pinned `Scalar` on the grounds that no other tier existed on wasm, and that
-        // sentence stopped being true the moment the island landed — leaving the fast kernel
-        // built, dispatchable, and never dispatched.
-        #[cfg(target_arch = "wasm32")]
-        {
-            KernelPlanV0::pinned(Int8Tier::dispatch())
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if std::env::var("FTTS_INT8_TIER").is_ok() {
-                return KernelPlanV0::pinned(Int8Tier::dispatch());
-            }
-            if let Some(cached) = load_persisted_plan() {
-                return cached;
-            }
-            let plan = KernelPlanV0 {
-                // Talker/microdecoder decode: one activation row against tall matrices; K = 1024
-                // and 3072 are the real reduction lengths, 256 output rows keep the probe cheap
-                // while streaming enough weight bytes to reach the bandwidth regime.
-                decode_gemv: fastest_tier(&[(1, 1024, 256), (1, 3072, 256)]),
-                // Verify/prefill/codec batches: sixteen rows, same reduction lengths.
-                batch_gemm: fastest_tier(&[(16, 1024, 128), (16, 3072, 64)]),
-            };
-            persist_plan(plan);
-            plan
-        }
-    })
+    PLAN_STATE.0
 }
 
+/// The provenance of [`autotuned_plan`], decided in the same one-shot init.
+#[must_use]
+pub fn plan_source() -> PlanSource {
+    PLAN_STATE.1
+}
+
+static PLAN_STATE: LazyLock<(KernelPlanV0, PlanSource)> = LazyLock::new(decide_plan);
+
+fn decide_plan() -> (KernelPlanV0, PlanSource) {
+    // wasm32 is pinned, never measured: `Instant::now` panics as `unreachable` there (no
+    // monotonic clock in std — exactly how the browser playground's first synthesize died),
+    // and there is nothing to choose between anyway. `dispatch()` names the SIMD128 island
+    // when it is compiled in, which it is for every browser build; an earlier revision of
+    // this pinned `Scalar` on the grounds that no other tier existed on wasm, and that
+    // sentence stopped being true the moment the island landed — leaving the fast kernel
+    // built, dispatchable, and never dispatched.
+    #[cfg(target_arch = "wasm32")]
+    {
+        (
+            KernelPlanV0::pinned(Int8Tier::dispatch()),
+            PlanSource::Pinned,
+        )
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if std::env::var("FTTS_INT8_TIER").is_ok() {
+            return (
+                KernelPlanV0::pinned(Int8Tier::dispatch()),
+                PlanSource::Pinned,
+            );
+        }
+        if let Some(cached) = load_persisted_plan() {
+            return (cached, PlanSource::PersistedCache);
+        }
+        let plan = KernelPlanV0 {
+            // Talker/microdecoder decode: one activation row against tall matrices; K = 1024
+            // and 3072 are the real reduction lengths, 256 output rows keep the probe cheap
+            // while streaming enough weight bytes to reach the bandwidth regime.
+            decode_gemv: fastest_tier(&[(1, 1024, 256), (1, 3072, 256)]),
+            // Verify/prefill/codec batches: sixteen rows, same reduction lengths.
+            batch_gemm: fastest_tier(&[(16, 1024, 128), (16, 3072, 64)]),
+        };
+        persist_plan(plan);
+        (plan, PlanSource::FreshMeasurement)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 /// Where the measured plan is cached between runs: the pre-`.fttspack` v0 of the per-machine
 /// execution cache. Losing or corrupting this file only costs a re-measurement.
 fn plan_cache_path() -> Option<std::path::PathBuf> {
@@ -422,6 +451,7 @@ fn plan_cache_path() -> Option<std::path::PathBuf> {
         .map(|home| std::path::PathBuf::from(home).join(".cache/franken_tts/kernel_plan_v0.txt"))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The cache key: anything here changing invalidates the measurement.
 fn plan_cache_key() -> String {
     let tiers: Vec<&str> = Int8Tier::available().iter().map(|t| t.as_str()).collect();
@@ -439,6 +469,7 @@ fn plan_cache_key() -> String {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_persisted_plan() -> Option<KernelPlanV0> {
     // A valid plan file is three short lines; reading it bounded keeps a corrupt or hostile
     // multi-gigabyte file at this user-writable path from ballooning the process.
@@ -465,6 +496,7 @@ fn load_persisted_plan() -> Option<KernelPlanV0> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn persist_plan(plan: KernelPlanV0) {
     let Some(path) = plan_cache_path() else {
         return;
@@ -484,6 +516,7 @@ fn persist_plan(plan: KernelPlanV0) {
     );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Times every available tier over the given `(m, k, n)` probes; median of three rounds each,
 /// summed across probes, smallest total wins. Ties break toward the earlier tier in
 /// [`Int8Tier::available`] order (scalar first — the simpler route).

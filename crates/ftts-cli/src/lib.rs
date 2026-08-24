@@ -4041,7 +4041,10 @@ fn run_robot(
                     "version": 0,
                     "decode_gemv": plan.decode_gemv.as_str(),
                     "batch_gemm": plan.batch_gemm.as_str(),
-                    "persisted": false,
+                    "persisted": matches!(
+                        ftts_kernels::int8::plan_source(),
+                        ftts_kernels::int8::PlanSource::PersistedCache
+                    ),
                 }),
             );
             object.insert("pool_sizing".to_owned(), Value::Null);
