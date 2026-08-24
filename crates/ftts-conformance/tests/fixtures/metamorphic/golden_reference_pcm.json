@@ -1,8 +1,12 @@
 {
-  "frames": 15,
-  "pcm_f32_bits_sha256": "f2b06433eb9749b40de68dd56ea55629064b88d552cbd9507dc2f9cab926af9d",
+  "platforms": {
+    "macos-aarch64": {
+      "frames": 15,
+      "pcm_f32_bits_sha256": "f2b06433eb9749b40de68dd56ea55629064b88d552cbd9507dc2f9cab926af9d"
+    }
+  },
   "route": "cpu_fp32_reference",
-  "schema_version": 1,
+  "schema_version": 2,
   "text": "Hello.",
   "voice": "fixture_synthetic_tone"
 }
