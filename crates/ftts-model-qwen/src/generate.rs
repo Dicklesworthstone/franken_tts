@@ -33,6 +33,80 @@ use ftts_kernels::int8::{QuantLinearMode, QuantizedMatrix};
 /// them is a silent correctness failure, so the constant lives next to its only call sites.
 const MROPE_THETA: f32 = 1.0e6;
 
+/// Cross-target seam taps for the DISC-006 hunt (frankentts-p16p): when enabled, the generator
+/// emits one stable line per frame — hashes of the tensors that cross engine seams — so a native
+/// run and a wasm run of the same pinned inputs can be diffed line-by-line to name the first
+/// operator whose bits diverge. Hashes are FNV-1a over little-endian `f32` bit patterns, which is
+/// target-independent given identical bits. Off by default everywhere: native opts in through
+/// `FTTS_DEBUG_TAPS=1`, a wasm host calls [`set_taps_enabled`] (the CLI's file-output path never
+/// pays anything).
+static TAP_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TAP_SINK: std::sync::OnceLock<Box<dyn Fn(&str) + Send + Sync>> = std::sync::OnceLock::new();
+/// Native processes opt in through the environment; read once.
+#[cfg(not(target_arch = "wasm32"))]
+static NATIVE_TAPS_REQUESTED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FTTS_DEBUG_TAPS").is_some());
+
+/// Enables or disables tap emission for this process.
+pub fn set_taps_enabled(enabled: bool) {
+    TAP_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Installs a custom emission sink (the wasm bindings route lines to `console.error`; the
+/// default writes to stderr). Idempotent per process: only the first install wins.
+pub fn install_tap_sink(sink: Box<dyn Fn(&str) + Send + Sync>) {
+    let _ = TAP_SINK.set(sink);
+}
+
+fn taps_active() -> bool {
+    if TAP_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        *NATIVE_TAPS_REQUESTED
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
+fn tap_emit(line: &str) {
+    if !taps_active() {
+        return;
+    }
+    match TAP_SINK.get() {
+        Some(sink) => sink(line),
+        None => eprintln!("{line}"),
+    }
+}
+
+/// FNV-1a over the little-endian bit patterns of a slice — identical bits, identical hash, on
+/// every target.
+fn tap_hash_f32(values: &[f32]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for value in values {
+        for byte in value.to_bits().to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// The same hash over 16-bit code groups.
+fn tap_hash_u32(values: &[u32]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for value in values {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    hash
+}
+
 /// Reads one Q8 tensor out of a canonical artifact as an executable [`QuantizedMatrix`].
 ///
 /// The artifact's payload IS the canonical quantization — the converter and the runtime share one
@@ -832,6 +906,14 @@ impl<'a> QwenGenerator<'a> {
             continuation: false,
             text_finished: true,
         });
+        if taps_active() {
+            let parked = self.utterance.as_ref().expect("just constructed above");
+            tap_emit(&format!(
+                "ftts-tap prefill ph={:016x} plog={:016x}",
+                tap_hash_f32(&parked.pending_hidden),
+                tap_hash_f32(&parked.pending_logits),
+            ));
+        }
     }
 }
 
@@ -999,7 +1081,8 @@ impl FrameGenerator for QwenGenerator<'_> {
         {
             return Ok(FrameStep::AwaitingText);
         }
-
+        let entry_logits_hash = tap_hash_f32(&utterance.pending_logits);
+        let frame_index = utterance.frames_emitted;
         let primary = self
             .sampler
             .select_talker(
@@ -1127,6 +1210,15 @@ impl FrameGenerator for QwenGenerator<'_> {
         utterance.next_position += 1;
         utterance.frames_emitted += 1;
         utterance.group_zero_history.push(primary);
+        if taps_active() {
+            tap_emit(&format!(
+                "ftts-tap f={frame_index} pl={entry_logits_hash:016x} p={primary} \
+                 r={:016x} nh={:016x} nl={:016x}",
+                tap_hash_u32(&codes),
+                tap_hash_f32(&utterance.pending_hidden),
+                tap_hash_f32(&utterance.pending_logits),
+            ));
+        }
         Ok(FrameStep::Frame(CodeFrame { codes }))
     }
 }
