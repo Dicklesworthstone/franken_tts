@@ -41,7 +41,11 @@ f32-accumulation class covering every measured activation seam (DISC-002).
 
 ### DISC-006 browser-diverges-from-the-cli-after-frame-0
 
-`status: OPEN`; `severity: user-visible (different voice character, same words)`; `first_measured: this session, via site/harness/browser.mjs --cli-golden`.
+`claim_id: wasm-cli-token-stream-equality`; `evidence_id: site/harness/browser.mjs --cli-golden, measured 2026-08-23`; `status: ACCEPTED (carried divergence under active investigation — frankentts-rc-disc006-wasm-divergence-4oqv)`; `model_source_commit: 5d83992436eae1d760afd27aff78a71d676296fc`; `oracle_source: not-applicable (cross-target determinism claim, not a seam vs oracle)`; `fixture_sha256: not-applicable`; `artifact_sha256: not-applicable`; `cpu_features: native neon-sdot vs wasm32 simd128 int8 tier`; `command_env: browser harness --cli-golden vs ftts say golden, voice matt seed 0`; `reference_behavior: the CLI's canonical rendering of the pinned inputs`; `our_behavior: crates/ftts-wasm render — frame 0 exact to 1919/1920 samples @75.0 dB SNR, then unrelated draws (utterance 2.61% identical; 40 vs 41 frames)`; `kill_switch: none yet — restoration path is exact-i32 coverage of the surviving f32 reductions (RMSNorm sums / attention softmax / codec-head logits projection); this field is filled at fix time (same reasoned-deviation precedent as DISC-002)`; `measured_impact: same seed yields different valid renditions across surfaces — voice character differs, words do not`; `resolution: seam bisect owned by bead frankentts-rc-disc006-wasm-divergence-4oqv; endstate is a standing CLI==wasm token-stream equality gate`; `review_date: 2026-09-30`; `test_status: XFAIL`;
+
+> Schema note 2026-08-24: this entry originally carried `status: OPEN` and free-form fields,
+> outside the register vocabulary above. Rewritten into schema during the reality-check audit;
+> measurement prose below is unchanged evidence.
 
 **What is measured.** Same text, voice matt, seed 0, inputs read back and asserted. Frame 0 is 1919/1920 samples identical at 75.0 dB SNR. Frame 1 is 0.6 dB. Whole utterance 2.61% identical, and the browser emits 40 frames where the CLI emits 41.
 
@@ -66,6 +70,11 @@ f32-accumulation class covering every measured activation seam (DISC-002).
 ### DISC-001 tokenizer-regex-official-vs-native
 
 `claim_id: tokenizer-regex-official-vs-native`; `evidence_id: docs/truth-pack/tokenizer/tokenizer_conformance.json`; `status: ACCEPTED`; `model_source_commit: 5d83992436eae1d760afd27aff78a71d676296fc`; `oracle_source: docs/truth-pack/tokenizer/OQ11_TOKENIZER.md:72-148`; `fixture_sha256: 78f56d6ab68f2a1927ab33a37497908b722d4d8d77df47ed43149a4fbfeec99a`; `artifact_sha256: vocab.json=ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910, merges.txt=599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3, tokenizer_config.json=dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670`; `cpu_features: not-applicable (pure Rust tokenization)`; `command_env: CARGO_TARGET_DIR=/tmp/frankentts-tokenizer-target cargo test -p ftts-model-qwen --no-fail-fast`; `reference_behavior: the official Qwen3-TTS entrypoints load Qwen2TokenizerFast with fix_mistral_regex=True`; `our_behavior: crates/ftts-model-qwen/src/tokenizer.rs:13-14 and :28-39 default to the official Mistral expression, with the native Qwen expression only behind the explicit switch`; `kill_switch: FTTS_TOKENIZER_REGEX=native`; `measured_impact: 6/92 pinned corpus cases change token ids under native mode (five mixed-case identifier cases and Thai); all 92 official ids and their NFC decode values pass`; `resolution: retain official as the conformance default until a separate listening experiment evaluates the native alternative`; `review_date: 2026-08-06`; `test_status: PASS`.
+
+> Re-review 2026-08-24 (reality-check audit; original review date 2026-08-06 had lapsed):
+> decision stands — the official regex remains the conformance default and
+> `FTTS_TOKENIZER_REGEX=native` stays available; 92/92 pinned corpus ids still pass under the
+> default. Next review: 2026-09-30.
 
 ### DISC-002 f32-accumulation-vs-accelerate-sleef-stack
 
