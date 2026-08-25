@@ -554,6 +554,13 @@ pub struct HotElision {
     pub micro: bool,
     /// Skip widening the microdecoder's fifteen per-depth heads.
     pub micro_heads: bool,
+    /// Skip widening the microdecoder's fifteen per-depth residual embedding tables
+    /// (positions 2..=15). They feed two consumers — the microdecoder step gather and
+    /// the talker's every-frame feedback sum — and both dequantize rows on demand with
+    /// bit-exact parity against the stored bytes, so a widened copy is pure resident
+    /// cost (~31 MB) when the artifact verifiably carries all fifteen as Q8
+    /// (bead frankentts-x7bt).
+    pub residual_embeddings: bool,
 }
 
 /// Widens `names` concurrently, returning the tensors in the order the names were given.
@@ -1010,6 +1017,10 @@ pub struct TalkerCheckpoint {
     /// elided their widened forms. `None` on every other path: safetensors loads, default
     /// hydration, and `FTTS_ARTIFACT_Q8=0` forensics all keep widened heads instead.
     micro_heads_q8: Option<Vec<QuantizedMatrix>>,
+    /// The fifteen per-depth residual embedding tables read artifact-natively when
+    /// [`HotElision::residual_embeddings`] elided their widened forms — same contract
+    /// as [`Self::micro_heads_q8`], same None-on-other-paths rule.
+    residual_embeddings_q8: Option<Vec<QuantizedMatrix>>,
     fc1_weight: Vec<f32>,
     fc1_bias: Vec<f32>,
     fc2_weight: Vec<f32>,
@@ -1021,6 +1032,14 @@ impl TalkerCheckpoint {
     #[must_use]
     pub fn micro_heads_q8(&self) -> Option<&[QuantizedMatrix]> {
         self.micro_heads_q8.as_deref()
+    }
+
+    /// The artifact-native per-depth Q8 residual embedding tables, present exactly when
+    /// widening was elided. Consumers dequantize rows on demand — bit-exact against the
+    /// stored bytes the widened form carried.
+    #[must_use]
+    pub fn residual_embeddings_q8(&self) -> Option<&[QuantizedMatrix]> {
+        self.residual_embeddings_q8.as_deref()
     }
 }
 
@@ -1106,11 +1125,23 @@ impl TalkerCheckpoint {
         let heads_all_q8 = elision.micro_heads
             && (0..RESIDUAL_DEPTHS)
                 .all(|head| q8_present(&format!("talker.code_predictor.lm_head.{head}.weight")));
+        // Same all-or-nothing verdict for the per-depth residual embedding tables: one
+        // shared gate for the closure and the post-load Q8 read, so a bf16-tables
+        // artifact never trips "q8 embedding vanished" (the heads lesson, above).
+        let embeddings_all_q8 = elision.residual_embeddings
+            && (0..CODE_GROUP_COUNT - 1).all(|table| {
+                q8_present(&format!(
+                    "talker.code_predictor.model.codec_embedding.{table}.weight"
+                ))
+            });
         let elide = {
             let q8_present = q8_present.clone();
             move |name: &str| {
                 if name.starts_with("talker.code_predictor.lm_head.") {
                     return heads_all_q8;
+                }
+                if name.starts_with("talker.code_predictor.model.codec_embedding.") {
+                    return embeddings_all_q8;
                 }
                 let stack_elided = if name.starts_with("talker.code_predictor.model.layers.") {
                     elision.micro
@@ -1177,6 +1208,32 @@ impl TalkerCheckpoint {
                 })
                 .collect::<Result<Vec<_>, CheckpointError>>()?;
             loaded.micro_heads_q8 = Some(heads_q8);
+        }
+        if embeddings_all_q8 {
+            // Same shared-verdict guarantee as the heads read above: the closure only
+            // elided the tables because all fifteen verified as Q8, so a miss here is an
+            // artifact that changed under us and fails the load.
+            let embeddings_q8 = (0..CODE_GROUP_COUNT - 1)
+                .map(|table| {
+                    let name = format!(
+                        "talker.code_predictor.model.codec_embedding.{table}.weight"
+                    );
+                    crate::generate::q8_from_artifact(
+                        &artifact,
+                        &name,
+                        RESIDUAL_VOCAB,
+                        TALKER_HIDDEN,
+                    )
+                    .ok_or_else(|| {
+                        artifact_tensor_error(
+                            path,
+                            &name,
+                            "q8 embedding vanished between elision check and read",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, CheckpointError>>()?;
+            loaded.residual_embeddings_q8 = Some(embeddings_q8);
         }
         Ok(loaded)
     }
@@ -1414,6 +1471,7 @@ impl TalkerCheckpoint {
             )?,
             fc2_bias: single("talker.text_projection.linear_fc2.bias", Some(hidden))?,
             micro_heads_q8: None,
+            residual_embeddings_q8: None,
         })
     }
 
