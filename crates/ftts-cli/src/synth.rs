@@ -1807,11 +1807,7 @@ pub fn synthesize(
     // 4. Borrowed weights for the generator.
     let talker_layers = model.talker.talker_layer_weights();
     let micro_layers = model.talker.microdecoder_layer_weights();
-    let residual = model.talker.residual_embedding_slices();
     let heads = model.talker.microdecoder_head_slices();
-    // The microdecoder's internal tables cover depths 2..=15: the first fourteen of the same
-    // fifteen-table set the talker feedback path uses.
-    let micro_residual = &residual[..residual.len() - 1];
 
     // The fused int8 tables are a process asset, not an utterance one: the first utterance on
     // this LoadedModel pays the ~146 ms Q8-table build and every later one borrows the same
@@ -1824,13 +1820,9 @@ pub fn synthesize(
         talker_weights: model.talker.talker_weights(&talker_layers),
         text: model.talker.text_weights(&table),
         cold_rows: Some(&model.talker),
-        feedback: model.talker.feedback_tables(&residual),
+        feedback: model.talker.feedback_tables(),
         microdecoder_config: MicrodecoderConfig::default(),
-        microdecoder_weights: model.talker.microdecoder_weights(
-            &micro_layers,
-            micro_residual,
-            &heads,
-        ),
+        microdecoder_weights: model.talker.microdecoder_weights(&micro_layers, &heads),
         prompt_mode,
         header,
         tts_eos,

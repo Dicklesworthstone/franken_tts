@@ -1653,9 +1653,7 @@ impl TalkerCheckpoint {
                             .data
                             .chunks_exact(matrix.k)
                             .zip(matrix.scales.iter())
-                            .flat_map(|(row, scale)| {
-                                row.iter().map(|value| value as f32 * scale)
-                            })
+                            .flat_map(|(row, scale)| row.iter().map(|value| value as f32 * scale))
                             .collect::<Vec<f32>>()
                     })
                     .collect();
@@ -1674,33 +1672,48 @@ impl TalkerCheckpoint {
 
     /// Borrowed microdecoder weights.
     ///
-    /// `layers` is [`Self::microdecoder_layer_weights`], `residual` is
-    /// [`Self::residual_embedding_slices`], and `heads` is [`Self::microdecoder_head_slices`]. The
-    /// microdecoder's internal tables for depths 2..=15 are the first fourteen of the same
-    /// per-depth set the feedback path uses, so `residual` is passed here already trimmed by the
-    /// caller when the microdecoder wants fourteen rather than fifteen.
+    /// `layers` is [`Self::microdecoder_layer_weights`] and `heads` is
+    /// [`Self::microdecoder_head_slices`]. The microdecoder's internal embedding tables for
+    /// depths 2..=15 are the first fourteen of the per-depth set, taken from artifact-native
+    /// Q8 when hydration elided the widened forms (bead frankentts-x7bt), widened rows
+    /// otherwise.
     #[must_use]
     pub fn microdecoder_weights<'a>(
         &'a self,
         layers: &'a [LayerWeights<'a>],
-        residual: &'a [&'a [f32]],
         heads: &'a [&'a [f32]],
     ) -> MicrodecoderWeights<'a> {
+        let residual_embeddings = match self.residual_embeddings_q8.as_deref() {
+            // Fourteen tables: positions 2..=15 embed from codec_embedding[p - 2].
+            Some(q8) => ResidualEmbeddings::Quantized(&q8[..CODE_GROUP_COUNT - 2]),
+            None => ResidualEmbeddings::Widened(
+                self.residual_embeddings[..CODE_GROUP_COUNT - 2]
+                    .iter()
+                    .map(Vec::as_slice)
+                    .collect::<Vec<&[f32]>>(),
+            ),
+        };
         MicrodecoderWeights {
             layers,
             talker_codec_embedding: &self.codec_embedding,
-            residual_embeddings: ResidualEmbeddings::Widened(residual),
+            residual_embeddings,
             heads,
             final_norm: &self.micro_final_norm,
         }
     }
 
-    /// The sixteen talker-input feedback tables.
+    /// The sixteen talker-input feedback tables, artifact-native Q8 when hydration
+    /// elided the widened residual forms.
     #[must_use]
-    pub fn feedback_tables<'a>(&'a self, residual: &'a [&'a [f32]]) -> FeedbackTables<'a> {
+    pub fn feedback_tables(&self) -> FeedbackTables<'_> {
         FeedbackTables {
             talker_codec: &self.codec_embedding,
-            residual: residual.to_vec(),
+            residual: match self.residual_embeddings_q8.as_deref() {
+                Some(q8) => crate::generate::FeedbackResidual::Quantized(q8),
+                None => crate::generate::FeedbackResidual::Widened(
+                    self.residual_embeddings.iter().map(Vec::as_slice).collect(),
+                ),
+            },
         }
     }
 
