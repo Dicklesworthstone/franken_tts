@@ -1299,10 +1299,78 @@ impl FrameGenerator for QwenGenerator<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::microdecoder::{LayerWeights, RESIDUAL_DEPTHS};
-    use crate::prompt::CloneMode;
-    use crate::talker::{TALKER_LAYER_COUNT, TalkerLayerWeights};
     use ftts_core::{NormalizationMode, NormalizationTrace};
+
+    use crate::microdecoder::{residual_embedding_row, LayerWeights, RESIDUAL_DEPTHS};
+
+    /// The feedback sum must be BIT-identical whether the fifteen per-depth tables are
+    /// widened f32 or artifact-native Q8 dequantized on demand — elision (bead
+    /// frankentts-x7bt) is a memory decision, never a numerics one. Pins the exact
+    /// scale-multiply contract both consumers share.
+    #[test]
+    fn feedback_sum_is_bit_identical_across_widened_and_q8_tables() {
+        let hidden = 64_usize;
+        let codes: Vec<u32> = (0..CODE_GROUP_COUNT)
+            .map(|depth| u32::try_from((depth * 197 + 13) % RESIDUAL_VOCAB).expect("in vocab"))
+            .collect();
+        let tables: Vec<Vec<f32>> = (0..CODE_GROUP_COUNT - 1)
+            .map(|depth| {
+                let mut values = vec![0.0_f32; RESIDUAL_VOCAB * hidden];
+                for (index, value) in values.iter_mut().enumerate() {
+                    *value = ((index as i64 * (depth as i64 + 3) + 7) % 991) as f32 / 31.0
+                        - 16.0;
+                }
+                values
+            })
+            .collect();
+        let q8_tables: Vec<ftts_kernels::int8::QuantizedMatrix> = tables
+            .iter()
+            .map(|table| ftts_kernels::int8::QuantizedMatrix::quantize(table, RESIDUAL_VOCAB, hidden))
+            .collect();
+
+        let talker_codec = vec![0.5_f32; PRIMARY_CODE_VOCAB_SIZE * hidden];
+        let tts_pad = vec![-0.25_f32; hidden];
+
+        // Widened arm: slices straight off the stored rows.
+        let mut widened_rows: Vec<&[f32]> = Vec::with_capacity(CODE_GROUP_COUNT);
+        for (depth, &code) in codes.iter().enumerate() {
+            let table: &[f32] = if depth == 0 {
+                &talker_codec
+            } else {
+                &tables[depth - 1]
+            };
+            widened_rows.push(&table[code as usize * hidden..(code as usize + 1) * hidden]);
+        }
+        let mut widened_sum = vec![0.0_f32; hidden];
+        crate::talker::form_frame_input(
+            &widened_rows,
+            None,
+            &tts_pad,
+            &mut widened_sum,
+        );
+
+        // Quantized arm: the generator's on-demand path, byte-for-byte the same helper.
+        let mut q8_rows: Vec<&[f32]> = Vec::with_capacity(CODE_GROUP_COUNT);
+        let mut scratch: Vec<Vec<f32>> = Vec::new();
+        q8_rows.push(
+            &talker_codec[codes[0] as usize * hidden..(codes[0] as usize + 1) * hidden],
+        );
+        for (index, &code) in codes.iter().skip(1).enumerate() {
+            scratch.push(residual_embedding_row(&q8_tables[index], code as usize, hidden));
+            q8_rows.push(scratch.last().expect("row pushed above").as_slice());
+        }
+        let mut q8_sum = vec![0.0_f32; hidden];
+        crate::talker::form_frame_input(&q8_rows, None, &tts_pad, &mut q8_sum);
+
+        for (index, (wide, quantized)) in widened_sum.iter().zip(q8_sum.iter()).enumerate() {
+            assert_eq!(
+                wide.to_bits(),
+                quantized.to_bits(),
+                "feedback sum element {index} differs between widened and Q8 tables"
+            );
+        }
+    }
+
 
     /// Tiny but structurally complete geometry: talker width 8 with the mandatory 28 layers and
     /// the hardcoded 3072/2048 vocabularies, microdecoder width 8 with 2 layers.
