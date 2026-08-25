@@ -5,6 +5,7 @@
 pub mod census;
 pub mod converter;
 pub mod enhance_loader;
+pub mod fttspack;
 pub mod fttsq;
 pub mod safetensors;
 pub mod sha256;
