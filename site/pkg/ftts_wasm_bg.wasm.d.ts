@@ -19,12 +19,13 @@ export const wasmengine_enroll: (a: number, b: number, c: number) => [number, nu
 export const wasmengine_enroll_raw: (a: number, b: number, c: number) => [number, number, number, number];
 export const wasmengine_from_staging: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
 export const wasmengine_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
+export const wasmengine_set_debug_taps: (a: number, b: number) => void;
 export const wasmengine_synthesize: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => [number, number, number, number];
 export const wasmengine_synthesize_with_text_rows: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => [number, number, number, number];
 export const wasmengine_text_row_ids: (a: number, b: number, c: number) => [number, number, number, number];
 export const worker_loop_entry: (a: number) => [number, number];
-export const arm_worker_team: (a: number) => void;
 export const install_panic_hook: () => void;
+export const arm_worker_team: (a: number) => void;
 export const publish_team_block: () => void;
 export const worker_team_width: () => number;
 export const memory: WebAssembly.Memory;

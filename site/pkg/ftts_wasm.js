@@ -370,6 +370,15 @@ export class WasmEngine {
         return this;
     }
     /**
+     * Enables the DISC-006 cross-target seam taps (frankentts-p16p): one `console.error` line
+     * per generated frame carrying hashes of the tensors that cross engine seams. Off by
+     * default — a normal visitor's console never sees them.
+     * @param {boolean} enabled
+     */
+    set_debug_taps(enabled) {
+        wasm.wasmengine_set_debug_taps(this.__wbg_ptr, enabled);
+    }
+    /**
      * Synthesize `text` with a 1,024-float speaker vector; returns mono 24 kHz PCM in
      * `[-1, 1]`.
      *
@@ -635,7 +644,7 @@ function __wbg_get_imports(memory) {
         __wbg___wbindgen_throw_344f42d3211c4765: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
-        __wbg_error_43ea8f8b6e12137c: function(arg0, arg1) {
+        __wbg_error_17b80bf9273fd43b: function(arg0, arg1) {
             console.error(getStringFromWasm0(arg0, arg1));
         },
         __wbg_now_86c0d4ba3fa605b8: function() {
