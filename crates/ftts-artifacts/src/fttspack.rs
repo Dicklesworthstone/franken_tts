@@ -537,7 +537,7 @@ impl FttsPack {
         let stored_checksum = std::str::from_utf8(&bytes[20..84])
             .map_err(|_| PackError::CorruptHeader("non-utf8 checksum".into()))?;
 
-        let payload_start = 84;
+        let payload_start: usize = 84;
         let payload_end = payload_start
             .checked_add(json_len)
             .ok_or_else(|| PackError::CorruptHeader("json payload offset overflow".into()))?;
