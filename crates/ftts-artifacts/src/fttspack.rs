@@ -210,7 +210,7 @@ impl TileLayout {
     /// # Errors
     ///
     /// Returns `PackError::CorruptHeader` on unknown layout string.
-    pub fn from_str(s: &str) -> Result<Self, PackError> {
+    pub fn parse_layout(s: &str) -> Result<Self, PackError> {
         match s {
             "row_major" => Ok(Self::RowMajor),
             "tile_4x16_sdot" => Ok(Self::Tile4x16Sdot),
@@ -220,6 +220,13 @@ impl TileLayout {
     }
 }
 
+impl std::str::FromStr for TileLayout {
+    type Err = PackError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_layout(s)
+    }
+}
 /// A packed weight tensor ready for zero-copy kernel execution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackedTensor {
@@ -272,7 +279,7 @@ impl PackedTensor {
             .get("layout")
             .and_then(Value::as_str)
             .ok_or_else(|| PackError::CorruptHeader("missing layout".into()))?;
-        let layout = TileLayout::from_str(layout_str)?;
+        let layout = TileLayout::parse_layout(layout_str)?;
 
         let scales: Vec<f32> = obj
             .get("scales")
