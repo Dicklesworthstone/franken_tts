@@ -102,6 +102,14 @@ jobs:
           test -f /dp/frankentorch/crates/ft-core/Cargo.toml \
             || { echo "::error::frankentorch checkout does not have the expected layout"; exit 1; }
 
+      # Self-hosted runners execute non-interactive shells that never source .bashrc, so a
+      # rustup installed under ~/.cargo/bin (the rustup.rs default) is invisible to them.
+      # yto lost its service-level PATH on 2026-08-24 and every gate/cross run 127'd on
+      # `rustup` for ~20 hours while the tree itself was fine. Prepending here makes the
+      # workflow independent of however the runner service happened to be started; on
+      # hosted runners this is a harmless no-op (the directory already exists on PATH).
+      - name: Put cargo toolchain on PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       # rust-toolchain.toml pins the nightly; rustup honours it automatically. Installing the
       # components explicitly makes a toolchain problem fail here with a clear message rather
       # than midway through the gate.
@@ -198,6 +206,10 @@ jobs:
       - name: Add target
         working-directory: frankentts
         run: rustup target add ${{ matrix.target }}
+
+      # Same self-hosted-PATH independence as the gate job's bootstrap step above.
+      - name: Put cargo toolchain on PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@v2
         with:
