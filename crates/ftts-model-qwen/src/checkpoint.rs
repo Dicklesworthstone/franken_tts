@@ -1215,9 +1215,8 @@ impl TalkerCheckpoint {
             // artifact that changed under us and fails the load.
             let embeddings_q8 = (0..CODE_GROUP_COUNT - 1)
                 .map(|table| {
-                    let name = format!(
-                        "talker.code_predictor.model.codec_embedding.{table}.weight"
-                    );
+                    let name =
+                        format!("talker.code_predictor.model.codec_embedding.{table}.weight");
                     crate::generate::q8_from_artifact(
                         &artifact,
                         &name,
@@ -1653,7 +1652,9 @@ impl TalkerCheckpoint {
                             .data
                             .chunks_exact(matrix.k)
                             .zip(matrix.scales.iter())
-                            .flat_map(|(row, scale)| row.iter().map(move |value| *value as f32 * scale))
+                            .flat_map(|(row, scale)| {
+                                row.iter().map(move |value| *value as f32 * scale)
+                            })
                             .collect::<Vec<f32>>()
                     })
                     .collect();

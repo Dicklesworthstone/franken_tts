@@ -1823,7 +1823,9 @@ pub fn synthesize(
         cold_rows: Some(&model.talker),
         feedback: model.talker.feedback_tables(),
         microdecoder_config: MicrodecoderConfig::default(),
-        microdecoder_weights: model.talker.microdecoder_weights(&micro_layers, residual, &heads),
+        microdecoder_weights: model
+            .talker
+            .microdecoder_weights(&micro_layers, residual, &heads),
         prompt_mode,
         header,
         tts_eos,

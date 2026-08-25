@@ -1304,7 +1304,7 @@ impl FrameGenerator for QwenGenerator<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::microdecoder::{residual_embedding_row, LayerWeights, RESIDUAL_DEPTHS};
+    use crate::microdecoder::{LayerWeights, RESIDUAL_DEPTHS, residual_embedding_row};
     use crate::prompt::CloneMode;
     use crate::talker::{TALKER_LAYER_COUNT, TalkerLayerWeights};
     use ftts_core::{NormalizationMode, NormalizationTrace};
@@ -1369,11 +1369,13 @@ mod tests {
         // Quantized arm: the generator's on-demand path, byte-for-byte the same helper.
         let mut q8_rows: Vec<&[f32]> = Vec::with_capacity(CODE_GROUP_COUNT);
         let mut scratch: Vec<Vec<f32>> = Vec::new();
-        q8_rows.push(
-            &talker_codec[codes[0] as usize * hidden..(codes[0] as usize + 1) * hidden],
-        );
+        q8_rows.push(&talker_codec[codes[0] as usize * hidden..(codes[0] as usize + 1) * hidden]);
         for (index, &code) in codes.iter().skip(1).enumerate() {
-            scratch.push(residual_embedding_row(&q8_tables[index], code as usize, hidden));
+            scratch.push(residual_embedding_row(
+                &q8_tables[index],
+                code as usize,
+                hidden,
+            ));
         }
         for row in &scratch {
             q8_rows.push(row.as_slice());
@@ -1389,7 +1391,6 @@ mod tests {
             );
         }
     }
-
 
     /// Tiny but structurally complete geometry: talker width 8 with the mandatory 28 layers and
     /// the hardcoded 3072/2048 vocabularies, microdecoder width 8 with 2 layers.
