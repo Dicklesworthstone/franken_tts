@@ -327,7 +327,7 @@ impl Hydrated {
                 // The microdecoder's internal tables for positions 2..=15 are the first 14 of the
                 // same per-depth set the feedback path uses.
                 residual_embeddings: ftts_model_qwen::microdecoder::ResidualEmbeddings::Widened(
-                    micro_residual,
+                    micro_residual.to_vec(),
                 ),
                 heads: micro_heads,
                 final_norm: &self.micro_final_norm,
