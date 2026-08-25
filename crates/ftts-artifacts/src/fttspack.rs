@@ -6,7 +6,7 @@
 //! `.fttspack` is **per-machine and regenerable**: it holds arch-specific packed layouts
 //! (e.g. SDOT, i8mm, AVX-VNNI, AMX tile interleavings), the physically separated
 //! **Microdecoder Hot Pack** (tuned for cache residency across the 15 sequential steps),
-//! and the persisted [`KernelPlan`] (which kernel tier wins per op/shape/regime).
+//! and the persisted [`PersistedKernelPlan`] (which kernel tier wins per op/shape/regime).
 //!
 //! # 8-Tuple Cache Key
 //!
@@ -28,7 +28,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::sha256::{Sha256, hex_digest};
+use serde_json::{Value, json};
+
+use crate::sha256::hex_digest;
 
 /// Magic bytes identifying a `.fttspack` container.
 pub const PACK_MAGIC: &[u8; 8] = b"FTTSPACK";
@@ -73,7 +75,7 @@ impl fmt::Display for PackError {
 impl std::error::Error for PackError {}
 
 /// The 8-tuple cache key governing cache validation and regeneration.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackKey {
     pub model_content_hash: String,
     pub kernel_abi_version: u32,
@@ -110,10 +112,64 @@ impl PackKey {
     pub fn matches(&self, other: &Self) -> bool {
         self.compute_cache_key() == other.compute_cache_key()
     }
+
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            "model_content_hash": self.model_content_hash,
+            "kernel_abi_version": self.kernel_abi_version,
+            "cpu_vendor_model": self.cpu_vendor_model,
+            "isa_features": self.isa_features,
+            "op_shape_plan": self.op_shape_plan,
+            "packing_version": self.packing_version,
+            "quant_execution_mode": self.quant_execution_mode,
+            "autotune_result_hash": self.autotune_result_hash,
+        })
+    }
+
+    /// Parses a `PackKey` from a JSON `Value`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PackError::CorruptHeader` if any field is missing or invalid.
+    pub fn from_json(val: &Value) -> Result<Self, PackError> {
+        let obj = val.as_object().ok_or_else(|| PackError::CorruptHeader("expected key object".into()))?;
+        let get_str = |k: &str| {
+            obj.get(k)
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .ok_or_else(|| PackError::CorruptHeader(format!("missing {k}")))
+        };
+        let get_u32 = |k: &str| {
+            obj.get(k)
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| PackError::CorruptHeader(format!("missing {k}")))
+        };
+        let isa_features = obj
+            .get("isa_features")
+            .and_then(Value::as_array)
+            .ok_or_else(|| PackError::CorruptHeader("missing isa_features array".into()))?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect();
+
+        Ok(Self {
+            model_content_hash: get_str("model_content_hash")?,
+            kernel_abi_version: get_u32("kernel_abi_version")?,
+            cpu_vendor_model: get_str("cpu_vendor_model")?,
+            isa_features,
+            op_shape_plan: get_str("op_shape_plan")?,
+            packing_version: get_u32("packing_version")?,
+            quant_execution_mode: get_str("quant_execution_mode")?,
+            autotune_result_hash: get_str("autotune_result_hash")?,
+        })
+    }
 }
 
 /// Packing mode used for an individual weight matrix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TileLayout {
     /// Standard row-major [N, K].
     RowMajor,
@@ -123,8 +179,33 @@ pub enum TileLayout {
     Tile4x32Vnni,
 }
 
+impl TileLayout {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RowMajor => "row_major",
+            Self::Tile4x16Sdot => "tile_4x16_sdot",
+            Self::Tile4x32Vnni => "tile_4x32_vnni",
+        }
+    }
+
+    /// Parses a layout from string.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PackError::CorruptHeader` on unknown layout string.
+    pub fn from_str(s: &str) -> Result<Self, PackError> {
+        match s {
+            "row_major" => Ok(Self::RowMajor),
+            "tile_4x16_sdot" => Ok(Self::Tile4x16Sdot),
+            "tile_4x32_vnni" => Ok(Self::Tile4x32Vnni),
+            other => Err(PackError::CorruptHeader(format!("unknown layout: {other}"))),
+        }
+    }
+}
+
 /// A packed weight tensor ready for zero-copy kernel execution.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PackedTensor {
     pub name: String,
     pub rows: usize,
@@ -134,8 +215,54 @@ pub struct PackedTensor {
     pub data: Vec<i8>,
 }
 
+impl PackedTensor {
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "rows": self.rows,
+            "cols": self.cols,
+            "layout": self.layout.as_str(),
+            "scales": self.scales,
+            "data": self.data.iter().map(|&b| b as i32).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Parses a `PackedTensor` from a JSON `Value`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PackError::CorruptHeader` if fields are invalid.
+    pub fn from_json(val: &Value) -> Result<Self, PackError> {
+        let obj = val.as_object().ok_or_else(|| PackError::CorruptHeader("expected tensor object".into()))?;
+        let name = obj.get("name").and_then(Value::as_str).ok_or_else(|| PackError::CorruptHeader("missing name".into()))?.to_string();
+        let rows = obj.get("rows").and_then(Value::as_u64).ok_or_else(|| PackError::CorruptHeader("missing rows".into()))? as usize;
+        let cols = obj.get("cols").and_then(Value::as_u64).ok_or_else(|| PackError::CorruptHeader("missing cols".into()))? as usize;
+        let layout_str = obj.get("layout").and_then(Value::as_str).ok_or_else(|| PackError::CorruptHeader("missing layout".into()))?;
+        let layout = TileLayout::from_str(layout_str)?;
+
+        let scales: Vec<f32> = obj.get("scales")
+            .and_then(Value::as_array)
+            .ok_or_else(|| PackError::CorruptHeader("missing scales".into()))?
+            .iter()
+            .filter_map(Value::as_f64)
+            .map(|f| f as f32)
+            .collect();
+
+        let data: Vec<i8> = obj.get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| PackError::CorruptHeader("missing data".into()))?
+            .iter()
+            .filter_map(Value::as_i64)
+            .map(|i| i as i8)
+            .collect();
+
+        Ok(Self { name, rows, cols, layout, scales, data })
+    }
+}
+
 /// The physically separated Microdecoder Hot Pack, tuned for cache residency.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MicrodecoderHotPack {
     pub body_layers: Vec<PackedTensor>,
     pub per_depth_heads: Vec<PackedTensor>,
@@ -143,16 +270,90 @@ pub struct MicrodecoderHotPack {
     pub footprint_bytes: usize,
 }
 
+impl MicrodecoderHotPack {
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            "body_layers": self.body_layers.iter().map(PackedTensor::to_json).collect::<Vec<_>>(),
+            "per_depth_heads": self.per_depth_heads.iter().map(PackedTensor::to_json).collect::<Vec<_>>(),
+            "per_depth_embeddings": self.per_depth_embeddings.iter().map(PackedTensor::to_json).collect::<Vec<_>>(),
+            "footprint_bytes": self.footprint_bytes,
+        })
+    }
+
+    /// Parses a `MicrodecoderHotPack` from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PackError::CorruptHeader` on invalid fields.
+    pub fn from_json(val: &Value) -> Result<Self, PackError> {
+        let obj = val.as_object().ok_or_else(|| PackError::CorruptHeader("expected hot pack object".into()))?;
+        let parse_tensors = |key: &str| -> Result<Vec<PackedTensor>, PackError> {
+            obj.get(key)
+                .and_then(Value::as_array)
+                .ok_or_else(|| PackError::CorruptHeader(format!("missing {key}")))?
+                .iter()
+                .map(PackedTensor::from_json)
+                .collect()
+        };
+        let body_layers = parse_tensors("body_layers")?;
+        let per_depth_heads = parse_tensors("per_depth_heads")?;
+        let per_depth_embeddings = parse_tensors("per_depth_embeddings")?;
+        let footprint_bytes = obj.get("footprint_bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| PackError::CorruptHeader("missing footprint_bytes".into()))? as usize;
+
+        Ok(Self { body_layers, per_depth_heads, per_depth_embeddings, footprint_bytes })
+    }
+}
+
 /// Persisted autotuner winner mapping per op / shape / regime.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedKernelPlan {
     pub decode_gemv_winner: String,
     pub batch_gemm_winner: String,
     pub per_op_winners: BTreeMap<String, String>,
 }
 
+impl PersistedKernelPlan {
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            "decode_gemv_winner": self.decode_gemv_winner,
+            "batch_gemm_winner": self.batch_gemm_winner,
+            "per_op_winners": self.per_op_winners,
+        })
+    }
+
+    /// Parses a `PersistedKernelPlan` from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PackError::CorruptHeader` on invalid fields.
+    pub fn from_json(val: &Value) -> Result<Self, PackError> {
+        let obj = val.as_object().ok_or_else(|| PackError::CorruptHeader("expected plan object".into()))?;
+        let decode_gemv_winner = obj.get("decode_gemv_winner")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PackError::CorruptHeader("missing decode_gemv_winner".into()))?
+            .to_string();
+        let batch_gemm_winner = obj.get("batch_gemm_winner")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PackError::CorruptHeader("missing batch_gemm_winner".into()))?
+            .to_string();
+        
+        let per_op_winners = obj.get("per_op_winners")
+            .and_then(Value::as_object)
+            .ok_or_else(|| PackError::CorruptHeader("missing per_op_winners".into()))?
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
+
+        Ok(Self { decode_gemv_winner, batch_gemm_winner, per_op_winners })
+    }
+}
+
 /// The full `.fttspack` execution cache container.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FttsPack {
     pub key: PackKey,
     pub plan: PersistedKernelPlan,
@@ -161,24 +362,56 @@ pub struct FttsPack {
 }
 
 impl FttsPack {
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            "key": self.key.to_json(),
+            "plan": self.plan.to_json(),
+            "microdecoder_hot_pack": self.microdecoder_hot_pack.to_json(),
+            "talker_tensors": self.talker_tensors.iter().map(PackedTensor::to_json).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Parses an `FttsPack` from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PackError::CorruptHeader` on invalid fields.
+    pub fn from_json(val: &Value) -> Result<Self, PackError> {
+        let obj = val.as_object().ok_or_else(|| PackError::CorruptHeader("expected pack object".into()))?;
+        let key = PackKey::from_json(obj.get("key").ok_or_else(|| PackError::CorruptHeader("missing key".into()))?)?;
+        let plan = PersistedKernelPlan::from_json(obj.get("plan").ok_or_else(|| PackError::CorruptHeader("missing plan".into()))?)?;
+        let microdecoder_hot_pack = MicrodecoderHotPack::from_json(
+            obj.get("microdecoder_hot_pack").ok_or_else(|| PackError::CorruptHeader("missing hot pack".into()))?,
+        )?;
+        let talker_tensors = obj.get("talker_tensors")
+            .and_then(Value::as_array)
+            .ok_or_else(|| PackError::CorruptHeader("missing talker_tensors".into()))?
+            .iter()
+            .map(PackedTensor::from_json)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self { key, plan, microdecoder_hot_pack, talker_tensors })
+    }
+
     /// Encodes the pack into a binary byte vector with header, JSON metadata, and payload.
     ///
     /// # Errors
     ///
     /// Returns `PackError::CorruptHeader` if serialization fails.
     pub fn encode(&self) -> Result<Vec<u8>, PackError> {
-        let json_text = serde_json::to_string(&self)
+        let json_val = self.to_json();
+        let json_bytes = serde_json::to_vec(&json_val)
             .map_err(|e| PackError::CorruptHeader(e.to_string()))?;
-        let json_bytes = json_text.as_bytes();
         let json_len = json_bytes.len() as u64;
-        let checksum = hex_digest(json_bytes);
+        let checksum = hex_digest(&json_bytes);
 
         let mut output = Vec::with_capacity(8 + 4 + 8 + 64 + json_bytes.len());
         output.extend_from_slice(PACK_MAGIC);
         output.extend_from_slice(&PACK_FORMAT_VERSION.to_le_bytes());
         output.extend_from_slice(&json_len.to_le_bytes());
         output.extend_from_slice(checksum.as_bytes()); // 64 ASCII hex bytes
-        output.extend_from_slice(json_bytes);
+        output.extend_from_slice(&json_bytes);
 
         Ok(output)
     }
@@ -238,9 +471,9 @@ impl FttsPack {
             });
         }
 
-        let pack: Self = serde_json::from_slice(json_slice)
+        let val: Value = serde_json::from_slice(json_slice)
             .map_err(|e| PackError::CorruptHeader(e.to_string()))?;
-        Ok(pack)
+        Self::from_json(&val)
     }
 
     /// Writes the pack atomically to the given file path.
