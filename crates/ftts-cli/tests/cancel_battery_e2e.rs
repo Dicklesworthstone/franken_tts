@@ -20,6 +20,11 @@
 //! (`cancel_storm_across_many_utterances_without_deadlock`).
 //!
 //! Receipts: each test prints `receipt: {...}` NDJSON with measured values.
+//!
+//! Every case uses real POSIX signals, so the whole crate is `#![cfg(unix)]`:
+//! on non-unix cross-target checks it compiles as an empty test binary instead
+//! of a wall of dead-code warnings against the gate's -D pass.
+#![cfg(unix)]
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
