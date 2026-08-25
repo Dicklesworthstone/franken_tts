@@ -15,7 +15,8 @@ individual commits are intentionally not cited.
 
 | Version | Date | Status | Summary |
 |---------|------|--------|---------|
-| 0.1.8 | 2026-08-12 | current | model downloads survive GitHub throttling: Hugging Face is the primary mirror everywhere |
+| 0.1.9 | 2026-08-25 | current | the voice compiler: ICL QUALITY packs end to end; enrollment diagnostics; Ctrl-C contract everywhere; micro-q8 artifacts |
+| 0.1.8 | 2026-08-12 | superseded | model downloads survive GitHub throttling: Hugging Face is the primary mirror everywhere |
 | 0.1.7 | 2026-08-12 | superseded | browser memory diet (no double-resident model), native↔browser parity harness, w8a16 multicore |
 | 0.1.6 | 2026-08-10 | superseded | voice cards (a picture that IS the voice), phone↔CLI interop; iOS video export unstuck; output denoising |
 | 0.1.5 | 2026-08-10 | superseded | browser engine 9.4× faster; iOS survives; enrollment denoises itself; Windows installer |
@@ -25,19 +26,52 @@ individual commits are intentionally not cited.
 | 0.1.1 | 2026-08-08 | superseded | zero-config UX: `ftts pull`, default model cache, m4a/mp3 enrollment |
 | 0.1.0 | 2026-08-08 | first release | f32 reference engine, CLI, conformance ladder, artifact groundwork |
 
-## [Unreleased]
+## [0.1.9] - 2026-08-25
+
+The voice compiler becomes real: enrollment now grades your reference audio,
+writes portable `.ftvoice` packs, and `ftts say` consumes ICL QUALITY packs —
+reference audio *and* transcript riding along. And Ctrl-C works everywhere.
+
 ### Added
 
-- **`.ftvoice` and `.ftvoice-cache` voice artifacts** (bead
-  `frankentts-p4-ftvoice-format-x0p`): the two-layer voice format — a portable pack carrying the
-  speaker embedding, consent attestation, transcript, reference codec tokens, enrollment
-  diagnostics, and the reproducible preprocessing recipe under three privacy profiles
-  (portable/private/minimal, enforced at read time), plus a derived-state cache keyed by the full
-  OQ-10 §5.1 tuple. Hardened like `.fttsq` (digest-verified sections, checked arithmetic, named
-  refusals) and byte-idempotent by construction — no timestamps enter the encoding.
-  `ftts voice inspect` now renders real pack contents (human summary + full `voice_inspect`
-  robot event), and `ftts say --voice pack.ftvoice` consumes packs directly.
+- **ICL QUALITY packs end to end**: `ftts enroll --quality/--quick/--auto`
+  (bead `frankentts-p4-enrollment-en6`) writes `.ftvoice` packs carrying the
+  speaker embedding, consent attestation, transcript, reference codec tokens,
+  and reproducible preprocessing recipe under three privacy profiles
+  (portable/private/minimal); `ftts say --voice pack.ftvoice` consumes them
+  through the reference-prefix codec path (prime, cut exactly, snapshot), so
+  cloning quality no longer depends on x-vector alone.
   Design rationale in `docs/VOICE_COMPILER_DESIGN.md`.
+- **Enrollment signal-quality diagnostics**: VAD speech ratio, clipping, SNR,
+  music/stationarity, and loudness checks with named refusals — a bad
+  reference is explained, never silently enrolled.
+- **`ftts convert --micro-q8`** (opt-in): Q8 storage for the microdecoder's
+  per-depth tables; artifact-native hydration elides their widened forms so
+  the resident footprint drops (~2 GiB lower peak RSS measured on a full say
+  run vs forced widening, single-pair indicative). Bit-exact gather contract
+  pinned by test; kill switch `FTTS_ARTIFACT_Q8=0`.
+- **Streaming C ABI for iOS**: chunk callback + cancellation for on-device
+  synthesis (frankentts-omad).
+- **`ftts doctor` reports real readiness** instead of a placeholder phase;
+  kernel-plan provenance is queryable (`ftts robot backends`).
+- Audible-TTFA metric and caller-tunable codec packet size.
+- Conformance: metamorphic invariants suite, prosody contour metrics
+  (pitch/energy), ProductionQuality (Contract B) harness, TTFA certification
+  as one command.
+
+### Fixed
+
+- **Ctrl-C honors the two-strike contract everywhere**: `ftts say` cancels
+  promptly during inline synthesis (the codec pipeline no longer drains its
+  backlog after a strike) and during resident-daemon waits; `ftts talk`
+  settles the in-flight utterance and exits 6 the same way. Cancelled runs
+  keep a valid partial WAV.
+- The wasm bindings were silently red against the FrameGenerator API; they
+  build again, and a gate stage keeps it that way.
+- The site's model download shrinks by 225 MB: only the decoder half of the
+  codec ships to the browser (bit-exact).
+- Robot mode reports honest `resident-hit`/`resident-miss` stages and real
+  kernel-plan persistence state.
 
 ## [0.1.8] - 2026-08-12
 
