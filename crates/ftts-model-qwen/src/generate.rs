@@ -710,7 +710,7 @@ impl<'a> QwenGenerator<'a> {
                 }
             }
             FeedbackResidual::Quantized(tables) => {
-                for matrix in tables {
+                for matrix in tables.iter() {
                     assert_eq!(
                         matrix.k, hidden,
                         "each Q8 residual feedback table must gather {hidden}-wide rows"
@@ -1221,16 +1221,21 @@ impl FrameGenerator for QwenGenerator<'_> {
                 }
             }
             FeedbackResidual::Quantized(tables) => {
-                let talker_row = &self.feedback.talker_codec
-                    [primary as usize * hidden..(primary as usize + 1) * hidden];
-                rows.push(talker_row);
+                // Push every dequantized row BEFORE borrowing them into `rows`: rows
+                // holds immutable borrows of this scratch through form_frame_input.
+                q8_rows.reserve(codes.len() - 1);
                 for (index, &code) in residuals.iter().enumerate() {
                     q8_rows.push(microdecoder::residual_embedding_row(
                         &tables[index],
                         code as usize,
                         hidden,
                     ));
-                    let row = q8_rows.last().expect("row pushed above");
+                }
+                rows.push(
+                    &self.feedback.talker_codec
+                        [primary as usize * hidden..(primary as usize + 1) * hidden],
+                );
+                for row in &q8_rows {
                     rows.push(row.as_slice());
                 }
             }

@@ -1653,7 +1653,7 @@ impl TalkerCheckpoint {
                             .data
                             .chunks_exact(matrix.k)
                             .zip(matrix.scales.iter())
-                            .flat_map(|(row, scale)| row.iter().map(|value| value as f32 * scale))
+                            .flat_map(|(row, scale)| row.iter().map(|value| *value as f32 * scale))
                             .collect::<Vec<f32>>()
                     })
                     .collect();
@@ -1686,12 +1686,13 @@ impl TalkerCheckpoint {
         let residual_embeddings = match self.residual_embeddings_q8.as_deref() {
             // Fourteen tables: positions 2..=15 embed from codec_embedding[p - 2].
             Some(q8) => ResidualEmbeddings::Quantized(&q8[..CODE_GROUP_COUNT - 2]),
-            None => ResidualEmbeddings::Widened(
-                self.residual_embeddings[..CODE_GROUP_COUNT - 2]
+            None => {
+                widened = self.residual_embeddings[..CODE_GROUP_COUNT - 2]
                     .iter()
                     .map(Vec::as_slice)
-                    .collect::<Vec<&[f32]>>(),
-            ),
+                    .collect();
+                ResidualEmbeddings::Widened(&widened)
+            }
         };
         MicrodecoderWeights {
             layers,
