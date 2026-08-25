@@ -5602,4 +5602,30 @@ mod tests {
         // No partial staging files left behind.
         assert!(!dir.join("w.ftvoice.partial").exists());
     }
+
+    #[test]
+    fn doctor_reports_expected_json_and_human_format() {
+        let environment = Environment {
+            values: BTreeMap::new(),
+            stage_budget_values: BTreeMap::new(),
+        };
+
+        // JSON mode
+        let mut json_out = Vec::new();
+        let args_json = DoctorArgs { json: true };
+        run_doctor(&args_json, &environment, &mut json_out).expect("run_doctor json");
+        let report: Value = serde_json::from_slice(&json_out).expect("valid json");
+        assert_eq!(report["schema_version"], ROBOT_SCHEMA_VERSION);
+        assert_eq!(report["stateless_default"], true);
+        assert_eq!(report["persistent_history"], false);
+
+        // Human mode
+        let mut text_out = Vec::new();
+        let args_text = DoctorArgs { json: false };
+        run_doctor(&args_text, &environment, &mut text_out).expect("run_doctor text");
+        let text_str = String::from_utf8(text_out).expect("valid utf8");
+        assert!(text_str.contains("FrankenTTS ftts — local readiness"));
+        assert!(text_str.contains("stateless default: yes"));
+    }
 }
+
