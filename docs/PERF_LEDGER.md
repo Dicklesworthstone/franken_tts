@@ -163,3 +163,24 @@ tally_w_l_n: 0/0/0 (baseline)
 ## Inherited priors (pre-truth-pack)
 
 None admitted. The inherited graveyard is intentionally indexed only in `NEGATIVE_EVIDENCE.md`; re-confirmed measurements receive new `PERF-NNN` evidence IDs and must satisfy the current-tree gate.
+
+```text
+PERF-008
+claim_id: native-route-rtf-and-ttfa-recert
+evidence_id: docs/truth-pack/perf/perf-recert-loadavg.ndjson (98-sample machine-state timeline; attempt 2026-08-25 17:26Z–19:07Z+); harness benches/perf_recert_window.sh + analyzer benches/sprt_analyze.py (committed, turnkey for the next window)
+status: NO_EVIDENCE — FAILED-TO-CERTIFY. No calm window existed to measure in: across 98 loadavg samples spanning ~1h45m the host ranged 0.0–492.6 (mean 160.8) during a multi-agent build storm that ultimately exhausted the machine's process table (fork EAGAIN killed the sampler). Zero measurement attempts were made — correctly, per the recorded threshold.
+model_source_commit: tree at attempt = a7fe166 (v0.1.9 tag 4ff8000 lineage)
+fixture_sha256: not-applicable (attempt never reached measurement)
+artifact_sha256: qwen3-tts-12hz-0.6b-base.fttsq=597f7eb3314a2fe5be74fa10a6a3a28ace9e10e582c641deccd37348a0ccd824 (staged and verified present pre-attempt)
+cpu_features: Apple M4 Pro (14-core); intended route = int8 default (W8A8 talker+microdecoder, f32 BLAS codec), packet_frames=1
+command_env: benches/perf_recert_window.sh (admission: loadavg(1m) < 6.0 sustained 3 min, timeline recorded; harness = cargo test --target aarch64-apple-darwin --release -p ftts-cli --test warm_engine_e2e ttfa_certification -- --ignored --nocapture, binary warm_engine_e2e-336520836a6adcda built and verified)
+kill_switch: n/a (never measured)
+incumbent: this tree's f32 reference per §10.3 (not reached)
+before_after: none — no admissible measurement exists
+cv_percent: not-applicable
+equivalence: parity qualification not reached
+disposition: DEFER
+tally_w_l_n: 0/0/1
+
+NEXT-WINDOW PLAN (turnkey): when the fleet is quiescent, run `benches/perf_recert_window.sh` (it self-gates on the same recorded threshold, samples machine state throughout, drives the harness, lands NDJSON receipts at docs/truth-pack/perf/), then `python3 benches/sprt_analyze.py <receipts>` — write the CERTIFY/FAIL verdict plus mean ttfa_audible (short+long) and mean RTF into a PERF row here, and update README's "~450 ms ttfa"/"1.4–1.6× RT" claims to the certified figures or drop them. The v0.1.9 release notes deliberately quote no admissible numbers.
+```
