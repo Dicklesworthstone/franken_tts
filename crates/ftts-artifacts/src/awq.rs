@@ -101,7 +101,7 @@ pub fn awq_scales(saliency: &[f64], alpha: f64) -> Vec<f32> {
         .map(|&moment| {
             // Saliency values are non-negative by construction; guard anyway so a
             // stray NaN or negative cannot poison the geometric mean below.
-            let value = if moment.is_finite() && *moment > 0.0 { moment } else { 1.0 };
+            let value = if moment.is_finite() && moment > 0.0 { moment } else { 1.0 };
             value.powf(alpha)
         })
         .collect();
@@ -287,7 +287,7 @@ pub fn gptq_round_matrix(
 ) -> Vec<f32> {
     assert_eq!(inverse_hessian.len(), k * k, "inverse hessian shape");
     let levels = (1_u64 << (bits - 1)) as f64;
-    let mut w: Vec<f64> = weight_row_major.iter().map(f64::from).collect();
+    let mut w: Vec<f64> = weight_row_major.iter().map(|&value| f64::from(value)).collect();
 
     // Per-row scales fixed ONCE from incoming magnitudes: re-deriving them
     // mid-sweep would silently rewrite already-rounded columns.
