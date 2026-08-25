@@ -723,6 +723,10 @@ async function handleMessage({ data }) {
         const memBefore = memoryBytes();
         stage("synthesize", `mem ${(memBefore / 1e9).toFixed(2)} GB`);
         const started = performance.now();
+        // DISC-006 seam taps (frankentts-p16p): per-request, off unless the page asked.
+        if (typeof engine.set_debug_taps === "function") {
+          engine.set_debug_taps(Boolean(data.debugTaps));
+        }
         // Packet size is a pure speed/memory dial: the streaming==batch gate makes output
         // bit-identical under every schedule, so 0 (the engine's default of 4) and any override
         // produce the same samples. Bigger packets mean a larger `m` in every codec GEMM.

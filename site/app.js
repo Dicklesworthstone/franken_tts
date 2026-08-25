@@ -709,6 +709,10 @@ ui.speak.addEventListener("click", async () => {
     if (Number.isFinite(globalThis.__fttsPacketFrames)) {
       payload.packetFrames = globalThis.__fttsPacketFrames;
     }
+    // DISC-006 seam taps (frankentts-p16p): the harness flips this on for cross-target diffs.
+    if (globalThis.__fttsDebugTaps) {
+      payload.debugTaps = true;
+    }
     const { pcm, sampleRate, elapsedMs } = await call("synthesize", payload);
     const samples = new Float32Array(pcm);
     setWavBlob(pcmToWavBlob(samples, sampleRate));

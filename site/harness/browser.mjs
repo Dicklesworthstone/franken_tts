@@ -54,6 +54,10 @@ const CONFORMANCE_TEXT = "The quick brown fox jumps over the lazy dog.";
 // and the CLI-parity check still has to pass at each size, which is what proves that claim here
 // rather than assuming it.
 const PACKET_FRAMES = Number(argValue("--packet-frames") ?? 0);
+// `--debug-taps` turns on the DISC-006 cross-target seam taps (frankentts-p16p): one
+// console line per frame whose hashes must match the native run's `FTTS_DEBUG_TAPS` lines
+// exactly until the first divergent operator.
+const DEBUG_TAPS = process.argv.includes("--debug-taps");
 
 const modelFiles = {
   "qwen3-tts-12hz-0.6b-base.fttsq": path.join(modelDir, "qwen3-tts-12hz-0.6b-base.fttsq"),
@@ -236,6 +240,12 @@ try {
         globalThis.__fttsPacketFrames = n;
       }, PACKET_FRAMES);
       console.log(`      packet frames: ${PACKET_FRAMES}`);
+    }
+    if (DEBUG_TAPS) {
+      await page.evaluate(() => {
+        globalThis.__fttsDebugTaps = true;
+      });
+      console.log("      debug taps: on");
     }
     const inputs = await page.evaluate(() => ({
       text: document.getElementById("text")?.value ?? null,

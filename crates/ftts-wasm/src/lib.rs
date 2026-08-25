@@ -96,6 +96,10 @@ pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         console_error(&format!("ftts-wasm panic: {info}"));
     }));
+    // DISC-006 seam taps (frankentts-p16p) route through the same console channel. Emission
+    // itself stays off until a host calls `set_debug_taps(true)`; the sink only decides WHERE
+    // lines would go.
+    ftts_model_qwen::generate::install_tap_sink(Box::new(|line| console_error(line)));
 }
 
 /// Wasm linear memory in bytes, read from the engine itself.
@@ -908,6 +912,13 @@ impl WasmEngine {
         max_frames: u32,
     ) -> Result<Vec<f32>, JsValue> {
         self.synthesize_inner(text, speaker, seed, max_frames, None, 0)
+    }
+
+    /// Enables the DISC-006 cross-target seam taps (frankentts-p16p): one `console.error` line
+    /// per generated frame carrying hashes of the tensors that cross engine seams. Off by
+    /// default — a normal visitor's console never sees them.
+    pub fn set_debug_taps(&self, enabled: bool) {
+        ftts_model_qwen::generate::set_taps_enabled(enabled);
     }
 
     /// The cold-text-embedding ids this exact text will need, in the order the rows must arrive.
