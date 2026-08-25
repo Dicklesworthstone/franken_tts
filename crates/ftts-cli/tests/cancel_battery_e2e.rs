@@ -60,6 +60,9 @@ brother Bob. We also need a small plastic snake and a big toy frog for the kids.
 these things into three red bags, and we will go meet her Wednesday at the train station. \
 When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow.";
 
+// The signal cases are #[cfg(unix)]; on non-unix cross-target checks these helpers
+// would otherwise be dead code and fail the gate's -D warnings pass.
+#[cfg(unix)]
 fn scratch_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "ftts-cancel-battery-{label}-{}-{}",
@@ -71,10 +74,10 @@ fn scratch_dir(label: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
 }
-
 /// Spawn `ftts` with BOTH streams redirected to files: signal cases need to poll the
 /// event stream while the child runs, and files make the final assertions byte-exact
 /// without drain threads racing the signal.
+#[cfg(unix)]
 fn spawn_to_files(
     args: &[&str],
     envs: &[(&str, &str)],
