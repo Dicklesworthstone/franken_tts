@@ -330,15 +330,47 @@ pub struct TextEmbeddingWeights<'a> {
 
 /// The 16 feedback embedding tables summed into every next-frame talker input.
 ///
-/// Table 0 is the talker's own codec embedding (`[3072, hidden]`); tables 1..=15 are the residual
-/// feedback tables (`[2048, hidden]` each). These are talker-input tables, distinct from the
-/// microdecoder's internal per-depth embeddings.
+/// Table 0 is the talker's own codec embedding (`[3072, hidden]`); tables 1..=15 are
+/// the residual feedback tables (`[2048, hidden]` each), widened or artifact-native Q8.
+/// These are talker-input tables, distinct from the microdecoder's internal per-depth
+/// embeddings.
 #[derive(Clone, Debug)]
 pub struct FeedbackTables<'a> {
     /// `[PRIMARY_CODE_VOCAB_SIZE, hidden]`, indexed by `c0`.
     pub talker_codec: &'a [f32],
     /// Fifteen `[RESIDUAL_VOCAB, hidden]` tables, indexed by `c1..=c15` in depth order.
-    pub residual: Vec<&'a [f32]>,
+    pub residual: FeedbackResidual<'a>,
+}
+
+/// The fifteen per-depth residual feedback tables, widened or artifact-native Q8.
+///
+/// The quantized arm carries the exact [`QuantizedMatrix`] bytes the converter's
+/// per-row Q8 recipe writes; a gathered row dequantizes to precisely the f32 the
+/// widened hydration would have held (bead frankentts-x7bt), so the choice is a
+/// memory decision, never a numerics one.
+#[derive(Clone, Debug)]
+pub enum FeedbackResidual<'a> {
+    /// Widened f32 rows, one `[RESIDUAL_VOCAB, hidden]` table per depth.
+    Widened(Vec<&'a [f32]>),
+    /// Per-row Q8 tables, dequantized on gather.
+    Quantized(&'a [QuantizedMatrix]),
+}
+
+impl FeedbackResidual<'_> {
+    /// The number of per-depth tables.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Widened(tables) => tables.len(),
+            Self::Quantized(tables) => tables.len(),
+        }
+    }
+
+    /// Whether there are no tables at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Reference-voice conditioning for ICL clone mode.
