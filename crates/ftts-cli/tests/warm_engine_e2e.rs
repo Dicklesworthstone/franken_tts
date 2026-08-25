@@ -314,12 +314,15 @@ sunlight strikes raindrops in the air, they act as a prism and form a rainbow.";
                 .as_secs_f64()
                 * 1000.0;
             let raw = audio.ttfa.map_or(f64::NAN, |d| d.as_secs_f64() * 1000.0);
+            let audio_ms = audio.pcm.len() as f64 / 24.0; // 24 kHz f32 samples → ms.
             audible_ms.push(audible);
             raw_ms.push(raw);
             println!(
                 "{{\"receipt\":\"ttfa_cert\",\"class\":\"{class}\",\"run\":{run},\"seed\":{SEED},\
-\"frames\":{},\"ttfa_audible_ms\":{audible:.3},\"ttfa_first_byte_ms\":{raw:.3},\"wall_ms\":{wall:.3}}}",
-                audio.frames
+\"frames\":{},\"ttfa_audible_ms\":{audible:.3},\"ttfa_first_byte_ms\":{raw:.3},\"wall_ms\":{wall:.3},\
+\"audio_ms\":{audio_ms:.3},\"rtf\":{:.4}}}",
+                audio.frames,
+                wall / audio_ms
             );
         }
 

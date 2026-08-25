@@ -128,8 +128,13 @@ be a golden*.
 **Agents never invent a tolerance to bridge the branches.** If the evidence is equivocal, the answer
 is L5-fixed, because it is the branch that makes no perceptual claim.
 
-Note the two branches differ in *what L5 measures*, not in whether the kernel work is correct — L0–L4
-are unaffected either way, which is why this fork does not block Phase 1.
+### 3.1 Decision Verdict: `L5-fixed`
+
+**BRANCH SELECTED: `L5-fixed`.**
+- In hierarchical residual codec autoregression, unconditioned greedy argmax collapses acoustic entropy, leading to monotonic metallic timbre and tonal buzz.
+- **L5 Definition:** Exactness over **codec-fixed audio** (bit-identical decode of frozen token streams).
+- Perceptual quality evaluation is transferred **wholly to Contract B** (the production sampling pipeline with temperature=0.9, top_k=50, repetition_penalty=1.05).
+- L0–L4 remain strictly exact under canonical greedy.
 
 ---
 
