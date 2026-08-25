@@ -526,17 +526,21 @@ impl FttsPack {
             return Err(PackError::UnsupportedVersion(version));
         }
 
-        let json_len = u64::from_le_bytes(
+        let json_len_u64 = u64::from_le_bytes(
             bytes[12..20]
                 .try_into()
                 .map_err(|_| PackError::CorruptHeader("bad json length offset".into()))?,
-        ) as usize;
+        );
+        let json_len = usize::try_from(json_len_u64)
+            .map_err(|_| PackError::CorruptHeader("json length exceeds platform address space".into()))?;
 
         let stored_checksum = std::str::from_utf8(&bytes[20..84])
             .map_err(|_| PackError::CorruptHeader("non-utf8 checksum".into()))?;
 
         let payload_start = 84;
-        let payload_end = payload_start + json_len;
+        let payload_end = payload_start
+            .checked_add(json_len)
+            .ok_or_else(|| PackError::CorruptHeader("json payload offset overflow".into()))?;
         if bytes.len() < payload_end {
             return Err(PackError::TruncatedPayload {
                 expected_bytes: payload_end,
@@ -608,6 +612,8 @@ impl FttsPack {
 #[must_use]
 pub fn pack_matrix_sdot_4x16(matrix: &[i8], rows: usize, cols: usize) -> Vec<i8> {
     assert_eq!(matrix.len(), rows * cols);
+    assert_eq!(rows % 4, 0, "rows must be a multiple of 4 for 4x16 tiling");
+    assert_eq!(cols % 16, 0, "cols must be a multiple of 16 for 4x16 tiling");
     let mut packed = vec![0i8; rows * cols];
     let row_blocks = rows / 4;
     let col_blocks = cols / 16;
@@ -627,6 +633,7 @@ pub fn pack_matrix_sdot_4x16(matrix: &[i8], rows: usize, cols: usize) -> Vec<i8>
             }
         }
     }
+    debug_assert_eq!(dst_idx, rows * cols);
     packed
 }
 
@@ -634,6 +641,8 @@ pub fn pack_matrix_sdot_4x16(matrix: &[i8], rows: usize, cols: usize) -> Vec<i8>
 #[must_use]
 pub fn unpack_matrix_sdot_4x16(packed: &[i8], rows: usize, cols: usize) -> Vec<i8> {
     assert_eq!(packed.len(), rows * cols);
+    assert_eq!(rows % 4, 0, "rows must be a multiple of 4 for 4x16 tiling");
+    assert_eq!(cols % 16, 0, "cols must be a multiple of 16 for 4x16 tiling");
     let mut unpacked = vec![0i8; rows * cols];
     let row_blocks = rows / 4;
     let col_blocks = cols / 16;
@@ -653,6 +662,7 @@ pub fn unpack_matrix_sdot_4x16(packed: &[i8], rows: usize, cols: usize) -> Vec<i
             }
         }
     }
+    debug_assert_eq!(src_idx, rows * cols);
     unpacked
 }
 
