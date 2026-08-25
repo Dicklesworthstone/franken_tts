@@ -242,7 +242,7 @@ fn q4_awq_beats_rtn_on_captured_microdecoder_activations() {
                 let num: f64 = reference
                     .iter()
                     .zip(logits)
-                    .map(|(r, q)| (f64::from(r) - f64::from(q)).powi(2))
+                    .map(|(r, q)| (f64::from(*r) - f64::from(*q)).powi(2))
                     .sum();
                 let den: f64 = reference.iter().map(|&r| f64::from(r) * f64::from(r)).sum();
                 if den == 0.0 { 0.0 } else { num / den }
@@ -287,6 +287,6 @@ fn q4_awq_beats_rtn_on_captured_microdecoder_activations() {
     Receipt::new(TEST, Outcome::Passed)
         .contract(CONTRACT)
         .seam("microdecoder.q4_awq")
-        .detail(format!("cases={cases} worst_err_ratio={worst_ratio:.4}"))
+        .detail(serde_json::json!({"cases": cases, "worst_err_ratio": worst_ratio}))
         .emit();
 }
