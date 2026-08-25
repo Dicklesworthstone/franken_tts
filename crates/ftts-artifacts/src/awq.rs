@@ -77,7 +77,11 @@ impl CalibrationStats {
         let denominator = self.samples.max(1) as f64;
         let mut means: Vec<f64> = self.second_moment.iter().map(|m| m / denominator).collect();
         let floor = means.iter().cloned().fold(f64::INFINITY, f64::min);
-        let floor = if floor.is_finite() && floor > 0.0 { floor } else { 1.0 };
+        let floor = if floor.is_finite() && floor > 0.0 {
+            floor
+        } else {
+            1.0
+        };
         for mean in &mut means {
             if *mean <= 0.0 {
                 *mean = floor;
@@ -101,7 +105,11 @@ pub fn awq_scales(saliency: &[f64], alpha: f64) -> Vec<f32> {
         .map(|&moment| {
             // Saliency values are non-negative by construction; guard anyway so a
             // stray NaN or negative cannot poison the geometric mean below.
-            let value = if moment.is_finite() && moment > 0.0 { moment } else { 1.0 };
+            let value = if moment.is_finite() && moment > 0.0 {
+                moment
+            } else {
+                1.0
+            };
             value.powf(alpha)
         })
         .collect();
@@ -287,16 +295,21 @@ pub fn gptq_round_matrix(
 ) -> Vec<f32> {
     assert_eq!(inverse_hessian.len(), k * k, "inverse hessian shape");
     let levels = (1_u64 << (bits - 1)) as f64;
-    let mut w: Vec<f64> = weight_row_major.iter().map(|&value| f64::from(value)).collect();
+    let mut w: Vec<f64> = weight_row_major
+        .iter()
+        .map(|&value| f64::from(value))
+        .collect();
 
     // Per-row scales fixed ONCE from incoming magnitudes: re-deriving them
     // mid-sweep would silently rewrite already-rounded columns.
     let row_scales: Vec<f64> = (0..n)
         .map(|row| {
-            let max_abs = (0..k)
-                .map(|j| w[row * k + j].abs())
-                .fold(0.0_f64, f64::max);
-            if max_abs == 0.0 { 1.0 } else { max_abs / levels }
+            let max_abs = (0..k).map(|j| w[row * k + j].abs()).fold(0.0_f64, f64::max);
+            if max_abs == 0.0 {
+                1.0
+            } else {
+                max_abs / levels
+            }
         })
         .collect();
 
@@ -365,14 +378,7 @@ mod tests {
 
         let (best_alpha, scales) = awq_best_alpha(&weight, n, k, &calib, 4, 0.05);
         let error_best = rescaled_quantization_error(&weight, n, k, &calib, &scales, 4);
-        let error_rtn = rescaled_quantization_error(
-            &weight,
-            n,
-            k,
-            &calib,
-            &vec![1.0; k],
-            4,
-        );
+        let error_rtn = rescaled_quantization_error(&weight, n, k, &calib, &vec![1.0; k], 4);
         assert!(
             error_best < error_rtn,
             "grid result ({best_alpha}) must beat naive RTN: {error_best} !< {error_rtn}"
@@ -403,7 +409,7 @@ mod tests {
         let mut rtn = vec![0.0_f32; n * k];
         for row in 0..n {
             let src = &weight[row * k..(row + 1) * k];
-            let max_abs = src.iter().fold(0.0_f32, f32::max);
+            let max_abs = src.iter().fold(0.0_f32, |acc, &value| acc.max(value));
             let scale = max_abs / levels;
             for (j, &w) in src.iter().enumerate() {
                 rtn[row * k + j] = (w / scale).round().clamp(-levels, levels) * scale;
@@ -434,10 +440,16 @@ mod tests {
 
     #[test]
     fn inverse_hessian_solves_identity_for_diagonal_input() {
-        // H = diag(2, 8): H⁻¹ = diag(1/2, 1/8) up to damping noise on the zeros.
+        // H = diag(2, 8). Damping adds damp*trace(H)/k = 0.0001*10/2 to both
+        // diagonals before inversion — part of the contract, asserted exactly.
         let hessian = vec![2.0, 0.0, 0.0, 8.0];
         let z = gptq_inverse_hessian(&hessian, 2, 0.0001).expect("invertible");
-        assert!((z[0] - 0.5).abs() < 1e-6, "z00={}", z[0]);
-        assert!((z[3] - 0.125).abs() < 1e-6, "z11={}", z[3]);
+        let damp = 0.0001 * 10.0 / 2.0;
+        assert!((z[0] - 1.0 / (2.0 + damp)).abs() < 1e-12, "z00={}", z[0]);
+        assert!((z[3] - 1.0 / (8.0 + damp)).abs() < 1e-12, "z11={}", z[3]);
+        assert!(
+            z[1].abs() < 1e-9 && z[2].abs() < 1e-9,
+            "diagonal stays diagonal"
+        );
     }
 }
