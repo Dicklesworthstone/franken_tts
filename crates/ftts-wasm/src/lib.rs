@@ -99,7 +99,7 @@ pub fn install_panic_hook() {
     // DISC-006 seam taps (frankentts-p16p) route through the same console channel. Emission
     // itself stays off until a host calls `set_debug_taps(true)`; the sink only decides WHERE
     // lines would go.
-    ftts_model_qwen::generate::install_tap_sink(Box::new(|line| console_error(line)));
+    ftts_model_qwen::generate::install_tap_sink(Box::new(console_error));
 }
 
 /// Wasm linear memory in bytes, read from the engine itself.
