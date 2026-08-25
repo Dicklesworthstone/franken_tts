@@ -1319,41 +1319,52 @@ mod tests {
         let codes: Vec<u32> = (0..CODE_GROUP_COUNT)
             .map(|depth| u32::try_from((depth * 197 + 13) % RESIDUAL_VOCAB).expect("in vocab"))
             .collect();
-        let tables: Vec<Vec<f32>> = (0..CODE_GROUP_COUNT - 1)
+        // Source rows only seed the quantizer; both arms below read the STORED bytes,
+        // exactly like the real pipeline: hydration widens dequant(artifact Q8) once,
+        // elision dequantizes per gather.
+        let seeds: Vec<Vec<f32>> = (0..CODE_GROUP_COUNT - 1)
             .map(|depth| {
-                let mut values = vec![0.0_f32; RESIDUAL_VOCAB * hidden];
-                for (index, value) in values.iter_mut().enumerate() {
-                    *value = ((index as i64 * (depth as i64 + 3) + 7) % 991) as f32 / 31.0
-                        - 16.0;
-                }
-                values
+                (0..RESIDUAL_VOCAB * hidden)
+                    .map(|index| {
+                        ((index as i64 * (depth as i64 + 3) + 7) % 991) as f32 / 31.0 - 16.0
+                    })
+                    .collect()
             })
             .collect();
-        let q8_tables: Vec<ftts_kernels::int8::QuantizedMatrix> = tables
+        let q8_tables: Vec<ftts_kernels::int8::QuantizedMatrix> = seeds
             .iter()
-            .map(|table| ftts_kernels::int8::QuantizedMatrix::quantize(table, RESIDUAL_VOCAB, hidden))
+            .map(|table| {
+                ftts_kernels::int8::QuantizedMatrix::quantize(table, RESIDUAL_VOCAB, hidden)
+            })
+            .collect();
+        // What non-elided hydration would hold: full dequantize of the stored bytes.
+        let hydrated: Vec<Vec<f32>> = q8_tables
+            .iter()
+            .map(|matrix| {
+                matrix
+                    .data
+                    .chunks_exact(hidden)
+                    .zip(matrix.scales.iter())
+                    .flat_map(|(row, scale)| row.iter().map(move |value| *value as f32 * scale))
+                    .collect()
+            })
             .collect();
 
         let talker_codec = vec![0.5_f32; PRIMARY_CODE_VOCAB_SIZE * hidden];
         let tts_pad = vec![-0.25_f32; hidden];
 
-        // Widened arm: slices straight off the stored rows.
+        // Widened arm: slices straight off the hydrated rows.
         let mut widened_rows: Vec<&[f32]> = Vec::with_capacity(CODE_GROUP_COUNT);
         for (depth, &code) in codes.iter().enumerate() {
             let table: &[f32] = if depth == 0 {
                 &talker_codec
             } else {
-                &tables[depth - 1]
+                &hydrated[depth - 1]
             };
             widened_rows.push(&table[code as usize * hidden..(code as usize + 1) * hidden]);
         }
         let mut widened_sum = vec![0.0_f32; hidden];
-        crate::talker::form_frame_input(
-            &widened_rows,
-            None,
-            &tts_pad,
-            &mut widened_sum,
-        );
+        crate::talker::form_frame_input(&widened_rows, None, &tts_pad, &mut widened_sum);
 
         // Quantized arm: the generator's on-demand path, byte-for-byte the same helper.
         let mut q8_rows: Vec<&[f32]> = Vec::with_capacity(CODE_GROUP_COUNT);
