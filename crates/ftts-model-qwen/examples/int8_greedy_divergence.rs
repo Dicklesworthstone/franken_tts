@@ -89,6 +89,7 @@ fn main() {
         text: talker.text_weights(&table),
         cold_rows: None,
         feedback: talker.feedback_tables(),
+        microdecoder_config: MicrodecoderConfig::default(),
         microdecoder_weights: talker.microdecoder_weights(&micro_layers, residual, &heads),
         prompt_mode: PromptMode {
             clone_mode: CloneMode::XVector,

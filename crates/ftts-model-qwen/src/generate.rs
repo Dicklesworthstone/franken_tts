@@ -1363,7 +1363,9 @@ mod tests {
         );
         for (index, &code) in codes.iter().skip(1).enumerate() {
             scratch.push(residual_embedding_row(&q8_tables[index], code as usize, hidden));
-            q8_rows.push(scratch.last().expect("row pushed above").as_slice());
+        }
+        for row in &scratch {
+            q8_rows.push(row.as_slice());
         }
         let mut q8_sum = vec![0.0_f32; hidden];
         crate::talker::form_frame_input(&q8_rows, None, &tts_pad, &mut q8_sum);
@@ -1549,7 +1551,7 @@ mod tests {
                 layers: micro_layers,
                 talker_codec_embedding: &weights.talker_codec_embedding,
                 residual_embeddings: crate::microdecoder::ResidualEmbeddings::Widened(
-                    micro_residual,
+                    micro_residual.to_vec(),
                 ),
                 heads: micro_heads,
                 final_norm: &weights.norm,
@@ -2033,7 +2035,7 @@ mod tests {
                 layers: micro_layers,
                 talker_codec_embedding: &weights.talker_codec_embedding,
                 residual_embeddings: crate::microdecoder::ResidualEmbeddings::Widened(
-                    micro_residual,
+                    micro_residual.to_vec(),
                 ),
                 heads: micro_heads,
                 final_norm: &weights.norm,
