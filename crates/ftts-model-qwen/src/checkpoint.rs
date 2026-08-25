@@ -1700,7 +1700,7 @@ impl TalkerCheckpoint {
                 ResidualEmbeddings::Quantized(&q8[..CODE_GROUP_COUNT - 2])
             }
             ResidualEmbeddings::Widened(tables) => {
-                ResidualEmbeddings::Widened(&tables[..CODE_GROUP_COUNT - 2])
+                ResidualEmbeddings::Widened(tables[..CODE_GROUP_COUNT - 2].to_vec())
             }
         };
         MicrodecoderWeights {

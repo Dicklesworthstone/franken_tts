@@ -1542,7 +1542,7 @@ mod tests {
             cold_rows: None,
             feedback: FeedbackTables {
                 talker_codec: &weights.talker_codec_embedding,
-                residual: residual_feedback,
+                residual: crate::generate::FeedbackResidual::Widened(residual_feedback),
             },
             microdecoder_config: microdecoder_config(),
             microdecoder_weights: MicrodecoderWeights {
@@ -2026,7 +2026,7 @@ mod tests {
             cold_rows,
             feedback: FeedbackTables {
                 talker_codec: &weights.talker_codec_embedding,
-                residual: residual_feedback,
+                residual: crate::generate::FeedbackResidual::Widened(residual_feedback),
             },
             microdecoder_config: microdecoder_config(),
             microdecoder_weights: MicrodecoderWeights {
@@ -2609,14 +2609,14 @@ mod tests {
             cold_rows: None,
             feedback: FeedbackTables {
                 talker_codec: &weights.talker_codec_embedding,
-                residual: residual_feedback,
+                residual: crate::generate::FeedbackResidual::Widened(residual_feedback),
             },
             microdecoder_config: microdecoder_config(),
             microdecoder_weights: MicrodecoderWeights {
                 layers: &micro_layers,
                 talker_codec_embedding: &weights.talker_codec_embedding,
                 residual_embeddings: crate::microdecoder::ResidualEmbeddings::Widened(
-                    &micro_residual,
+                    micro_residual.to_vec(),
                 ),
                 heads: &micro_heads,
                 final_norm: &weights.norm,

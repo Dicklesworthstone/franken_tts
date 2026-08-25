@@ -1065,10 +1065,10 @@ pub fn argmax(logits: &[f32]) -> usize {
 /// writes — and dequantizes a row only when a step gathers it: fifteen 1,024-wide row
 /// reads per frame against ~31 MB of widened tables held for a whole run (bead
 /// frankentts-x7bt; kill-switch `FTTS_ARTIFACT_Q8=0` restores widening at hydration).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum ResidualEmbeddings<'a> {
     /// Widened f32 rows, one table per depth.
-    Widened(&'a [&'a [f32]]),
+    Widened(Vec<&'a [f32]>),
     /// Per-row Q8 tables, one per depth, dequantized on gather.
     Quantized(&'a [QuantizedMatrix]),
 }
@@ -1132,7 +1132,7 @@ pub fn residual_embedding_row(matrix: &QuantizedMatrix, token: usize, hidden: us
 }
 
 /// Everything the 15-step loop needs, borrowed for one frame.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct MicrodecoderWeights<'a> {
     /// The five layers, in order.
     pub layers: &'a [LayerWeights<'a>],
@@ -2691,7 +2691,7 @@ mod tests {
         let weights = MicrodecoderWeights {
             layers: &borrowed,
             talker_codec_embedding: &talker_codec,
-            residual_embeddings: ResidualEmbeddings::Widened(&residual_refs),
+            residual_embeddings: ResidualEmbeddings::Widened(residual_refs.clone()),
             heads: &head_refs,
             final_norm: &final_norm,
         };
@@ -2796,7 +2796,7 @@ mod tests {
         let weights = MicrodecoderWeights {
             layers: &borrowed,
             talker_codec_embedding: &talker_codec,
-            residual_embeddings: ResidualEmbeddings::Widened(&residual_refs),
+            residual_embeddings: ResidualEmbeddings::Widened(residual_refs.clone()),
             heads: &head_refs,
             final_norm: &final_norm,
         };
@@ -3111,7 +3111,7 @@ mod tests {
             MicrodecoderWeights {
                 layers,
                 talker_codec_embedding: &self.talker_codec_embedding,
-                residual_embeddings: ResidualEmbeddings::Widened(embeddings),
+                residual_embeddings: ResidualEmbeddings::Widened(embeddings.to_vec()),
                 heads,
                 final_norm: &self.final_norm,
             }
