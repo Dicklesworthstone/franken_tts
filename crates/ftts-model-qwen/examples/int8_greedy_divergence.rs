@@ -80,6 +80,7 @@ fn main() {
 
     let talker_layers = talker.talker_layer_weights();
     let micro_layers = talker.microdecoder_layer_weights();
+    let residual = talker.residual_embedding_source();
     let heads = talker.microdecoder_head_slices();
 
     let mut generator = QwenGenerator::new(QwenGeneratorConfig {
@@ -88,8 +89,7 @@ fn main() {
         text: talker.text_weights(&table),
         cold_rows: None,
         feedback: talker.feedback_tables(),
-        microdecoder_config: MicrodecoderConfig::default(),
-        microdecoder_weights: talker.microdecoder_weights(&micro_layers, &heads),
+        microdecoder_weights: talker.microdecoder_weights(&micro_layers, residual, &heads),
         prompt_mode: PromptMode {
             clone_mode: CloneMode::XVector,
             non_streaming_mode: false,

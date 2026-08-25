@@ -1807,6 +1807,7 @@ pub fn synthesize(
     // 4. Borrowed weights for the generator.
     let talker_layers = model.talker.talker_layer_weights();
     let micro_layers = model.talker.microdecoder_layer_weights();
+    let residual = model.talker.residual_embedding_source();
     let heads = model.talker.microdecoder_head_slices();
 
     // The fused int8 tables are a process asset, not an utterance one: the first utterance on
@@ -1822,7 +1823,7 @@ pub fn synthesize(
         cold_rows: Some(&model.talker),
         feedback: model.talker.feedback_tables(),
         microdecoder_config: MicrodecoderConfig::default(),
-        microdecoder_weights: model.talker.microdecoder_weights(&micro_layers, &heads),
+        microdecoder_weights: model.talker.microdecoder_weights(&micro_layers, residual, &heads),
         prompt_mode,
         header,
         tts_eos,

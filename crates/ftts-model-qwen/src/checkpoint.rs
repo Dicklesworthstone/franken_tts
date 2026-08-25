@@ -1653,7 +1653,7 @@ impl TalkerCheckpoint {
                             .data
                             .chunks_exact(matrix.k)
                             .zip(matrix.scales.iter())
-                            .flat_map(|(row, scale)| row.iter().map(|value| *value as f32 * scale))
+                            .flat_map(|(row, scale)| row.iter().map(move |value| *value as f32 * scale))
                             .collect::<Vec<f32>>()
                     })
                     .collect();
@@ -1670,28 +1670,37 @@ impl TalkerCheckpoint {
         self.micro_heads.iter().map(Vec::as_slice).collect()
     }
 
+    /// The per-depth embedding tables in whichever form hydration left them.
+    ///
+    /// Quantized when artifact-native Q8 was kept (bead frankentts-x7bt); widened f32
+    /// otherwise. The full fifteen-table set — consumers trim.
+    #[must_use]
+    pub fn residual_embedding_source(&self) -> ResidualEmbeddings<'_> {
+        match self.residual_embeddings_q8.as_deref() {
+            Some(q8) => ResidualEmbeddings::Quantized(q8),
+            None => ResidualEmbeddings::Widened(self.residual_embedding_slices()),
+        }
+    }
+
     /// Borrowed microdecoder weights.
     ///
     /// `layers` is [`Self::microdecoder_layer_weights`] and `heads` is
     /// [`Self::microdecoder_head_slices`]. The microdecoder's internal embedding tables for
-    /// depths 2..=15 are the first fourteen of the per-depth set, taken from artifact-native
-    /// Q8 when hydration elided the widened forms (bead frankentts-x7bt), widened rows
-    /// otherwise.
+    /// depths 2..=15 are the first fourteen of `residual`, which is the full fifteen-table
+    /// [`Self::residual_embedding_source`] set.
     #[must_use]
     pub fn microdecoder_weights<'a>(
         &'a self,
         layers: &'a [LayerWeights<'a>],
+        residual: ResidualEmbeddings<'a>,
         heads: &'a [&'a [f32]],
     ) -> MicrodecoderWeights<'a> {
-        let residual_embeddings = match self.residual_embeddings_q8.as_deref() {
-            // Fourteen tables: positions 2..=15 embed from codec_embedding[p - 2].
-            Some(q8) => ResidualEmbeddings::Quantized(&q8[..CODE_GROUP_COUNT - 2]),
-            None => {
-                widened = self.residual_embeddings[..CODE_GROUP_COUNT - 2]
-                    .iter()
-                    .map(Vec::as_slice)
-                    .collect();
-                ResidualEmbeddings::Widened(&widened)
+        let residual_embeddings = match residual {
+            ResidualEmbeddings::Quantized(q8) => {
+                ResidualEmbeddings::Quantized(&q8[..CODE_GROUP_COUNT - 2])
+            }
+            ResidualEmbeddings::Widened(tables) => {
+                ResidualEmbeddings::Widened(&tables[..CODE_GROUP_COUNT - 2])
             }
         };
         MicrodecoderWeights {

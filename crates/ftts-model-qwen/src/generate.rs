@@ -1304,9 +1304,10 @@ impl FrameGenerator for QwenGenerator<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ftts_core::{NormalizationMode, NormalizationTrace};
-
     use crate::microdecoder::{residual_embedding_row, LayerWeights, RESIDUAL_DEPTHS};
+    use crate::prompt::CloneMode;
+    use crate::talker::{TALKER_LAYER_COUNT, TalkerLayerWeights};
+    use ftts_core::{NormalizationMode, NormalizationTrace};
 
     /// The feedback sum must be BIT-identical whether the fifteen per-depth tables are
     /// widened f32 or artifact-native Q8 dequantized on demand — elision (bead
