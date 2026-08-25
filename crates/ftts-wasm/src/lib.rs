@@ -828,14 +828,13 @@ impl HydratedArtifact {
         let int8 = {
             let talker_layers = talker.talker_layer_weights();
             let micro_layers = talker.microdecoder_layer_weights();
-            let residual = talker.residual_embedding_slices();
+            let residual_source = talker.residual_embedding_source();
             let heads = talker.microdecoder_head_slices();
-            let micro_residual = &residual[..residual.len() - 1];
             ftts_model_qwen::generate::prepare_int8_route(
                 &TalkerConfig::default(),
                 &talker.talker_weights(&talker_layers),
                 &MicrodecoderConfig::default(),
-                &talker.microdecoder_weights(&micro_layers, micro_residual, &heads),
+                &talker.microdecoder_weights(&micro_layers, residual_source, &heads),
                 Some(&artifact),
             )
             .map(Arc::new)
@@ -1027,9 +1026,8 @@ impl WasmEngine {
 
         let talker_layers = self.talker.talker_layer_weights();
         let micro_layers = self.talker.microdecoder_layer_weights();
-        let residual = self.talker.residual_embedding_slices();
+        let residual_source = self.talker.residual_embedding_source();
         let heads = self.talker.microdecoder_head_slices();
-        let micro_residual = &residual[..residual.len() - 1];
 
         let mut generator = QwenGenerator::new_with_prepared_int8(
             QwenGeneratorConfig {
@@ -1037,11 +1035,11 @@ impl WasmEngine {
                 talker_weights: self.talker.talker_weights(&talker_layers),
                 text: self.talker.text_weights(&table),
                 cold_rows: None,
-                feedback: self.talker.feedback_tables(&residual),
+                feedback: self.talker.feedback_tables(),
                 microdecoder_config: MicrodecoderConfig::default(),
                 microdecoder_weights: self.talker.microdecoder_weights(
                     &micro_layers,
-                    micro_residual,
+                    residual_source,
                     &heads,
                 ),
                 prompt_mode: PromptMode {
