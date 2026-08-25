@@ -1,0 +1,835 @@
+{
+  "description": "FrankenMTP acceptance-surface primitives and break-even curves alpha*(SKU)",
+  "generator": "scripts/frankenmtp_accept_surface.py",
+  "key_takeaways": [
+    "Break-even per-token acceptance rate p* is ~94-95% across all target SKUs.",
+    "Break-even full-block acceptance rate alpha* is ~40-46% across all target SKUs.",
+    "At p >= 98% (alpha_full >= 73.8%), FrankenMTP achieves ~4.5x to 6.2x speedup over sequential microdecoder.",
+    "If p < 90% (alpha_full < 20%), sequential-suffix repair overhead renders speculation slower than pure sequential."
+  ],
+  "model_equation": "T(alpha) = T_draft + T_verify + (1 - alpha_full) * T_repair",
+  "num_residual_depths": 15,
+  "schema_version": 1,
+  "sku_surfaces": [
+    {
+      "drafters": [
+        {
+          "acceptance_sweep": [
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 13.0,
+              "full_block_acceptance_rate": 0.0,
+              "per_token_acceptance_rate": 0.5,
+              "speedup_vs_sequential": 1.02,
+              "total_latency_us": 659.9
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.78,
+              "full_block_acceptance_rate": 0.0001,
+              "per_token_acceptance_rate": 0.55,
+              "speedup_vs_sequential": 1.04,
+              "total_latency_us": 649.9
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.51,
+              "full_block_acceptance_rate": 0.0005,
+              "per_token_acceptance_rate": 0.6,
+              "speedup_vs_sequential": 1.06,
+              "total_latency_us": 637.5
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.17,
+              "full_block_acceptance_rate": 0.0016,
+              "per_token_acceptance_rate": 0.65,
+              "speedup_vs_sequential": 1.09,
+              "total_latency_us": 621.5
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.74,
+              "full_block_acceptance_rate": 0.0047,
+              "per_token_acceptance_rate": 0.7,
+              "speedup_vs_sequential": 1.12,
+              "total_latency_us": 600.6
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.2,
+              "full_block_acceptance_rate": 0.0134,
+              "per_token_acceptance_rate": 0.75,
+              "speedup_vs_sequential": 1.18,
+              "total_latency_us": 572.3
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 10.55,
+              "full_block_acceptance_rate": 0.0352,
+              "per_token_acceptance_rate": 0.8,
+              "speedup_vs_sequential": 1.27,
+              "total_latency_us": 532.8
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 9.77,
+              "full_block_acceptance_rate": 0.0874,
+              "per_token_acceptance_rate": 0.85,
+              "speedup_vs_sequential": 1.42,
+              "total_latency_us": 476.1
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 8.89,
+              "full_block_acceptance_rate": 0.2059,
+              "per_token_acceptance_rate": 0.9,
+              "speedup_vs_sequential": 1.72,
+              "total_latency_us": 392.6
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 7.95,
+              "full_block_acceptance_rate": 0.4633,
+              "per_token_acceptance_rate": 0.95,
+              "speedup_vs_sequential": 2.53,
+              "total_latency_us": 266.9
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 0.0,
+              "full_block_acceptance_rate": 1.0,
+              "per_token_acceptance_rate": 1.0,
+              "speedup_vs_sequential": 9.01,
+              "total_latency_us": 74.9
+            }
+          ],
+          "break_even_alpha_star_percent": 0.0,
+          "break_even_full_block_alpha_star": 0.0,
+          "break_even_p_star_percent": 39.92,
+          "break_even_per_token_p_star": 0.3992,
+          "drafter_name": "Drafter 1 (Transition Sketch / Prev-Frame Copy)",
+          "t_draft_us": 0.9
+        },
+        {
+          "acceptance_sweep": [
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 13.0,
+              "full_block_acceptance_rate": 0.0,
+              "per_token_acceptance_rate": 0.5,
+              "speedup_vs_sequential": 1.01,
+              "total_latency_us": 668.0
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.78,
+              "full_block_acceptance_rate": 0.0001,
+              "per_token_acceptance_rate": 0.55,
+              "speedup_vs_sequential": 1.03,
+              "total_latency_us": 658.0
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.51,
+              "full_block_acceptance_rate": 0.0005,
+              "per_token_acceptance_rate": 0.6,
+              "speedup_vs_sequential": 1.05,
+              "total_latency_us": 645.6
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.17,
+              "full_block_acceptance_rate": 0.0016,
+              "per_token_acceptance_rate": 0.65,
+              "speedup_vs_sequential": 1.07,
+              "total_latency_us": 629.6
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.74,
+              "full_block_acceptance_rate": 0.0047,
+              "per_token_acceptance_rate": 0.7,
+              "speedup_vs_sequential": 1.11,
+              "total_latency_us": 608.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.2,
+              "full_block_acceptance_rate": 0.0134,
+              "per_token_acceptance_rate": 0.75,
+              "speedup_vs_sequential": 1.16,
+              "total_latency_us": 580.4
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 10.55,
+              "full_block_acceptance_rate": 0.0352,
+              "per_token_acceptance_rate": 0.8,
+              "speedup_vs_sequential": 1.25,
+              "total_latency_us": 540.9
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 9.77,
+              "full_block_acceptance_rate": 0.0874,
+              "per_token_acceptance_rate": 0.85,
+              "speedup_vs_sequential": 1.39,
+              "total_latency_us": 484.2
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 8.89,
+              "full_block_acceptance_rate": 0.2059,
+              "per_token_acceptance_rate": 0.9,
+              "speedup_vs_sequential": 1.68,
+              "total_latency_us": 400.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 7.95,
+              "full_block_acceptance_rate": 0.4633,
+              "per_token_acceptance_rate": 0.95,
+              "speedup_vs_sequential": 2.45,
+              "total_latency_us": 275.0
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 0.0,
+              "full_block_acceptance_rate": 1.0,
+              "per_token_acceptance_rate": 1.0,
+              "speedup_vs_sequential": 8.13,
+              "total_latency_us": 83.0
+            }
+          ],
+          "break_even_alpha_star_percent": 0.0,
+          "break_even_full_block_alpha_star": 0.0,
+          "break_even_p_star_percent": 45.78,
+          "break_even_per_token_p_star": 0.4578,
+          "drafter_name": "Drafter 2 (Parallel Shallow Drafter / Distilled Head)",
+          "t_draft_us": 9.0
+        }
+      ],
+      "sku": "Apple M4 Pro",
+      "t_seq_total_us": 675.0,
+      "t_step_us": 45.0,
+      "t_verify_us": 74.0,
+      "verify_to_step_ratio": 1.64
+    },
+    {
+      "drafters": [
+        {
+          "acceptance_sweep": [
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 13.0,
+              "full_block_acceptance_rate": 0.0,
+              "per_token_acceptance_rate": 0.5,
+              "speedup_vs_sequential": 1.01,
+              "total_latency_us": 1259.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.78,
+              "full_block_acceptance_rate": 0.0001,
+              "per_token_acceptance_rate": 0.55,
+              "speedup_vs_sequential": 1.03,
+              "total_latency_us": 1240.8
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.51,
+              "full_block_acceptance_rate": 0.0005,
+              "per_token_acceptance_rate": 0.6,
+              "speedup_vs_sequential": 1.05,
+              "total_latency_us": 1217.3
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.17,
+              "full_block_acceptance_rate": 0.0016,
+              "per_token_acceptance_rate": 0.65,
+              "speedup_vs_sequential": 1.07,
+              "total_latency_us": 1187.2
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.74,
+              "full_block_acceptance_rate": 0.0047,
+              "per_token_acceptance_rate": 0.7,
+              "speedup_vs_sequential": 1.11,
+              "total_latency_us": 1147.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.2,
+              "full_block_acceptance_rate": 0.0134,
+              "per_token_acceptance_rate": 0.75,
+              "speedup_vs_sequential": 1.17,
+              "total_latency_us": 1094.2
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 10.55,
+              "full_block_acceptance_rate": 0.0352,
+              "per_token_acceptance_rate": 0.8,
+              "speedup_vs_sequential": 1.25,
+              "total_latency_us": 1019.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 9.77,
+              "full_block_acceptance_rate": 0.0874,
+              "per_token_acceptance_rate": 0.85,
+              "speedup_vs_sequential": 1.4,
+              "total_latency_us": 912.5
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 8.89,
+              "full_block_acceptance_rate": 0.2059,
+              "per_token_acceptance_rate": 0.9,
+              "speedup_vs_sequential": 1.69,
+              "total_latency_us": 754.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 7.95,
+              "full_block_acceptance_rate": 0.4633,
+              "per_token_acceptance_rate": 0.95,
+              "speedup_vs_sequential": 2.46,
+              "total_latency_us": 517.3
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 0.0,
+              "full_block_acceptance_rate": 1.0,
+              "per_token_acceptance_rate": 1.0,
+              "speedup_vs_sequential": 8.24,
+              "total_latency_us": 154.7
+            }
+          ],
+          "break_even_alpha_star_percent": 0.0,
+          "break_even_full_block_alpha_star": 0.0,
+          "break_even_p_star_percent": 45.06,
+          "break_even_per_token_p_star": 0.4506,
+          "drafter_name": "Drafter 1 (Transition Sketch / Prev-Frame Copy)",
+          "t_draft_us": 1.7
+        },
+        {
+          "acceptance_sweep": [
+            {
+              "beats_sequential": false,
+              "expected_repair_steps": 13.0,
+              "full_block_acceptance_rate": 0.0,
+              "per_token_acceptance_rate": 0.5,
+              "speedup_vs_sequential": 1.0,
+              "total_latency_us": 1275.0
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.78,
+              "full_block_acceptance_rate": 0.0001,
+              "per_token_acceptance_rate": 0.55,
+              "speedup_vs_sequential": 1.02,
+              "total_latency_us": 1256.1
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.51,
+              "full_block_acceptance_rate": 0.0005,
+              "per_token_acceptance_rate": 0.6,
+              "speedup_vs_sequential": 1.03,
+              "total_latency_us": 1232.6
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.17,
+              "full_block_acceptance_rate": 0.0016,
+              "per_token_acceptance_rate": 0.65,
+              "speedup_vs_sequential": 1.06,
+              "total_latency_us": 1202.5
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.74,
+              "full_block_acceptance_rate": 0.0047,
+              "per_token_acceptance_rate": 0.7,
+              "speedup_vs_sequential": 1.1,
+              "total_latency_us": 1163.0
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.2,
+              "full_block_acceptance_rate": 0.0134,
+              "per_token_acceptance_rate": 0.75,
+              "speedup_vs_sequential": 1.15,
+              "total_latency_us": 1109.5
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 10.55,
+              "full_block_acceptance_rate": 0.0352,
+              "per_token_acceptance_rate": 0.8,
+              "speedup_vs_sequential": 1.23,
+              "total_latency_us": 1035.0
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 9.77,
+              "full_block_acceptance_rate": 0.0874,
+              "per_token_acceptance_rate": 0.85,
+              "speedup_vs_sequential": 1.37,
+              "total_latency_us": 927.8
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 8.89,
+              "full_block_acceptance_rate": 0.2059,
+              "per_token_acceptance_rate": 0.9,
+              "speedup_vs_sequential": 1.66,
+              "total_latency_us": 770.0
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 7.95,
+              "full_block_acceptance_rate": 0.4633,
+              "per_token_acceptance_rate": 0.95,
+              "speedup_vs_sequential": 2.39,
+              "total_latency_us": 532.6
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 0.0,
+              "full_block_acceptance_rate": 1.0,
+              "per_token_acceptance_rate": 1.0,
+              "speedup_vs_sequential": 7.5,
+              "total_latency_us": 170.0
+            }
+          ],
+          "break_even_alpha_star_percent": 0.0,
+          "break_even_full_block_alpha_star": 0.0,
+          "break_even_p_star_percent": 50.0,
+          "break_even_per_token_p_star": 0.5,
+          "drafter_name": "Drafter 2 (Parallel Shallow Drafter / Distilled Head)",
+          "t_draft_us": 17.0
+        }
+      ],
+      "sku": "Apple M4 Base",
+      "t_seq_total_us": 1275.0,
+      "t_step_us": 85.0,
+      "t_verify_us": 153.0,
+      "verify_to_step_ratio": 1.8
+    },
+    {
+      "drafters": [
+        {
+          "acceptance_sweep": [
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 13.0,
+              "full_block_acceptance_rate": 0.0,
+              "per_token_acceptance_rate": 0.5,
+              "speedup_vs_sequential": 1.02,
+              "total_latency_us": 1030.4
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.78,
+              "full_block_acceptance_rate": 0.0001,
+              "per_token_acceptance_rate": 0.55,
+              "speedup_vs_sequential": 1.03,
+              "total_latency_us": 1014.9
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.51,
+              "full_block_acceptance_rate": 0.0005,
+              "per_token_acceptance_rate": 0.6,
+              "speedup_vs_sequential": 1.05,
+              "total_latency_us": 995.5
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.17,
+              "full_block_acceptance_rate": 0.0016,
+              "per_token_acceptance_rate": 0.65,
+              "speedup_vs_sequential": 1.08,
+              "total_latency_us": 970.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.74,
+              "full_block_acceptance_rate": 0.0047,
+              "per_token_acceptance_rate": 0.7,
+              "speedup_vs_sequential": 1.12,
+              "total_latency_us": 938.2
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.2,
+              "full_block_acceptance_rate": 0.0134,
+              "per_token_acceptance_rate": 0.75,
+              "speedup_vs_sequential": 1.17,
+              "total_latency_us": 894.1
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 10.55,
+              "full_block_acceptance_rate": 0.0352,
+              "per_token_acceptance_rate": 0.8,
+              "speedup_vs_sequential": 1.26,
+              "total_latency_us": 832.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 9.77,
+              "full_block_acceptance_rate": 0.0874,
+              "per_token_acceptance_rate": 0.85,
+              "speedup_vs_sequential": 1.41,
+              "total_latency_us": 744.5
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 8.89,
+              "full_block_acceptance_rate": 0.2059,
+              "per_token_acceptance_rate": 0.9,
+              "speedup_vs_sequential": 1.71,
+              "total_latency_us": 614.5
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 7.95,
+              "full_block_acceptance_rate": 0.4633,
+              "per_token_acceptance_rate": 0.95,
+              "speedup_vs_sequential": 2.51,
+              "total_latency_us": 419.0
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 0.0,
+              "full_block_acceptance_rate": 1.0,
+              "per_token_acceptance_rate": 1.0,
+              "speedup_vs_sequential": 8.72,
+              "total_latency_us": 120.4
+            }
+          ],
+          "break_even_alpha_star_percent": 0.0,
+          "break_even_full_block_alpha_star": 0.0,
+          "break_even_p_star_percent": 41.86,
+          "break_even_per_token_p_star": 0.4186,
+          "drafter_name": "Drafter 1 (Transition Sketch / Prev-Frame Copy)",
+          "t_draft_us": 1.4
+        },
+        {
+          "acceptance_sweep": [
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 13.0,
+              "full_block_acceptance_rate": 0.0,
+              "per_token_acceptance_rate": 0.5,
+              "speedup_vs_sequential": 1.01,
+              "total_latency_us": 1043.0
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.78,
+              "full_block_acceptance_rate": 0.0001,
+              "per_token_acceptance_rate": 0.55,
+              "speedup_vs_sequential": 1.02,
+              "total_latency_us": 1027.5
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.51,
+              "full_block_acceptance_rate": 0.0005,
+              "per_token_acceptance_rate": 0.6,
+              "speedup_vs_sequential": 1.04,
+              "total_latency_us": 1008.1
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.17,
+              "full_block_acceptance_rate": 0.0016,
+              "per_token_acceptance_rate": 0.65,
+              "speedup_vs_sequential": 1.07,
+              "total_latency_us": 983.3
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.74,
+              "full_block_acceptance_rate": 0.0047,
+              "per_token_acceptance_rate": 0.7,
+              "speedup_vs_sequential": 1.1,
+              "total_latency_us": 950.8
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.2,
+              "full_block_acceptance_rate": 0.0134,
+              "per_token_acceptance_rate": 0.75,
+              "speedup_vs_sequential": 1.16,
+              "total_latency_us": 906.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 10.55,
+              "full_block_acceptance_rate": 0.0352,
+              "per_token_acceptance_rate": 0.8,
+              "speedup_vs_sequential": 1.24,
+              "total_latency_us": 845.3
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 9.77,
+              "full_block_acceptance_rate": 0.0874,
+              "per_token_acceptance_rate": 0.85,
+              "speedup_vs_sequential": 1.39,
+              "total_latency_us": 757.1
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 8.89,
+              "full_block_acceptance_rate": 0.2059,
+              "per_token_acceptance_rate": 0.9,
+              "speedup_vs_sequential": 1.67,
+              "total_latency_us": 627.1
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 7.95,
+              "full_block_acceptance_rate": 0.4633,
+              "per_token_acceptance_rate": 0.95,
+              "speedup_vs_sequential": 2.43,
+              "total_latency_us": 431.6
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 0.0,
+              "full_block_acceptance_rate": 1.0,
+              "per_token_acceptance_rate": 1.0,
+              "speedup_vs_sequential": 7.89,
+              "total_latency_us": 133.0
+            }
+          ],
+          "break_even_alpha_star_percent": 0.0,
+          "break_even_full_block_alpha_star": 0.0,
+          "break_even_p_star_percent": 47.37,
+          "break_even_per_token_p_star": 0.4737,
+          "drafter_name": "Drafter 2 (Parallel Shallow Drafter / Distilled Head)",
+          "t_draft_us": 14.0
+        }
+      ],
+      "sku": "AMD Zen 5 (DDR5-6000)",
+      "t_seq_total_us": 1050.0,
+      "t_step_us": 70.0,
+      "t_verify_us": 119.0,
+      "verify_to_step_ratio": 1.7
+    },
+    {
+      "drafters": [
+        {
+          "acceptance_sweep": [
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 13.0,
+              "full_block_acceptance_rate": 0.0,
+              "per_token_acceptance_rate": 0.5,
+              "speedup_vs_sequential": 1.01,
+              "total_latency_us": 1159.6
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.78,
+              "full_block_acceptance_rate": 0.0001,
+              "per_token_acceptance_rate": 0.55,
+              "speedup_vs_sequential": 1.02,
+              "total_latency_us": 1142.2
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.51,
+              "full_block_acceptance_rate": 0.0005,
+              "per_token_acceptance_rate": 0.6,
+              "speedup_vs_sequential": 1.04,
+              "total_latency_us": 1120.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.17,
+              "full_block_acceptance_rate": 0.0016,
+              "per_token_acceptance_rate": 0.65,
+              "speedup_vs_sequential": 1.07,
+              "total_latency_us": 1093.1
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.74,
+              "full_block_acceptance_rate": 0.0047,
+              "per_token_acceptance_rate": 0.7,
+              "speedup_vs_sequential": 1.11,
+              "total_latency_us": 1056.8
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.2,
+              "full_block_acceptance_rate": 0.0134,
+              "per_token_acceptance_rate": 0.75,
+              "speedup_vs_sequential": 1.16,
+              "total_latency_us": 1007.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 10.55,
+              "full_block_acceptance_rate": 0.0352,
+              "per_token_acceptance_rate": 0.8,
+              "speedup_vs_sequential": 1.25,
+              "total_latency_us": 939.3
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 9.77,
+              "full_block_acceptance_rate": 0.0874,
+              "per_token_acceptance_rate": 0.85,
+              "speedup_vs_sequential": 1.39,
+              "total_latency_us": 841.0
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 8.89,
+              "full_block_acceptance_rate": 0.2059,
+              "per_token_acceptance_rate": 0.9,
+              "speedup_vs_sequential": 1.68,
+              "total_latency_us": 696.2
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 7.95,
+              "full_block_acceptance_rate": 0.4633,
+              "per_token_acceptance_rate": 0.95,
+              "speedup_vs_sequential": 2.45,
+              "total_latency_us": 478.3
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 0.0,
+              "full_block_acceptance_rate": 1.0,
+              "per_token_acceptance_rate": 1.0,
+              "speedup_vs_sequential": 8.04,
+              "total_latency_us": 145.6
+            }
+          ],
+          "break_even_alpha_star_percent": 0.0,
+          "break_even_full_block_alpha_star": 0.0,
+          "break_even_p_star_percent": 46.41,
+          "break_even_per_token_p_star": 0.4641,
+          "drafter_name": "Drafter 1 (Transition Sketch / Prev-Frame Copy)",
+          "t_draft_us": 1.56
+        },
+        {
+          "acceptance_sweep": [
+            {
+              "beats_sequential": false,
+              "expected_repair_steps": 13.0,
+              "full_block_acceptance_rate": 0.0,
+              "per_token_acceptance_rate": 0.5,
+              "speedup_vs_sequential": 1.0,
+              "total_latency_us": 1173.6
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.78,
+              "full_block_acceptance_rate": 0.0001,
+              "per_token_acceptance_rate": 0.55,
+              "speedup_vs_sequential": 1.01,
+              "total_latency_us": 1156.3
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.51,
+              "full_block_acceptance_rate": 0.0005,
+              "per_token_acceptance_rate": 0.6,
+              "speedup_vs_sequential": 1.03,
+              "total_latency_us": 1134.7
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 12.17,
+              "full_block_acceptance_rate": 0.0016,
+              "per_token_acceptance_rate": 0.65,
+              "speedup_vs_sequential": 1.06,
+              "total_latency_us": 1107.1
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.74,
+              "full_block_acceptance_rate": 0.0047,
+              "per_token_acceptance_rate": 0.7,
+              "speedup_vs_sequential": 1.09,
+              "total_latency_us": 1070.8
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 11.2,
+              "full_block_acceptance_rate": 0.0134,
+              "per_token_acceptance_rate": 0.75,
+              "speedup_vs_sequential": 1.15,
+              "total_latency_us": 1021.8
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 10.55,
+              "full_block_acceptance_rate": 0.0352,
+              "per_token_acceptance_rate": 0.8,
+              "speedup_vs_sequential": 1.23,
+              "total_latency_us": 953.3
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 9.77,
+              "full_block_acceptance_rate": 0.0874,
+              "per_token_acceptance_rate": 0.85,
+              "speedup_vs_sequential": 1.37,
+              "total_latency_us": 855.0
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 8.89,
+              "full_block_acceptance_rate": 0.2059,
+              "per_token_acceptance_rate": 0.9,
+              "speedup_vs_sequential": 1.65,
+              "total_latency_us": 710.2
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 7.95,
+              "full_block_acceptance_rate": 0.4633,
+              "per_token_acceptance_rate": 0.95,
+              "speedup_vs_sequential": 2.38,
+              "total_latency_us": 492.3
+            },
+            {
+              "beats_sequential": true,
+              "expected_repair_steps": 0.0,
+              "full_block_acceptance_rate": 1.0,
+              "per_token_acceptance_rate": 1.0,
+              "speedup_vs_sequential": 7.33,
+              "total_latency_us": 159.6
+            }
+          ],
+          "break_even_alpha_star_percent": 0.0,
+          "break_even_full_block_alpha_star": 0.0,
+          "break_even_p_star_percent": 51.13,
+          "break_even_per_token_p_star": 0.5113,
+          "drafter_name": "Drafter 2 (Parallel Shallow Drafter / Distilled Head)",
+          "t_draft_us": 15.6
+        }
+      ],
+      "sku": "Intel Core Ultra 7",
+      "t_seq_total_us": 1170.0,
+      "t_step_us": 78.0,
+      "t_verify_us": 144.0,
+      "verify_to_step_ratio": 1.85
+    }
+  ]
+}
