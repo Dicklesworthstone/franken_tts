@@ -2,6 +2,7 @@
 
 //! Safe readers and writers for FrankenTTS artifacts.
 
+pub mod awq;
 pub mod census;
 pub mod converter;
 pub mod enhance_loader;
