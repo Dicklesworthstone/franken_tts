@@ -41,7 +41,9 @@ const MROPE_THETA: f32 = 1.0e6;
 /// `FTTS_DEBUG_TAPS=1`, a wasm host calls [`set_taps_enabled`] (the CLI's file-output path never
 /// pays anything).
 static TAP_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static TAP_SINK: std::sync::OnceLock<Box<dyn Fn(&str) + Send + Sync>> = std::sync::OnceLock::new();
+/// A debug-tap sink: receives one line of NDJSON-ish text per tapped event.
+type TapSink = Box<dyn Fn(&str) + Send + Sync>;
+static TAP_SINK: std::sync::OnceLock<TapSink> = std::sync::OnceLock::new();
 /// Native processes opt in through the environment; read once.
 #[cfg(not(target_arch = "wasm32"))]
 static NATIVE_TAPS_REQUESTED: std::sync::LazyLock<bool> =
@@ -1227,7 +1229,7 @@ impl FrameGenerator for QwenGenerator<'_> {
                 for (index, &code) in residuals.iter().enumerate() {
                     q8_rows.push(microdecoder::residual_embedding_row(
                         &tables[index],
-                        code as usize,
+                        code,
                         hidden,
                     ));
                 }
