@@ -1100,23 +1100,35 @@ impl ResidualEmbeddings<'_> {
     pub fn row(&self, table: usize, token: usize, hidden: usize) -> Vec<f32> {
         match self {
             Self::Widened(tables) => embedding_row(tables[table], token, hidden),
-            Self::Quantized(tables) => {
-                let matrix = &tables[table];
-                assert_eq!(matrix.k, hidden, "embedding row width mismatch");
-                let start = token * hidden;
-                assert!(
-                    start + hidden <= matrix.data.len(),
-                    "token {token} is outside a [{}, {hidden}] embedding table",
-                    matrix.n
-                );
-                let scale = matrix.scales[token];
-                matrix.data[start..start + hidden]
-                    .iter()
-                    .map(|&value| value as f32 * scale)
-                    .collect()
-            }
+            Self::Quantized(tables) => residual_embedding_row(&tables[table], token, hidden),
         }
     }
+}
+
+/// Dequantizes one `[hidden]` embedding row from an artifact-native per-row Q8 table.
+///
+/// The arithmetic is exactly the hydration widening — `i8 as f32 * row scale` — which is
+/// what makes eliding the widened tables a memory decision rather than a numerics one
+/// (bead frankentts-x7bt). The feedback sum and the microdecoder gather share this one
+/// implementation so the two surfaces cannot drift.
+///
+/// # Panics
+///
+/// Panics when `token` is outside the table or the row width disagrees with `hidden`.
+#[must_use]
+pub fn residual_embedding_row(matrix: &QuantizedMatrix, token: usize, hidden: usize) -> Vec<f32> {
+    assert_eq!(matrix.k, hidden, "embedding row width mismatch");
+    let start = token * hidden;
+    assert!(
+        start + hidden <= matrix.data.len(),
+        "token {token} is outside a [{}, {hidden}] embedding table",
+        matrix.n
+    );
+    let scale = matrix.scales[token];
+    matrix.data[start..start + hidden]
+        .iter()
+        .map(|&value| value as f32 * scale)
+        .collect()
 }
 
 /// Everything the 15-step loop needs, borrowed for one frame.

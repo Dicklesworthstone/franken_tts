@@ -288,11 +288,14 @@ pub fn hot_elision_from_environment() -> crate::checkpoint::HotElision {
     crate::checkpoint::HotElision {
         talker,
         micro,
-        // The per-depth heads feed only the int8 coarse-score path, which reads the
-        // artifact's Q8 bytes natively (frankentts-x7bt); widening them is pure startup
-        // cost whenever the artifact verifiably carries all fifteen as Q8 — the load-time
-        // closure enforces that all-or-nothing and keeps widened heads otherwise.
+        // The per-depth heads feed only the int8 coarse-score path, and the per-depth
+        // residual tables feed the microdecoder gather plus the feedback sum — those
+        // consumers dequantize artifact-native Q8 rows on demand with bit-exact parity
+        // (frankentts-x7bt), so widening them is pure startup/resident cost whenever
+        // the artifact verifiably carries them as Q8 — the load-time closures enforce
+        // that all-or-nothing and keep widened forms otherwise.
         micro_heads: micro,
+        residual_embeddings: micro,
     }
 }
 
@@ -696,12 +699,28 @@ impl<'a> QwenGenerator<'a> {
             "expected {} residual feedback tables",
             CODE_GROUP_COUNT - 1
         );
-        for table in &config.feedback.residual {
-            assert_eq!(
-                table.len(),
-                RESIDUAL_VOCAB * hidden,
-                "each residual feedback table must be [{RESIDUAL_VOCAB}, hidden]"
-            );
+        match &config.feedback.residual {
+            FeedbackResidual::Widened(tables) => {
+                for table in tables {
+                    assert_eq!(
+                        table.len(),
+                        RESIDUAL_VOCAB * hidden,
+                        "each residual feedback table must be [{RESIDUAL_VOCAB}, hidden]"
+                    );
+                }
+            }
+            FeedbackResidual::Quantized(tables) => {
+                for matrix in tables {
+                    assert_eq!(
+                        matrix.k, hidden,
+                        "each Q8 residual feedback table must gather {hidden}-wide rows"
+                    );
+                    assert_eq!(
+                        matrix.n, RESIDUAL_VOCAB,
+                        "each Q8 residual feedback table must have {RESIDUAL_VOCAB} rows"
+                    );
+                }
+            }
         }
         assert_eq!(
             config.text.fc2_bias.len(),
@@ -1184,15 +1203,37 @@ impl FrameGenerator for QwenGenerator<'_> {
         codes.extend(residuals.iter().map(|&code| code as u32));
 
         // Feedback: sum the 16 code embeddings onto one trailing-text hidden (or tts_pad).
+        // Q8 tables dequantize each gathered row into `q8_rows` scratch — the same
+        // scale-multiply the widened hydration ran, so the summed input is bit-identical
+        // across the two table forms (frankentts-x7bt).
+        let hidden = self.talker_config.hidden_size;
         let mut rows: Vec<&[f32]> = Vec::with_capacity(CODE_GROUP_COUNT);
-        for (depth, &code) in codes.iter().enumerate() {
-            let table = if depth == 0 {
-                self.feedback.talker_codec
-            } else {
-                self.feedback.residual[depth - 1]
-            };
-            let hidden = self.talker_config.hidden_size;
-            rows.push(&table[code as usize * hidden..(code as usize + 1) * hidden]);
+        let mut q8_rows: Vec<Vec<f32>> = Vec::new();
+        match &self.feedback.residual {
+            FeedbackResidual::Widened(tables) => {
+                for (depth, &code) in codes.iter().enumerate() {
+                    let table = if depth == 0 {
+                        self.feedback.talker_codec
+                    } else {
+                        tables[depth - 1]
+                    };
+                    rows.push(&table[code as usize * hidden..(code as usize + 1) * hidden]);
+                }
+            }
+            FeedbackResidual::Quantized(tables) => {
+                let talker_row = &self.feedback.talker_codec
+                    [primary as usize * hidden..(primary as usize + 1) * hidden];
+                rows.push(talker_row);
+                for (index, &code) in residuals.iter().enumerate() {
+                    q8_rows.push(microdecoder::residual_embedding_row(
+                        &tables[index],
+                        code as usize,
+                        hidden,
+                    ));
+                    let row = q8_rows.last().expect("row pushed above");
+                    rows.push(row.as_slice());
+                }
+            }
         }
         let text_row = utterance
             .trailing_text_hidden

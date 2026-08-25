@@ -1640,7 +1640,29 @@ impl TalkerCheckpoint {
         &self,
         codes: &[u16],
     ) -> Result<Vec<HiddenState>, CheckpointError> {
-        let residual: Vec<&[f32]> = self.residual_embeddings.iter().map(Vec::as_slice).collect();
+        // Under embedding elision the widened tables are empty; materialize the rows
+        // once per call from the artifact-native Q8 — bit-identical, and this path runs
+        // once per utterance, not per frame.
+        let dequantized: Vec<Vec<f32>>;
+        let residual: Vec<&[f32]> = match self.residual_embeddings_q8.as_deref() {
+            Some(q8) => {
+                dequantized = q8
+                    .iter()
+                    .map(|matrix| {
+                        matrix
+                            .data
+                            .chunks_exact(matrix.k)
+                            .zip(matrix.scales.iter())
+                            .flat_map(|(row, scale)| {
+                                row.iter().map(|value| value as f32 * scale)
+                            })
+                            .collect::<Vec<f32>>()
+                    })
+                    .collect();
+                dequantized.iter().map(Vec::as_slice).collect()
+            }
+            None => self.residual_embeddings.iter().map(Vec::as_slice).collect(),
+        };
         icl_reference_codec_frames(&self.codec_embedding, &residual, codes, TALKER_HIDDEN)
     }
 
