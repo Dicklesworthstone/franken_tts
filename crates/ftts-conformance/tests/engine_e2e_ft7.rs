@@ -315,7 +315,9 @@ impl Hydrated {
             cold_rows: None,
             feedback: FeedbackTables {
                 talker_codec: &self.talker_codec_embedding,
-                residual: self.residual_embeddings.iter().map(Vec::as_slice).collect(),
+                residual: FeedbackResidual::Widened(
+                    self.residual_embeddings.iter().map(Vec::as_slice).collect(),
+                ),
             },
             microdecoder_config: MicrodecoderConfig::default(),
             microdecoder_weights: MicrodecoderWeights {
