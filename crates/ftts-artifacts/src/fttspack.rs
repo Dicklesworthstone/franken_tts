@@ -44,9 +44,18 @@ pub enum PackError {
     BadMagic([u8; 8]),
     UnsupportedVersion(u32),
     CorruptHeader(String),
-    KeyMismatch { expected: String, actual: String },
-    TruncatedPayload { expected_bytes: usize, actual_bytes: usize },
-    ChecksumMismatch { expected: String, actual: String },
+    KeyMismatch {
+        expected: String,
+        actual: String,
+    },
+    TruncatedPayload {
+        expected_bytes: usize,
+        actual_bytes: usize,
+    },
+    ChecksumMismatch {
+        expected: String,
+        actual: String,
+    },
     Io(String),
 }
 
@@ -57,16 +66,21 @@ impl fmt::Display for PackError {
             Self::UnsupportedVersion(v) => write!(f, "unsupported fttspack version: {v}"),
             Self::CorruptHeader(msg) => write!(f, "corrupt fttspack header: {msg}"),
             Self::KeyMismatch { expected, actual } => {
-                write!(f, "fttspack key mismatch (expected '{expected}', got '{actual}')")
+                write!(
+                    f,
+                    "fttspack key mismatch (expected '{expected}', got '{actual}')"
+                )
             }
-            Self::TruncatedPayload { expected_bytes, actual_bytes } => write!(
+            Self::TruncatedPayload {
+                expected_bytes,
+                actual_bytes,
+            } => write!(
                 f,
                 "truncated payload: expected {expected_bytes} bytes, found {actual_bytes}"
             ),
-            Self::ChecksumMismatch { expected, actual } => write!(
-                f,
-                "checksum mismatch: expected {expected}, actual {actual}"
-            ),
+            Self::ChecksumMismatch { expected, actual } => {
+                write!(f, "checksum mismatch: expected {expected}, actual {actual}")
+            }
             Self::Io(msg) => write!(f, "fttspack I/O error: {msg}"),
         }
     }
@@ -133,7 +147,9 @@ impl PackKey {
     ///
     /// Returns `PackError::CorruptHeader` if any field is missing or invalid.
     pub fn from_json(val: &Value) -> Result<Self, PackError> {
-        let obj = val.as_object().ok_or_else(|| PackError::CorruptHeader("expected key object".into()))?;
+        let obj = val
+            .as_object()
+            .ok_or_else(|| PackError::CorruptHeader("expected key object".into()))?;
         let get_str = |k: &str| {
             obj.get(k)
                 .and_then(Value::as_str)
@@ -234,14 +250,32 @@ impl PackedTensor {
     ///
     /// Returns `PackError::CorruptHeader` if fields are invalid.
     pub fn from_json(val: &Value) -> Result<Self, PackError> {
-        let obj = val.as_object().ok_or_else(|| PackError::CorruptHeader("expected tensor object".into()))?;
-        let name = obj.get("name").and_then(Value::as_str).ok_or_else(|| PackError::CorruptHeader("missing name".into()))?.to_string();
-        let rows = obj.get("rows").and_then(Value::as_u64).ok_or_else(|| PackError::CorruptHeader("missing rows".into()))? as usize;
-        let cols = obj.get("cols").and_then(Value::as_u64).ok_or_else(|| PackError::CorruptHeader("missing cols".into()))? as usize;
-        let layout_str = obj.get("layout").and_then(Value::as_str).ok_or_else(|| PackError::CorruptHeader("missing layout".into()))?;
+        let obj = val
+            .as_object()
+            .ok_or_else(|| PackError::CorruptHeader("expected tensor object".into()))?;
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PackError::CorruptHeader("missing name".into()))?
+            .to_string();
+        let rows = obj
+            .get("rows")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| PackError::CorruptHeader("missing rows".into()))?
+            as usize;
+        let cols = obj
+            .get("cols")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| PackError::CorruptHeader("missing cols".into()))?
+            as usize;
+        let layout_str = obj
+            .get("layout")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PackError::CorruptHeader("missing layout".into()))?;
         let layout = TileLayout::from_str(layout_str)?;
 
-        let scales: Vec<f32> = obj.get("scales")
+        let scales: Vec<f32> = obj
+            .get("scales")
             .and_then(Value::as_array)
             .ok_or_else(|| PackError::CorruptHeader("missing scales".into()))?
             .iter()
@@ -249,7 +283,8 @@ impl PackedTensor {
             .map(|f| f as f32)
             .collect();
 
-        let data: Vec<i8> = obj.get("data")
+        let data: Vec<i8> = obj
+            .get("data")
             .and_then(Value::as_array)
             .ok_or_else(|| PackError::CorruptHeader("missing data".into()))?
             .iter()
@@ -257,7 +292,14 @@ impl PackedTensor {
             .map(|i| i as i8)
             .collect();
 
-        Ok(Self { name, rows, cols, layout, scales, data })
+        Ok(Self {
+            name,
+            rows,
+            cols,
+            layout,
+            scales,
+            data,
+        })
     }
 }
 
@@ -287,7 +329,9 @@ impl MicrodecoderHotPack {
     ///
     /// Returns `PackError::CorruptHeader` on invalid fields.
     pub fn from_json(val: &Value) -> Result<Self, PackError> {
-        let obj = val.as_object().ok_or_else(|| PackError::CorruptHeader("expected hot pack object".into()))?;
+        let obj = val
+            .as_object()
+            .ok_or_else(|| PackError::CorruptHeader("expected hot pack object".into()))?;
         let parse_tensors = |key: &str| -> Result<Vec<PackedTensor>, PackError> {
             obj.get(key)
                 .and_then(Value::as_array)
@@ -299,11 +343,18 @@ impl MicrodecoderHotPack {
         let body_layers = parse_tensors("body_layers")?;
         let per_depth_heads = parse_tensors("per_depth_heads")?;
         let per_depth_embeddings = parse_tensors("per_depth_embeddings")?;
-        let footprint_bytes = obj.get("footprint_bytes")
+        let footprint_bytes = obj
+            .get("footprint_bytes")
             .and_then(Value::as_u64)
-            .ok_or_else(|| PackError::CorruptHeader("missing footprint_bytes".into()))? as usize;
+            .ok_or_else(|| PackError::CorruptHeader("missing footprint_bytes".into()))?
+            as usize;
 
-        Ok(Self { body_layers, per_depth_heads, per_depth_embeddings, footprint_bytes })
+        Ok(Self {
+            body_layers,
+            per_depth_heads,
+            per_depth_embeddings,
+            footprint_bytes,
+        })
     }
 }
 
@@ -331,24 +382,33 @@ impl PersistedKernelPlan {
     ///
     /// Returns `PackError::CorruptHeader` on invalid fields.
     pub fn from_json(val: &Value) -> Result<Self, PackError> {
-        let obj = val.as_object().ok_or_else(|| PackError::CorruptHeader("expected plan object".into()))?;
-        let decode_gemv_winner = obj.get("decode_gemv_winner")
+        let obj = val
+            .as_object()
+            .ok_or_else(|| PackError::CorruptHeader("expected plan object".into()))?;
+        let decode_gemv_winner = obj
+            .get("decode_gemv_winner")
             .and_then(Value::as_str)
             .ok_or_else(|| PackError::CorruptHeader("missing decode_gemv_winner".into()))?
             .to_string();
-        let batch_gemm_winner = obj.get("batch_gemm_winner")
+        let batch_gemm_winner = obj
+            .get("batch_gemm_winner")
             .and_then(Value::as_str)
             .ok_or_else(|| PackError::CorruptHeader("missing batch_gemm_winner".into()))?
             .to_string();
-        
-        let per_op_winners = obj.get("per_op_winners")
+
+        let per_op_winners = obj
+            .get("per_op_winners")
             .and_then(Value::as_object)
             .ok_or_else(|| PackError::CorruptHeader("missing per_op_winners".into()))?
             .iter()
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect();
 
-        Ok(Self { decode_gemv_winner, batch_gemm_winner, per_op_winners })
+        Ok(Self {
+            decode_gemv_winner,
+            batch_gemm_winner,
+            per_op_winners,
+        })
     }
 }
 
@@ -378,20 +438,35 @@ impl FttsPack {
     ///
     /// Returns `PackError::CorruptHeader` on invalid fields.
     pub fn from_json(val: &Value) -> Result<Self, PackError> {
-        let obj = val.as_object().ok_or_else(|| PackError::CorruptHeader("expected pack object".into()))?;
-        let key = PackKey::from_json(obj.get("key").ok_or_else(|| PackError::CorruptHeader("missing key".into()))?)?;
-        let plan = PersistedKernelPlan::from_json(obj.get("plan").ok_or_else(|| PackError::CorruptHeader("missing plan".into()))?)?;
-        let microdecoder_hot_pack = MicrodecoderHotPack::from_json(
-            obj.get("microdecoder_hot_pack").ok_or_else(|| PackError::CorruptHeader("missing hot pack".into()))?,
+        let obj = val
+            .as_object()
+            .ok_or_else(|| PackError::CorruptHeader("expected pack object".into()))?;
+        let key = PackKey::from_json(
+            obj.get("key")
+                .ok_or_else(|| PackError::CorruptHeader("missing key".into()))?,
         )?;
-        let talker_tensors = obj.get("talker_tensors")
+        let plan = PersistedKernelPlan::from_json(
+            obj.get("plan")
+                .ok_or_else(|| PackError::CorruptHeader("missing plan".into()))?,
+        )?;
+        let microdecoder_hot_pack = MicrodecoderHotPack::from_json(
+            obj.get("microdecoder_hot_pack")
+                .ok_or_else(|| PackError::CorruptHeader("missing hot pack".into()))?,
+        )?;
+        let talker_tensors = obj
+            .get("talker_tensors")
             .and_then(Value::as_array)
             .ok_or_else(|| PackError::CorruptHeader("missing talker_tensors".into()))?
             .iter()
             .map(PackedTensor::from_json)
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Self { key, plan, microdecoder_hot_pack, talker_tensors })
+        Ok(Self {
+            key,
+            plan,
+            microdecoder_hot_pack,
+            talker_tensors,
+        })
     }
 
     /// Encodes the pack into a binary byte vector with header, JSON metadata, and payload.
@@ -401,8 +476,8 @@ impl FttsPack {
     /// Returns `PackError::CorruptHeader` if serialization fails.
     pub fn encode(&self) -> Result<Vec<u8>, PackError> {
         let json_val = self.to_json();
-        let json_bytes = serde_json::to_vec(&json_val)
-            .map_err(|e| PackError::CorruptHeader(e.to_string()))?;
+        let json_bytes =
+            serde_json::to_vec(&json_val).map_err(|e| PackError::CorruptHeader(e.to_string()))?;
         let json_len = json_bytes.len() as u64;
         let checksum = hex_digest(&json_bytes);
 
@@ -506,8 +581,8 @@ impl FttsPack {
     ///
     /// Returns `PackError` if reading, decoding, or key verification fails.
     pub fn read_from_file_checked(path: &Path, expected_key: &PackKey) -> Result<Self, PackError> {
-        let mut file = File::open(path)
-            .map_err(|e| PackError::Io(format!("open {}: {e}", path.display())))?;
+        let mut file =
+            File::open(path).map_err(|e| PackError::Io(format!("open {}: {e}", path.display())))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|e| PackError::Io(format!("read {}: {e}", path.display())))?;
@@ -529,7 +604,7 @@ pub fn pack_matrix_sdot_4x16(matrix: &[i8], rows: usize, cols: usize) -> Vec<i8>
     let mut packed = vec![0i8; rows * cols];
     let row_blocks = rows / 4;
     let col_blocks = cols / 16;
-    
+
     let mut dst_idx = 0;
     for rb in 0..row_blocks {
         let r_base = rb * 4;
@@ -555,7 +630,7 @@ pub fn unpack_matrix_sdot_4x16(packed: &[i8], rows: usize, cols: usize) -> Vec<i
     let mut unpacked = vec![0i8; rows * cols];
     let row_blocks = rows / 4;
     let col_blocks = cols / 16;
-    
+
     let mut src_idx = 0;
     for rb in 0..row_blocks {
         let r_base = rb * 4;
@@ -703,7 +778,10 @@ mod tests {
         let last = encoded.len() - 1;
         encoded[last] ^= 0xFF;
         let err = FttsPack::decode(&encoded).expect_err("must reject tampered payload");
-        assert!(matches!(err, PackError::ChecksumMismatch { .. } | PackError::CorruptHeader(_)));
+        assert!(matches!(
+            err,
+            PackError::ChecksumMismatch { .. } | PackError::CorruptHeader(_)
+        ));
     }
 
     #[test]
@@ -719,13 +797,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fttspack_test_{}", std::process::id()));
         let file_path = dir.join("cache.fttspack");
         let pack = sample_pack();
-        
+
         pack.write_to_file(&file_path).expect("write pack to file");
         assert!(file_path.exists());
 
         // Valid read
-        let loaded = FttsPack::read_from_file_checked(&file_path, &pack.key)
-            .expect("read valid pack");
+        let loaded =
+            FttsPack::read_from_file_checked(&file_path, &pack.key).expect("read valid pack");
         assert_eq!(pack, loaded);
 
         // Mismatched key read fails
