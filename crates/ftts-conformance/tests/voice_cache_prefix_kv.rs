@@ -10,9 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use ftts_artifacts::voice::{
-    FtVoiceCacheKey, parse_ftvoice_cache, serialize_ftvoice_cache,
-};
+use ftts_artifacts::voice::{FtVoiceCacheKey, parse_ftvoice_cache, serialize_ftvoice_cache};
 use ftts_model_qwen::prompt::{
     CloneMode, HiddenState, PromptAssemblyInput, PromptHeader, PromptMode, assemble_prompt,
 };
@@ -31,8 +29,17 @@ fn sample_hidden(width: usize, seed: u64) -> HiddenState {
 
 fn sample_header(hidden_size: usize) -> PromptHeader {
     PromptHeader {
-        role: vec![sample_hidden(hidden_size, 0x1001), sample_hidden(hidden_size, 0x1002), sample_hidden(hidden_size, 0x1003)],
-        codec_prefill: vec![sample_hidden(hidden_size, 0x2001), sample_hidden(hidden_size, 0x2002), sample_hidden(hidden_size, 0x2003), sample_hidden(hidden_size, 0x2004)],
+        role: vec![
+            sample_hidden(hidden_size, 0x1001),
+            sample_hidden(hidden_size, 0x1002),
+            sample_hidden(hidden_size, 0x1003),
+        ],
+        codec_prefill: vec![
+            sample_hidden(hidden_size, 0x2001),
+            sample_hidden(hidden_size, 0x2002),
+            sample_hidden(hidden_size, 0x2003),
+            sample_hidden(hidden_size, 0x2004),
+        ],
         tts_bos: sample_hidden(hidden_size, 0x3001),
         tts_pad: sample_hidden(hidden_size, 0x3002),
     }
@@ -136,12 +143,27 @@ fn prompt_assembly_prefix_invariance_streaming_and_non_streaming() {
     let header = sample_header(hidden_size);
     let tts_eos = sample_hidden(hidden_size, 0x4001);
 
-    let ref_text = vec![sample_hidden(hidden_size, 0x5001), sample_hidden(hidden_size, 0x5002)];
-    let ref_codec = vec![sample_hidden(hidden_size, 0x6001), sample_hidden(hidden_size, 0x6002)];
+    let ref_text = vec![
+        sample_hidden(hidden_size, 0x5001),
+        sample_hidden(hidden_size, 0x5002),
+    ];
+    let ref_codec = vec![
+        sample_hidden(hidden_size, 0x6001),
+        sample_hidden(hidden_size, 0x6002),
+    ];
 
     // Target text A and Target text B (different utterances for the same voice)
-    let target_a = vec![sample_hidden(hidden_size, 0x7001), sample_hidden(hidden_size, 0x7002), sample_hidden(hidden_size, 0x7003)];
-    let target_b = vec![sample_hidden(hidden_size, 0x8001), sample_hidden(hidden_size, 0x8002), sample_hidden(hidden_size, 0x8003), sample_hidden(hidden_size, 0x8004)];
+    let target_a = vec![
+        sample_hidden(hidden_size, 0x7001),
+        sample_hidden(hidden_size, 0x7002),
+        sample_hidden(hidden_size, 0x7003),
+    ];
+    let target_b = vec![
+        sample_hidden(hidden_size, 0x8001),
+        sample_hidden(hidden_size, 0x8002),
+        sample_hidden(hidden_size, 0x8003),
+        sample_hidden(hidden_size, 0x8004),
+    ];
 
     for non_streaming in [false, true] {
         let mode = PromptMode {
@@ -157,7 +179,8 @@ fn prompt_assembly_prefix_invariance_streaming_and_non_streaming() {
             reference_codec: Some(ref_codec.clone()),
             tts_eos: tts_eos.clone(),
             hold_tts_eos: false,
-        }).expect("assemble a");
+        })
+        .expect("assemble a");
 
         let assembly_b = assemble_prompt(PromptAssemblyInput {
             mode,
@@ -167,7 +190,8 @@ fn prompt_assembly_prefix_invariance_streaming_and_non_streaming() {
             reference_codec: Some(ref_codec.clone()),
             tts_eos: tts_eos.clone(),
             hold_tts_eos: false,
-        }).expect("assemble b");
+        })
+        .expect("assemble b");
 
         // The voice-dependent prefix length is computed by the prompt builder
         let prefix_len_a = assembly_a.target_independent_prefix_len;
@@ -180,8 +204,7 @@ fn prompt_assembly_prefix_invariance_streaming_and_non_streaming() {
 
         for pos in 0..prefix_len_a {
             assert_eq!(
-                assembly_a.prefill[pos],
-                assembly_b.prefill[pos],
+                assembly_a.prefill[pos], assembly_b.prefill[pos],
                 "position {pos} in mode (non_streaming={non_streaming}) must be identical across utterances"
             );
         }
