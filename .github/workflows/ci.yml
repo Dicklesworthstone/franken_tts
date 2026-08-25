@@ -203,13 +203,13 @@ jobs:
           sudo mkdir -p /dp
           sudo ln -sfn "$GITHUB_WORKSPACE/frankentorch" /dp/frankentorch
 
-      - name: Add target
-        working-directory: frankentts
-        run: rustup target add ${{ matrix.target }}
-
       # Same self-hosted-PATH independence as the gate job's bootstrap step above.
       - name: Put cargo toolchain on PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Add target
+        working-directory: frankentts
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
