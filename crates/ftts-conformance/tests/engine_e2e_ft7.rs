@@ -62,7 +62,8 @@ use ftts_core::{
     TextPreparationError, TextPreparer, TtsEngine,
 };
 use ftts_model_qwen::generate::{
-    FeedbackTables, QwenGenerator, QwenGeneratorConfig, TextEmbeddingWeights,
+    FeedbackResidual, FeedbackTables, QwenGenerator, QwenGeneratorConfig,
+    TextEmbeddingWeights,
 };
 use ftts_model_qwen::microdecoder::{
     LayerWeights, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_DEPTHS,
