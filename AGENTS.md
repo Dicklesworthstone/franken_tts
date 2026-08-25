@@ -34,7 +34,19 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 - Do not reference `master` in docs/scripts.
 - If release instructions require sync, push `main:master` after `main`.
 
----
+### Release Train
+
+- Cut a patch/minor release whenever `main` is **≥ 50 commits or ≥ 7 days
+  past the last tag**, gated only by a green bar (CI `gate` job green on the
+  exact commit being tagged — never from red).
+- Mechanics: bump `[workspace.package] version`, regenerate `Cargo.lock`,
+  write the CHANGELOG section, commit as `chore(release): bump workspace to
+  X.Y.Z + changelog`, tag `vX.Y.Z`, push, then run `dsr` — the configured
+  release authority for this repo (GH Actions capacity is starvation-prone) —
+  to build the five platform assets and publish the GitHub release with
+  SHA256SUMS. Verify one clean-room install before announcing. crates.io
+  publishing is separately blocked (bead 46n).
+
 
 ## Project Mission
 
