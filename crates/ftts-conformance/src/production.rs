@@ -439,6 +439,166 @@ pub fn pitch_contour(pcm: &[f32], sample_rate: u32, silence_floor: f64) -> Optio
     })
 }
 
+/// Tail-risk summary metrics (AF-2 release gate).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TailRiskSummary {
+    /// Sample mean across all items.
+    pub mean: f64,
+    /// Sample median (50th percentile).
+    pub median: f64,
+    /// 90th percentile.
+    pub p90: f64,
+    /// 95th percentile.
+    pub p95: f64,
+    /// 99th percentile.
+    pub p99: f64,
+    /// Conditional Value at Risk at alpha = 0.10 (mean of the worst 10% tail).
+    pub cvar_10: f64,
+    /// Conditional Value at Risk at alpha = 0.05 (mean of the worst 5% tail).
+    pub cvar_05: f64,
+    /// Extreme Value Theory (EVT) Generalized Pareto tail estimate at p = 0.99, or `None` if under the sample floor.
+    pub evt_p99x: Option<f64>,
+    /// Number of samples analyzed.
+    pub sample_count: usize,
+}
+
+/// Computes the Conditional Value at Risk (CVaR) over the worst `alpha` fraction of `samples`.
+///
+/// If `higher_is_worse` is true (e.g. WER, loss), evaluates the upper tail.
+/// If `higher_is_worse` is false (e.g. cosine similarity), evaluates the lower tail.
+/// Returns `None` if `samples` is empty or `alpha <= 0.0` or `alpha > 1.0`.
+#[must_use]
+pub fn cvar_alpha(samples: &[f64], alpha: f64, higher_is_worse: bool) -> Option<f64> {
+    if samples.is_empty() || alpha <= 0.0 || alpha > 1.0 {
+        return None;
+    }
+    let mut sorted: Vec<f64> = samples.iter().copied().filter(|v| v.is_finite()).collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    let k = ((n as f64 * alpha).round() as usize).clamp(1, n);
+
+    if higher_is_worse {
+        let tail = &sorted[n - k..];
+        Some(tail.iter().sum::<f64>() / tail.len() as f64)
+    } else {
+        let tail = &sorted[..k];
+        Some(tail.iter().sum::<f64>() / tail.len() as f64)
+    }
+}
+
+/// Fits a Generalized Pareto Distribution (GPD) via method of moments on excesses over threshold `u`,
+/// estimating the extreme quantile at probability `p`.
+///
+/// Returns `None` if `samples.len() < 20` or excess count `< 5` (sample-size floor per honesty doctrine).
+#[must_use]
+pub fn evt_gpd_tail_quantile(samples: &[f64], p: f64, threshold_quantile: f64) -> Option<f64> {
+    if samples.len() < 20 || p <= threshold_quantile || p >= 1.0 || threshold_quantile <= 0.0 {
+        return None;
+    }
+    let mut sorted: Vec<f64> = samples.iter().copied().filter(|v| v.is_finite()).collect();
+    if sorted.len() < 20 {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+
+    let u_idx = ((n - 1) as f64 * threshold_quantile).round() as usize;
+    let u = sorted[u_idx];
+
+    let excesses: Vec<f64> = sorted.iter().copied().filter(|&x| x > u).map(|x| x - u).collect();
+    let k = excesses.len();
+    if k < 5 {
+        return None;
+    }
+
+    let mean_excess = excesses.iter().sum::<f64>() / k as f64;
+    let var_excess = excesses
+        .iter()
+        .map(|&y| (y - mean_excess) * (y - mean_excess))
+        .sum::<f64>()
+        / (k - 1) as f64;
+
+    if mean_excess <= 0.0 || var_excess <= 0.0 {
+        return None;
+    }
+
+    let ratio = (mean_excess * mean_excess) / var_excess;
+    let xi = 0.5 * (1.0 - ratio);
+    let sigma = mean_excess * (1.0 - xi);
+
+    if sigma <= 0.0 {
+        // Fallback to exponential tail
+        let factor = (k as f64) / (n as f64 * (1.0 - p));
+        if factor <= 0.0 {
+            return None;
+        }
+        return Some(u + mean_excess * factor.ln());
+    }
+
+    if xi.abs() < 1.0e-4 {
+        // Exponential tail limit
+        let factor = (k as f64) / (n as f64 * (1.0 - p));
+        if factor <= 0.0 {
+            return None;
+        }
+        Some(u + sigma * factor.ln())
+    } else {
+        let prob_ratio = (n as f64 / k as f64) * (1.0 - p);
+        if prob_ratio <= 0.0 {
+            return None;
+        }
+        let term = prob_ratio.powf(-xi);
+        Some(u + (sigma / xi) * (term - 1.0))
+    }
+}
+
+/// Computes the comprehensive tail-risk summary over a sample vector.
+#[must_use]
+pub fn compute_tail_risk(samples: &[f64], higher_is_worse: bool) -> Option<TailRiskSummary> {
+    let mut sorted: Vec<f64> = samples.iter().copied().filter(|v| v.is_finite()).collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+
+    let mean = sorted.iter().sum::<f64>() / n as f64;
+    let percentile = |frac: f64| -> f64 {
+        let idx = ((n - 1) as f64 * frac).round() as usize;
+        sorted[idx.min(n - 1)]
+    };
+
+    let median = percentile(0.50);
+    let p90 = percentile(0.90);
+    let p95 = percentile(0.95);
+    let p99 = percentile(0.99);
+
+    let cvar_10 = cvar_alpha(&sorted, 0.10, higher_is_worse)?;
+    let cvar_05 = cvar_alpha(&sorted, 0.05, higher_is_worse)?;
+    let evt_p99x = if higher_is_worse {
+        evt_gpd_tail_quantile(&sorted, 0.99, 0.85)
+    } else {
+        // Invert to upper tail for EVT then invert result
+        let inverted: Vec<f64> = sorted.iter().map(|&x| -x).collect();
+        evt_gpd_tail_quantile(&inverted, 0.99, 0.85).map(|val| -val)
+    };
+
+    Some(TailRiskSummary {
+        mean,
+        median,
+        p90,
+        p95,
+        p99,
+        cvar_10,
+        cvar_05,
+        evt_p99x,
+        sample_count: n,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,4 +824,53 @@ mod tests {
     fn pitch_contour_needs_enough_audio() {
         assert!(pitch_contour(&sine(200.0, 0.01, 24_000, 0.4), 24_000, 0.01).is_none());
     }
+
+    #[test]
+    fn cvar_computes_expected_shortfall_on_uniform_distribution() {
+        // Uniform 0 to 100 with 100 samples: [1.0, 2.0, ..., 100.0]
+        let samples: Vec<f64> = (1..=100).map(|x| x as f64).collect();
+
+        // Higher is worse: top 10% is 91..=100 -> mean is 95.5
+        let cvar10_upper = cvar_alpha(&samples, 0.10, true).expect("cvar10 upper");
+        assert!((cvar10_upper - 95.5).abs() < 1e-6);
+
+        // Lower is worse: bottom 10% is 1..=10 -> mean is 5.5
+        let cvar10_lower = cvar_alpha(&samples, 0.10, false).expect("cvar10 lower");
+        assert!((cvar10_lower - 5.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn evt_gpd_quantile_recovers_exponential_tail() {
+        // Exponential distribution with mean scale lambda = 1.0
+        // F(x) = 1 - exp(-x), Quantile Q(p) = -ln(1 - p)
+        // Q(0.99) = -ln(0.01) ≈ 4.60517
+        let n = 200;
+        let samples: Vec<f64> = (1..=n)
+            .map(|i| {
+                let p = (i as f64 - 0.5) / n as f64;
+                -(1.0 - p).ln()
+            })
+            .collect();
+
+        let est_p99 = evt_gpd_tail_quantile(&samples, 0.99, 0.85).expect("evt estimate");
+        let true_p99 = -(0.01f64).ln();
+        assert!(
+            (est_p99 - true_p99).abs() < 0.25,
+            "EVT GPD estimate {est_p99} must recover true exponential quantile {true_p99}"
+        );
+    }
+
+    #[test]
+    fn tail_risk_summary_reports_complete_envelope_and_refuses_empty() {
+        assert!(compute_tail_risk(&[], true).is_none());
+
+        let samples: Vec<f64> = (1..=100).map(|x| x as f64).collect();
+        let summary = compute_tail_risk(&samples, true).expect("summary");
+        assert_eq!(summary.sample_count, 100);
+        assert!((summary.mean - 50.5).abs() < 1e-6);
+        assert!((summary.median - 50.5).abs() < 1e-6);
+        assert!((summary.cvar_10 - 95.5).abs() < 1e-6);
+        assert!((summary.cvar_05 - 98.0).abs() < 1e-6);
+    }
 }
+
