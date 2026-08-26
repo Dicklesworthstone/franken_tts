@@ -173,6 +173,26 @@ impl LoadedModel {
     ///
     /// If any checkpoint or tokenizer file is unreadable or not the pinned model.
     pub fn load(bundle: &ModelBundle) -> Result<Self, FttsError> {
+        // Digest verification over the multi-GB artifact is the longest silent
+        // stretch of a cold run; under heavy ambient load it can run for many
+        // minutes (bead frankentts-9dwj). Surface per-section progress on
+        // stderr — throttled to 10% steps so a normal load prints one or two
+        // lines and a contended one shows the run is alive.
+        let last_reported = std::sync::AtomicU8::new(0);
+        ftts_artifacts::fttsq::set_digest_progress_sink(Box::new(move |progress| {
+            if progress.bytes_total == 0 {
+                return;
+            }
+            let pct = ((progress.bytes_done as f64 / progress.bytes_total as f64) * 100.0) as u8;
+            let last = last_reported.load(std::sync::atomic::Ordering::Relaxed);
+            if pct >= last + 10 || pct == 100 {
+                eprintln!(
+                    "[load] verifying artifact digests: {}% ({})",
+                    pct, progress.section
+                );
+                last_reported.store(pct, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
         let read = |name: &str| -> Result<String, FttsError> {
             let path = bundle.root.join(name);
             fs::read_to_string(&path).map_err(|error| {

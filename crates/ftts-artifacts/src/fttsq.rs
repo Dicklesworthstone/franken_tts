@@ -54,6 +54,31 @@ use serde_json::{Value, json};
 
 use crate::sha256::{Sha256, hex_digest, to_hex};
 
+/// One step of artifact digest verification, for caller-owned progress UI.
+#[derive(Clone, Debug)]
+pub struct DigestProgress {
+    /// The section whose digest was just verified.
+    pub section: String,
+    /// Payload bytes verified so far, cumulative across sections.
+    pub bytes_done: u64,
+    /// Total payload bytes this verification will cover.
+    pub bytes_total: u64,
+}
+
+static DIGEST_PROGRESS_SINK: std::sync::OnceLock<Box<dyn Fn(&DigestProgress) + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Installs a callback invoked after each section digest is verified.
+///
+/// Runtime-set (the CLI wires this to its robot/stderr channels), which is why
+/// a [`OnceLock`](std::sync::OnceLock) rather than [`LazyLock`](std::sync::LazyLock):
+/// the initializer arrives from the caller, not declaration time. Unset sinks
+/// make verification exactly as silent as it has always been; only one sink
+/// fits (the last setter wins) because progress has exactly one audience.
+pub fn set_digest_progress_sink(sink: Box<dyn Fn(&DigestProgress) + Send + Sync>) {
+    let _ = DIGEST_PROGRESS_SINK.set(sink);
+}
+
 /// File magic. Eight bytes so the directory length lands 8-byte aligned.
 pub const MAGIC: &[u8; 8] = b"FTTSQ\0\0\0";
 
@@ -1083,6 +1108,9 @@ impl FttsqReader {
     ///
     /// Returns [`FttsqError::DigestMismatch`] naming the first corrupt section.
     pub fn verify_digests(&self, bytes: &[u8]) -> Result<(), FttsqError> {
+        let sink = DIGEST_PROGRESS_SINK.get();
+        let total: u64 = self.sections.iter().map(|s| s.length).sum();
+        let mut done: u64 = 0;
         for section in &self.sections {
             let payload = self.section_bytes(section, bytes)?;
             let actual = to_hex(&crate::sha256::digest(payload));
@@ -1093,20 +1121,23 @@ impl FttsqReader {
                     actual,
                 });
             }
+            done += section.length;
+            if let Some(sink) = sink {
+                sink(&DigestProgress {
+                    section: section.name.clone(),
+                    bytes_done: done,
+                    bytes_total: total,
+                });
+            }
         }
         Ok(())
     }
-
-    /// Verify every section the bytes fully contain, skipping those they stop short of.
-    ///
-    /// The skip is deliberately silent because the caller has already classified what is absent
-    /// and refused any section that was merely truncated — see [`MappedFttsq::from_prefix_bytes`].
-    /// What this verifies, it verifies exactly as [`FttsqReader::verify_digests`] does.
-    ///
     /// # Errors
     ///
     /// On any present section whose payload does not match its declared digest.
     pub fn verify_digests_of_present(&self, bytes: &[u8]) -> Result<(), FttsqError> {
+        let sink = DIGEST_PROGRESS_SINK.get();
+        let mut done: u64 = 0;
         for section in &self.sections {
             let Some(end) = section.end() else { continue };
             if end > bytes.len() as u64 {
@@ -1121,18 +1152,17 @@ impl FttsqReader {
                     actual,
                 });
             }
+            done += section.length;
+            if let Some(sink) = sink {
+                sink(&DigestProgress {
+                    section: section.name.clone(),
+                    bytes_done: done,
+                    bytes_total: done.max(bytes.len() as u64),
+                });
+            }
         }
         Ok(())
     }
-
-    /// Which sections a prefix of `available` bytes stops short of entirely.
-    ///
-    /// A section is absent when it starts at or after the cut, and present when it ends at or
-    /// before it. A section straddling the cut is neither: it cannot be digest-checked and must
-    /// not be read, so it is an error rather than a third category. That distinction is what
-    /// separates "the caller deliberately declined a trailing section" from "the download stopped
-    /// early", which would otherwise both arrive here looking identical.
-    ///
     /// # Errors
     ///
     /// When the prefix splits a section, or a declared section's range overflows.
@@ -2609,6 +2639,48 @@ impl FttsqWriter {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    #[test]
+    fn digest_progress_sink_receives_monotonic_per_section_coverage() {
+        // Unique section names: a parallel test installing its own sink (or
+        // verifying its own artifact) cannot inject entries into THIS capture.
+        const A: &str = "awq_prog_unique_a";
+        const B: &str = "awq_prog_unique_b";
+        let bytes = FttsqWriter::new("progress-fixture", "a".repeat(64))
+            .license_notice(NOTICE)
+            .model_config(json!({}))
+            .quantization_manifest(json!({}))
+            .section(A, AccessClass::HotRecurrentMicrodecoder, vec![3_u8; 128])
+            .section(B, AccessClass::ColdTextEmbedding, vec![5_u8; 96])
+            .finish()
+            .expect("fixture writes");
+        let reader = FttsqReader::parse_directory(&bytes).expect("fixture parses");
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, u64)>>> = Default::default();
+        let capture = std::sync::Arc::clone(&seen);
+        set_digest_progress_sink(Box::new(move |progress| {
+            capture
+                .lock()
+                .expect("capture lock")
+                .push((progress.section.clone(), progress.bytes_done));
+        }));
+
+        reader.verify_digests(&bytes).expect("fixture verifies");
+
+        let got = seen.lock().expect("capture lock").clone();
+        assert_eq!(
+            got.iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec![A, B],
+            "one emission per section, in declaration order"
+        );
+        let last = got.last().expect("emissions exist").1;
+        assert_eq!(last, 128 + 96);
+        assert!(
+            got.windows(2).all(|w| w[0].1 <= w[1].1),
+            "byte coverage must be monotonic"
+        );
+    }
 
     /// The §3 notice from `docs/LICENSE_AND_ATTRIBUTION.md`, abbreviated for tests.
     const NOTICE: &str = "Copyright 2026 Alibaba Cloud\nApache-2.0\nCHANGES: requantized to .fttsq";
