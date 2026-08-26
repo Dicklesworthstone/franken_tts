@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Cross-target tap comparator for frankentts-p16p verification.
 
-Compares prefill sub-stage lines (ftts-tapP rows/g/p/h) and per-layer
-eight-stage lines (ftts-tapL l=) between a native tap log and a wasm
-transcript. Prints the first divergence point and an overall verdict so the
-DISC-006 seam-B chase has one mechanical receipt command.
+Compares prefill sub-stage lines (ftts-tapP g/p/h), text-projection
+sub-stage lines (ftts-tapX fc1/silu/fc2), and per-layer eight-stage lines
+(ftts-tapL l=) between a native tap log and a wasm transcript. Prints the
+first divergence point and an overall verdict so the DISC-006 seam-B chase
+has one mechanical receipt command.
 Usage: compare_taps.py <native_log> <wasm_transcript>
 """
 import re
@@ -16,16 +17,32 @@ L = re.compile(
     r"g=([0-9a-f]{16}) h=([0-9a-f]{16})"
 )
 STAGES = ["anorm", "qkv", "qrope", "krope", "softmax", "ares", "mnorm", "gateup", "out"]
-G = re.compile(r"ftts-tapP rows=(\d+) g=([0-9a-f]{16})")
-P = re.compile(r"ftts-tapP p=([0-9a-f]{16})")
-H = re.compile(r"ftts-tapP h=([0-9a-f]{16})")
+GATHER = re.compile(r"ftts-tapP rows=(\d+) g=([0-9a-f]{16})")
+PROJECTED = re.compile(r"ftts-tapP p=([0-9a-f]{16})")
+HIDDEN = re.compile(r"ftts-tapP h=([0-9a-f]{16})")
+FC1 = re.compile(r"ftts-tapX fc1=([0-9a-f]{16})")
+SILU = re.compile(r"ftts-tapX silu=([0-9a-f]{16})")
+FC2 = re.compile(r"ftts-tapX fc2=([0-9a-f]{16})")
 
 
 def collect(path):
     layers = {}
-    gather = None
-    projected = []
-    hidden = []
+    stage_hashes = {
+        "gather": None,
+        "projected": [],
+        "hidden": [],
+        "fc1": [],
+        "silu": [],
+        "fc2": [],
+    }
+    patterns = (
+        (GATHER, "gather"),
+        (PROJECTED, "projected"),
+        (HIDDEN, "hidden"),
+        (FC1, "fc1"),
+        (SILU, "silu"),
+        (FC2, "fc2"),
+    )
     with open(path, errors="replace") as source:
         for line in source:
             m = L.search(line)
@@ -34,43 +51,54 @@ def collect(path):
                 if key not in layers:
                     layers[key] = m.groups()[1:]
                 continue
-            m = G.search(line)
-            if m:
-                gather = (int(m.group(1)), m.group(2))
-            for pat, bucket in ((P, projected), (H, hidden)):
-                mm = pat.search(line)
-                if mm:
-                    bucket.append(mm.group(1))
-    return layers, (gather, projected, hidden)
+            for pattern, name in patterns:
+    # The wasm transcript mirrors every console line ([error] … plus an
+    # [engine-worker] copy), so identical values appear twice. Dedupe
+    # order-preserving so a genuinely bit-equal pair compares equal.
+    for name in ("projected", "hidden", "fc1", "silu", "fc2"):
+        seen = []
+        for value in stage_hashes[name]:
+            if value not in seen:
+                seen.append(value)
+        stage_hashes[name] = seen
+    return layers, stage_hashes
+                if name == "gather":
+                    stage_hashes[name] = (int(mm.group(1)), mm.group(2))
+                else:
+                    stage_hashes[name].append(mm.group(1))
+    return layers, stage_hashes
 
 
 def main(native_path, wasm_path):
-    nl, ngather, nproj, nhid = _triplet(collect(native_path))
-    wl, wgather, wproj, whid = _triplet(collect(wasm_path))
-    print(f"tapP gather: native={ngather} wasm={wgather} equal={ngather == wgather}")
-    print(f"tapP projected: native={nproj} wasm={wproj} equal={nproj == wproj}")
-    print(f"tapP hidden: native={nhid} wasm={whid} equal={nhid == whid}")
-    common = sorted(set(nl) & set(wl))
-    print(f"layers native {len(nl)} wasm {len(wl)} common {len(common)}")
+    native_layers, native_stages = collect(native_path)
+    wasm_layers, wasm_stages = collect(wasm_path)
+    for name in ("gather", "projected", "hidden", "fc1", "silu", "fc2"):
+        n_value = native_stages[name]
+        w_value = wasm_stages[name]
+        equal = n_value == w_value
+        marker = "" if equal else ("   <-- FIRST-MOVER CANDIDATE" if name == "silu" or True else "")
+        print(f"tap[{name}] native={n_value} wasm={w_value} equal={equal}{marker}")
+    common = sorted(set(native_layers) & set(wasm_layers))
+    print(f"layers native {len(native_layers)} wasm {len(wasm_layers)} common {len(common)}")
     first = None
     matches = 0
     for k in common:
-        diffs = [STAGES[i] for i, (x, y) in enumerate(zip(nl[k], wl[k])) if x != y]
+        diffs = [
+            STAGES[i]
+            for i, (x, y) in enumerate(zip(native_layers[k], wasm_layers[k]))
+            if x != y
+        ]
         if not diffs:
             matches += 1
         elif first is None:
             first = (k, diffs)
     print(f"fully-matching layers: {matches}/{len(common)}")
-    if len(common) == len(nl) == len(wl) and matches == len(common):
+    if len(common) == len(native_layers) == len(wasm_layers) and matches == len(common):
         print("VERDICT: ALL LAYERS x STAGES MATCH")
     elif first:
-        print(f"FIRST DIVERGENCE layer {first[0]} stages: {','.join(first[1])}")
+        print(f"FIRST LAYER DIVERGENCE layer {first[0]} stages: {','.join(first[1])}")
     else:
         print("VERDICT: INCOMPLETE PAIR")
-
-
-def _triplet(parsed):
-    return parsed[0], parsed[1][0], parsed[1][1], parsed[1][2]
 
 
 if __name__ == "__main__":

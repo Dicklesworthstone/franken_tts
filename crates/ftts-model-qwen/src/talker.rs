@@ -1084,8 +1084,20 @@ pub fn project_text_rows(
         intermediate_width,
         &mut activated,
     );
+    if crate::taps::taps_active() {
+        crate::taps::tap_emit(&format!(
+            "ftts-tapX fc1={:016x}",
+            crate::taps::tap_hash_f32(&activated),
+        ));
+    }
     for value in &mut activated {
         *value = *value / (1.0 + (-*value).exp());
+    }
+    if crate::taps::taps_active() {
+        crate::taps::tap_emit(&format!(
+            "ftts-tapX silu={:016x}",
+            crate::taps::tap_hash_f32(&activated),
+        ));
     }
     f32ref::linear(
         &activated,
@@ -1096,6 +1108,12 @@ pub fn project_text_rows(
         output_width,
         output,
     );
+    if crate::taps::taps_active() {
+        crate::taps::tap_emit(&format!(
+            "ftts-tapX fc2={:016x}",
+            crate::taps::tap_hash_f32(output),
+        ));
+    }
 }
 
 /// Forms the next-frame talker input from the prior frame's 16 code embeddings and text stream.
