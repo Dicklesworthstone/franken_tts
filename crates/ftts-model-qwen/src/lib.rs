@@ -11,6 +11,7 @@ pub mod prompt;
 pub mod sampler;
 pub mod speaker;
 pub mod speech_encoder;
+mod taps;
 pub mod talker;
 pub mod tokenizer;
 

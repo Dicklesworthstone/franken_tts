@@ -712,6 +712,7 @@ impl TalkerLayerQuant {
 /// Panics on any shape mismatch, exactly as [`forward_layer`] does.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_layer_q8(
+    layer: usize,
     config: &TalkerConfig,
     weights: &TalkerLayerWeights<'_>,
     quant: &TalkerLayerQuant,
@@ -722,6 +723,11 @@ pub fn forward_layer_q8(
     cache: &mut KvCache,
     mode: QuantLinearMode,
 ) {
+    // DISC-006 stage taps (frankentts-p16p): one FNV hash per operator boundary, emitted once
+    // at layer end so a native/wasm diff names the first divergent (layer, stage) pair
+    // directly. Captures are pure math and only run when taps are enabled.
+    let tap = crate::taps::taps_active();
+    let mut t = [0u64; 8];
     let hidden_size = config.hidden_size;
     let head_dim = config.head_dim;
     let query_width = config.query_width();
@@ -755,12 +761,17 @@ pub fn forward_layer_q8(
         hidden_size,
         &mut normed,
     );
-
+    if tap {
+        t[0] = crate::taps::tap_hash_f32(&normed);
+    }
     // One fused Q‖K‖V dispatch, then split into the per-role buffers the norm/rope steps
     // mutate. Row r of the fused output holds [queries | keys | values] contiguously.
     let fused_width = query_width + 2 * kv_width;
     let mut qkv = vec![0.0f32; seq * fused_width];
     quant_linear(mode, &normed, &quant.qkv, None, seq, &mut qkv);
+    if tap {
+        t[1] = crate::taps::tap_hash_f32(&qkv);
+    }
     let mut queries = vec![0.0f32; seq * query_width];
     let mut keys = vec![0.0f32; seq * kv_width];
     let mut values = vec![0.0f32; seq * kv_width];
