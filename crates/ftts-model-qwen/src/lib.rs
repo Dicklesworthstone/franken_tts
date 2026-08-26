@@ -11,8 +11,8 @@ pub mod prompt;
 pub mod sampler;
 pub mod speaker;
 pub mod speech_encoder;
-mod taps;
 pub mod talker;
+mod taps;
 pub mod tokenizer;
 
 /// Identifies this crate's scaffold revision.

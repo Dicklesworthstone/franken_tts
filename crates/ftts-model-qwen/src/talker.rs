@@ -892,7 +892,14 @@ pub fn forward_layer_q8(
         crate::taps::tap_emit(&format!(
             "ftts-tapL l={layer} a={:016x} b={:016x} q={:016x} k={:016x} d={:016x} \
              e={:016x} f={:016x} g={:016x} h={:016x}",
-            t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7],
+            t[0],
+            t[1],
+            t[2],
+            t[3],
+            t[4],
+            t[5],
+            t[6],
+            t[7],
             crate::taps::tap_hash_f32(hidden),
         ));
     }

@@ -90,6 +90,17 @@ pub(crate) fn tap_emit(line: &str) {
     }
 }
 
+/// The same hash over little-endian `u32` values (code groups).
+pub(crate) fn tap_hash_u32(values: &[u32]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for value in values {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    hash
+}
 /// FNV-1a over the little-endian bit patterns of a slice — identical bits, identical hash, on
 /// every target.
 pub(crate) fn tap_hash_f32(values: &[f32]) -> u64 {
