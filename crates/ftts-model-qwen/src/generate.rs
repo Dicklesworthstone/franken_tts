@@ -793,6 +793,16 @@ impl<'a> QwenGenerator<'a> {
                 &self.overlay_rows[slot * embed_width..(slot + 1) * embed_width],
             );
         }
+        // Prefill sub-stage taps (frankentts-p16p): bisecting seam B above the layer loop.
+        // Emitted symmetrically because this crate is compiled into both engines; keys
+        // g= gathered rows, p= projected rows, h= hidden handed to run_prefill.
+        if taps_active() {
+            tap_emit(&format!(
+                "ftts-tapP rows={} g={:016x}",
+                ids.len(),
+                tap_hash_f32(&embedded),
+            ));
+        }
 
         let hidden = self.talker_config.hidden_size;
         let intermediate = self.text.fc1_bias.len();
@@ -810,6 +820,9 @@ impl<'a> QwenGenerator<'a> {
                 self.text.fc2_bias,
                 &mut projected,
             );
+        }
+        if taps_active() {
+            tap_emit(&format!("ftts-tapP p={:016x}", tap_hash_f32(&projected)));
         }
         Ok(projected.chunks(hidden).map(<[f32]>::to_vec).collect())
     }
@@ -969,6 +982,9 @@ impl FrameGenerator for QwenGenerator<'_> {
             hidden.extend_from_slice(state);
         }
 
+        if taps_active() {
+            tap_emit(&format!("ftts-tapP h={:016x}", tap_hash_f32(&hidden)));
+        }
         self.run_prefill(hidden, seq, assembly.trailing_text_hidden);
         if matches!(mode, UtteranceStart::Continuation)
             && let Some(utterance) = self.utterance.as_mut()
