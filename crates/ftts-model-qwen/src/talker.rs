@@ -1265,6 +1265,7 @@ mod tests {
             let mut hidden = base.clone();
             let mut cache = KvCache::new();
             forward_layer_q8(
+                0,
                 &config,
                 &weights,
                 &quant,
@@ -1331,6 +1332,7 @@ mod tests {
         let mut actual = base.clone();
         let mut q8_cache = KvCache::new();
         forward_layer_q8(
+            0,
             &config,
             &weights,
             &quant,
