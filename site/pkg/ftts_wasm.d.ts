@@ -231,6 +231,12 @@ export class WasmEngine {
      */
     constructor(fttsq: Uint8Array, codec: Uint8Array, vocab_json: string, merges_txt: string, tokenizer_config_json: string);
     /**
+     * Enables canonical cross-target RMSNorm arithmetic (frankentts-p16p / DISC-006): the
+     * norm scale computes through f64 so arm64 FMA contraction cannot shift bits relative
+     * to wasm. Off by default — default-route numerics are untouched.
+     */
+    set_canonical_norm(enabled: boolean): void;
+    /**
      * Enables the DISC-006 cross-target seam taps (frankentts-p16p): one `console.error` line
      * per generated frame carrying hashes of the tensors that cross engine seams. Off by
      * default — a normal visitor's console never sees them.
@@ -389,6 +395,7 @@ export interface InitOutput {
     readonly wasmengine_enroll_raw: (a: number, b: number, c: number) => [number, number, number, number];
     readonly wasmengine_from_staging: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly wasmengine_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
+    readonly wasmengine_set_canonical_norm: (a: number, b: number) => void;
     readonly wasmengine_set_debug_taps: (a: number, b: number) => void;
     readonly wasmengine_synthesize: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => [number, number, number, number];
     readonly wasmengine_synthesize_with_text_rows: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number, j: number) => [number, number, number, number];

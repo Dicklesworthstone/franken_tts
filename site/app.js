@@ -713,6 +713,10 @@ ui.speak.addEventListener("click", async () => {
     if (globalThis.__fttsDebugTaps) {
       payload.debugTaps = true;
     }
+    // Canonical RMSNorm (frankentts-p16p): the harness flips this on for cross-target diffs.
+    if (globalThis.__fttsCanonicalNorm) {
+      payload.canonicalNorm = true;
+    }
     const { pcm, sampleRate, elapsedMs } = await call("synthesize", payload);
     const samples = new Float32Array(pcm);
     setWavBlob(pcmToWavBlob(samples, sampleRate));

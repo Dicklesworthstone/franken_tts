@@ -58,6 +58,9 @@ const PACKET_FRAMES = Number(argValue("--packet-frames") ?? 0);
 // console line per frame whose hashes must match the native run's `FTTS_DEBUG_TAPS` lines
 // exactly until the first divergent operator.
 const DEBUG_TAPS = process.argv.includes("--debug-taps");
+// `--canonical-math` turns on the canonical cross-target RMSNorm (frankentts-p16p): the
+// native side must run with FTTS_CANONICAL_NORM=1 for the comparison to be apples-to-apples.
+const CANONICAL_MATH = process.argv.includes("--canonical-math");
 // `--transcript-out <path>` writes the COMPLETE captured console/page/worker transcript
 // (not the tail-only dump this script prints) — DISC-006 tap runs need every
 // `ftts-tap` line, and long downloads push early ones out of the printed window.
@@ -250,6 +253,12 @@ try {
         globalThis.__fttsDebugTaps = true;
       });
       console.log("      debug taps: on");
+    }
+    if (CANONICAL_MATH) {
+      await page.evaluate(() => {
+        globalThis.__fttsCanonicalNorm = true;
+      });
+      console.log("      canonical math: on");
     }
     const inputs = await page.evaluate(() => ({
       text: document.getElementById("text")?.value ?? null,

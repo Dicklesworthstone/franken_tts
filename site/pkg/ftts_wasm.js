@@ -370,6 +370,15 @@ export class WasmEngine {
         return this;
     }
     /**
+     * Enables canonical cross-target RMSNorm arithmetic (frankentts-p16p / DISC-006): the
+     * norm scale computes through f64 so arm64 FMA contraction cannot shift bits relative
+     * to wasm. Off by default — default-route numerics are untouched.
+     * @param {boolean} enabled
+     */
+    set_canonical_norm(enabled) {
+        wasm.wasmengine_set_canonical_norm(this.__wbg_ptr, enabled);
+    }
+    /**
      * Enables the DISC-006 cross-target seam taps (frankentts-p16p): one `console.error` line
      * per generated frame carrying hashes of the tensors that cross engine seams. Off by
      * default — a normal visitor's console never sees them.

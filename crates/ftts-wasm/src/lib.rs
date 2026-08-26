@@ -920,6 +920,13 @@ impl WasmEngine {
         ftts_model_qwen::generate::set_taps_enabled(enabled);
     }
 
+    /// Enables canonical cross-target RMSNorm arithmetic (frankentts-p16p / DISC-006): the
+    /// norm scale computes through f64 so arm64 FMA contraction cannot shift bits relative
+    /// to wasm. Off by default — default-route numerics are untouched.
+    pub fn set_canonical_norm(&self, enabled: bool) {
+        ftts_kernels::f32ref::set_canonical_norm_enabled(enabled);
+    }
+
     /// The cold-text-embedding ids this exact text will need, in the order the rows must arrive.
     ///
     /// The caller reads these rows out of the artifact itself (in the browser: out of OPFS) and

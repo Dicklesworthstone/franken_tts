@@ -89,6 +89,11 @@ pub enum F32RmsNormArithmetic {
     TorchCascade8ReciprocalSqrt,
     /// f64 reduction and scale calculation, narrowed only at the final scale.
     F64ReciprocalSqrt,
+    /// Integer-exact accumulation (frankentts-p16p): every `f32` square is exact in a u128
+    /// fixed-point accumulator, so the sum is provably identical on every target — no FP
+    /// contraction, reduction-order, or libm variance can reach it. The scale narrows through
+    /// f64 at the end on operands that are already identical everywhere.
+    FixedPointExactReciprocalSqrt,
 }
 
 impl F32RmsNormArithmetic {
@@ -589,21 +594,89 @@ unsafe extern "C" {
     fn vvexpf(out: *mut f32, x: *const f32, count: *const i32);
 }
 
+/// Canonical-f32 mode (frankentts-p16p / DISC-006): when enabled, [`rms_norm`] computes its
+/// scale through the f64 variant, whose result is bit-identical across targets regardless of
+/// whether the host fuses multiply-adds (arm64 `fmadd` contracts; wasm32 cannot). Native
+/// processes opt in through `FTTS_CANONICAL_NORM=1`; a wasm host calls
+/// [`set_canonical_norm_enabled`]. Default off: every default-route bit is untouched.
+static CANONICAL_NORM_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(not(target_arch = "wasm32"))]
+static NATIVE_CANONICAL_NORM: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FTTS_CANONICAL_NORM").is_some());
+
+/// Enables canonical cross-target RMSNorm arithmetic for this process.
+pub fn set_canonical_norm_enabled(enabled: bool) {
+    CANONICAL_NORM_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn canonical_norm_requested() -> bool {
+    if CANONICAL_NORM_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        *NATIVE_CANONICAL_NORM
+    }
+    #[cfg(target_arch = "wasm32")]
+    false
+}
 /// Qwen3 RMSNorm: `x * rsqrt(mean(x^2) + eps) * weight`, weight-only, no centering.
+///
+/// Under canonical-f32 mode the scale accumulates through [`F32RmsNormArithmetic::
+/// FixedPointExactReciprocalSqrt`], whose integer-exact sum is bit-identical on every target.
 ///
 /// # Panics
 ///
 /// Panics if `x` is not `rows * dim` elements or `weight` is not `dim`.
 pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32, rows: usize, dim: usize, out: &mut [f32]) {
-    rms_norm_with_arithmetic(
-        x,
-        weight,
-        eps,
-        rows,
-        dim,
-        F32RmsNormArithmetic::ScalarReciprocalSqrt,
-        out,
-    );
+    let arithmetic = if canonical_norm_requested() {
+        F32RmsNormArithmetic::FixedPointExactReciprocalSqrt
+    } else {
+        F32RmsNormArithmetic::ScalarReciprocalSqrt
+    };
+    rms_norm_with_arithmetic(x, weight, eps, rows, dim, arithmetic, out);
+}
+
+/// Integer-exact mean-square accumulation (frankentts-p16p): each `f32` square is exact in
+/// ≤49 mantissa bits, so the u128 fixed-point sum below is identical on every target — no FP
+/// contraction, lane order, or libm variance can reach it. Non-normal inputs fall back to the
+/// f64 path; speech never produces them.
+fn rms_scale_fixed_point_exact(src: &[f32], eps: f32) -> f32 {
+    let mut terms: Vec<(u64, i32)> = Vec::with_capacity(src.len());
+    for &value in src {
+        let bits = value.to_bits();
+        if bits & 0x7fff_ffff == 0 {
+            continue; // ±0 contributes nothing.
+        }
+        let exponent_field = ((bits >> 23) & 0xff) as i32;
+        let mantissa = u64::from((bits & 0x007f_ffff) | 0x0080_0000);
+        if exponent_field == 0 || exponent_field == 0xff {
+            return rms_scale_f64(src, eps); // Subnormal/inf/nan: outside the envelope.
+        }
+        terms.push((mantissa * mantissa, 2 * (exponent_field - 150)));
+    }
+    let max_e2 = terms.iter().map(|term| term.1).max().unwrap_or(0);
+    let mut acc: u128 = 0;
+    for &(m2, e2) in &terms {
+        let shift = u32::try_from(max_e2 - e2).unwrap_or(u32::MAX);
+        if shift > 100 {
+            return rms_scale_f64(src, eps); // Exponent spread beyond exact alignment.
+        }
+        acc += u128::from(m2) >> shift;
+    }
+    let sum = acc as f64 * 2f64.powi(max_e2);
+    let mean = if src.is_empty() { 0.0 } else { sum / src.len() as f64 };
+    ((mean + f64::from(eps)).sqrt().recip()) as f32
+}
+
+/// The f64 attribution path, reused by the fixed-point fallbacks above.
+fn rms_scale_f64(src: &[f32], eps: f32) -> f32 {
+    let mut sum = 0.0f64;
+    for &value in src {
+        sum += f64::from(value) * f64::from(value);
+    }
+    ((sum / src.len() as f64 + f64::from(eps)).sqrt().recip()) as f32
 }
 
 /// Same operation as [`rms_norm`], with an explicitly selected reduction and scale calculation.
@@ -673,6 +746,9 @@ fn rms_scale(src: &[f32], eps: f32, arithmetic: F32RmsNormArithmetic) -> f32 {
                 sum += value * value;
             }
             (sum / src.len() as f64 + f64::from(eps)).sqrt().recip() as f32
+        }
+        F32RmsNormArithmetic::FixedPointExactReciprocalSqrt => {
+            rms_scale_fixed_point_exact(src, eps)
         }
     }
 }
@@ -1442,6 +1518,40 @@ pub fn apply_rope_in_place(row: &mut [f32], cos: &[f32], sin: &[f32]) {
 mod tests {
     use super::*;
 
+
+    /// The whole point of the fixed-point variant: the accumulated integer is order-free, so
+    /// any permutation of the input yields the identical scale — the property wasm-vs-native
+    /// bit-equality rests on (frankentts-p16p).
+    #[test]
+    fn fixed_point_rms_scale_is_shuffle_invariant() {
+        let mut src: Vec<f32> = (0..1024)
+            .map(|i| ((i % 37) as f32 - 18.0) * 0.037)
+            .chain(std::iter::once(1.5e-4))
+            .collect();
+        let baseline = rms_scale(&src, 1e-6, F32RmsNormArithmetic::FixedPointExactReciprocalSqrt);
+        for i in (1..src.len()).rev() {
+            let j = (i * 7919) % (i + 1);
+            src.swap(i, j);
+        }
+        let shuffled = rms_scale(&src, 1e-6, F32RmsNormArithmetic::FixedPointExactReciprocalSqrt);
+        assert_eq!(baseline.to_bits(), shuffled.to_bits());
+    }
+
+    /// Exactness must not cost sanity: the fixed-point scale agrees with the widened-f64
+    /// attribution path to well under a few f32 ulps on ordinary speech-magnitude data.
+    #[test]
+    fn fixed_point_rms_scale_tracks_the_widened_f64_path() {
+        let src: Vec<f32> = (0..1024)
+            .map(|i| ((i as f64 * 0.618_033_988_7).fract() - 0.5) as f32 * 2.0)
+            .collect();
+        let exact = rms_scale(&src, 1e-6, F32RmsNormArithmetic::FixedPointExactReciprocalSqrt);
+        let wide = rms_scale(&src, 1e-6, F32RmsNormArithmetic::F64ReciprocalSqrt);
+        let ulp = f32::EPSILON * wide.abs().max(1.0);
+        assert!(
+            (exact - wide).abs() <= 4.0 * ulp,
+            "exact {exact} vs widened {wide}"
+        );
+    }
     #[test]
     fn linear_matches_a_hand_computed_product() {
         // x = [[1, 2, 3]], weight = [[1, 0, -1], [2, 2, 2]] -> [1*1 + 2*0 + 3*-1, 2+4+6] = [-2, 12]
@@ -1699,3 +1809,4 @@ mod tests {
         );
     }
 }
+

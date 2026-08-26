@@ -727,6 +727,10 @@ async function handleMessage({ data }) {
         if (typeof engine.set_debug_taps === "function") {
           engine.set_debug_taps(Boolean(data.debugTaps));
         }
+        // Canonical RMSNorm (frankentts-p16p): per-request, off unless the page asked.
+        if (typeof engine.set_canonical_norm === "function") {
+          engine.set_canonical_norm(Boolean(data.canonicalNorm));
+        }
         // Packet size is a pure speed/memory dial: the streaming==batch gate makes output
         // bit-identical under every schedule, so 0 (the engine's default of 4) and any override
         // produce the same samples. Bigger packets mean a larger `m` in every codec GEMM.
