@@ -47,7 +47,9 @@ f32-accumulation class covering every measured activation seam (DISC-002).
 > outside the register vocabulary above. Rewritten into schema during the reality-check audit;
 > measurement prose below is unchanged evidence.
 
-**What is measured.** Same text, voice matt, seed 0, inputs read back and asserted. Frame 0 is 1919/1920 samples identical at 75.0 dB SNR. Frame 1 is 0.6 dB. Whole utterance 2.61% identical, and the browser emits 40 frames where the CLI emits 41. Reproduced unchanged on 2026-08-24 at HEAD `37011dd` with freshly built site/pkg and a fresh native golden (numbers identical to the decimal).
+**What is measured.** Same text, voice matt, seed 0, inputs read back and asserted. Frame 0 is 1919/1920 samples identical at 75.0 dB SNR. Frame 1 is 0.6 dB. Whole utterance 2.61% identical, and the browser emits 40 frames where the CLI emits 41. Reproduced unchanged on 2026-08-24 and again 2026-08-25 at current HEAD with freshly built site/pkg and a fresh native golden (numbers identical to the decimal).
+
+**What the seam taps added (2026-08-25, frankentts-p16p).** Generator-side taps (`FTTS_DEBUG_TAPS`, file sink) hash the tensors crossing each seam; the wasm twin emits the same lines to its console (`--debug-taps --transcript-out`). Result at current HEAD: the PREFILL output already diverges — `ph`/`plog` hashes differ before any frame is generated — so the per-target f32 epsilon lives in the shared talker prompt-forward compiled per target, exactly where the int8-exact path gives no coverage. Early draws usually survive the epsilon (frame 0's primary matched here), and one flip cascades to unrelated renderings and the 40-vs-41 frame count.
 
 **Why one epsilon is enough.** The talker SAMPLES — `do_sample=true`, T=0.9, top_k=50, sixteen draws per frame — and the CLI's own note scopes determinism to "build + ISA + sampler version + seed". So any difference that reaches the logits flips a draw, and from the next frame on the two renderings are unrelated. This is not a degradation; both are valid draws. It is still a defect, because the same seed should give the same audio everywhere and nothing in this pipeline is lossy.
 

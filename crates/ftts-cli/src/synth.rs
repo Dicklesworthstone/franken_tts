@@ -2092,11 +2092,14 @@ impl FrameGenerator for TeeGenerator<'_> {
                     Some(value) if !value.is_empty() && value != one => {
                         std::path::PathBuf::from(value)
                     }
-                    _ => std::env::temp_dir()
-                        .join(format!("ftts-codes-{}.log", std::process::id())),
+                    _ => {
+                        std::env::temp_dir().join(format!("ftts-codes-{}.log", std::process::id()))
+                    }
                 };
-                if let Ok(mut file) =
-                    std::fs::OpenOptions::new().create(true).append(true).open(&path)
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
                 {
                     use std::io::Write;
                     let _ = writeln!(file, "ftts-cli codes[{}]: {:?}", self.printed, frame.codes);

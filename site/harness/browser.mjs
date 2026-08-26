@@ -58,6 +58,10 @@ const PACKET_FRAMES = Number(argValue("--packet-frames") ?? 0);
 // console line per frame whose hashes must match the native run's `FTTS_DEBUG_TAPS` lines
 // exactly until the first divergent operator.
 const DEBUG_TAPS = process.argv.includes("--debug-taps");
+// `--transcript-out <path>` writes the COMPLETE captured console/page/worker transcript
+// (not the tail-only dump this script prints) — DISC-006 tap runs need every
+// `ftts-tap` line, and long downloads push early ones out of the printed window.
+const TRANSCRIPT_OUT = argValue("--transcript-out");
 
 const modelFiles = {
   "qwen3-tts-12hz-0.6b-base.fttsq": path.join(modelDir, "qwen3-tts-12hz-0.6b-base.fttsq"),
@@ -333,6 +337,10 @@ try {
 } finally {
   console.log("\n--- browser transcript ---");
   for (const line of transcript.slice(-60)) console.log(line);
+  if (TRANSCRIPT_OUT) {
+    await fs.writeFile(TRANSCRIPT_OUT, transcript.join("\n"));
+    console.log(`full transcript: ${TRANSCRIPT_OUT} (${transcript.length} lines)`);
+  }
   if (!KEEP) {
     await browser.close();
     server.close();
