@@ -113,8 +113,10 @@ jobs:
           set -euo pipefail
           if ! command -v rustup > /dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
+          # The proxies (cargo/rustc/clippy) live beside rustup; expose them to
+          # this and every later step regardless of how the runner service env.
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           command -v rustup > /dev/null || { echo "::error::rustup still not on PATH after install"; exit 1; }
       # rust-toolchain.toml pins the nightly; rustup honours it automatically. Installing the
       # components explicitly makes a toolchain problem fail here with a clear message rather
@@ -215,8 +217,8 @@ jobs:
           set -euo pipefail
           if ! command -v rustup > /dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Add target
         working-directory: frankentts
