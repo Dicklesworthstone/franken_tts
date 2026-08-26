@@ -65,8 +65,10 @@ pub struct DigestProgress {
     pub bytes_total: u64,
 }
 
-static DIGEST_PROGRESS_SINK: std::sync::OnceLock<Box<dyn Fn(&DigestProgress) + Send + Sync>> =
-    std::sync::OnceLock::new();
+/// A digest-progress callback: invoked once per verified section.
+type DigestProgressSink = Box<dyn Fn(&DigestProgress) + Send + Sync>;
+
+static DIGEST_PROGRESS_SINK: std::sync::OnceLock<DigestProgressSink> = std::sync::OnceLock::new();
 
 /// Installs a callback invoked after each section digest is verified.
 ///
