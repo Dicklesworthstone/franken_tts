@@ -526,17 +526,17 @@ mod tests {
         let (n, k) = (16_usize, 32_usize);
         let mut weight = seeded(77, n * k);
         for row in 0..n {
-            weight[row * k + 9] *= 15.0;
+            weight[row * k + 9] *= 60.0;
         }
         let calib: Vec<Vec<f32>> = (0..16)
             .map(|i| {
                 let mut x = seeded(900 + i, k);
-                x[9] *= 15.0;
+                x[9] *= 60.0;
                 x
             })
             .collect();
 
-        let result = calibrate_and_round(&weight, n, k, &calib, 4, 0.1);
+        let result = calibrate_and_round(&weight, n, k, &calib, 4, 0.05);
         assert_eq!(result.weights_dequantized.len(), n * k);
         assert_eq!(result.scales.len(), k);
 
