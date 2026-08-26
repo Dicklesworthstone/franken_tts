@@ -819,6 +819,10 @@ pub fn forward_layer_q8(
         }
     }
 
+    if tap {
+        t[2] = crate::taps::tap_hash_f32(&queries);
+        t[3] = crate::taps::tap_hash_f32(&keys);
+    }
     for position in 0..seq {
         cache.append(
             &keys[position * kv_width..position * kv_width + kv_width],
@@ -839,13 +843,18 @@ pub fn forward_layer_q8(
         head_dim,
         &mut context,
     );
+    if tap {
+        t[4] = crate::taps::tap_hash_f32(&context);
+    }
 
     let mut attention = vec![0.0f32; seq * hidden_size];
     quant_linear(mode, &context, &quant.o_proj, None, seq, &mut attention);
     for (state, delta) in hidden.iter_mut().zip(&attention) {
         *state += *delta;
     }
-
+    if tap {
+        t[5] = crate::taps::tap_hash_f32(hidden);
+    }
     // ── MLP block ───────────────────────────────────────────────────────────────────────────
     f32ref::rms_norm(
         hidden,
@@ -855,11 +864,16 @@ pub fn forward_layer_q8(
         hidden_size,
         &mut normed,
     );
+    if tap {
+        t[6] = crate::taps::tap_hash_f32(&normed);
+    }
 
     let intermediate = config.intermediate_size;
-    // One fused gate‖up dispatch, split the same way.
     let mut gate_up = vec![0.0f32; seq * 2 * intermediate];
     quant_linear(mode, &normed, &quant.gate_up, None, seq, &mut gate_up);
+    if tap {
+        t[7] = crate::taps::tap_hash_f32(&gate_up);
+    }
     let mut gate = vec![0.0f32; seq * intermediate];
     let mut up = vec![0.0f32; seq * intermediate];
     for row in 0..seq {
@@ -873,6 +887,14 @@ pub fn forward_layer_q8(
     quant_linear(mode, &gate, &quant.down_proj, None, seq, &mut down);
     for (state, delta) in hidden.iter_mut().zip(&down) {
         *state += *delta;
+    }
+    if tap {
+        crate::taps::tap_emit(&format!(
+            "ftts-tapL l={layer} a={:016x} b={:016x} q={:016x} k={:016x} d={:016x} \
+             e={:016x} f={:016x} g={:016x} h={:016x}",
+            t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7],
+            crate::taps::tap_hash_f32(hidden),
+        ));
     }
 }
 
@@ -926,13 +948,17 @@ pub fn forward_talker_q8(
     );
     assert!(
         logits.len() == seq * PRIMARY_CODE_VOCAB_SIZE || logits.len() == PRIMARY_CODE_VOCAB_SIZE,
-        "logits are [seq, 3072] for the teacher-forced full head or [3072] for last-row-only"
+        "logits are [seq, 3072] for the teacher-forced full head or [3072] for last-row-only",
     );
-
-    for ((layer, layer_quant), layer_cache) in
-        weights.layers.iter().zip(quant).zip(&mut cache.layers)
+    for (index, ((layer, layer_quant), layer_cache)) in weights
+        .layers
+        .iter()
+        .zip(quant)
+        .zip(&mut cache.layers)
+        .enumerate()
     {
         forward_layer_q8(
+            index,
             config,
             layer,
             layer_quant,
