@@ -571,7 +571,11 @@ pub fn compute_tail_risk(samples: &[f64], higher_is_worse: bool) -> Option<TailR
         sorted[idx.min(n - 1)]
     };
 
-    let median = percentile(0.50);
+    let median = if n.is_multiple_of(2) {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    } else {
+        sorted[n / 2]
+    };
     let p90 = percentile(0.90);
     let p95 = percentile(0.95);
     let p99 = percentile(0.99);
