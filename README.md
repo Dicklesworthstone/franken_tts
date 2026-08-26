@@ -6,7 +6,7 @@
 
 [![License: MIT + rider](https://img.shields.io/badge/license-MIT%20%2B%20rider-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-0.1.5-green.svg)](https://github.com/Dicklesworthstone/franken_tts/releases)
+[![Version](https://img.shields.io/badge/version-0.1.9-green.svg)](https://github.com/Dicklesworthstone/franken_tts/releases)
 
 ```bash
 # macOS / Linux
@@ -111,7 +111,7 @@ on A18-class hardware.
 
 ## Status: faster than real time, realtime-capable end to end
 
-The release log: v0.1.0 shipped the f32 reference engine, v0.1.1 made the model a one-command download, v0.1.2 moved that download to a pre-quantized artifact, v0.1.3 made the optimized int8 route the library-wide default, v0.1.4 crossed real time and shipped seven built-in voices, and v0.1.5 landed the realtime conversation layer — `ftts talk` streaming sessions with continuation, live PCM emission during synthesis, and a proven cancellation contract (SIGINT yields the cancelled exit code 6 with the partial audio already delivered: `say` emits a `run_error{kind:"cancelled"}` terminal event; `talk` settles the in-flight utterance with its `speak_cancelled` receipt; a second signal force-exits). Releases v0.1.6–v0.1.8 added voice cards, browser download resilience, and grouped-Q8 experiments — see the releases page for the running list. What works now:
+The release log: v0.1.0 shipped the f32 reference engine, v0.1.1 made the model a one-command download, v0.1.2 moved that download to a pre-quantized artifact, v0.1.3 made the optimized int8 route the library-wide default, v0.1.4 crossed real time and shipped seven built-in voices, and v0.1.5 landed the realtime conversation layer — `ftts talk` streaming sessions with continuation, live PCM emission during synthesis, and a proven cancellation contract (SIGINT yields the cancelled exit code 6 with the partial audio already delivered: `say` emits a `run_error{kind:"cancelled"}` terminal event; `talk` settles the in-flight utterance with its `speak_cancelled` receipt; a second signal force-exits). Releases v0.1.6–v0.1.8 added voice cards, browser download resilience, and grouped-Q8 experiments — see the releases page for the running list. v0.1.9 (2026-08-25) shipped the post-v0.1.8 backlog — ICL QUALITY voice-pack say-side consumption groundwork, metamorphic/prosody conformance harnesses, HF-mirror download-resilience refinements — cut from green main after CI-runner starvation was root-caused and remedied. What works now:
 
 - **Real speech out.** `ftts say` synthesizes complete utterances on Apple Silicon with the production sampling stack matching upstream runtime defaults: do_sample, temperature 0.9, top-k 50, repetition penalty 1.05, sampled subtalker.
 - **Parity receipts.**
