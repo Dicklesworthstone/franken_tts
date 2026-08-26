@@ -102,14 +102,20 @@ jobs:
           test -f /dp/frankentorch/crates/ft-core/Cargo.toml \
             || { echo "::error::frankentorch checkout does not have the expected layout"; exit 1; }
 
-      # Self-hosted runners execute non-interactive shells that never source .bashrc, so a
-      # rustup installed under ~/.cargo/bin (the rustup.rs default) is invisible to them.
-      # yto lost its service-level PATH on 2026-08-24 and every gate/cross run 127'd on
-      # `rustup` for ~20 hours while the tree itself was fine. Prepending here makes the
-      # workflow independent of however the runner service happened to be started; on
-      # hosted runners this is a harmless no-op (the directory already exists on PATH).
-      - name: Put cargo toolchain on PATH
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # Self-hosted runners execute non-interactive shells that never source .bashrc, AND
+      # something on those boxes periodically deletes ~/.cargo/bin/rustup (observed twice on
+      # yto: 2026-08-24 ~07:49Z and 2026-08-25 ~07:40Z — hours of red gate each time). So the
+      # bootstrap below is fully self-healing: if rustup is missing anywhere on PATH, install
+      # it fresh (minimal profile; the pinned toolchain step right after adds components),
+      # then expose it to this and later steps via GITHUB_PATH.
+      - name: Ensure rustup + cargo toolchain on PATH
+        run: |
+          set -euo pipefail
+          if ! command -v rustup > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          command -v rustup > /dev/null || { echo "::error::rustup still not on PATH after install"; exit 1; }
       # rust-toolchain.toml pins the nightly; rustup honours it automatically. Installing the
       # components explicitly makes a toolchain problem fail here with a clear message rather
       # than midway through the gate.
@@ -203,9 +209,14 @@ jobs:
           sudo mkdir -p /dp
           sudo ln -sfn "$GITHUB_WORKSPACE/frankentorch" /dp/frankentorch
 
-      # Same self-hosted-PATH independence as the gate job's bootstrap step above.
-      - name: Put cargo toolchain on PATH
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # Same self-healing bootstrap as the gate job's step above.
+      - name: Ensure rustup + cargo toolchain on PATH
+        run: |
+          set -euo pipefail
+          if ! command -v rustup > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Add target
         working-directory: frankentts
