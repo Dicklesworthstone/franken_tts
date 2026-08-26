@@ -3,9 +3,12 @@
 
 Compares prefill sub-stage lines (ftts-tapP g/p/h), text-projection
 sub-stage lines (ftts-tapX fc1/silu/fc2), and per-layer eight-stage lines
-(ftts-tapL l=) between a native tap log and a wasm transcript. Prints the
-first divergence point and an overall verdict so the DISC-006 seam-B chase
-has one mechanical receipt command.
+(ftts-tapL l=) between a native tap log and a wasm transcript.
+
+The wasm transcript mirrors every console line ([error] ... plus an
+[engine-worker] copy), so repeated identical hashes are deduped
+order-preserving before comparison.
+
 Usage: compare_taps.py <native_log> <wasm_transcript>
 """
 import re
@@ -23,6 +26,8 @@ HIDDEN = re.compile(r"ftts-tapP h=([0-9a-f]{16})")
 FC1 = re.compile(r"ftts-tapX fc1=([0-9a-f]{16})")
 SILU = re.compile(r"ftts-tapX silu=([0-9a-f]{16})")
 FC2 = re.compile(r"ftts-tapX fc2=([0-9a-f]{16})")
+
+SCALAR_STAGES = ("projected", "hidden", "fc1", "silu", "fc2")
 
 
 def collect(path):
@@ -45,27 +50,30 @@ def collect(path):
     )
     with open(path, errors="replace") as source:
         for line in source:
-            m = L.search(line)
-            if m and len(m.group(10)) == 16:
-                key = int(m.group(1))
+            layer_match = L.search(line)
+            if layer_match and len(layer_match.group(10)) == 16:
+                key = int(layer_match.group(1))
                 if key not in layers:
-                    layers[key] = m.groups()[1:]
+                    layers[key] = layer_match.groups()[1:]
                 continue
             for pattern, name in patterns:
-    # The wasm transcript mirrors every console line ([error] … plus an
-    # [engine-worker] copy), so identical values appear twice. Dedupe
-    # order-preserving so a genuinely bit-equal pair compares equal.
-    for name in ("projected", "hidden", "fc1", "silu", "fc2"):
-        seen = []
-        for value in stage_hashes[name]:
-            if value not in seen:
-                seen.append(value)
-        stage_hashes[name] = seen
-    return layers, stage_hashes
+                mm = pattern.search(line)
+                if not mm:
+                    continue
                 if name == "gather":
                     stage_hashes[name] = (int(mm.group(1)), mm.group(2))
                 else:
                     stage_hashes[name].append(mm.group(1))
+
+    def dedupe(values):
+        seen = []
+        for value in values:
+            if value not in seen:
+                seen.append(value)
+        return seen
+
+    for name in SCALAR_STAGES:
+        stage_hashes[name] = dedupe(stage_hashes[name])
     return layers, stage_hashes
 
 
@@ -76,8 +84,7 @@ def main(native_path, wasm_path):
         n_value = native_stages[name]
         w_value = wasm_stages[name]
         equal = n_value == w_value
-        marker = "" if equal else ("   <-- FIRST-MOVER CANDIDATE" if name == "silu" or True else "")
-        print(f"tap[{name}] native={n_value} wasm={w_value} equal={equal}{marker}")
+        print(f"tap[{name}] native={n_value} wasm={w_value} equal={equal}")
     common = sorted(set(native_layers) & set(wasm_layers))
     print(f"layers native {len(native_layers)} wasm {len(wasm_layers)} common {len(common)}")
     first = None
