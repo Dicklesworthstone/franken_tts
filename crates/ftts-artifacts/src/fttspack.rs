@@ -531,8 +531,9 @@ impl FttsPack {
                 .try_into()
                 .map_err(|_| PackError::CorruptHeader("bad json length offset".into()))?,
         );
-        let json_len = usize::try_from(json_len_u64)
-            .map_err(|_| PackError::CorruptHeader("json length exceeds platform address space".into()))?;
+        let json_len = usize::try_from(json_len_u64).map_err(|_| {
+            PackError::CorruptHeader("json length exceeds platform address space".into())
+        })?;
 
         let stored_checksum = std::str::from_utf8(&bytes[20..84])
             .map_err(|_| PackError::CorruptHeader("non-utf8 checksum".into()))?;
@@ -613,7 +614,11 @@ impl FttsPack {
 pub fn pack_matrix_sdot_4x16(matrix: &[i8], rows: usize, cols: usize) -> Vec<i8> {
     assert_eq!(matrix.len(), rows * cols);
     assert_eq!(rows % 4, 0, "rows must be a multiple of 4 for 4x16 tiling");
-    assert_eq!(cols % 16, 0, "cols must be a multiple of 16 for 4x16 tiling");
+    assert_eq!(
+        cols % 16,
+        0,
+        "cols must be a multiple of 16 for 4x16 tiling"
+    );
     let mut packed = vec![0i8; rows * cols];
     let row_blocks = rows / 4;
     let col_blocks = cols / 16;
@@ -642,7 +647,11 @@ pub fn pack_matrix_sdot_4x16(matrix: &[i8], rows: usize, cols: usize) -> Vec<i8>
 pub fn unpack_matrix_sdot_4x16(packed: &[i8], rows: usize, cols: usize) -> Vec<i8> {
     assert_eq!(packed.len(), rows * cols);
     assert_eq!(rows % 4, 0, "rows must be a multiple of 4 for 4x16 tiling");
-    assert_eq!(cols % 16, 0, "cols must be a multiple of 16 for 4x16 tiling");
+    assert_eq!(
+        cols % 16,
+        0,
+        "cols must be a multiple of 16 for 4x16 tiling"
+    );
     let mut unpacked = vec![0i8; rows * cols];
     let row_blocks = rows / 4;
     let col_blocks = cols / 16;

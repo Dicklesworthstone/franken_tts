@@ -508,7 +508,12 @@ pub fn evt_gpd_tail_quantile(samples: &[f64], p: f64, threshold_quantile: f64) -
     let u_idx = ((n - 1) as f64 * threshold_quantile).round() as usize;
     let u = sorted[u_idx];
 
-    let excesses: Vec<f64> = sorted.iter().copied().filter(|&x| x > u).map(|x| x - u).collect();
+    let excesses: Vec<f64> = sorted
+        .iter()
+        .copied()
+        .filter(|&x| x > u)
+        .map(|x| x - u)
+        .collect();
     let k = excesses.len();
     if k < 5 {
         return None;
@@ -877,4 +882,3 @@ mod tests {
         assert!((summary.cvar_05 - 98.0).abs() < 1e-6);
     }
 }
-
