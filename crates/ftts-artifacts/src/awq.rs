@@ -329,6 +329,71 @@ pub fn gptq_round_matrix(
 
     w.into_iter().map(|value| value as f32).collect()
 }
+/// The complete calibrated-quantization pipeline result for one `[n, k]` matrix.
+#[derive(Clone, Debug)]
+pub struct CalibratedRounding {
+    /// Final AWQ-scaled, GPTQ-compensated, rounded-and-dequantized weights
+    /// (`[n, k]`). The converter packs these however its container wants; the
+    /// AWQ `scales` fold into the runtime op input and must travel with them.
+    pub weights_dequantized: Vec<f32>,
+    /// Per-input-channel scales (geometric-mean normalized).
+    pub scales: Vec<f32>,
+    /// The grid-searched protection exponent that produced the scales.
+    pub alpha: f64,
+}
+
+/// Runs the whole stack — saliency → grid-searched AWQ scales → scaled
+/// Hessian → GPTQ sweep — in one call. See the module docs for why each stage
+/// exists; see the tests for the error-reduction contracts each must honor.
+///
+/// # Panics
+///
+/// Panics on shape disagreements or an empty calibration set.
+#[must_use]
+pub fn calibrate_and_round(
+    weight_row_major: &[f32],
+    n: usize,
+    k: usize,
+    calib_x: &[Vec<f32>],
+    bits: u32,
+    grid_step: f64,
+) -> CalibratedRounding {
+    assert_eq!(weight_row_major.len(), n * k, "weight shape mismatch");
+    let (alpha, scales) = awq_best_alpha(weight_row_major, n, k, calib_x, bits, grid_step);
+
+    let mut rescaled_w = vec![0.0_f32; n * k];
+    for row in 0..n {
+        for j in 0..k {
+            rescaled_w[row * k + j] = weight_row_major[row * k + j] / scales[j];
+        }
+    }
+    let scaled_calib: Vec<Vec<f32>> = calib_x
+        .iter()
+        .map(|x| {
+            x.iter()
+                .enumerate()
+                .map(|(j, &value)| value * scales[j])
+                .collect()
+        })
+        .collect();
+
+    let mut hessian = vec![0.0_f64; k * k];
+    for x in &scaled_calib {
+        for i in 0..k {
+            for j in 0..k {
+                hessian[i * k + j] += f64::from(x[i]) * f64::from(x[j]);
+            }
+        }
+    }
+    let inverse = gptq_inverse_hessian(&hessian, k, 0.01)
+        .expect("calibration Hessian invertible after damping");
+    let weights_dequantized = gptq_round_matrix(&rescaled_w, n, k, &inverse, bits);
+    CalibratedRounding {
+        weights_dequantized,
+        scales,
+        alpha,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -450,6 +515,59 @@ mod tests {
         assert!(
             z[1].abs() < 1e-9 && z[2].abs() < 1e-9,
             "diagonal stays diagonal"
+        );
+    }
+
+    #[test]
+    fn calibrate_and_round_pipeline_beats_rtn_end_to_end() {
+        // The composition API must preserve the per-stage contracts: on a
+        // skewed calibration set the returned weights + scales deliver less
+        // expected output error than plain RTN at the same bit width.
+        let (n, k) = (16_usize, 32_usize);
+        let mut weight = seeded(77, n * k);
+        for row in 0..n {
+            weight[row * k + 9] *= 15.0;
+        }
+        let calib: Vec<Vec<f32>> = (0..16)
+            .map(|i| {
+                let mut x = seeded(900 + i, k);
+                x[9] *= 15.0;
+                x
+            })
+            .collect();
+
+        let result = calibrate_and_round(&weight, n, k, &calib, 4, 0.1);
+        assert_eq!(result.weights_dequantized.len(), n * k);
+        assert_eq!(result.scales.len(), k);
+
+        let levels = 8.0_f32;
+        let mut rtn = vec![0.0_f32; n * k];
+        for row in 0..n {
+            let src = &weight[row * k..(row + 1) * k];
+            let max_abs = src.iter().fold(0.0_f32, |acc, &value| acc.max(value.abs()));
+            let scale = if max_abs > 0.0 { max_abs / levels } else { 1.0 };
+            for (j, &w) in src.iter().enumerate() {
+                rtn[row * k + j] = (w / scale).round().clamp(-levels, levels) * scale;
+            }
+        }
+        let error_of = |q: &[f32]| -> f64 {
+            let mut total = 0.0;
+            for x in &calib {
+                for row in 0..n {
+                    let (exact, approx) = (0..k).fold((0.0_f64, 0.0_f64), |acc, j| {
+                        (
+                            acc.0 + f64::from(x[j]) * f64::from(weight[row * k + j]),
+                            acc.1 + f64::from(x[j]) * f64::from(q[row * k + j]),
+                        )
+                    });
+                    total += (exact - approx).powi(2);
+                }
+            }
+            total
+        };
+        assert!(
+            error_of(&result.weights_dequantized) < error_of(&rtn),
+            "pipeline output must beat plain RTN end to end"
         );
     }
 }
