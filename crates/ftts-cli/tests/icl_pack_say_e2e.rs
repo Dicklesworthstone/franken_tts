@@ -94,11 +94,6 @@ fn run(mut command: Command, what: &str) -> std::process::Output {
         .unwrap_or_else(|error| panic!("spawn {what}: {error}"))
 }
 
-// HONEST IGNORE (frankentts-tgei): synthesis aborts via stack overflow on remote workers
-// for x-vector AND ICL conditioning alike — a pre-existing shared-path fault, not this
-// test's logic. Re-enable once tgei lands its fix; until then a green here would be
-// counterfeit and a red here is noise.
-#[ignore = "synthesis stack overflow on workers — bead frankentts-tgei"]
 #[test]
 fn quality_pack_enrolls_inspects_and_synthesizes_end_to_end() {
     const TEST: &str = "quality_pack_enrolls_inspects_and_synthesizes_end_to_end";
@@ -215,7 +210,6 @@ fn quality_pack_enrolls_inspects_and_synthesizes_end_to_end() {
     assert_eq!(&wav[..4], b"RIFF", "output must be a parseable WAV");
 }
 
-#[ignore = "synthesis stack overflow on workers — bead frankentts-tgei"]
 #[test]
 fn quick_pack_control_synthesizes_without_icl() {
     // CONTROL for the ICL overflow: identical fixture and flow, but QUICK mode —

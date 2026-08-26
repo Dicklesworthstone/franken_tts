@@ -2082,7 +2082,25 @@ impl FrameGenerator for TeeGenerator<'_> {
             // differ) or inside it (codes agree, PCM differs). Gated off by default: normal
             // runs neither pay nor print anything.
             if self.printed < 3 && std::env::var_os("FTTS_DEBUG_CODES").is_some() {
-                eprintln!("ftts-cli codes[{}]: {:?}", self.printed, frame.codes);
+                // Same file-sink discipline as the generator taps (frankentts-p16p): an
+                // `eprintln!` here wedged release builds on the stdio ReentrantLock, so
+                // codes go to an O_APPEND file instead — `FTTS_DEBUG_CODES=1` picks
+                // `$TMPDIR/ftts-codes-<pid>.log`, any other value is the path.
+                let requested = std::env::var_os("FTTS_DEBUG_CODES");
+                let one = std::ffi::OsStr::new("1");
+                let path = match requested.as_deref() {
+                    Some(value) if !value.is_empty() && value != one => {
+                        std::path::PathBuf::from(value)
+                    }
+                    _ => std::env::temp_dir()
+                        .join(format!("ftts-codes-{}.log", std::process::id())),
+                };
+                if let Ok(mut file) =
+                    std::fs::OpenOptions::new().create(true).append(true).open(&path)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(file, "ftts-cli codes[{}]: {:?}", self.printed, frame.codes);
+                }
                 self.printed += 1;
             }
             if self.frames.send(frame.clone()).is_err() {

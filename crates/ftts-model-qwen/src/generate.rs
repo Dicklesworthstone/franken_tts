@@ -80,7 +80,49 @@ fn tap_emit(line: &str) {
     }
     match TAP_SINK.get() {
         Some(sink) => sink(line),
-        None => eprintln!("{line}"),
+        None => {
+            // Native default: append-only FILE, never stderr. An earlier revision used
+            // `eprintln!` here and wedged synthesis under fat-LTO release builds: the
+            // producer blocked forever acquiring the stdio ReentrantLock inside
+            // `_eprint` (thread dump: run_prefill → _eprint → Stdout::lock →
+            // __psynch_mutexwait) while every other thread sat idle — a lost-unlock
+            // class interaction between ICF-folded stdio lock symbols and the scoped
+            // producer thread. Taps are machine data; an O_APPEND file side-steps the
+            // entire stdio-lock surface. `FTTS_DEBUG_TAPS=1` picks
+            // `$TMPDIR/ftts-taps-<pid>.log`; any other value is used as the path.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                use std::io::Write;
+                static TAP_FILE: std::sync::Mutex<Option<std::fs::File>> =
+                    std::sync::Mutex::new(None);
+                let mut slot = TAP_FILE.lock().expect("tap file mutex");
+                if slot.is_none() {
+                    let requested = std::env::var_os("FTTS_DEBUG_TAPS");
+                    let one = std::ffi::OsStr::new("1");
+                    let path = match requested.as_deref() {
+                        Some(value) if !value.is_empty() && value != one => {
+                            std::path::PathBuf::from(value)
+                        }
+                        _ => std::env::temp_dir()
+                            .join(format!("ftts-taps-{}.log", std::process::id())),
+                    };
+                    *slot = Some(
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                            .expect("open tap sink file"),
+                    );
+                }
+                let file = slot.as_mut().expect("tap file just initialized");
+                let _ = file.write_all(line.as_bytes());
+                let _ = file.write_all(b"\n");
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                eprintln!("{line}");
+            }
+        }
     }
 }
 
