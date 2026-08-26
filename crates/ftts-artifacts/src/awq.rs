@@ -521,8 +521,10 @@ mod tests {
     #[test]
     fn calibrate_and_round_pipeline_beats_rtn_end_to_end() {
         // The composition API must preserve the per-stage contracts: on a
-        // skewed calibration set the returned weights + scales deliver less
-        // expected output error than plain RTN at the same bit width.
+        // STRONGLY skewed calibration set — the regime AWQ exists for — the
+        // returned weights + scales deliver less expected output error than
+        // plain RTN at the same bit width. Mild skew offers no such guarantee;
+        // that is a property of the heuristic, not a bug.
         let (n, k) = (16_usize, 32_usize);
         let mut weight = seeded(77, n * k);
         for row in 0..n {
