@@ -29,7 +29,6 @@ const MODES: [&str; 4] = [
     "icl_streaming",
 ];
 const HIDDEN: usize = 1024;
-const TOP_K: usize = 50;
 
 fn checkpoint_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
