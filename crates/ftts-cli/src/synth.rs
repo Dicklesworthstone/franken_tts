@@ -178,7 +178,7 @@ impl LoadedModel {
         // minutes (bead frankentts-9dwj). Surface per-section progress on
         // stderr — throttled to 10% steps so a normal load prints one or two
         // lines and a contended one shows the run is alive.
-        let last_reported = std::sync::AtomicU8::new(0);
+        let last_reported = std::sync::atomic::AtomicU8::new(0);
         ftts_artifacts::fttsq::set_digest_progress_sink(Box::new(move |progress| {
             if progress.bytes_total == 0 {
                 return;
