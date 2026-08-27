@@ -1379,6 +1379,18 @@ impl CausalTransposeConvStream {
         joined.extend_from_slice(&self.history);
         joined.extend_from_slice(input);
         let joined_frames = history_frames + frames;
+        if crate::taps::taps_active() {
+            // Packet-level input probe (frankentts-uuac): hash the history
+            // window, the new packet, and the joined GEMM operand separately,
+            // so a packet-1 divergence attributes to retained history versus
+            // the new packet versus the GEMM itself.
+            crate::taps::tap_emit(&format!(
+                "ftts-tapJ hf={history_frames} his={:016x} in={:016x} j={:016x}",
+                crate::taps::tap_hash_f32(&self.history),
+                crate::taps::tap_hash_f32(input),
+                crate::taps::tap_hash_f32(&joined),
+            ));
+        }
         let mut all = vec![0.0f32; joined_frames * self.stride * self.output_channels];
         // Derive the column layout once per stream. `is_empty` is the whole guard: a stream is
         // built for one utterance and driven with one weight, so the first packet fills this and
@@ -1613,6 +1625,15 @@ pub struct CodecDecoderWeights<'a> {
 /// on different bits because `1/sqrt(2)` is not exactly representable.
 #[must_use]
 pub fn gelu(x: f32) -> f32 {
+    if ftts_kernels::f32ref::canonical_norm_requested() {
+        // Canonical mode: evaluate in f64 and narrow once. std erf resolves to
+        // the system libm on macOS-native but a pure-Rust implementation on
+        // wasm32, so the f32 form diverges ULP-wise per target; the f64
+        // detour pushes that noise below f32 visibility (frankentts-uuac).
+        let wide = f64::from(x);
+        let g = 0.5 * wide * (1.0 + (wide * core::f64::consts::FRAC_1_SQRT_2).erf());
+        return g as f32;
+    }
     0.5 * x * (1.0 + (x * core::f32::consts::FRAC_1_SQRT_2).erf())
 }
 
@@ -1629,16 +1650,32 @@ fn causal_depthwise_conv1d(
     assert_eq!(weight.len(), channels * kernel, "depthwise weight shape");
     assert_eq!(bias.len(), channels, "depthwise bias shape");
     assert_eq!(output.len(), frames * channels, "depthwise output shape");
+    let canonical = ftts_kernels::f32ref::canonical_norm_requested();
     for frame in 0..frames {
         for channel in 0..channels {
-            let mut total = bias[channel];
-            for tap in 0..kernel {
-                if let Some(source_frame) = frame.checked_sub(kernel - 1 - tap) {
-                    total +=
-                        input[source_frame * channels + channel] * weight[channel * kernel + tap];
+            if canonical {
+                // f64 accumulation, narrowed once: native f32 fmadd
+                // contraction cannot diverge from wasm's unfused adds when
+                // both compute in f64 (differences land below f32
+                // visibility; frankentts-uuac).
+                let mut total = f64::from(bias[channel]);
+                for tap in 0..kernel {
+                    if let Some(source_frame) = frame.checked_sub(kernel - 1 - tap) {
+                        total += f64::from(input[source_frame * channels + channel])
+                            * f64::from(weight[channel * kernel + tap]);
+                    }
                 }
+                output[frame * channels + channel] = total as f32;
+            } else {
+                let mut total = bias[channel];
+                for tap in 0..kernel {
+                    if let Some(source_frame) = frame.checked_sub(kernel - 1 - tap) {
+                        total += input[source_frame * channels + channel]
+                            * weight[channel * kernel + tap];
+                    }
+                }
+                output[frame * channels + channel] = total;
             }
-            output[frame * channels + channel] = total;
         }
     }
 }
@@ -1647,21 +1684,44 @@ fn layer_norm_in_place(values: &mut [f32], frames: usize, weight: &[f32], bias: 
     let channels = weight.len();
     assert_eq!(bias.len(), channels, "LayerNorm bias width");
     assert_eq!(values.len(), frames * channels, "LayerNorm values shape");
+    let canonical = ftts_kernels::f32ref::canonical_norm_requested();
     for frame in 0..frames {
         let row = &mut values[frame * channels..(frame + 1) * channels];
-        let mut mean = 0.0f32;
-        for value in row.iter() {
-            mean += *value;
-        }
-        mean /= channels as f32;
-        let mut variance = 0.0f32;
-        for value in row.iter() {
-            let centered = *value - mean;
-            variance += centered * centered;
-        }
-        let scale = (variance / channels as f32 + eps).sqrt().recip();
-        for channel in 0..channels {
-            row[channel] = (row[channel] - mean) * scale * weight[channel] + bias[channel];
+        if canonical {
+            // f64 statistics, one narrowing per element: the native f32 path
+            // contracts (fmadd) while wasm cannot, so the canonical gate
+            // computes in f64 where that latitude vanishes below f32
+            // visibility (frankentts-uuac).
+            let mut mean = 0.0_f64;
+            for value in row.iter() {
+                mean += f64::from(*value);
+            }
+            mean /= channels as f64;
+            let mut variance = 0.0_f64;
+            for value in row.iter() {
+                let centered = f64::from(*value) - mean;
+                variance += centered * centered;
+            }
+            let scale = (variance / channels as f64 + f64::from(eps)).sqrt().recip();
+            for (index, slot) in row.iter_mut().enumerate() {
+                *slot = ((f64::from(*slot) - mean) * scale * f64::from(weight[index])
+                    + f64::from(bias[index])) as f32;
+            }
+        } else {
+            let mut mean = 0.0f32;
+            for value in row.iter() {
+                mean += *value;
+            }
+            mean /= channels as f32;
+            let mut variance = 0.0f32;
+            for value in row.iter() {
+                let centered = *value - mean;
+                variance += centered * centered;
+            }
+            let scale = (variance / channels as f32 + eps).sqrt().recip();
+            for channel in 0..channels {
+                row[channel] = (row[channel] - mean) * scale * weight[channel] + bias[channel];
+            }
         }
     }
 }
