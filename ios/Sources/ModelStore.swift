@@ -145,7 +145,7 @@ final class ModelStore {
         cachedBytes = ModelManifest.files.reduce(Int64(0)) { total, file in
             let path = modelDirectory.appendingPathComponent(file.relativePath).path
             let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
-            return total + (size ?? 0)
+            return total + size
         }
     }
 
