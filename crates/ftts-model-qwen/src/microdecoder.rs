@@ -2532,6 +2532,78 @@ mod tests {
         }
     }
 
+    /// Wall-clock rows comparing the blocked seq-16 schedule against fifteen per-position layer
+    /// steps over the REAL pinned geometry ([`MicrodecoderConfig::default`]), across every
+    /// dispatchable tier. Correctness is separately pinned by
+    /// [`microdecoder_block_matches_sequential_q8_bit_for_bit`]; this produces the profiling row
+    /// frankentts-k-rcd-engine-6e3 asks for. Ignored because it is a measurement, not a gate:
+    /// cargo test -p ftts-model-qwen --lib microdecoder_block_vs_sequential_step_q8_bench_rows -- --ignored --nocapture
+    ///
+    /// Input regeneration per frame defeats any caching short-circuit; medians absorb shared-host
+    /// jitter. Rows from loaded hosts stay PROVISIONAL under the fleet honesty law until a
+    /// calm-window repeat.
+    #[test]
+    #[ignore = "wall-clock profiling row for frankentts-k-rcd-engine-6e3, not a gate"]
+    fn microdecoder_block_vs_sequential_step_q8_bench_rows() {
+        let config = MicrodecoderConfig::default();
+        let rope = RopeTable::new(&config);
+        let layer = TestLayer::new(&config);
+        let borrowed = layer.borrow();
+        let quant = MicroLayerQuant::quantize(&config, &borrowed);
+
+        const WARMUP_FRAMES: u32 = 3;
+        const TIMED_FRAMES: u32 = 20;
+        for tier in ftts_kernels::int8::Int8Tier::available() {
+            let mode = QuantLinearMode::W8A8(KernelPlanV0::pinned(tier));
+
+            let frame_input = |frame: u32| {
+                weights_of(FRAME_POSITIONS * config.hidden_size, 9_000 + frame % 7)
+            };
+            let run_sequential = |frame: u32| -> std::time::Duration {
+                let seeded = frame_input(frame);
+                let start = std::time::Instant::now();
+                let mut state = FrameKvState::new(&config);
+                for position in 0..FRAME_POSITIONS {
+                    let (cos, sin) = rope.row(position);
+                    let row =
+                        &seeded[position * config.hidden_size..(position + 1) * config.hidden_size];
+                    let _ = layer_step_q8(
+                        &config, &borrowed, &quant, cos, sin, row, &mut state, mode,
+                    );
+                }
+                start.elapsed()
+            };
+            let run_blocked = |frame: u32| -> std::time::Duration {
+                let seeded = frame_input(frame);
+                let start = std::time::Instant::now();
+                let _ = layer_block_q8(&config, &borrowed, &quant, &rope, &seeded, mode);
+                start.elapsed()
+            };
+
+            for frame in 0..WARMUP_FRAMES {
+                let _ = run_sequential(frame);
+                let _ = run_blocked(frame);
+            }
+            let mut seq_ns: Vec<u128> = Vec::with_capacity(TIMED_FRAMES as usize);
+            let mut blk_ns: Vec<u128> = Vec::with_capacity(TIMED_FRAMES as usize);
+            for frame in 0..TIMED_FRAMES {
+                seq_ns.push(run_sequential(frame).as_nanos());
+                blk_ns.push(run_blocked(frame).as_nanos());
+            }
+            seq_ns.sort_unstable();
+            blk_ns.sort_unstable();
+            let median = |rows: &[u128]| rows[rows.len() / 2];
+            println!(
+                "ftts-bench-block tier={tier:?} timed_frames={TIMED_FRAMES} \
+                 median_seq_frame_ns={} median_block_frame_ns={} ratio_seq_over_block={:.3}",
+                median(&seq_ns),
+                median(&blk_ns),
+                f64::from(u32::try_from(median(&seq_ns)).unwrap_or(u32::MAX))
+                    / f64::from(u32::try_from(median(&blk_ns)).unwrap_or(1)),
+            );
+        }
+    }
+
     /// Speculation is a scheduling device, not a quality one. Whatever the drafter proposes —
     /// a perfect guess, one stale code, or pure garbage — the codes that come out must equal
     /// what the same route's sequential greedy decode emits.
