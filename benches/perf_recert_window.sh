@@ -39,11 +39,13 @@ mkdir -p "$(dirname "$RECEIPTS")" "$(dirname "$TIMELINE")"
 
 # Fail fast on malformed knobs: a typo'd threshold used to surface as a silent
 # four-hour wait with a misleading no_calm_window reason (python syntax error on
-# every sample read as "not calm"), and SUSTAIN_MIN=0 referenced $L1 before any
-# sample existed, tripping set -u.
-case "$THRESHOLD" in
-  ''|*[!0-9.]*) emit param_invalid "{\"param\":\"PERF_RECERT_THRESHOLD\",\"value\":\"$THRESHOLD\"}"; exit 5 ;;
-esac
+# every sample read as "not calm"). THRESHOLD is validated by parsing it the
+# same way the per-sample comparison will: a glob check alone both accepted ".."
+# (python syntax error per sample) and rejected valid floats like "1e1".
+if ! python3 -c "import sys; v=float(sys.argv[1]); sys.exit(0 if 0 < v < float('inf') else 1)" "$THRESHOLD" 2>/dev/null; then
+  emit param_invalid "{\"param\":\"PERF_RECERT_THRESHOLD\",\"value\":\"$THRESHOLD\"}"
+  exit 5
+fi
 case "$SUSTAIN_MIN" in
   ''|*[!0-9]*) emit param_invalid "{\"param\":\"PERF_RECERT_SUSTAIN_MIN\",\"value\":\"$SUSTAIN_MIN\"}"; exit 5 ;;
 esac
