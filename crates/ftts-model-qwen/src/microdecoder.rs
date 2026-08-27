@@ -928,9 +928,15 @@ fn attend_one_position(
                 * scale;
         }
         let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let canonical = ftts_kernels::f32ref::canonical_norm_requested();
         let mut total = 0.0_f32;
         for score in &mut scores {
-            *score = (*score - max).exp();
+            let shifted = *score - max;
+            *score = if canonical {
+                ftts_kernels::f32ref::canonical_exp_f32(shifted)
+            } else {
+                shifted.exp()
+            };
             total += *score;
         }
         let out = &mut context[head * config.head_dim..(head + 1) * config.head_dim];
@@ -1852,6 +1858,12 @@ fn decode_frame_with_selector_inner(
         spec_probe_enabled().then(|| PROBE_DRAFTER.with(|drafter| drafter.borrow().draft()));
     let mut codes = Vec::with_capacity(RESIDUAL_DEPTHS);
     let mut previous_code = primary_code;
+    if crate::taps::taps_active() {
+        crate::taps::tap_emit(&format!(
+            "ftts-tapM0 h={:016x} pc={primary_code}",
+            crate::taps::tap_hash_f32(talker_hidden),
+        ));
+    }
 
     for position in 0..FRAME_POSITIONS {
         let role = position_role(position);
@@ -1927,7 +1939,17 @@ fn decode_frame_with_selector_inner(
             let acceptance = crate::sampler::production_probability(&logits, draft[depth]);
             eprintln!("{{\"probe\":\"spec\",\"depth\":{depth},\"p_draft\":{acceptance:.6}}}");
         }
+        if crate::taps::taps_active() {
+            crate::taps::tap_emit(&format!(
+                "ftts-tapM d={} lg={:016x}",
+                codes.len(),
+                crate::taps::tap_hash_f32(&logits),
+            ));
+        }
         let code = select(&logits);
+        if crate::taps::taps_active() {
+            crate::taps::tap_emit(&format!("ftts-tapM d={} c={code}", codes.len(),));
+        }
         assert!(
             code < RESIDUAL_VOCAB,
             "selector returned {code}, outside the residual vocab"

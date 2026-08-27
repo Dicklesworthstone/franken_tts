@@ -1193,6 +1193,24 @@ impl FrameGenerator for QwenGenerator<'_> {
             .get(utterance.frames_emitted)
             .map(Vec::as_slice);
         let mut next_input = vec![0.0_f32; self.talker_config.hidden_size];
+        if taps_active() {
+            // Component probe for the frame input (frankentts-uuac): hash the
+            // sixteen feedback embedding rows and the text/pad row separately,
+            // so a divergence in the assembled next_input attributes to its
+            // inputs versus the summation itself.
+            let mut flat = Vec::with_capacity(rows.len() * self.talker_config.hidden_size);
+            for row in &rows {
+                flat.extend_from_slice(row);
+            }
+            let text_tag = text_row
+                .map(|row| format!("{:016x}", tap_hash_f32(row)))
+                .unwrap_or_else(|| "pad".to_owned());
+            tap_emit(&format!(
+                "ftts-tapF fi={} rh={:016x} t={text_tag}",
+                utterance.frames_emitted,
+                tap_hash_f32(&flat),
+            ));
+        }
         talker::form_frame_input(&rows, text_row, &self.header.tts_pad, &mut next_input);
         if taps_active() {
             tap_emit(&format!(

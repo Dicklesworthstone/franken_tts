@@ -250,7 +250,11 @@ impl SplitResidualVectorQuantizer<'_> {
             frames,
             config.codebook_dim,
             config.codec_latent_dim,
-            f32ref::F32LinearAccumulation::AccelerateRowInvariant,
+            if ftts_kernels::f32ref::canonical_norm_requested() {
+                f32ref::F32LinearAccumulation::Scalar
+            } else {
+                f32ref::F32LinearAccumulation::AccelerateRowInvariant
+            },
             &mut first_projected,
         );
         f32ref::linear_with_accumulation(
@@ -260,7 +264,11 @@ impl SplitResidualVectorQuantizer<'_> {
             frames,
             config.codebook_dim,
             config.codec_latent_dim,
-            f32ref::F32LinearAccumulation::AccelerateRowInvariant,
+            if ftts_kernels::f32ref::canonical_norm_requested() {
+                f32ref::F32LinearAccumulation::Scalar
+            } else {
+                f32ref::F32LinearAccumulation::AccelerateRowInvariant
+            },
             &mut rest_projected,
         );
         for index in 0..output.len() {
@@ -772,7 +780,11 @@ fn dense_linear(
             m,
             k,
             n,
-            f32ref::F32LinearAccumulation::AccelerateBiasSeededRowInvariant,
+            if ftts_kernels::f32ref::canonical_norm_requested() {
+                f32ref::F32LinearAccumulation::Scalar
+            } else {
+                f32ref::F32LinearAccumulation::AccelerateBiasSeededRowInvariant
+            },
             out,
         );
         return;
@@ -982,7 +994,11 @@ pub fn causal_conv1d(
         frames,
         reduction,
         output_channels,
-        f32ref::F32LinearAccumulation::AccelerateBiasSeededRowInvariant,
+        if ftts_kernels::f32ref::canonical_norm_requested() {
+            f32ref::F32LinearAccumulation::Scalar
+        } else {
+            f32ref::F32LinearAccumulation::AccelerateBiasSeededRowInvariant
+        },
         output,
     );
 }
@@ -1100,7 +1116,11 @@ pub fn causal_transpose_conv1d_columns(
         frames,
         input_channels,
         column_width,
-        f32ref::F32LinearAccumulation::AccelerateRowInvariant,
+        if ftts_kernels::f32ref::canonical_norm_requested() {
+            f32ref::F32LinearAccumulation::Scalar
+        } else {
+            f32ref::F32LinearAccumulation::AccelerateRowInvariant
+        },
         &mut columns,
     );
 
