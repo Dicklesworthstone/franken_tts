@@ -943,7 +943,47 @@ pub fn canonical_exp_f32(x: f32) -> f32 {
     acc = r * acc + 1.0;
     let poly = r * acc + 1.0;
     let value = scale_exact(poly, k);
-    value as f32
+    value
+}
+
+/// The f64-domain form of [`canonical_exp_f32`] for consumers that must stay
+/// in double precision (the sampler's probability paths). Same op sequence,
+/// same no-libm contract; host-parity is intentionally not claimed at f64
+/// resolution (the degree-8 polynomial truncation is ~2e-10 relative).
+#[must_use]
+pub fn canonical_exp_wide(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x == f64::NEG_INFINITY {
+        return 0.0;
+    }
+    if x == f64::INFINITY {
+        return f64::INFINITY;
+    }
+    const LOG2E: f64 = core::f64::consts::LOG2_E;
+    const LN2_HI: f64 = 6.931_471_803_691_238e-1;
+    const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
+    let kf = (x * LOG2E).round();
+    let k = kf.clamp(-1100.0, 1100.0) as i64;
+    let kf64 = f64::from(k as i32);
+    let r = (x - kf64 * LN2_HI) - kf64 * LN2_LO;
+    let mut acc = 1.0 / 40_320.0;
+    acc = r * acc + 1.0 / 5_040.0;
+    acc = r * acc + 1.0 / 720.0;
+    acc = r * acc + 1.0 / 120.0;
+    acc = r * acc + 1.0 / 24.0;
+    acc = r * acc + 1.0 / 6.0;
+    acc = r * acc + 0.5;
+    acc = r * acc + 1.0;
+    let poly = r * acc + 1.0;
+    scale_exact(poly, k)
+}
+
+/// f32 narrowing wrapper over [`canonical_exp_wide`].
+#[must_use]
+pub fn canonical_exp_f32(x: f32) -> f32 {
+    canonical_exp_wide(f64::from(x)) as f32
 }
 
 /// Multiplies by 2^k exactly, covering subnormal-to-overflow k range via a

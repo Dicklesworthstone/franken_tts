@@ -881,7 +881,15 @@ pub fn forward_layer_q8(
         gate[row * intermediate..(row + 1) * intermediate].copy_from_slice(&fused[..intermediate]);
         up[row * intermediate..(row + 1) * intermediate].copy_from_slice(&fused[intermediate..]);
     }
-    f32ref::silu_mul_in_place(&mut gate, &up);
+    f32ref::silu_mul_in_place_with_arithmetic(
+        &mut gate,
+        &up,
+        if f32ref::canonical_norm_requested() {
+            F32SiluArithmetic::Canonical
+        } else {
+            F32SiluArithmetic::Divide
+        },
+    );
 
     let mut down = vec![0.0f32; seq * hidden_size];
     quant_linear(mode, &gate, &quant.down_proj, None, seq, &mut down);
