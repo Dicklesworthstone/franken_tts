@@ -413,7 +413,7 @@ struct LabView: View {
                     Text(
                         model.store.cachedBytes > 0
                             ? "Part of the model is already here; completing the download fetches only what is missing and re-verifies the rest."
-                            : "First use downloads the quantized model (≈2.0 GB) into this app's private storage: verified against pinned digests, resumable, kept until you clear it."
+                            : "First use downloads static model files (≈2.0 GB) from the developer's GitHub release into this app's private storage. No text, recording, voice data, or generated media is sent; all AI runs locally. The files are verified against pinned digests, resumable, and kept until you clear them."
                     )
                     .font(.system(size: 14))
                     .foregroundStyle(Lab.textSecondary)
@@ -431,8 +431,8 @@ struct LabView: View {
                         .buttonStyle(PrimaryButtonStyle())
                         .confirmationDialog(
                             model.store.cachedBytes > 0
-                                ? "Fetch the missing files now? Existing files are kept and re-verified, not re-downloaded."
-                                : "Download 2.0 GB now? It stays on this device, resumes if interrupted, and Clear Model removes it.",
+                                ? "Fetch the missing static model files from GitHub now? No user content is sent. Existing files are kept and re-verified, not re-downloaded."
+                                : "Download 2.0 GB of static model files from GitHub now? No user content is sent. The files stay on this device, resume if interrupted, and Clear Model removes them.",
                             isPresented: $showConsent, titleVisibility: .visible
                         ) {
                             Button("Start the download") { model.store.startDownload() }
