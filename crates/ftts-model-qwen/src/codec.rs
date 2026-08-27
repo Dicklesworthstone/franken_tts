@@ -2028,9 +2028,21 @@ impl CodecUpsampleStageStream {
             Some(weights.transposed.bias),
             &mut hidden,
         );
+        if crate::taps::taps_active() {
+            crate::taps::tap_emit(&format!(
+                "ftts-tapU t={:016x}",
+                crate::taps::tap_hash_f32(&hidden),
+            ));
+        }
         let output_frames = frames * weights.transposed.stride;
         self.convnext
             .push(&hidden, output_frames, weights.convnext, output);
+        if crate::taps::taps_active() {
+            crate::taps::tap_emit(&format!(
+                "ftts-tapU c={:016x}",
+                crate::taps::tap_hash_f32(output),
+            ));
+        }
         output_frames
     }
 }

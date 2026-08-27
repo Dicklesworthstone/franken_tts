@@ -917,6 +917,7 @@ fn attend_one_position(
         let keys = &state.keys[kv_head];
         let values = &state.values[kv_head];
 
+        let canonical = ftts_kernels::f32ref::canonical_norm_requested();
         let mut scores = vec![0.0_f32; positions];
         for (p, score) in scores.iter_mut().enumerate() {
             let key = &keys[p * config.head_dim..(p + 1) * config.head_dim];
@@ -928,7 +929,6 @@ fn attend_one_position(
                 * scale;
         }
         let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let canonical = ftts_kernels::f32ref::canonical_norm_requested();
         let mut total = 0.0_f32;
         for score in &mut scores {
             let shifted = *score - max;

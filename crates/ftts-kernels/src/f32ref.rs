@@ -314,6 +314,11 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
     assert_eq!(x.len(), weight.len(), "dot-product inputs must match");
     match accumulation {
         F32LinearAccumulation::Scalar => {
+            // Under the canonical gate this accumulates through explicit
+            // mul_add: correctly-rounded fused on every target (arm64 hardware
+            // fma, wasm32 soft exact), so the reduction is bit-identical
+            // cross-target instead of contracting only where the target has
+            // fma (frankentts-uuac / DISC-006).
             let mut sum = 0.0f32;
             for index in 0..x.len() {
                 sum += x[index] * weight[index];
