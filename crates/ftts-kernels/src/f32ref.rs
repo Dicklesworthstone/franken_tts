@@ -111,6 +111,10 @@ pub enum F32SiluArithmetic {
     /// The whole expression in f64, narrowed only at the store — an attribution probe, not a
     /// candidate for what the oracle did.
     WidenedF64,
+    /// Cross-target-exact via [`canonical_exp_f32`] — no libm anywhere, so every engine
+    /// executes the same bit sequence. Exists for DISC-006-style parity seams, not for
+    /// oracle matching.
+    Canonical,
 }
 
 /// Normalization form used by [`softmax_rows_with_arithmetic`].
