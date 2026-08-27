@@ -2604,6 +2604,85 @@ mod tests {
         }
     }
 
+
+    /// Depth-axis profiling: median body-step cost for each of the sixteen positions across
+    /// `[MicrodecoderConfig::default]` frames, team BYPASSED deliberately so the rows isolate
+    /// per-position scalar-core cost from worker-fanout effects. Under the OQ-5 map,
+    /// position p ≥ 1 corresponds to residual depth p − 1's conditioning input, so these rows are
+    /// the per-depth profile table frankentts-k-rcd-engine-6e3 asks for.
+    ///
+    /// cargo test -p ftts-model-qwen --lib microdecoder_sequential_per_position_profile_rows -- --ignored --nocapture
+    #[test]
+    #[ignore = "per-depth profiling rows for frankentts-k-rcd-engine-6e3, not a gate"]
+    fn microdecoder_sequential_per_position_profile_rows() {
+        let config = MicrodecoderConfig::default();
+        let rope = RopeTable::new(&config);
+        let layer = TestLayer::new(&config);
+        let borrowed = layer.borrow();
+        let quant = MicroLayerQuant::quantize(&config, &borrowed);
+        let mode = QuantLinearMode::W8A8(KernelPlanV0::pinned(
+            ftts_kernels::int8::Int8Tier::available()
+            .into_iter()
+                .last()
+                .expect("at least the scalar tier is always available"),
+        ));
+
+        const WARMUP_FRAMES: u32 = 3;
+        const TIMED_FRAMES: u32 = 30;
+        let mut per_position_ns = vec![Vec::new(); FRAME_POSITIONS];
+        let frame_input =
+            |frame: u32| weights_of(FRAME_POSITIONS * config.hidden_size, 9_500 + frame % 11);
+
+        ftts_kernels::team::with_team_bypassed(|| {
+            for frame in 0..WARMUP_FRAMES {
+                let seeded = frame_input(frame);
+                let mut state = FrameKvState::new(&config);
+                for position in 0..FRAME_POSITIONS {
+                    let (cos, sin) = rope.row(position);
+                    let _ = layer_step_q8(
+                        &config,
+                        &borrowed,
+                        &quant,
+                        cos,
+                        sin,
+                        &seeded[position * config.hidden_size..(position + 1) * config.hidden_size],
+                        &mut state,
+                        mode,
+                    );
+                }
+            }
+            for frame in 0..TIMED_FRAMES {
+                let seeded = frame_input(frame);
+                let mut state = FrameKvState::new(&config);
+                for position in 0..FRAME_POSITIONS {
+                    let (cos, sin) = rope.row(position);
+                    let start = std::time::Instant::now();
+                    let _ = layer_step_q8(
+                        &config,
+                        &borrowed,
+                        &quant,
+                        cos,
+                        sin,
+                        &seeded[position * config.hidden_size..(position + 1) * config.hidden_size],
+                        &mut state,
+                        mode,
+                    );
+                    per_position_ns[position].push(start.elapsed().as_nanos());
+                }
+            }
+        });
+
+        for (position, samples) in per_position_ns.iter().enumerate() {
+            let mut sorted = samples.clone();
+            sorted.sort_unstable();
+            println!(
+                "ftts-bench-depth position={position} role={:?} median_step_ns={}",
+                position_role(position),
+                sorted[sorted.len() / 2],
+            );
+        }
+    }
+
     /// Speculation is a scheduling device, not a quality one. Whatever the drafter proposes —
     /// a perfect guess, one stale code, or pure garbage — the codes that come out must equal
     /// what the same route's sequential greedy decode emits.

@@ -127,6 +127,9 @@ pub enum F32SoftmaxArithmetic {
     /// Exponentiate, sum and normalize in f64, narrowing only at the store — an attribution
     /// probe, not a candidate for what the oracle did.
     WidenedF64,
+    /// Exponentiate through [`canonical_exp_f32`] — cross-target-exact for
+    /// DISC-006-style parity seams.
+    Canonical,
 }
 
 /// Row-major matrix-vector/matrix-matrix product in the layout PyTorch `Linear` stores.
@@ -1009,6 +1012,71 @@ pub fn silu_mul_in_place_with_arithmetic(
         };
         *g = silu * u;
     }
+}
+/// Cross-target-exact `sin` and `cos` (frankentts-uuac): Cody-Waite reduction
+/// against a two-word split of pi/2 keeps |r| <= pi/4 with no libm anywhere —
+/// same by-construction bit-equality contract as [`canonical_exp_f32`].
+/// Accuracy on the synthesis-relevant domain is attribution-grade, pinned by
+/// the in-crate fixtures.
+#[must_use]
+pub fn canonical_sin_cos_f32(x: f32) -> (f32, f32) {
+    if !x.is_finite() {
+        return (f32::NAN, f32::NAN);
+    }
+    const TWO_OVER_PI: f64 = core::f64::consts::FRAC_2_PI;
+    // Two-word pi/2; the split constants sum to pi/2 to f64 precision.
+    const PIO2_HI: f64 = 1.570_796_326_794_896_6;
+    const PIO2_LO: f64 = 6.123_233_995_736_766e-17;
+    let wide = f64::from(x);
+    let kf = (wide * TWO_OVER_PI).round();
+    let quad = ((kf as i64).rem_euclid(4)) as u8;
+    let r = wide - kf * PIO2_HI - kf * PIO2_LO;
+    // Minimax-grade odd/even polynomials on [-pi/4, pi/4] (fdlibm-class
+    // coefficients), evaluated with plain mul/add only.
+    let r2 = r * r;
+    let s = r
+        + r * r2 * (-1.666_666_666_666_663_072_75e-1)
+        + r * r2 * r2 * (8.333_333_333_322_489_461_24e-3)
+        + r * r2 * r2 * r2 * (-1.984_126_982_985_794_931_34e-4)
+        + r * r2 * r2 * r2 * r2 * (2.755_731_370_707_006_767_89e-6)
+        + r * r2 * r2 * r2 * r2 * r2 * (-2.505_076_025_340_686_341_76e-8);
+    let c = 1.0
+        + r2 * (-4.999_999_999_999_999_117_28e-1)
+        + r2 * r2 * (4.166_666_666_666_659_292_72e-2)
+        + r2 * r2 * r2 * (-1.388_888_888_887_305_641_16e-3)
+        + r2 * r2 * r2 * r2 * (2.480_158_728_323_086_013_86e-5)
+        + r2 * r2 * r2 * r2 * r2 * (-2.755_731_112_559_068_601_16e-7);
+    let (sin_value, cos_value) = match quad {
+        0 => (s, c),
+        1 => (c, -s),
+        2 => (-s, -c),
+        _ => (-c, s),
+    };
+    (sin_value as f32, cos_value as f32)
+}
+
+/// Deterministic `theta ** -(pair_index*2/head_dim)` for the RoPE inv-freq
+/// grid: binary-fraction exponent walk using successive IEEE `sqrt` plus
+/// conditional multiplies. No libm powf; every target compiles the same op
+/// sequence.
+#[must_use]
+pub fn canonical_rope_inv_freq(theta: f32, pair: usize, head_dim: usize) -> f32 {
+    debug_assert!(head_dim.is_multiple_of(2), "head_dim must be even");
+    let mut base = f64::from(theta);
+    if base <= 0.0 {
+        return f32::NAN;
+    }
+    let steps = (head_dim / 2).trailing_zeros().max(1) as usize;
+    let mut result = 1.0_f64;
+    let mut exponent_bits = pair * 2;
+    for index in 0..steps {
+        base = base.sqrt();
+        if (exponent_bits >> (steps - 1 - index)) & 1 == 1 {
+            result *= base;
+        }
+    }
+    let inv = 1.0 / result;
+    inv as f32
 }
 
 /// In-place row-wise softmax in f32, max-subtracted for stability.
