@@ -65,6 +65,8 @@ pub struct CodecConfig {
     pub rms_norm_eps: f32,
 }
 
+use crate::taps::{tap_emit, tap_hash_f32, taps_active};
+
 impl Default for CodecConfig {
     fn default() -> Self {
         Self {
@@ -2214,6 +2216,15 @@ pub fn decode_codec_offline(
 ) -> Result<Vec<f32>, CodecError> {
     let mut codec_latents = vec![0.0f32; frames * config.codec_latent_dim];
     quantizer.decode(config, codes, frames, &mut codec_latents)?;
+    let tap_block = |tag: &str, buf: &[f32]| {
+        if taps_active() {
+            tap_emit(&format!(
+                "ftts-tapC b={tag} h={:016x}",
+                tap_hash_f32(buf),
+            ));
+        }
+    };
+    tap_block("quant", &codec_latents);
     let pre_transformer_input = weights.pre_conv.forward(&codec_latents, frames);
     let mut caches = vec![CodecKvCache::new(config); weights.pre_transformer.layers.len()];
     let mut hidden = vec![0.0f32; frames * config.transformer_latent_dim];

@@ -2146,6 +2146,27 @@ mod tests {
             assert!(sym_ok(neg_c, c), "cos even symmetry at {x}: {neg_c} vs {c}");
             index += 1;
         }
+        // Codec-magnitude sweep: SnakeBeta arguments reach |x| ~ 1e5 after the
+        // conv stack, far beyond the RoPE grid. The reduction must hold its
+        // accuracy there or the parity mode diverges exactly like the
+        // 25-vs-34-sample golden delta observed on frankentts-uuac.
+        let mut mag = 4_000.0_f32;
+        while mag <= 120_000.0 {
+            for frac in [0.0_f32, 0.13, 0.37, 0.5, 0.63, 0.79, 1.0] {
+                let x = mag * frac;
+                let (s, c) = canonical_sin_cos_f32(x);
+                let (hs, hc) = (x.sin(), x.cos());
+                for (got, want) in [(s, hs), (c, hc)] {
+                    let next = f32::from_bits(want.to_bits() + 1);
+                    let ulp = (next - want).abs().max(f32::MIN_POSITIVE);
+                    assert!(
+                        (got - want).abs() / ulp <= 8.0,
+                        "codec-magnitude trig drift at {x}: {got} vs {want}"
+                    );
+                }
+            }
+            mag *= 1.5;
+        }
         let (s0, c0) = canonical_sin_cos_f32(0.0);
         assert_eq!(s0.to_bits(), 0.0_f32.to_bits());
         assert_eq!(c0.to_bits(), 1.0_f32.to_bits());
