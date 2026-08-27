@@ -2218,14 +2218,12 @@ pub fn decode_codec_offline(
     quantizer.decode(config, codes, frames, &mut codec_latents)?;
     let tap_block = |tag: &str, buf: &[f32]| {
         if taps_active() {
-            tap_emit(&format!(
-                "ftts-tapC b={tag} h={:016x}",
-                tap_hash_f32(buf),
-            ));
+            tap_emit(&format!("ftts-tapC b={tag} h={:016x}", tap_hash_f32(buf),));
         }
     };
     tap_block("quant", &codec_latents);
     let pre_transformer_input = weights.pre_conv.forward(&codec_latents, frames);
+    tap_block("preconv", &pre_transformer_input);
     let mut caches = vec![CodecKvCache::new(config); weights.pre_transformer.layers.len()];
     let mut hidden = vec![0.0f32; frames * config.transformer_latent_dim];
     forward_codec_pre_transformer(
@@ -2237,9 +2235,10 @@ pub fn decode_codec_offline(
         &mut caches,
         &mut hidden,
     );
+    tap_block("pretrans", &hidden);
 
     let mut latent_frames = frames;
-    for stage in weights.latent_upsample {
+    for (stage_index, stage) in weights.latent_upsample.iter().enumerate() {
         hidden = stage.transposed.forward(&hidden, latent_frames);
         latent_frames *= stage.transposed.stride;
         hidden = forward_convnext(
@@ -2248,15 +2247,18 @@ pub fn decode_codec_offline(
             stage.transposed.output_channels,
             stage.convnext,
         );
+        tap_block(&format!("up{stage_index}"), &hidden);
     }
     hidden = weights.decoder_input.forward(&hidden, latent_frames);
+    tap_block("decin", &hidden);
     let mut waveform_frames = latent_frames;
     let mut channels = weights.decoder_input.output_channels;
-    for block in weights.decoder_blocks {
+    for (block_index, block) in weights.decoder_blocks.into_iter().enumerate() {
         let (next, next_frames) = forward_decoder_block(&hidden, waveform_frames, channels, block);
         hidden = next;
         waveform_frames = next_frames;
         channels = block.transposed.output_channels;
+        tap_block(&format!("dec{block_index}"), &hidden);
     }
     snake_beta_in_place(
         &mut hidden,
@@ -2264,7 +2266,9 @@ pub fn decode_codec_offline(
         weights.final_alpha_log,
         weights.final_beta_log,
     );
+    tap_block("snake", &hidden);
     hidden = weights.final_conv.forward(&hidden, waveform_frames);
+    tap_block("fin", &hidden);
     assert_eq!(
         hidden.len(),
         waveform_frames,
