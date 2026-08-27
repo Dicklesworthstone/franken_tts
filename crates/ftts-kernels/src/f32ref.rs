@@ -617,7 +617,7 @@ pub fn set_canonical_norm_enabled(enabled: bool) {
     CANONICAL_NORM_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn canonical_norm_requested() -> bool {
+pub fn canonical_norm_requested() -> bool {
     if CANONICAL_NORM_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
@@ -1023,8 +1023,10 @@ pub fn canonical_sin_cos_f32(x: f32) -> (f32, f32) {
     if !x.is_finite() {
         return (f32::NAN, f32::NAN);
     }
+    #[allow(clippy::approx_constant)] // intentional: needs the f64 pi/2 split pair
     const TWO_OVER_PI: f64 = core::f64::consts::FRAC_2_PI;
     // Two-word pi/2; the split constants sum to pi/2 to f64 precision.
+    #[allow(clippy::approx_constant)]
     const PIO2_HI: f64 = 1.570_796_326_794_896_6;
     const PIO2_LO: f64 = 6.123_233_995_736_766e-17;
     let wide = f64::from(x);
@@ -1035,24 +1037,31 @@ pub fn canonical_sin_cos_f32(x: f32) -> (f32, f32) {
     // coefficients), evaluated with plain mul/add only.
     let r2 = r * r;
     let s = r
-        + r * r2 * (-1.666_666_666_666_663_072_75e-1)
-        + r * r2 * r2 * (8.333_333_333_322_489_461_24e-3)
-        + r * r2 * r2 * r2 * (-1.984_126_982_985_794_931_34e-4)
-        + r * r2 * r2 * r2 * r2 * (2.755_731_370_707_006_767_89e-6)
-        + r * r2 * r2 * r2 * r2 * r2 * (-2.505_076_025_340_686_341_76e-8);
+        + r * r2 * (-1.666_666_666_666_663e-1)
+        + r * r2 * r2 * (8.333_333_333_322_49e-3)
+        + r * r2 * r2 * r2 * (-1.984_126_982_985_795e-4)
+        + r * r2 * r2 * r2 * r2 * (2.755_731_370_707_007e-6)
+        + r * r2 * r2 * r2 * r2 * r2 * (-2.505_076_025_340_686e-8);
     let c = 1.0
-        + r2 * (-4.999_999_999_999_999_117_28e-1)
-        + r2 * r2 * (4.166_666_666_666_659_292_72e-2)
-        + r2 * r2 * r2 * (-1.388_888_888_887_305_641_16e-3)
-        + r2 * r2 * r2 * r2 * (2.480_158_728_323_086_013_86e-5)
-        + r2 * r2 * r2 * r2 * r2 * (-2.755_731_112_559_068_601_16e-7);
+        + r2 * (-4.999_999_999_999_999e-1)
+        + r2 * r2 * (4.166_666_666_666_659e-2)
+        + r2 * r2 * r2 * (-1.388_888_888_887_306e-3)
+        + r2 * r2 * r2 * r2 * (2.480_158_728_323_086e-5)
+        + r2 * r2 * r2 * r2 * r2 * (-2.755_731_112_559_069e-7);
     let (sin_value, cos_value) = match quad {
         0 => (s, c),
         1 => (c, -s),
         2 => (-s, -c),
         _ => (-c, s),
     };
-    (sin_value as f32, cos_value as f32)
+    // Normalize signed zero: the cross-target symmetry contract compares bits,
+    // and a +0/-0 split between engines is semantically meaningless here.
+    let sin_f = s as f32;
+    let cos_f = c as f32;
+    (
+        if sin_f == 0.0 { 0.0 } else { sin_f },
+        if cos_f == 0.0 { 0.0 } else { cos_f },
+    )
 }
 
 /// Deterministic `theta ** -(pair_index*2/head_dim)` for the RoPE inv-freq
@@ -1066,9 +1075,11 @@ pub fn canonical_rope_inv_freq(theta: f32, pair: usize, head_dim: usize) -> f32 
     if base <= 0.0 {
         return f32::NAN;
     }
-    let steps = (head_dim / 2).trailing_zeros().max(1) as usize;
+    // Exponent is (2*pair)/head_dim => bit resolution of 1/head_dim.
+    let steps = head_dim.trailing_zeros().max(1) as usize;
+    debug_assert!(pair * 2 < head_dim, "pair out of range");
     let mut result = 1.0_f64;
-    let mut exponent_bits = pair * 2;
+    let exponent_bits = pair * 2;
     for index in 0..steps {
         base = base.sqrt();
         if (exponent_bits >> (steps - 1 - index)) & 1 == 1 {
@@ -1114,15 +1125,21 @@ pub fn softmax_rows_with_arithmetic(
             }
             continue;
         }
+        let canonical = arithmetic == F32SoftmaxArithmetic::Canonical;
         let mut sum = 0.0f32;
         for value in slice.iter_mut() {
-            *value = (*value - max).exp();
+            let shifted = *value - max;
+            *value = if canonical {
+                canonical_exp_f32(shifted)
+            } else {
+                shifted.exp()
+            };
             sum += *value;
         }
         for value in slice.iter_mut() {
             *value = match arithmetic {
                 F32SoftmaxArithmetic::ReciprocalMultiply => *value * sum.recip(),
-                F32SoftmaxArithmetic::Divide => *value / sum,
+                F32SoftmaxArithmetic::Divide | F32SoftmaxArithmetic::Canonical => *value / sum,
                 F32SoftmaxArithmetic::WidenedF64 => unreachable!("handled above"),
             };
         }
@@ -1163,7 +1180,11 @@ pub fn gqa_attention(
         q_heads,
         kv_heads,
         head_dim,
-        F32SoftmaxArithmetic::ReciprocalMultiply,
+        if canonical_norm_requested() {
+            F32SoftmaxArithmetic::Canonical
+        } else {
+            F32SoftmaxArithmetic::ReciprocalMultiply
+        },
         out,
     );
 }
@@ -2066,6 +2087,61 @@ mod tests {
                 );
             }
             previous = Some(single);
+        }
+    }
+
+    /// Trig attribution fixtures: nextafter-ulp parity against the host on the
+    /// RoPE-reachable domain, exact odd/even symmetry (cross-target equality
+    /// demands symmetric structure), and exact values at the quadrant anchors.
+    #[test]
+    fn canonical_trig_matches_host_with_symmetry_and_anchors() {
+        let mut index = -4000_i32;
+        while index <= 4000 {
+            let x = index as f32 * 0.5;
+            let (s, c) = canonical_sin_cos_f32(x);
+            let host_s = x.sin();
+            let host_c = x.cos();
+            for (got, want) in [(s, host_s), (c, host_c)] {
+                let ulp = {
+                    let next = f32::from_bits(want.to_bits() + 1);
+                    (next - want).abs().max(f32::MIN_POSITIVE)
+                };
+                assert!(
+                    (got - want).abs() / ulp <= 8.0,
+                    "canonical trig drifted at {x}: {got} vs {want}"
+                );
+            }
+            let (neg_s, neg_c) = canonical_sin_cos_f32(-x);
+            assert_eq!(neg_s.to_bits(), (-s).to_bits(), "sin odd symmetry at {x}");
+            assert_eq!(neg_c.to_bits(), c.to_bits(), "cos even symmetry at {x}");
+            index += 1;
+        }
+        let (s0, c0) = canonical_sin_cos_f32(0.0);
+        assert_eq!(s0.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(c0.to_bits(), 1.0_f32.to_bits());
+    }
+
+    /// The inv-freq walk is deterministic and lands within a tight relative
+    /// bound of the platform powf across the real head_dim=128 grid.
+    #[test]
+    fn canonical_rope_inv_freq_tracks_powf_across_grid() {
+        let theta = 1.0e6_f32;
+        let mut previous: Option<f32> = None;
+        for pair in 0..64_usize {
+            let got = canonical_rope_inv_freq(theta, pair, 128);
+            if pair == 0 {
+                assert_eq!(got.to_bits(), 1.0_f32.to_bits());
+            }
+            let exponent = (2 * pair) as f32 / 128.0;
+            let host = theta.powf(-exponent);
+            assert!(
+                (got - host).abs() / host <= 5e-6,
+                "inv-freq drift at pair {pair}: {got} vs {host}"
+            );
+            if let Some(prev) = previous {
+                assert!(got <= prev, "inv-freq not monotone at pair {pair}");
+            }
+            previous = Some(got);
         }
     }
 }

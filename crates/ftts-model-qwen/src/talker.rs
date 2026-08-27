@@ -1020,13 +1020,23 @@ pub fn mrope_rows(positions: &[i64], head_dim: usize, theta: f32) -> (Vec<f32>, 
     let mut sin = vec![0.0f32; positions.len() * head_dim];
     for (row, position) in positions.iter().enumerate() {
         for pair in 0..half {
-            let exponent = (2 * pair) as f32 / head_dim as f32;
-            let angle = *position as f32 * theta.powf(-exponent);
+            let angle = if f32ref::canonical_norm_requested() {
+                let inv_freq = f32ref::canonical_rope_inv_freq(theta, pair, head_dim);
+                *position as f32 * inv_freq
+            } else {
+                let exponent = (2 * pair) as f32 / head_dim as f32;
+                *position as f32 * theta.powf(-exponent)
+            };
             let offset = row * head_dim + pair;
-            cos[offset] = angle.cos();
-            cos[offset + half] = cos[offset];
-            sin[offset] = angle.sin();
-            sin[offset + half] = sin[offset];
+            let (s, c) = if f32ref::canonical_norm_requested() {
+                f32ref::canonical_sin_cos_f32(angle)
+            } else {
+                (angle.sin(), angle.cos())
+            };
+            cos[offset] = c;
+            cos[offset + half] = c;
+            sin[offset] = s;
+            sin[offset + half] = s;
         }
     }
     (cos, sin)
