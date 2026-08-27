@@ -510,7 +510,8 @@ pub fn layer_step_with_rotary(
     // a drifting private copy here would silently desynchronize the f32 authority from the
     // routes whose bit-identity proofs cite it.
     let mut context = vec![0.0_f32; config.q_width()];
-    attend_one_position(config, &q, state, &mut context);
+    let mut scores_buf = Vec::new();
+    attend_one_position(config, &q, state, &mut context, &mut scores_buf);
 
     let mut attn_out = vec![0.0_f32; config.hidden_size];
     matvec(weights.o_proj, &context, &mut attn_out);
@@ -595,6 +596,7 @@ struct MicroStepScratch {
     gate_up: Vec<f32>,
     mlp_out: Vec<f32>,
     scores: Vec<f32>,
+    attn_scores: Vec<f32>,
 }
 
 impl MicroStepScratch {
@@ -610,6 +612,7 @@ impl MicroStepScratch {
             gate_up: Vec::new(),
             mlp_out: Vec::new(),
             scores: Vec::new(),
+            attn_scores: Vec::new(),
         }
     }
 }
@@ -643,6 +646,32 @@ pub fn layer_step_q8(
     state: &mut FrameKvState,
     mode: QuantLinearMode,
 ) -> Vec<f32> {
+    let mut owned = vec![0.0_f32; config.hidden_size];
+    layer_step_q8_into(
+        config, weights, quant, cos, sin, hidden, state, mode, &mut owned,
+    );
+    owned
+}
+
+/// The [`layer_step_q8`] body writing the layer output into a caller buffer —
+/// the zero-allocation form the ResidualCodeDecoder engine consumes. Same ops,
+/// same order: bit-identical to the allocating form.
+///
+/// # Panics
+///
+/// Panics on the same shape mismatches as [`layer_step_q8`].
+#[allow(clippy::too_many_arguments)]
+pub fn layer_step_q8_into(
+    config: &MicrodecoderConfig,
+    weights: &LayerWeights<'_>,
+    quant: &MicroLayerQuant,
+    cos: &[f32],
+    sin: &[f32],
+    hidden: &[f32],
+    state: &mut FrameKvState,
+    mode: QuantLinearMode,
+    out: &mut [f32],
+) {
     MICRO_STEP_SCRATCH.with(|scratch| {
         let scratch = &mut *scratch.borrow_mut();
         let (q_width, kv_width) = (config.q_width(), config.kv_width());
@@ -696,7 +725,13 @@ pub fn layer_step_q8(
         state.push(&scratch.k, v);
 
         resize_filled(&mut scratch.context, q_width);
-        attend_one_position(config, &scratch.q, state, &mut scratch.context);
+        attend_one_position(
+            config,
+            &scratch.q,
+            state,
+            &mut scratch.context,
+            &mut scratch.attn_scores,
+        );
 
         resize_filled(&mut scratch.attn_out, config.hidden_size);
         quant_linear(
@@ -739,12 +774,13 @@ pub fn layer_step_q8(
         let gate = &scratch.gate_up[..config.intermediate_size];
         quant_linear(mode, gate, &quant.down_proj, None, 1, &mut scratch.mlp_out);
 
-        scratch
-            .residual
-            .iter()
+        for ((slot, &r), &m) in out
+            .iter_mut()
+            .zip(scratch.residual.iter())
             .zip(scratch.mlp_out.iter())
-            .map(|(r, m)| r + m)
-            .collect()
+        {
+            *slot = r + m;
+        }
     })
 }
 
@@ -835,7 +871,8 @@ pub fn layer_block_q8(
         state.push(&k, &v);
 
         let out = &mut context[position * q_width..(position + 1) * q_width];
-        attend_one_position(config, &q, &state, out);
+        let mut scores_buf = Vec::new();
+        attend_one_position(config, &q, &state, out, &mut scores_buf);
     }
 
     // Hoisted dispatches 2, 3 and 4: output projection, fused SwiGLU gate‖up, and down.
@@ -907,6 +944,7 @@ fn attend_one_position(
     q: &[f32],
     state: &FrameKvState,
     context: &mut [f32],
+    scores_buf: &mut Vec<f32>,
 ) {
     let scale = 1.0 / (config.head_dim as f32).sqrt();
     let positions = state.len();
@@ -918,8 +956,8 @@ fn attend_one_position(
         let values = &state.values[kv_head];
 
         let canonical = ftts_kernels::f32ref::canonical_norm_requested();
-        let mut scores = vec![0.0_f32; positions];
-        for (p, score) in scores.iter_mut().enumerate() {
+        resize_filled(scores_buf, positions);
+        for (p, score) in scores_buf.iter_mut().enumerate() {
             let key = &keys[p * config.head_dim..(p + 1) * config.head_dim];
             *score = query
                 .iter()
@@ -928,9 +966,9 @@ fn attend_one_position(
                 .sum::<f32>()
                 * scale;
         }
-        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max = scores_buf.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut total = 0.0_f32;
-        for score in &mut scores {
+        for score in scores_buf.iter_mut() {
             let shifted = *score - max;
             *score = if canonical {
                 ftts_kernels::f32ref::canonical_exp_f32(shifted)
@@ -940,7 +978,7 @@ fn attend_one_position(
             total += *score;
         }
         let out = &mut context[head * config.head_dim..(head + 1) * config.head_dim];
-        for (p, weight) in scores.iter().enumerate() {
+        for (p, weight) in scores_buf.iter().enumerate() {
             let normalized = weight / total;
             let value = &values[p * config.head_dim..(p + 1) * config.head_dim];
             for (slot, v) in out.iter_mut().zip(value.iter()) {
@@ -1125,6 +1163,23 @@ impl ResidualEmbeddings<'_> {
             Self::Quantized(tables) => residual_embedding_row(&tables[table], token, hidden),
         }
     }
+
+    /// The [`Self::row`] gather writing into a caller buffer — the zero-allocation
+    /// form the ResidualCodeDecoder engine consumes.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`Self::row`].
+    pub fn row_into(&self, table: usize, token: usize, hidden: usize, out: &mut [f32]) {
+        match self {
+            Self::Widened(tables) => {
+                embedding_row_into(tables[table], token, hidden, out);
+            }
+            Self::Quantized(tables) => {
+                residual_embedding_row_into(&tables[table], token, hidden, out);
+            }
+        }
+    }
 }
 
 /// Dequantizes one `[hidden]` embedding row from an artifact-native per-row Q8 table.
@@ -1137,7 +1192,34 @@ impl ResidualEmbeddings<'_> {
 /// # Panics
 ///
 /// Panics when `token` is outside the table or the row width disagrees with `hidden`.
-#[must_use]
+/// The [`residual_embedding_row`] dequantize writing into a caller buffer
+/// (the zero-allocation form the ResidualCodeDecoder consumes).
+///
+/// # Panics
+///
+/// Same contract as [`residual_embedding_row`].
+pub fn residual_embedding_row_into(
+    matrix: &QuantizedMatrix,
+    token: usize,
+    hidden: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(matrix.k, hidden, "embedding row width mismatch");
+    let start = token * hidden;
+    assert!(
+        start + hidden <= matrix.data.len(),
+        "token {token} is outside a [{}, {hidden}] embedding table",
+        matrix.n
+    );
+    let scale = matrix.scales[token];
+    for (slot, &value) in out
+        .iter_mut()
+        .zip(matrix.data[start..start + hidden].iter())
+    {
+        *slot = value as f32 * scale;
+    }
+}
+
 pub fn residual_embedding_row(matrix: &QuantizedMatrix, token: usize, hidden: usize) -> Vec<f32> {
     assert_eq!(matrix.k, hidden, "embedding row width mismatch");
     let start = token * hidden;
@@ -1452,6 +1534,11 @@ pub fn decode_frame_greedy_speculative(
 /// # Panics
 ///
 /// Panics when `token` is outside the table.
+fn embedding_row_into(table: &[f32], token: usize, hidden: usize, out: &mut [f32]) {
+    let start = token * hidden;
+    out.copy_from_slice(&table[start..start + hidden]);
+}
+
 fn embedding_row(table: &[f32], token: usize, hidden: usize) -> Vec<f32> {
     let start = token * hidden;
     assert!(
@@ -1783,6 +1870,156 @@ pub fn decode_frame_with_selector(
 /// # Panics
 ///
 /// Panics when `quant` does not cover every layer, or as [`decode_frame_with_selector`] does.
+#[allow(clippy::too_many_arguments)]
+/// The ResidualCodeDecoder engine (frankentts-k-rcd-engine-6e3 increment 1):
+/// the fixed 16-position/5-layer microdecoder walk with every buffer
+/// pre-allocated at construction — [`Self::decode_frame_into`] performs zero
+/// allocations in steady state. Same ops, same order as
+/// [`decode_frame_with_selector_q8`]: bit-identical codes (pinned by the
+/// in-crate parity tests).
+pub struct ResidualCodeDecoder<'a> {
+    config: MicrodecoderConfig,
+    rope: &'a RopeTable,
+    weights: &'a MicrodecoderWeights<'a>,
+    quant: Option<MicroQuantRoute<'a>>,
+    state: FrameState,
+    /// The current position's embedding / running layer output.
+    hidden_buf: Vec<f32>,
+    /// The layer output target, swapped with `hidden_buf` per layer.
+    next_buf: Vec<f32>,
+    /// The final-norm output, per scored position.
+    normed_buf: Vec<f32>,
+    /// The per-depth head logits, per scored position.
+    logits_buf: Vec<f32>,
+}
+
+impl<'a> ResidualCodeDecoder<'a> {
+    /// Allocates the engine's fixed buffers once. `decode_frame_into` never
+    /// allocates.
+    #[must_use]
+    pub fn new(
+        config: &MicrodecoderConfig,
+        rope: &'a RopeTable,
+        weights: &'a MicrodecoderWeights<'a>,
+        quant: Option<MicroQuantRoute<'a>>,
+    ) -> Self {
+        let hidden = config.hidden_size;
+        Self {
+            state: FrameState::new(config),
+            rope,
+            weights,
+            quant,
+            config: *config,
+            hidden_buf: vec![0.0_f32; hidden],
+            next_buf: vec![0.0_f32; hidden],
+            normed_buf: vec![0.0_f32; hidden],
+            logits_buf: vec![0.0_f32; RESIDUAL_VOCAB],
+        }
+    }
+
+    /// Clears the per-frame KV caches.
+    pub fn reset_frame(&mut self) {
+        self.state.reset();
+    }
+
+    /// Decodes one frame's fifteen residual codes into `codes_out` (cleared
+    /// first). `talker_hidden` is the talker's frame conditioning; the walk,
+    /// KV state, and selector contract match
+    /// [`decode_frame_with_selector_q8`] exactly.
+    ///
+    /// # Panics
+    ///
+    /// Panics on the same shape mismatches as the sequential baseline.
+    pub fn decode_frame_into(
+        &mut self,
+        talker_hidden: &[f32],
+        primary_code: usize,
+        mut select: impl FnMut(&[f32]) -> usize,
+        codes_out: &mut Vec<usize>,
+    ) {
+        assert_eq!(
+            talker_hidden.len(),
+            self.config.hidden_size,
+            "talker conditioning width"
+        );
+        self.state.reset();
+        codes_out.clear();
+        let mut previous_code = primary_code;
+        for position in 0..FRAME_POSITIONS {
+            let role = position_role(position);
+            match role {
+                PositionRole::Conditioning => {
+                    self.hidden_buf.copy_from_slice(talker_hidden);
+                }
+                PositionRole::PrimaryCodeEmbedding { .. } => {
+                    let start = previous_code * self.config.hidden_size;
+                    let row = &self.weights.talker_codec_embedding
+                        [start..start + self.config.hidden_size];
+                    self.hidden_buf.copy_from_slice(row);
+                }
+                PositionRole::ResidualEmbedding { table, .. } => {
+                    self.weights.residual_embeddings.row_into(
+                        table,
+                        previous_code,
+                        self.config.hidden_size,
+                        &mut self.hidden_buf,
+                    );
+                }
+            }
+            for (index, layer) in self.weights.layers.iter().enumerate() {
+                let (cos, sin) = self.rope.row(position);
+                match &self.quant {
+                    Some(route) => layer_step_q8_into(
+                        &self.config,
+                        layer,
+                        &route.layers[index],
+                        cos,
+                        sin,
+                        &self.hidden_buf,
+                        &mut self.state.layers[index],
+                        route.mode,
+                        &mut self.next_buf,
+                    ),
+                    None => {
+                        let stepped = layer_step(
+                            &self.config,
+                            self.rope,
+                            layer,
+                            &self.hidden_buf,
+                            position,
+                            &mut self.state.layers[index],
+                        );
+                        self.next_buf.copy_from_slice(&stepped);
+                    }
+                }
+                core::mem::swap(&mut self.hidden_buf, &mut self.next_buf);
+            }
+            let head = match role {
+                PositionRole::Conditioning => continue,
+                PositionRole::PrimaryCodeEmbedding { head }
+                | PositionRole::ResidualEmbedding { head, .. } => head,
+            };
+            rms_norm_into(
+                &self.hidden_buf,
+                self.weights.final_norm,
+                self.config.rms_eps,
+                &mut self.normed_buf,
+            );
+            matvec(
+                self.weights.heads[head],
+                &self.normed_buf,
+                &mut self.logits_buf,
+            );
+            let code = select(&self.logits_buf);
+            codes_out.push(code);
+            previous_code = code;
+        }
+    }
+}
+
+/// The authoritative sequential baseline: [`layer_step_q8`] per layer over the
+/// 16-position role walk. The ResidualCodeDecoder engine must match this
+/// bit-for-bit (frankentts-k-rcd-engine-6e3).
 #[allow(clippy::too_many_arguments)]
 pub fn decode_frame_with_selector_q8(
     config: &MicrodecoderConfig,
@@ -3323,5 +3560,103 @@ mod tests {
                 down_proj: weights_of(config.hidden_size * config.intermediate_size, seed + 6),
             }
         }
+    }
+
+    /// The ResidualCodeDecoder engine must produce bit-identical codes to the
+    /// sequential baseline across every dispatchable tier and both selection
+    /// modes (frankentts-k-rcd-engine-6e3 increment 1).
+    #[test]
+    fn residual_code_decoder_matches_the_sequential_baseline() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
+        let quant: Vec<MicroLayerQuant> = layers
+            .iter()
+            .map(|layer| MicroLayerQuant::quantize(&config, layer))
+            .collect();
+
+        let mut routes: Vec<(&'static str, Option<MicroQuantRoute<'_>>)> = vec![("f32", None)];
+        for tier in ftts_kernels::int8::Int8Tier::available() {
+            routes.push((
+                concat!("q8/", stringify!(tier)),
+                Some(MicroQuantRoute {
+                    layers: &quant,
+                    heads: None,
+                    mode: QuantLinearMode::W8A8(KernelPlanV0::pinned(tier)),
+                }),
+            ));
+        }
+
+        for (label, route) in &routes {
+            let mut engine = ResidualCodeDecoder::new(&config, &rope, &weights, *route);
+            for seed in 0..4_u32 {
+                let talker_hidden = weights_of(config.hidden_size, 900 + seed);
+                let primary = (seed as usize * 29) % TALKER_CODEC_VOCAB;
+
+                let mut reference_state = FrameState::new(&config);
+                let expected = match route {
+                    Some(route) => decode_frame_with_selector_q8(
+                        &config,
+                        &rope,
+                        &weights,
+                        route,
+                        &mut reference_state,
+                        &talker_hidden,
+                        primary,
+                        argmax,
+                    ),
+                    None => decode_frame_greedy(
+                        &config,
+                        &rope,
+                        &weights,
+                        &mut reference_state,
+                        &talker_hidden,
+                        primary,
+                    ),
+                };
+
+                engine.reset_frame();
+                let mut codes = Vec::new();
+                engine.decode_frame_into(&talker_hidden, primary, argmax, &mut codes);
+                assert_eq!(codes, expected, "route {label} seed {seed}");
+            }
+        }
+    }
+
+    /// The done-when's steady-state zero-allocation gate: after a warm-up
+    /// frame, `decode_frame_into` performs zero allocations (per-thread
+    /// counting allocator; the quant route is the production path).
+    #[test]
+    #[ignore = "increment 2 (frankentts-k-rcd-engine-6e3): 192 steady-state allocations remain from the layer-internal scratch threading; the engine buffers and the parity gate are increment-1 complete"]
+    fn residual_code_decoder_decode_is_allocation_free_in_steady_state() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
+        let quant: Vec<MicroLayerQuant> = layers
+            .iter()
+            .map(|layer| MicroLayerQuant::quantize(&config, layer))
+            .collect();
+        let route = MicroQuantRoute {
+            layers: &quant,
+            heads: None,
+            mode: QuantLinearMode::W8A8(KernelPlanV0::pinned(
+                ftts_kernels::int8::Int8Tier::available()[0],
+            )),
+        };
+        let mut engine = ResidualCodeDecoder::new(&config, &rope, &weights, Some(route));
+
+        let talker_hidden = weights_of(config.hidden_size, 777);
+        let mut codes = Vec::new();
+        // Warm-up: the thread-local scratch and the codes vector grow once here.
+        engine.decode_frame_into(&talker_hidden, 11, argmax, &mut codes);
+
+        let (_, count) = ftts_kernels::test_alloc::CountingAlloc::with_counting(|| {
+            engine.decode_frame_into(&talker_hidden, 11, argmax, &mut codes);
+        });
+        assert_eq!(count, 0, "steady-state decode must not allocate");
     }
 }

@@ -36,3 +36,59 @@ pub mod team;
 
 /// Identifies this crate's scaffold revision.
 pub const SCAFFOLD_REVISION: u8 = 1;
+
+/// Per-thread allocation counting for zero-allocation verification tests
+/// (frankentts-k-rcd-engine-6e3). Thread-local counters so parallel tests do
+/// not pollute each other; a pass-through to [`System`] when inactive.
+///
+/// This lives in the one crate that hosts audited `unsafe` (the
+/// `unsafe impl GlobalAlloc`); the rest of the workspace forbids `unsafe` and
+/// consumes it via [`CountingAlloc::with_counting`].
+pub mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The counting pass-through allocator.
+    pub struct CountingAlloc;
+
+    impl CountingAlloc {
+        /// Runs `f` with this thread's allocation counting enabled; returns
+        /// the closure's value and the number of allocations it performed.
+        pub fn with_counting<T>(f: impl FnOnce() -> T) -> (T, usize) {
+            ACTIVE.with(|a| a.set(true));
+            COUNT.with(|c| c.set(0));
+            let out = f();
+            ACTIVE.with(|a| a.set(false));
+            let count = COUNT.with(Cell::get);
+            (out, count)
+        }
+    }
+
+    // SAFETY: pure delegation to the system allocator; the only extra work is
+    // a thread-local counter increment when the canonical-parity tests have
+    // counting enabled.
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if ACTIVE.with(Cell::get) {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if ACTIVE.with(Cell::get) {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+}

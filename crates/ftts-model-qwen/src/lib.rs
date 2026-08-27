@@ -17,3 +17,8 @@ pub mod tokenizer;
 
 /// Identifies this crate's scaffold revision.
 pub const SCAFFOLD_REVISION: u8 = 1;
+
+#[cfg(test)]
+#[global_allocator]
+static GLOBAL_ALLOC: ftts_kernels::test_alloc::CountingAlloc =
+    ftts_kernels::test_alloc::CountingAlloc;
