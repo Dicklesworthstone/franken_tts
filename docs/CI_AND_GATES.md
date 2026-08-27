@@ -213,13 +213,16 @@ local copy — so the remote passed and failed on source nobody was looking at. 
 validates different source than you have is worse than a slow gate (G1 > G2). Use rch for
 exploratory builds; run the gate locally until rch can pin out-of-tree path deps.
 
-### Status: not yet observed running
+### Status: running on a self-hosted lane since 2026-08-24
 
-> The workflow is committed and its YAML parses, and `scripts/check.sh` is verified green
-> locally. **The workflow itself has not executed** — that requires a push to GitHub, which this
-> bead does not perform. Its first run is the thing that will confirm the sibling-checkout and
-> `/dp` symlink steps, and whether `SIBLING_REPO_TOKEN` is needed. Treat the first CI run as part
-> of this bead's verification, not as a formality.
+> First concluded run after six-plus days of upstream runner starvation: run 32688757593
+> (`gate (scripts/check.sh)`, ~19 min, green-concluding). The starvation's root cause was never
+> simple capacity — ubuntu-latest jobs simply never allocated for days while every API
+> (cancel/rerun) worked — so enforcement moved to a registered self-hosted runner (`yto`, a
+> systemd service claiming `[self-hosted, linux, x86_64]`). Full history: bead
+> `frankentts-rc-ci-first-run-7a4x` (closed CONCLUDED GREEN); predecessor `frankentts-nlb`
+> documents the Aug-8 runs and remediations (drained starved queue, `paths-ignore .beads/**`,
+> `ASUPERSYNC` token fix).
 
 `ubs` is not available on hosted runners, so the CI gate closes with `GREEN WITH SKIPS`. `ubs` is
 enforced locally before every commit instead (`ubs --diff` during work, `ubs --staged` immediately
