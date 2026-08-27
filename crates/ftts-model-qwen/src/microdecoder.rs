@@ -2607,13 +2607,14 @@ mod tests {
             seq_ns.sort_unstable();
             blk_ns.sort_unstable();
             let median = |rows: &[u128]| rows[rows.len() / 2];
+            let (seq_median, blk_median) = (median(&seq_ns), median(&blk_ns));
             println!(
                 "ftts-bench-block tier={tier:?} timed_frames={TIMED_FRAMES} \
-                 median_seq_frame_ns={} median_block_frame_ns={} ratio_seq_over_block={:.3}",
-                median(&seq_ns),
-                median(&blk_ns),
-                f64::from(u32::try_from(median(&seq_ns)).unwrap_or(u32::MAX))
-                    / f64::from(u32::try_from(median(&blk_ns)).unwrap_or(1)),
+                 median_seq_frame_ns={seq_median} median_block_frame_ns={blk_median} \
+                 ratio_seq_over_block={:.3}",
+                // Direct u128 widening: nanosecond medians on a starved CI host can exceed
+                // u32::MAX, and a clamped operand prints a silently wrong ratio.
+                seq_median as f64 / blk_median as f64,
             );
         }
     }
@@ -2622,7 +2623,9 @@ mod tests {
     /// `[MicrodecoderConfig::default]` frames, team BYPASSED deliberately so the rows isolate
     /// per-position scalar-core cost from worker-fanout effects. Under the OQ-5 map,
     /// position p ≥ 1 corresponds to residual depth p − 1's conditioning input, so these rows are
-    /// the per-depth profile table frankentts-k-rcd-engine-6e3 asks for.
+    /// the per-depth profile table frankentts-k-rcd-engine-6e3 asks for. The tier is the LAST of
+    /// [`Int8Tier::available`] — the most advanced route this machine reports, i.e. the
+    /// production pick on dotprod silicon.
     ///
     /// cargo test -p ftts-model-qwen --lib microdecoder_sequential_per_position_profile_rows -- --ignored --nocapture
     #[test]

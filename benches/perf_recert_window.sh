@@ -37,6 +37,21 @@ RECEIPTS="${PERF_RECERT_RECEIPTS:-$ROOT/docs/truth-pack/perf/perf-recert-receipt
 TIMELINE="${PERF_RECERT_TIMELINE:-$ROOT/docs/truth-pack/perf/perf-recert-loadavg.ndjson}"
 mkdir -p "$(dirname "$RECEIPTS")" "$(dirname "$TIMELINE")"
 
+# Fail fast on malformed knobs: a typo'd threshold used to surface as a silent
+# four-hour wait with a misleading no_calm_window reason (python syntax error on
+# every sample read as "not calm"), and SUSTAIN_MIN=0 referenced $L1 before any
+# sample existed, tripping set -u.
+case "$THRESHOLD" in
+  ''|*[!0-9.]*) emit param_invalid "{\"param\":\"PERF_RECERT_THRESHOLD\",\"value\":\"$THRESHOLD\"}"; exit 5 ;;
+esac
+case "$SUSTAIN_MIN" in
+  ''|*[!0-9]*) emit param_invalid "{\"param\":\"PERF_RECERT_SUSTAIN_MIN\",\"value\":\"$SUSTAIN_MIN\"}"; exit 5 ;;
+esac
+case "$MAX_WAIT_MIN" in
+  ''|*[!0-9]*) emit param_invalid "{\"param\":\"PERF_RECERT_MAX_WAIT_MIN\",\"value\":\"$MAX_WAIT_MIN\"}"; exit 5 ;;
+esac
+[ "$SUSTAIN_MIN" -ge 1 ] || { emit param_invalid '{"param":"PERF_RECERT_SUSTAIN_MIN","reason":"must be >= 1"}'; exit 5; }
+
 # Resolve the pinned-revision harness BEFORE waiting: failing here costs seconds;
 # discovering a missing binary after a four-hour window wait wastes the window.
 # (Commit e417681 ran this resolution after the wait loop.)
