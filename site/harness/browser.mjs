@@ -312,7 +312,15 @@ try {
         const n = Math.min(golden.length, pcm.length);
         // The browser holds f32 in [-1,1]; the CLI's WAV is i16. Quantize ours the same way
         // before comparing, so the comparison measures the ENGINE and not the WAV encoder.
-        const ours = pcm.slice(0, n).map((v) => Math.max(-32768, Math.min(32767, Math.round(v * 32767))));
+        // Quantize with round-half-away-from-zero to match the CLI's
+        // `sample_to_i16` (ftts_core::audio): JS Math.round breaks ties toward
+        // +infinity, which disagrees with Rust's f32::round on negative halves
+        // and manufactured phantom 1-LSB diffs at exact .5 boundaries.
+        const ours = pcm.slice(0, n).map((v) => {
+          const scaled = v * 32767;
+          const rounded = Math.sign(scaled) * Math.round(Math.abs(scaled));
+          return Math.max(-32768, Math.min(32767, rounded));
+        });
         const theirs = golden.slice(0, n);
         let identical = 0;
         let maxDiff = 0;
