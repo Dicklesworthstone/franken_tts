@@ -290,14 +290,24 @@ pub fn codec_rope_rows(position: usize, head_dim: usize, cos: &mut [f32], sin: &
     assert_eq!(cos.len(), head_dim, "codec RoPE cos width");
     assert_eq!(sin.len(), head_dim, "codec RoPE sin width");
     let half = head_dim / 2;
+    let canonical = ftts_kernels::f32ref::canonical_norm_requested();
     for index in 0..half {
-        let exponent = (2 * index) as f32 / head_dim as f32;
-        // The reference forms `inv_freq = 1 / theta^(2i/d)` once and multiplies by the position;
-        // dividing the position directly lands on different bits.
-        let inv_freq = CODEC_ROPE_THETA.powf(exponent).recip();
-        let angle = position as f32 * inv_freq;
-        let cosine = angle.cos();
-        let sine = angle.sin();
+        let angle = if canonical {
+            let inv_freq =
+                ftts_kernels::f32ref::canonical_rope_inv_freq(CODEC_ROPE_THETA, index, head_dim);
+            position as f32 * inv_freq
+        } else {
+            let exponent = (2 * index) as f32 / head_dim as f32;
+            // The reference forms `inv_freq = 1 / theta^(2i/d)` once and multiplies by the
+            // position; dividing the position directly lands on different bits.
+            let inv_freq = CODEC_ROPE_THETA.powf(exponent).recip();
+            position as f32 * inv_freq
+        };
+        let (sine, cosine) = if canonical {
+            ftts_kernels::f32ref::canonical_sin_cos_f32(angle)
+        } else {
+            (angle.sin(), angle.cos())
+        };
         cos[index] = cosine;
         cos[index + half] = cosine;
         sin[index] = sine;
@@ -838,13 +848,28 @@ pub fn snake_beta_in_place(values: &mut [f32], frames: usize, alpha_log: &[f32],
         snake_beta_fast(values, frames, alpha_log, beta_log);
         return;
     }
+    let canonical = ftts_kernels::f32ref::canonical_norm_requested();
+    let exp = |v: f32| -> f32 {
+        if canonical {
+            ftts_kernels::f32ref::canonical_exp_f32(v)
+        } else {
+            v.exp()
+        }
+    };
+    let sine_of = |v: f32| -> f32 {
+        if canonical {
+            ftts_kernels::f32ref::canonical_sin_cos_f32(v).0
+        } else {
+            v.sin()
+        }
+    };
     for channel in 0..channels {
-        let alpha = alpha_log[channel].exp();
-        let beta = beta_log[channel].exp();
+        let alpha = exp(alpha_log[channel]);
+        let beta = exp(beta_log[channel]);
         let scale = (beta + 1e-9).recip();
         for frame in 0..frames {
             let index = frame * channels + channel;
-            let sine = (values[index] * alpha).sin();
+            let sine = sine_of(values[index] * alpha);
             // The reference squares `sin` first (`pow(sin, 2)`) and then applies the reciprocal;
             // associating the scale into the first product lands on different bits.
             values[index] += scale * (sine * sine);

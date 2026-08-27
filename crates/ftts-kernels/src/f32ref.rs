@@ -1104,7 +1104,16 @@ pub fn canonical_rope_inv_freq(theta: f32, pair: usize, head_dim: usize) -> f32 
 
 /// In-place row-wise softmax in f32, max-subtracted for stability.
 pub fn softmax_rows(x: &mut [f32], rows: usize, cols: usize) {
-    softmax_rows_with_arithmetic(x, rows, cols, F32SoftmaxArithmetic::ReciprocalMultiply);
+    softmax_rows_with_arithmetic(
+        x,
+        rows,
+        cols,
+        if canonical_norm_requested() {
+            F32SoftmaxArithmetic::Canonical
+        } else {
+            F32SoftmaxArithmetic::ReciprocalMultiply
+        },
+    );
 }
 
 /// Same operation as [`softmax_rows`], with an explicitly selected normalization form.
