@@ -163,17 +163,19 @@ pub fn position_role(position: usize) -> PositionRole {
 #[must_use]
 fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     assert_eq!(x.len(), weight.len(), "rms_norm weight width mismatch");
-    let mean_square = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
-    let scale = 1.0 / (mean_square + eps).sqrt();
-    x.iter()
-        .zip(weight.iter())
-        .map(|(v, w)| v * scale * w)
-        .collect()
+    // Delegate to the single-source kernel so the canonical gate applies
+    // identically to the talker path (frankentts-uuac).
+    let mut out = vec![0.0_f32; x.len()];
+    ftts_kernels::f32ref::rms_norm(x, weight, eps, 1, x.len(), &mut out);
+    out
 }
 
 /// SiLU: `x * sigmoid(x)`.
 fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
+    // Single-source canonical-aware SiLU (frankentts-uuac).
+    let mut slot = [x];
+    ftts_kernels::f32ref::silu_in_place(&mut slot);
+    slot[0]
 }
 
 /// Row-major `[out, in]` matrix-vector product, matching `nn.Linear.weight`.
@@ -224,17 +226,31 @@ impl RopeTable {
         let mut sin = vec![0.0_f32; FRAME_POSITIONS * config.head_dim];
         for position in 0..FRAME_POSITIONS {
             for i in 0..half {
-                let freq = 1.0
-                    / config
-                        .rope_theta
-                        .powf(2.0 * i as f32 / config.head_dim as f32);
-                let angle = position as f32 * freq;
+                let angle = if ftts_kernels::f32ref::canonical_norm_requested() {
+                    let inv_freq = ftts_kernels::f32ref::canonical_rope_inv_freq(
+                        config.rope_theta,
+                        i,
+                        config.head_dim,
+                    );
+                    position as f32 * inv_freq
+                } else {
+                    let freq = 1.0
+                        / config
+                            .rope_theta
+                            .powf(2.0 * i as f32 / config.head_dim as f32);
+                    position as f32 * freq
+                };
                 let base = position * config.head_dim;
                 // `cat(freqs, freqs)`: the second half repeats the first.
-                cos[base + i] = angle.cos();
-                cos[base + i + half] = angle.cos();
-                sin[base + i] = angle.sin();
-                sin[base + i + half] = angle.sin();
+                let (s_v, c_v) = if ftts_kernels::f32ref::canonical_norm_requested() {
+                    ftts_kernels::f32ref::canonical_sin_cos_f32(angle)
+                } else {
+                    (angle.sin(), angle.cos())
+                };
+                cos[base + i] = c_v;
+                cos[base + i + half] = c_v;
+                sin[base + i] = s_v;
+                sin[base + i + half] = s_v;
             }
         }
         Self {
@@ -2556,9 +2572,8 @@ mod tests {
         for tier in ftts_kernels::int8::Int8Tier::available() {
             let mode = QuantLinearMode::W8A8(KernelPlanV0::pinned(tier));
 
-            let frame_input = |frame: u32| {
-                weights_of(FRAME_POSITIONS * config.hidden_size, 9_000 + frame % 7)
-            };
+            let frame_input =
+                |frame: u32| weights_of(FRAME_POSITIONS * config.hidden_size, 9_000 + frame % 7);
             let run_sequential = |frame: u32| -> std::time::Duration {
                 let seeded = frame_input(frame);
                 let start = std::time::Instant::now();
@@ -2567,9 +2582,8 @@ mod tests {
                     let (cos, sin) = rope.row(position);
                     let row =
                         &seeded[position * config.hidden_size..(position + 1) * config.hidden_size];
-                    let _ = layer_step_q8(
-                        &config, &borrowed, &quant, cos, sin, row, &mut state, mode,
-                    );
+                    let _ =
+                        layer_step_q8(&config, &borrowed, &quant, cos, sin, row, &mut state, mode);
                 }
                 start.elapsed()
             };
@@ -2604,7 +2618,6 @@ mod tests {
         }
     }
 
-
     /// Depth-axis profiling: median body-step cost for each of the sixteen positions across
     /// `[MicrodecoderConfig::default]` frames, team BYPASSED deliberately so the rows isolate
     /// per-position scalar-core cost from worker-fanout effects. Under the OQ-5 map,
@@ -2622,7 +2635,7 @@ mod tests {
         let quant = MicroLayerQuant::quantize(&config, &borrowed);
         let mode = QuantLinearMode::W8A8(KernelPlanV0::pinned(
             ftts_kernels::int8::Int8Tier::available()
-            .into_iter()
+                .into_iter()
                 .last()
                 .expect("at least the scalar tier is always available"),
         ));

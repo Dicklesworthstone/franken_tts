@@ -908,44 +908,6 @@ fn ceil_log2(value: usize) -> usize {
 ///
 /// Infinity/saturation semantics follow from the rescale: inputs beyond ~104
 /// collapse to 0 or +inf exactly as hardware narrowing does.
-#[must_use]
-pub fn canonical_exp_f32(x: f32) -> f32 {
-    if x.is_nan() {
-        return f32::NAN;
-    }
-    if x == f32::NEG_INFINITY {
-        return 0.0;
-    }
-    if x == f32::INFINITY {
-        return f32::INFINITY;
-    }
-    let wide = f64::from(x);
-    const LOG2E: f64 = core::f64::consts::LOG2_E;
-    // Split ln2 so k * LN2_HI cancels without stealing low bits of x.
-    const LN2_HI: f64 = 6.931_471_803_691_238e-1;
-    const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
-    let kf = (wide * LOG2E).round();
-    // Clamp keeps the exponent construction far inside both i32 index and
-    // u64 bit-shift safety; |x| beyond ±700 collapses via the scale anyway.
-    let k = kf.clamp(-1100.0, 1100.0) as i64;
-    let kf64 = f64::from(k as i32);
-    let r = (wide - kf64 * LN2_HI) - kf64 * LN2_LO;
-    // Horner over the n=8 Taylor coefficients (1/8! down to 1/2!), as
-    // sequential bindings. Truncation on |r| <= ln2/2 is ~2e-10 relative,
-    // dominated by the single final narrowing to f32.
-    let mut acc = 1.0 / 40_320.0;
-    acc = r * acc + 1.0 / 5_040.0;
-    acc = r * acc + 1.0 / 720.0;
-    acc = r * acc + 1.0 / 120.0;
-    acc = r * acc + 1.0 / 24.0;
-    acc = r * acc + 1.0 / 6.0;
-    acc = r * acc + 0.5;
-    acc = r * acc + 1.0;
-    let poly = r * acc + 1.0;
-    let value = scale_exact(poly, k);
-    value
-}
-
 /// The f64-domain form of [`canonical_exp_f32`] for consumers that must stay
 /// in double precision (the sampler's probability paths). Same op sequence,
 /// same no-libm contract; host-parity is intentionally not claimed at f64
@@ -1065,6 +1027,7 @@ pub fn canonical_sin_cos_f32(x: f32) -> (f32, f32) {
     }
     #[allow(clippy::approx_constant)]
     const TWO_OVER_PI: f64 = core::f64::consts::FRAC_2_PI;
+    #[allow(clippy::approx_constant)] // pi/2 split pair; not the standalone constant
     const PIO2_HI: f64 = 1.570_796_326_794_896_6;
     const PIO2_LO: f64 = 6.123_233_995_736_766e-17;
 

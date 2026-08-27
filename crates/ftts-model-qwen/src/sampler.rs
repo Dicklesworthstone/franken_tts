@@ -300,12 +300,25 @@ fn apply_top_p(scores: &mut [f32], top_p: f64) {
     };
     let denominator: f64 = ranked
         .iter()
-        .map(|(_, score)| f64::from(*score - max_score).exp())
+        .map(|(_, score)| {
+            let shifted = f64::from(*score - max_score);
+            if ftts_kernels::f32ref::canonical_norm_requested() {
+                ftts_kernels::f32ref::canonical_exp_wide(shifted)
+            } else {
+                shifted.exp()
+            }
+        })
         .sum();
 
     let mut cumulative = 0.0;
     for (rank, (token, score)) in ranked.into_iter().enumerate() {
-        let probability = f64::from(score - max_score).exp() / denominator;
+        let shifted = f64::from(score - max_score);
+        let numerator = if ftts_kernels::f32ref::canonical_norm_requested() {
+            ftts_kernels::f32ref::canonical_exp_wide(shifted)
+        } else {
+            shifted.exp()
+        };
+        let probability = numerator / denominator;
         if rank > 0 && cumulative >= top_p {
             scores[token] = f32::NEG_INFINITY;
         }
@@ -334,7 +347,12 @@ fn softmax_finite(scores: &[f32]) -> Result<Vec<(usize, f64)>, SamplerError> {
     let mut denominator = 0.0_f64;
     for (token, score) in scores.iter().enumerate() {
         if score.is_finite() {
-            let value = f64::from(*score - max_score).exp();
+            let shifted = f64::from(*score - max_score);
+            let value = if ftts_kernels::f32ref::canonical_norm_requested() {
+                ftts_kernels::f32ref::canonical_exp_wide(shifted)
+            } else {
+                shifted.exp()
+            };
             denominator += value;
             unnormalized.push((token, value));
         }

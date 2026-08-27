@@ -1194,6 +1194,13 @@ impl FrameGenerator for QwenGenerator<'_> {
             .map(Vec::as_slice);
         let mut next_input = vec![0.0_f32; self.talker_config.hidden_size];
         talker::form_frame_input(&rows, text_row, &self.header.tts_pad, &mut next_input);
+        if taps_active() {
+            tap_emit(&format!(
+                "ftts-tapI fi={} h={:016x}",
+                utterance.frames_emitted,
+                tap_hash_f32(&next_input),
+            ));
+        }
 
         let (cos, sin) = talker::mrope_rows(
             &[utterance.next_position as i64],
