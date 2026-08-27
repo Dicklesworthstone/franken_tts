@@ -1754,27 +1754,32 @@ impl TalkerCheckpoint {
             .collect()
     }
 
-    /// One text id through the cold embedding and the biased SiLU projection.
+    /// Projects one id through the SAME single-source implementation the batched
+    /// text path uses ([`crate::talker::project_text_rows`]) — historically this
+    /// was a private inline copy whose iterator-sum reduction and libm SiLU
+    /// diverged ULP-wise from that path per target, poisoning every
+    /// header/prompt row while the batched path tested clean (frankentts-uuac /
+    /// DISC-006 seam-B). Unifying removes the fork outright.
+    ///
+    /// Panics only where the previous version did: the id must be present in
+    /// the gathered set.
     fn project_text_id(&self, table: &TextEmbeddingTable, id: u32) -> HiddenState {
         let embed = table
             .row(id)
             .expect("projected ids must be in the gathered set (utterance_text_ids covers them)");
-
-        let mut inner = vec![0.0f32; TEXT_EMBED_WIDTH];
-        for (row, slot) in inner.iter_mut().enumerate() {
-            let weights = &self.fc1_weight[row * TEXT_EMBED_WIDTH..(row + 1) * TEXT_EMBED_WIDTH];
-            let sum: f32 = weights.iter().zip(embed).map(|(w, x)| w * x).sum();
-            let biased = sum + self.fc1_bias[row];
-            // SiLU, matching the pinned `hidden_act`.
-            *slot = biased / (1.0 + (-biased).exp());
-        }
-
         let mut out = vec![0.0f32; TALKER_HIDDEN];
-        for (row, slot) in out.iter_mut().enumerate() {
-            let weights = &self.fc2_weight[row * TEXT_EMBED_WIDTH..(row + 1) * TEXT_EMBED_WIDTH];
-            let sum: f32 = weights.iter().zip(&inner).map(|(w, x)| w * x).sum();
-            *slot = sum + self.fc2_bias[row];
-        }
+        crate::talker::project_text_rows(
+            embed,
+            1,
+            TEXT_EMBED_WIDTH,
+            self.fc1_bias.len(),
+            TALKER_HIDDEN,
+            &self.fc1_weight,
+            &self.fc1_bias,
+            &self.fc2_weight,
+            &self.fc2_bias,
+            &mut out,
+        );
         out
     }
 
