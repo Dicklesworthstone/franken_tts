@@ -430,6 +430,12 @@ pub fn forward_codec_transformer_step(
         f32ref::F32RmsNormArithmetic::Lanes4ReciprocalSqrt,
         &mut normed,
     );
+    if crate::taps::taps_active() {
+        crate::taps::tap_emit(&format!(
+            "ftts-tapT a-norm={:016x}",
+            crate::taps::tap_hash_f32(&normed),
+        ));
+    }
     let mut query = vec![0.0f32; attention];
     let mut key = vec![0.0f32; attention];
     let mut value = vec![0.0f32; attention];
@@ -500,7 +506,11 @@ pub fn forward_codec_transformer_step(
             &mut scores,
             1,
             cache.len(),
-            f32ref::F32SoftmaxArithmetic::Divide,
+            if ftts_kernels::f32ref::canonical_norm_requested() {
+                f32ref::F32SoftmaxArithmetic::Canonical
+            } else {
+                f32ref::F32SoftmaxArithmetic::Divide
+            },
         );
         let target = &mut context[head_offset..head_offset + config.attention_head_dim];
         target.fill(0.0);
@@ -559,7 +569,15 @@ pub fn forward_codec_transformer_step(
         intermediate,
         &mut up,
     );
-    f32ref::silu_mul_in_place(&mut gate, &up);
+    f32ref::silu_mul_in_place_with_arithmetic(
+        &mut gate,
+        &up,
+        if ftts_kernels::f32ref::canonical_norm_requested() {
+            f32ref::F32SiluArithmetic::Canonical
+        } else {
+            f32ref::F32SiluArithmetic::Divide
+        },
+    );
     let mut mlp_output = vec![0.0f32; hidden];
     dense_linear(
         DenseClass::Transformer,
@@ -2126,6 +2144,12 @@ impl CodecStreamingState {
         assert!(frames > 0, "streaming codec packets must contain a frame");
         let mut hidden = vec![0.0f32; frames * self.config.codec_latent_dim];
         quantizer.decode(self.config, codes, frames, &mut hidden)?;
+        let tap_block = |tag: &str, buf: &[f32]| {
+            if taps_active() {
+                tap_emit(&format!("ftts-tapC b={tag} h={:016x}", tap_hash_f32(buf),));
+            }
+        };
+        tap_block("quant", &hidden);
 
         let mut next = Vec::new();
         self.pre_conv.push(
@@ -2137,6 +2161,7 @@ impl CodecStreamingState {
             &mut next,
         );
         hidden = next;
+        tap_block("preconv", &hidden);
         next = vec![0.0f32; frames * self.config.transformer_latent_dim];
         forward_codec_pre_transformer(
             self.config,
@@ -2149,14 +2174,19 @@ impl CodecStreamingState {
         );
         self.frames_seen += frames;
         hidden = next;
+        tap_block("pretrans", &hidden);
         next = Vec::new();
 
         let mut current_frames = frames;
-        for (stage_state, stage_weights) in
-            self.latent_upsample.iter_mut().zip(weights.latent_upsample)
+        for (stage_index, (stage_state, stage_weights)) in self
+            .latent_upsample
+            .iter_mut()
+            .zip(weights.latent_upsample)
+            .enumerate()
         {
             current_frames = stage_state.push(&hidden, current_frames, stage_weights, &mut next);
             core::mem::swap(&mut hidden, &mut next);
+            tap_block(&format!("up{stage_index}"), &hidden);
         }
         self.decoder_input.push(
             &hidden,
@@ -2167,13 +2197,18 @@ impl CodecStreamingState {
             &mut next,
         );
         core::mem::swap(&mut hidden, &mut next);
+        tap_block("decin", &hidden);
 
         let mut waveform_frames = current_frames;
-        for (block_state, block_weights) in
-            self.decoder_blocks.iter_mut().zip(weights.decoder_blocks)
+        for (block_index, (block_state, block_weights)) in self
+            .decoder_blocks
+            .iter_mut()
+            .zip(weights.decoder_blocks)
+            .enumerate()
         {
             waveform_frames = block_state.push(&hidden, waveform_frames, block_weights, &mut next);
             core::mem::swap(&mut hidden, &mut next);
+            tap_block(&format!("dec{block_index}"), &hidden);
         }
         snake_beta_in_place(
             &mut hidden,
@@ -2181,6 +2216,7 @@ impl CodecStreamingState {
             weights.final_alpha_log,
             weights.final_beta_log,
         );
+        tap_block("snake", &hidden);
         self.final_conv.push(
             &hidden,
             waveform_frames,
@@ -2194,6 +2230,7 @@ impl CodecStreamingState {
             waveform_frames,
             "streaming codec output must be mono"
         );
+        tap_block("fin", output);
         for sample in output {
             *sample = sample.clamp(-1.0, 1.0);
         }
