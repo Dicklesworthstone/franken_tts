@@ -317,7 +317,12 @@ try {
         // +infinity, which disagrees with Rust's f32::round on negative halves
         // and manufactured phantom 1-LSB diffs at exact .5 boundaries.
         const ours = pcm.slice(0, n).map((v) => {
-          const scaled = v * 32767;
+          // Math.fround replicates the CLI's f32 arithmetic: sample_to_i16
+          // computes v * 32767.0 in f32 (the product rounds to f32 BEFORE the
+          // integer rounding), so the f64 product here must be f32-rounded
+          // first or exact-half products disagree by 1 LSB
+          // (ftts_core::audio::sample_to_i16; frankentts-uuac).
+          const scaled = Math.fround(v * 32767);
           const rounded = Math.sign(scaled) * Math.round(Math.abs(scaled));
           return Math.max(-32768, Math.min(32767, rounded));
         });
