@@ -844,7 +844,9 @@ pub fn snake_beta_in_place(values: &mut [f32], frames: usize, alpha_log: &[f32],
     let channels = alpha_log.len();
     assert_eq!(beta_log.len(), channels, "SnakeBeta beta width");
     assert_eq!(values.len(), frames * channels, "SnakeBeta values shape");
-    if fast_snake_armed() {
+    // Canonical parity mode runs the gate-aware scalar walk on every engine;
+    // the SLEEF fast path is a default-route-only lever.
+    if !ftts_kernels::f32ref::canonical_norm_requested() && fast_snake_armed() {
         snake_beta_fast(values, frames, alpha_log, beta_log);
         return;
     }
@@ -893,10 +895,27 @@ fn fast_snake_armed() -> bool {
 fn snake_beta_fast(values: &mut [f32], frames: usize, alpha_log: &[f32], beta_log: &[f32]) {
     let channels = alpha_log.len();
     // Per-channel constants once, instead of once per (channel, frame) pair.
-    let alpha: Vec<f32> = alpha_log.iter().map(|log| log.exp()).collect();
+    let canonical = ftts_kernels::f32ref::canonical_norm_requested();
+    let alpha: Vec<f32> = alpha_log
+        .iter()
+        .map(|log| {
+            if canonical {
+                ftts_kernels::f32ref::canonical_exp_f32(*log)
+            } else {
+                log.exp()
+            }
+        })
+        .collect();
     let scale: Vec<f32> = beta_log
         .iter()
-        .map(|log| (log.exp() + 1e-9).recip())
+        .map(|log| {
+            let beta = if canonical {
+                ftts_kernels::f32ref::canonical_exp_f32(*log)
+            } else {
+                log.exp()
+            };
+            (beta + 1e-9).recip()
+        })
         .collect();
     for frame in 0..frames {
         let row = &mut values[frame * channels..(frame + 1) * channels];
