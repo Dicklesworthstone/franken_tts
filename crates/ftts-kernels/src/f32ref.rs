@@ -1023,43 +1023,52 @@ pub fn canonical_sin_cos_f32(x: f32) -> (f32, f32) {
     if !x.is_finite() {
         return (f32::NAN, f32::NAN);
     }
-    #[allow(clippy::approx_constant)] // intentional: needs the f64 pi/2 split pair
-    const TWO_OVER_PI: f64 = core::f64::consts::FRAC_2_PI;
-    // Two-word pi/2; the split constants sum to pi/2 to f64 precision.
     #[allow(clippy::approx_constant)]
+    const TWO_OVER_PI: f64 = core::f64::consts::FRAC_2_PI;
     const PIO2_HI: f64 = 1.570_796_326_794_896_6;
     const PIO2_LO: f64 = 6.123_233_995_736_766e-17;
+
     let wide = f64::from(x);
-    let kf = (wide * TWO_OVER_PI).round();
-    let quad = ((kf as i64).rem_euclid(4)) as u8;
-    let r = wide - kf * PIO2_HI - kf * PIO2_LO;
-    // Minimax-grade odd/even polynomials on [-pi/4, pi/4] (fdlibm-class
-    // coefficients), evaluated with plain mul/add only.
-    let r2 = r * r;
-    let s = r
-        + r * r2 * (-1.666_666_666_666_663e-1)
-        + r * r2 * r2 * (8.333_333_333_322_49e-3)
-        + r * r2 * r2 * r2 * (-1.984_126_982_985_795e-4)
-        + r * r2 * r2 * r2 * r2 * (2.755_731_370_707_007e-6)
-        + r * r2 * r2 * r2 * r2 * r2 * (-2.505_076_025_340_686e-8);
-    let c = 1.0
-        + r2 * (-4.999_999_999_999_999e-1)
-        + r2 * r2 * (4.166_666_666_666_659e-2)
-        + r2 * r2 * r2 * (-1.388_888_888_887_306e-3)
-        + r2 * r2 * r2 * r2 * (2.480_158_728_323_086e-5)
-        + r2 * r2 * r2 * r2 * r2 * (-2.755_731_112_559_069e-7);
-    let (sin_value, cos_value) = match quad {
-        0 => (s, c),
-        1 => (c, -s),
-        2 => (-s, -c),
-        _ => (-c, s),
+    let mag = wide.abs();
+    let quarter = (mag * TWO_OVER_PI).floor();
+    let quarter_u = (quarter as i64).rem_euclid(4);
+    let red = mag - quarter * PIO2_HI - quarter * PIO2_LO;
+
+    // Plain Taylor on [0, pi/4]: truncation ~5e-9 relative, one order below
+    // the final f32 narrowing. Pure mul/add only.
+    let (sin_a, cos_a) = if red <= core::f64::consts::FRAC_PI_4 {
+        let r2 = red * red;
+        let s = red
+            * (1.0
+                + r2 * (-1.0 / 6.0
+                    + r2 * (1.0 / 120.0 + r2 * (-1.0 / 5_040.0 + r2 * (1.0 / 362_880.0)))));
+        let c = 1.0 + r2 * (-0.5 + r2 * (1.0 / 24.0 + r2 * (-1.0 / 720.0 + r2 * (1.0 / 40_320.0))));
+        (s, c)
+    } else {
+        let g = core::f64::consts::FRAC_PI_2 - red;
+        let g2 = g * g;
+        let c = g
+            * (1.0
+                + g2 * (-1.0 / 6.0
+                    + g2 * (1.0 / 120.0 + g2 * (-1.0 / 5_040.0 + g2 * (1.0 / 362_880.0)))));
+        let s = 1.0 + g2 * (-0.5 + g2 * (1.0 / 24.0 + g2 * (-1.0 / 720.0 + g2 * (1.0 / 40_320.0))));
+        (s, c)
     };
-    // Normalize signed zero: the cross-target symmetry contract compares bits,
-    // and a +0/-0 split between engines is semantically meaningless here.
-    let sin_f = s as f32;
-    let cos_f = c as f32;
+
+    // Rotate by quadrant of the absolute argument.
+    let (sin_abs, cos_abs) = match quarter_u {
+        0 => (sin_a, cos_a),
+        1 => (cos_a, -sin_a),
+        2 => (-sin_a, -cos_a),
+        _ => (-cos_a, sin_a),
+    };
+    let mut sin_signed = sin_abs as f32;
+    if wide < 0.0 {
+        sin_signed = -sin_signed;
+    }
+    let cos_f = cos_abs as f32;
     (
-        if sin_f == 0.0 { 0.0 } else { sin_f },
+        if sin_signed == 0.0 { 0.0 } else { sin_signed },
         if cos_f == 0.0 { 0.0 } else { cos_f },
     )
 }
