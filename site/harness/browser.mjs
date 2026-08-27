@@ -334,6 +334,17 @@ try {
           refSq += theirs[i] * theirs[i];
         }
         const snr = 10 * Math.log10((refSq || 1) / (sumSq || 1e-20));
+        // Sub-LSB diagnostics: for every differing sample, report the raw f32
+        // delta (in LSB units) BEFORE quantization — distinguishes i16
+        // tie-straddles (delta ~ 0.5 LSB) from genuine engine ULP noise
+        // (delta ~ 1e-4 LSB) (frankentts-uuac).
+        const rawDiffs = [];
+        for (let i = 0; i < n; i += 1) {
+          if (ours[i] !== theirs[i]) {
+            rawDiffs.push({ i, f32: pcm[i], deltaLsb: Math.abs(pcm[i] * 32767 - theirs[i]) });
+          }
+        }
+        console.log(`      raw f32 deltas at differing samples: ${JSON.stringify(rawDiffs.slice(0, 8))}`);
         console.log(`\n--- CLI PARITY (${CONFORMANCE_TEXT.slice(0, 32)}…, voice matt, seed 0) ---`);
         console.log(`      lengths: browser ${pcm.length}, cli ${golden.length}, compared ${n}`);
         console.log(`      identical samples: ${identical}/${n} (${((100 * identical) / n).toFixed(2)}%)`);

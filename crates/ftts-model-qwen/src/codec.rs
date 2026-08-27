@@ -1626,13 +1626,10 @@ pub struct CodecDecoderWeights<'a> {
 #[must_use]
 pub fn gelu(x: f32) -> f32 {
     if ftts_kernels::f32ref::canonical_norm_requested() {
-        // Canonical mode: evaluate in f64 and narrow once. std erf resolves to
-        // the system libm on macOS-native but a pure-Rust implementation on
-        // wasm32, so the f32 form diverges ULP-wise per target; the f64
-        // detour pushes that noise below f32 visibility (frankentts-uuac).
-        let wide = f64::from(x);
-        let g = 0.5 * wide * (1.0 + (wide * core::f64::consts::FRAC_1_SQRT_2).erf());
-        return g as f32;
+        // Canonical mode: the pure-Rust libm erf, same implementation on every
+        // target (std erf = system libm on macOS vs pure-Rust on wasm — the
+        // per-target divergence source; frankentts-uuac).
+        return ftts_kernels::f32ref::canonical_gelu_f32(x);
     }
     0.5 * x * (1.0 + (x * core::f32::consts::FRAC_1_SQRT_2).erf())
 }
@@ -1886,7 +1883,14 @@ impl CodecConvNextStream {
             weights.depthwise_bias,
             output,
         );
+        let tap_sub = |tag: &str, buf: &[f32]| {
+            if taps_active() {
+                tap_emit(&format!("ftts-tapD b={tag} h={:016x}", tap_hash_f32(buf),));
+            }
+        };
+        tap_sub("dw", output);
         layer_norm_in_place(output, frames, weights.norm_weight, weights.norm_bias, 1e-6);
+        tap_sub("ln", output);
         let mut expanded = vec![0.0f32; frames * 4 * channels];
         dense_linear(
             DenseClass::ConvNext,
@@ -1898,9 +1902,11 @@ impl CodecConvNextStream {
             4 * channels,
             &mut expanded,
         );
+        tap_sub("pw1", &expanded);
         for value in &mut expanded {
             *value = gelu(*value);
         }
+        tap_sub("gelu", &expanded);
         let mut residual = vec![0.0f32; input.len()];
         dense_linear(
             DenseClass::ConvNext,
@@ -1912,6 +1918,7 @@ impl CodecConvNextStream {
             channels,
             &mut residual,
         );
+        tap_sub("pw2", &residual);
         output.clear();
         output.reserve(residual.len());
         let gamma_add = ftts_kernels::f32ref::canonical_norm_requested();
@@ -1929,6 +1936,7 @@ impl CodecConvNextStream {
             };
             output.push(value);
         }
+        tap_sub("gamma", output);
     }
 }
 

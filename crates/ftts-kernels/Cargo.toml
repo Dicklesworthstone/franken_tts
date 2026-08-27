@@ -23,5 +23,10 @@ accelerate-sgemm = []
 neon-dotprod = []
 
 [dependencies]
+# Pure-Rust libm: the canonical-mode transcendentals (erf for the codec ConvNeXt
+# GELU) need the SAME implementation on every target — std erf binds the system
+# libm on macOS-native but a pure-Rust port on wasm32, and the two disagree by
+# f32-visible ulps (frankentts-uuac / DISC-006 seam-B).
+libm = "0.2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

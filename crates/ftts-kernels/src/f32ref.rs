@@ -953,6 +953,18 @@ pub fn canonical_exp_f32(x: f32) -> f32 {
     canonical_exp_wide(f64::from(x)) as f32
 }
 
+/// Canonical-mode GELU (frankentts-uuac): the erf-based form evaluated through
+/// the pure-Rust `libm` crate so every target executes the same implementation
+/// — std's f32::erf binds the system libm on macOS-native but a pure-Rust port
+/// on wasm32, and the two disagree at f32-visible ulps. Computed in f64,
+/// narrowed once. Default route keeps std erf (bits untouched).
+#[must_use]
+pub fn canonical_gelu_f32(x: f32) -> f32 {
+    let wide = f64::from(x);
+    let g = 0.5 * wide * (1.0 + libm::erf(wide * core::f64::consts::FRAC_1_SQRT_2));
+    g as f32
+}
+
 /// Multiplies by 2^k exactly, covering subnormal-to-overflow k range via a
 /// bounded two-step so no libm scalbnf appears anywhere.
 fn scale_exact(value: f64, k: i64) -> f64 {
