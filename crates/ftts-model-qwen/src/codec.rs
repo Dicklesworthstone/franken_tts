@@ -1914,8 +1914,20 @@ impl CodecConvNextStream {
         );
         output.clear();
         output.reserve(residual.len());
+        let gamma_add = ftts_kernels::f32ref::canonical_norm_requested();
         for index in 0..residual.len() {
-            output.push(input[index] + weights.gamma[index % channels] * residual[index]);
+            let value = if gamma_add {
+                // f64 accumulate, narrow once: the native f32 form contracts
+                // (fmadd) while wasm double-rounds, and this LayerScale
+                // residual is where that latitude straddled an i16 rounding
+                // boundary (frankentts-uuac — the last 2 golden samples).
+                (f64::from(input[index])
+                    + f64::from(weights.gamma[index % channels]) * f64::from(residual[index]))
+                    as f32
+            } else {
+                input[index] + weights.gamma[index % channels] * residual[index]
+            };
+            output.push(value);
         }
     }
 }
