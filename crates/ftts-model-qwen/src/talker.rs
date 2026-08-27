@@ -1090,9 +1090,7 @@ pub fn project_text_rows(
             crate::taps::tap_hash_f32(&activated),
         ));
     }
-    for value in &mut activated {
-        *value = *value / (1.0 + (-*value).exp());
-    }
+    f32ref::silu_in_place(&mut activated);
     if crate::taps::taps_active() {
         crate::taps::tap_emit(&format!(
             "ftts-tapX silu={:016x}",
