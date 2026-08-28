@@ -1304,7 +1304,7 @@ struct LabView: View {
                 .disabled(
                     !model.canSynthesizeFromCommand
                 )
-                if model.isSynthesizing || model.forge.phase.isActive {
+                if model.isSynthesizing {
                     GalvanicVoiceForge(
                         telemetry: model.forge,
                         elapsed: model.synthesisSeconds,
