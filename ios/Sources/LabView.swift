@@ -53,7 +53,7 @@ final class LabModel {
     var enrollmentSaved = false
 
     var text =
-        "The rainbow is a division of white light into many beautiful colors. Now, spoken entirely on this phone."
+        "The rainbow is a division of white light into many beautiful colors. Now, spoken entirely on this device."
     var seed: UInt64 = 0
 
     var isSynthesizing = false
@@ -459,38 +459,53 @@ struct LabView: View {
         GeometryReader { geometry in
             ZStack {
                 LaboratoryBackground()
-                ScrollView {
-                    if geometry.size.width >= 860 {
-                        HStack(alignment: .top, spacing: 22) {
-                            VStack(alignment: .leading, spacing: 16) {
-                                header
-                                modelStatusButton
-                                compactVoiceSelector(vertical: true)
-                                footer
-                            }
-                            .frame(width: min(320, geometry.size.width * 0.34))
-                            .frame(maxHeight: .infinity, alignment: .top)
+                if usesDashboardLayout, geometry.size.width >= 680 {
+                    HStack(alignment: .top, spacing: 18) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            header
+                            modelStatusButton
+                            compactVoiceSelector(vertical: true)
+                            Spacer(minLength: 4)
+                            footer
+                        }
+                        .frame(width: min(310, geometry.size.width * 0.34))
+                        .frame(maxHeight: .infinity, alignment: .top)
 
-                            utteranceCard
+                        ScrollView(.vertical) {
+                            utteranceCard(compact: true)
                                 .frame(maxWidth: 820)
                         }
-                        .frame(maxWidth: 1180, alignment: .center)
-                    } else {
+                        .scrollIndicators(.hidden)
+                    }
+                    .frame(maxWidth: 1180, maxHeight: .infinity, alignment: .top)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 14)
+                } else {
+                    ScrollView {
                         VStack(alignment: .leading, spacing: 18) {
                             header
                             modelStatusButton
                             compactVoiceSelector(vertical: false)
-                            utteranceCard
+                            utteranceCard(compact: false)
                             footer
                         }
                         .frame(maxWidth: 760)
                     }
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 16)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, geometry.size.width >= 860 ? 28 : 14)
-                .padding(.vertical, 16)
             }
+            .catalystReadableType()
         }
+    }
+
+    private var usesDashboardLayout: Bool {
+#if targetEnvironment(macCatalyst)
+        true
+#else
+        UIDevice.current.userInterfaceIdiom == .pad
+#endif
     }
 
     private var keyboardAwareView: some View {
@@ -726,10 +741,10 @@ struct LabView: View {
                 .frame(width: 52, height: 52)
             VStack(alignment: .leading, spacing: 2) {
                 Text("FrankenTTS")
-                    .font(.system(size: 22, weight: .black))
+                    .font(.system(size: Lab.typeSize(22), weight: .black))
                     .foregroundStyle(Lab.textPrimary)
                 Text("VOICE_ALIVE")
-                    .font(.system(size: 8, weight: .black, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(8), weight: .black, design: .monospaced))
                     .kerning(2)
                     .foregroundStyle(Lab.emerald)
             }
@@ -875,13 +890,13 @@ struct LabView: View {
                             ? "Part of the model is already here; completing the download fetches only what is missing and re-verifies the rest."
                             : "First use downloads static model files (≈2.0 GB) from the developer's GitHub release into this app's private storage. No text, recording, voice data, or generated media is sent; all AI runs locally. The files are verified against pinned digests, resumable, and kept until you clear them."
                     )
-                    .font(.system(size: 14))
+                    .font(.system(size: Lab.typeSize(14)))
                     .foregroundStyle(Lab.textSecondary)
                     if model.lowMemoryDevice {
                         Text(
-                            "This device reports under 6 GB of memory; the engine may not fit. A recent Pro-class iPhone is recommended."
+                            "This device reports under 6 GB of memory; the engine may not fit. A recent device with at least 6 GB is recommended."
                         )
-                        .font(.system(size: 13))
+                        .font(.system(size: Lab.typeSize(13)))
                         .foregroundStyle(Lab.danger)
                     }
                     Button(
@@ -904,19 +919,19 @@ struct LabView: View {
                     Text(
                         "\(asset)  ·  \(Self.gigabytes(done)) / \(Self.gigabytes(total)) GB  ·  \(eta)"
                     )
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(12), design: .monospaced))
                     .foregroundStyle(Lab.textSecondary)
                 case .verifying(let asset):
                     ProgressView().tint(Lab.emerald)
                     Text("verifying \(asset)…")
-                        .font(.system(size: 12, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(12), design: .monospaced))
                         .foregroundStyle(Lab.textSecondary)
                 case .ready:
                     VStack(alignment: .leading, spacing: 9) {
                         HStack {
                             Image(systemName: "checkmark.seal.fill").foregroundStyle(Lab.emerald)
                             Text("Model on device · \(Self.gigabytes(model.store.cachedBytes)) GB")
-                                .font(.system(size: 13, design: .monospaced))
+                                .font(.system(size: Lab.typeSize(13), design: .monospaced))
                                 .foregroundStyle(Lab.textPrimary)
                             Spacer()
                             Button("Clear") { model.clearModel() }
@@ -938,13 +953,13 @@ struct LabView: View {
                                        ? "Engine warm · ready to synthesize"
                                        : "Engine will warm automatically")
                             )
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.system(size: Lab.typeSize(11), design: .monospaced))
                             .foregroundStyle(model.isEngineWarm
                                              ? Lab.emerald : Lab.textSecondary)
                         }
                     }
                 case .failed(let message):
-                    Text(message).font(.system(size: 13)).foregroundStyle(Lab.danger)
+                    Text(message).font(.system(size: Lab.typeSize(13))).foregroundStyle(Lab.danger)
                     Button("Retry") { model.store.startDownload() }
                         .buttonStyle(PrimaryButtonStyle())
                 }
@@ -1002,7 +1017,7 @@ struct LabView: View {
                         Text("Add a voice from a picture")
                         Spacer()
                     }
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: Lab.typeSize(14), weight: .semibold))
                     .foregroundStyle(Lab.emerald)
                     .padding(.vertical, 8)
                     .padding(.horizontal, 10)
@@ -1014,17 +1029,17 @@ struct LabView: View {
                 .accessibilityHint(
                     "Pick a voice card someone sent you; the voice joins your library")
                 Text(
-                    "Cloning runs the speaker encoder on this phone; the recording is discarded once the 4 KB voice vector exists. A voice card someone sends you works the same way: the picture holds their voiceprint, and importing it never touches the internet. Clone or import only voices you have the right to use."
+                    "Cloning runs the speaker encoder on this device; the recording is discarded once the 4 KB voice vector exists. A voice card someone sends you works the same way: the picture holds their voiceprint, and importing it never touches the internet. Clone or import only voices you have the right to use."
                 )
-                .font(.system(size: 12))
+                .font(.system(size: Lab.typeSize(12)))
                 .foregroundStyle(Lab.textSecondary)
             }
         }
     }
 
-    private var utteranceCard: some View {
+    private func utteranceCard(compact: Bool) -> some View {
         LabPanel {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: compact ? 9 : 12) {
                 HStack(spacing: 8) {
                     LabLabel(text: "03 · The Utterance")
                     Spacer()
@@ -1046,7 +1061,7 @@ struct LabView: View {
                 ZStack(alignment: .topLeading) {
                     if model.text.isEmpty {
                         Text("Type or paste what FrankenTTS should say…")
-                            .font(.system(size: 16))
+                            .font(.system(size: Lab.typeSize(16)))
                             .foregroundStyle(Lab.textSecondary.opacity(0.72))
                             .padding(.horizontal, 13)
                             .padding(.vertical, 16)
@@ -1059,7 +1074,7 @@ struct LabView: View {
                     .scrollContentBackground(.hidden)
                     .padding(8)
                     .foregroundStyle(Lab.textPrimary)
-                    .font(.system(size: 16))
+                    .font(.system(size: Lab.typeSize(16)))
                     .lineSpacing(4)
                     .focused($focusedField, equals: .utterance)
                     .reportVoiceForgeTextEntry(.utterance)
@@ -1068,7 +1083,10 @@ struct LabView: View {
                 }
                 // More vertical room makes drag handles and the magnifier
                 // practical on a phone instead of fighting a three-line box.
-                .frame(minHeight: 170, maxHeight: 260)
+                .frame(
+                    minHeight: compact ? 104 : 138,
+                    maxHeight: compact ? 132 : 190
+                )
                 .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10)
@@ -1080,11 +1098,11 @@ struct LabView: View {
                 )
                 HStack {
                     Text("\(model.text.count) / 600")
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(11), design: .monospaced))
                         .foregroundStyle(Lab.textSecondary)
                     Spacer()
                     Text("seed")
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(11), design: .monospaced))
                         .foregroundStyle(Lab.textSecondary)
                     TextField(
                         "0",
@@ -1096,7 +1114,7 @@ struct LabView: View {
                     .keyboardType(.numberPad)
                     .focused($focusedField, equals: .seed)
                     .reportVoiceForgeTextEntry(.seed)
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(12), design: .monospaced))
                     .foregroundStyle(Lab.textPrimary)
                     .frame(width: 74)
                     .padding(.vertical, 5)
@@ -1130,13 +1148,18 @@ struct LabView: View {
                 .disabled(
                     !model.canSynthesizeFromCommand
                 )
-                GalvanicVoiceForge(
-                    telemetry: model.forge,
-                    elapsed: model.synthesisSeconds,
-                    cancel: model.isSynthesizing ? { model.cancelSynthesis() } : nil
-                )
+                if model.isSynthesizing || model.forge.phase.isActive {
+                    GalvanicVoiceForge(
+                        telemetry: model.forge,
+                        elapsed: model.synthesisSeconds,
+                        compact: compact,
+                        cancel: model.isSynthesizing ? { model.cancelSynthesis() } : nil
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
+                }
                 if let audio = model.lastAudio {
-                    WaveformView(samples: audio)
+                    PlaybackSignalView(samples: audio, player: model.player)
+                        .frame(height: compact ? 112 : 148)
                     HStack(spacing: 10) {
                         Button {
                             if model.player?.isPlaying == true {
@@ -1178,7 +1201,7 @@ struct LabView: View {
                             HStack(spacing: 6) {
                                 ProgressView().tint(Lab.emerald).controlSize(.small)
                                 Text("\(Int(model.videoProgress * 100))%")
-                                    .font(.system(size: 11, design: .monospaced))
+                                    .font(.system(size: Lab.typeSize(11), design: .monospaced))
                                     .foregroundStyle(Lab.textSecondary)
                             }
                         } else {
@@ -1195,7 +1218,7 @@ struct LabView: View {
                                         factor, 1 / max(factor, 0.001)
                                     )
                             )
-                                .font(.system(size: 11, design: .monospaced))
+                                .font(.system(size: Lab.typeSize(11), design: .monospaced))
                                 .foregroundStyle(factor >= 1 ? Lab.emerald : Lab.textSecondary)
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.7)
@@ -1222,7 +1245,7 @@ struct LabView: View {
                     }
                 }
                 if let error = model.lastError {
-                    Text(error).font(.system(size: 13)).foregroundStyle(Lab.danger)
+                    Text(error).font(.system(size: Lab.typeSize(13))).foregroundStyle(Lab.danger)
                 }
             }
         }
@@ -1258,7 +1281,7 @@ struct LabView: View {
             )
             .foregroundStyle(Lab.textSecondary)
         }
-        .font(.system(size: 10, design: .monospaced))
+        .font(.system(size: Lab.typeSize(10), design: .monospaced))
         .padding(10)
         .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 9))
         .accessibilityElement(children: .combine)
@@ -1311,12 +1334,12 @@ struct LabView: View {
             .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
             .accessibilityHint("Shows every voice as a shape; similar voices look alike and sit together")
             Text("Runs entirely on this device · frankentts.com")
-                .font(.system(size: 11, design: .monospaced))
+                .font(.system(size: Lab.typeSize(11), design: .monospaced))
                 .foregroundStyle(Lab.textSecondary)
             Text(
                 "If you like this free app, please show your appreciation by trying out my paid skills site at [JeffreysSkills.md](https://jeffreys-skills.md)."
             )
-            .font(.system(size: 10, design: .monospaced))
+            .font(.system(size: Lab.typeSize(10), design: .monospaced))
             .foregroundStyle(Lab.textSecondary.opacity(0.72))
             .tint(Lab.emerald.opacity(0.8))
             .multilineTextAlignment(.center)

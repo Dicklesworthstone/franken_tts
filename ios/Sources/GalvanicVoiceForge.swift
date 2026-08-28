@@ -158,6 +158,7 @@ struct VoiceForgeTelemetry: Sendable, Equatable {
 struct GalvanicVoiceForge: View {
     let telemetry: VoiceForgeTelemetry
     let elapsed: TimeInterval
+    var compact = false
     var cancel: (() -> Void)?
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -171,7 +172,7 @@ struct GalvanicVoiceForge: View {
                         .fill(phaseColor.opacity(0.13))
                         .frame(width: 42, height: 42)
                     Image(systemName: telemetry.phase.systemImage)
-                        .font(.system(size: 17, weight: .bold))
+                        .font(.system(size: Lab.typeSize(17), weight: .bold))
                         .foregroundStyle(phaseColor)
                         .symbolEffect(
                             .pulse,
@@ -198,7 +199,7 @@ struct GalvanicVoiceForge: View {
             }
 
             forgeCanvas
-                .frame(height: 220)
+                .frame(height: compact ? 126 : 190)
 
             HStack(spacing: 10) {
                 ForgeMetric(label: "TOKENS", value: telemetry.preparedTokens.formatted())
@@ -208,12 +209,15 @@ struct GalvanicVoiceForge: View {
                 if let cancel, telemetry.phase.isActive, telemetry.phase != .cancelling {
                     Button(role: .cancel, action: cancel) {
                         Label("Stop", systemImage: "stop.fill")
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                     .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                    .layoutPriority(2)
                 }
             }
         }
-        .padding(18)
+        .padding(compact ? 14 : 18)
         .background {
             panelBackground
                 .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
@@ -363,7 +367,7 @@ struct GalvanicVoiceForge: View {
         for (label, point) in labels {
             context.draw(
                 Text(label)
-                    .font(.system(size: 8, weight: .bold, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(8), weight: .bold, design: .monospaced))
                     .foregroundColor(Lab.textSecondary.opacity(0.7)),
                 at: point
             )
@@ -414,11 +418,11 @@ private struct ForgeMetric: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label)
-                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                .font(.system(size: Lab.typeSize(8), weight: .bold, design: .monospaced))
                 .kerning(1.2)
                 .foregroundStyle(Lab.textSecondary)
             Text(value)
-                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                .font(.system(size: Lab.typeSize(13), weight: .semibold, design: .monospaced))
                 .foregroundStyle(Lab.textPrimary)
                 .contentTransition(.numericText())
         }

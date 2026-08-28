@@ -22,12 +22,12 @@ struct FrankenTTSApp: App {
             LabView()
                 .preferredColorScheme(.dark)
 #if targetEnvironment(macCatalyst)
-                .frame(minWidth: 720, minHeight: 620)
+                .frame(minWidth: 760, minHeight: 640)
 #endif
         }
 #if targetEnvironment(macCatalyst)
         .defaultSize(width: 1180, height: 820)
-        .windowResizability(.contentMinSize)
+        .windowResizability(.automatic)
 #endif
         .commands { VoiceForgeCommands() }
     }
