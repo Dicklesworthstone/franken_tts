@@ -568,9 +568,10 @@ pub unsafe extern "C" fn ftts_synthesize_with_progress(
                     frame_count,
                     sample_count,
                 } => {
+                    let frame_count = u64::try_from(frame_count).unwrap_or(u64::MAX);
                     let current = observer_decoded
-                        .fetch_add(u64::from(frame_count), Ordering::AcqRel)
-                        + u64::from(frame_count);
+                        .fetch_add(frame_count, Ordering::AcqRel)
+                        .saturating_add(frame_count);
                     let mut event =
                         FttsProgressEvent::new(FTTS_PROGRESS_KIND_UNIT, FTTS_PROGRESS_STAGE_CODEC);
                     event.current = current;
@@ -1126,6 +1127,21 @@ mod tests {
         1
     }
 
+    unsafe extern "C" fn record_progress(ctx: *mut c_void, event: *const FttsProgressEvent) -> i32 {
+        // SAFETY: the test passes a live Mutex for the complete synchronous ABI call,
+        // and the event pointer is valid for this callback invocation. The mutex is
+        // required because generation and codec events may arrive from different threads.
+        #[allow(unsafe_code)]
+        let (events, event) = unsafe {
+            (
+                &*ctx.cast::<std::sync::Mutex<Vec<FttsProgressEvent>>>(),
+                *event,
+            )
+        };
+        events.lock().unwrap().push(event);
+        0
+    }
+
     #[test]
     fn progress_event_is_versioned_and_callback_can_cancel() {
         let cancellation = CancellationToken::new();
@@ -1226,8 +1242,28 @@ mod tests {
         }
         let c_dir = CString::new(dir.to_str().unwrap()).unwrap();
         // SAFETY: `c_dir` is a live NUL-terminated CString naming a directory that exists.
-        let engine = unsafe { ftts_engine_open(c_dir.as_ptr()) };
+        let events = std::sync::Mutex::new(Vec::<FttsProgressEvent>::new());
+        let context = (&raw const events).cast_mut().cast();
+        let engine = unsafe {
+            ftts_engine_open_with_progress(c_dir.as_ptr(), Some(record_progress), context)
+        };
         assert!(!engine.is_null(), "open failed: {}", last_error());
+        {
+            let observed = events.lock().unwrap();
+            for stage in [
+                FTTS_PROGRESS_STAGE_MODEL_BUNDLE,
+                FTTS_PROGRESS_STAGE_MODEL_WEIGHTS,
+                FTTS_PROGRESS_STAGE_RUNTIME,
+            ] {
+                assert!(
+                    observed.iter().any(|event| {
+                        event.kind == FTTS_PROGRESS_KIND_STAGE_FINISHED && event.stage == stage
+                    }),
+                    "missing completed load stage {stage}: {observed:?}"
+                );
+            }
+        }
+        events.lock().unwrap().clear();
         let mut speaker = vec![0.0_f32; SPEAKER_WIDTH];
         let matt = CString::new("matt").unwrap();
         // SAFETY: live CString name, and `speaker` holds exactly SPEAKER_WIDTH floats.
@@ -1242,18 +1278,39 @@ mod tests {
         // `speaker` holds SPEAKER_WIDTH floats and its length is passed alongside; `pcm` and `len`
         // are live out-parameters this call writes and the caller frees below.
         let code = unsafe {
-            ftts_synthesize(
+            ftts_synthesize_with_progress(
                 engine,
                 text.as_ptr(),
                 speaker.as_ptr(),
                 SPEAKER_WIDTH,
                 0,
+                Some(record_progress),
+                context,
                 &raw mut pcm,
                 &raw mut len,
             )
         };
         assert_eq!(code, 0, "synthesize failed: {}", last_error());
         assert!(len > 0 && !pcm.is_null());
+        let observed = events.lock().unwrap();
+        assert!(
+            observed.iter().any(|event| {
+                event.kind == FTTS_PROGRESS_KIND_UNIT
+                    && event.stage == FTTS_PROGRESS_STAGE_FRAMES
+                    && event.current > 0
+            }),
+            "missing frame progress: {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| {
+                event.kind == FTTS_PROGRESS_KIND_UNIT
+                    && event.stage == FTTS_PROGRESS_STAGE_CODEC
+                    && event.current > 0
+                    && event.detail > 0
+            }),
+            "missing codec packet progress: {observed:?}"
+        );
+        drop(observed);
         // SAFETY: `pcm`/`len` are exactly the buffer this crate allocated in the call above, freed
         // once; `engine` is the handle from the matching open, closed once.
         unsafe { ftts_pcm_free(pcm, len) };

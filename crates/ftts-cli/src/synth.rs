@@ -1984,6 +1984,10 @@ pub fn synthesize(
                         sink.deliver(packet_pcm, frames)?;
                     }
                     pcm.extend_from_slice(packet_pcm);
+                    observer.on_event(ftts_core::SynthesisEvent::PacketEmitted {
+                        frame_count: frames,
+                        sample_count: packet_pcm.len(),
+                    });
                     first_audio_at.get_or_insert_with(|| synthesis_started.elapsed());
                     if first_audible_at.is_none()
                         && packet_pcm.iter().any(|sample| sample.abs() > AUDIBLE_FLOOR)

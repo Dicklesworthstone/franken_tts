@@ -828,7 +828,7 @@ pub enum SynthesisEvent {
     },
     /// A packet entered the PCM stream.
     PacketEmitted {
-        frame_count: u8,
+        frame_count: usize,
         sample_count: usize,
     },
     /// A health event for the current request.
