@@ -39,6 +39,10 @@ private final class AudioFeedContext: @unchecked Sendable {
     func feed() async throws {
         while let sample = readerOutput.copyNextSampleBuffer() {
             while !audioInput.isReadyForMoreMediaData {
+                guard writer.status == .writing else {
+                    throw writer.error
+                        ?? EngineError.native("video writer stopped while waiting for audio")
+                }
                 try await Task.sleep(for: .milliseconds(4))
             }
             guard audioInput.append(sample) else {
@@ -94,6 +98,9 @@ enum MediaExporter {
         guard let renderer else { throw EngineError.lastFromNative() }
         defer { ftts_video_close(renderer) }
         let frames = ftts_video_frame_count(renderer)
+        guard width > 0, height > 0, fps > 0, frames > 0 else {
+            throw EngineError.native("video renderer returned invalid dimensions or no frames")
+        }
 
         let writer = try AVAssetWriter(outputURL: output, fileType: .mp4)
         let videoInput = AVAssetWriterInput(
@@ -191,6 +198,10 @@ enum MediaExporter {
                         throw EngineError.native("frame \(frame) went missing")
                     }
                     while !videoInput.isReadyForMoreMediaData {
+                        guard writer.status == .writing else {
+                            throw writer.error
+                                ?? EngineError.native("video writer stopped while waiting for frames")
+                        }
                         try await Task.sleep(for: .milliseconds(4))
                     }
                     guard let pool = adaptor.pixelBufferPool else {
@@ -201,8 +212,15 @@ enum MediaExporter {
                     guard let pixelBuffer = slot else {
                         throw EngineError.native("cannot allocate a pixel buffer")
                     }
-                    CVPixelBufferLockBaseAddress(pixelBuffer, [])
-                    if let base = CVPixelBufferGetBaseAddress(pixelBuffer) {
+                    let lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, [])
+                    guard lockStatus == kCVReturnSuccess else {
+                        throw EngineError.native("cannot lock a video pixel buffer")
+                    }
+                    do {
+                        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+                        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                            throw EngineError.native("video pixel buffer has no writable storage")
+                        }
                         let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
                         bgra.withUnsafeBufferPointer { source in
                             if stride == bgraStride {
@@ -217,7 +235,6 @@ enum MediaExporter {
                             }
                         }
                     }
-                    CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
                     let time = CMTime(value: CMTimeValue(frame), timescale: fps)
                     guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
                         throw writer.error

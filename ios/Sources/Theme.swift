@@ -145,6 +145,7 @@ struct PrimaryButtonStyle: ButtonStyle {
             .scaleEffect(configuration.isPressed ? 0.985 : 1)
             .shadow(color: isEnabled ? Lab.emerald.opacity(0.22) : .clear, radius: 12, y: 5)
             .animation(.easeOut(duration: 0.14), value: configuration.isPressed)
+            .hoverEffect(.highlight)
     }
 }
 
@@ -162,6 +163,7 @@ struct GhostButtonStyle: ButtonStyle {
             .background(Color.white.opacity(0.02), in: Capsule())
             .overlay(Capsule().stroke(Color.white.opacity(0.1), lineWidth: 1))
             .opacity(configuration.isPressed ? 0.7 : 1)
+            .hoverEffect(.highlight)
     }
 }
 
