@@ -377,6 +377,15 @@ try {
   if (!KEEP) {
     await browser.close();
     server.close();
+    // The persistent profile above is a full browser profile (~1.7 GB for
+    // Chromium). Nothing removed it, so every run left one in TMPDIR: 54 of
+    // them, 91 GB, by 2026-08-28. Remove it only AFTER the browser closes,
+    // or its still-open files reappear under the directory we just deleted.
+    // KEEP leaves the browser up for debugging, so it keeps the profile too.
+    // A cleanup failure must not mask the run's real result from this finally.
+    await fs.rm(profile, { recursive: true, force: true }).catch((error) => {
+      console.log(`warning: could not remove profile ${profile}: ${error.message}`);
+    });
   }
 }
 
