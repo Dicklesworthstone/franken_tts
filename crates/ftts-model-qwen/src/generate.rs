@@ -28,10 +28,30 @@ use crate::talker::{
 };
 use ftts_artifacts::fttsq::{MappedFttsq, StoredDtype};
 use ftts_kernels::int8::{QuantLinearMode, QuantizedMatrix};
+use std::time::{Duration, Instant};
 
 /// The talker's pinned mRoPE base. The microdecoder and codec each use a different theta; crossing
 /// them is a silent correctness failure, so the constant lives next to its only call sites.
 const MROPE_THETA: f32 = 1.0e6;
+
+/// Permanent, low-overhead attribution for one generator invocation.
+///
+/// These durations are active CPU-stage times, not additive wall time: the codec runs on a
+/// separate thread and is measured by the caller. Keeping the model split here makes a physical
+/// iPhone profile name the stage worth optimizing instead of inheriting a desktop hotspot list.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GenerationTimings {
+    /// Text projection, prompt assembly, and talker prefill.
+    pub prefill: Duration,
+    /// The fifteen dependent residual-code steps for emitted frames.
+    pub microdecoder: Duration,
+    /// Feedback-row gathering and assembly between residual decode and the talker.
+    pub feedback: Duration,
+    /// Single-position talker forwards after each emitted frame.
+    pub talker: Duration,
+    /// Frames that reached the talker feedback step.
+    pub frames: u64,
+}
 
 /// Cross-target seam taps: the machinery lives in [`crate::taps`] so `talker.rs` can tap
 /// inside the prefill layer loop; this module re-exports the public surface the wasm bindings
@@ -554,6 +574,7 @@ pub struct QwenGenerator<'a> {
     /// Shared rather than owned: the engine builds these once during hydration and lends the
     /// same tables to every utterance, which is what lets the artifact they came from be dropped.
     int8: Option<std::sync::Arc<Int8Route>>,
+    timings: GenerationTimings,
 }
 
 impl<'a> QwenGenerator<'a> {
@@ -704,7 +725,14 @@ impl<'a> QwenGenerator<'a> {
             overlay_ids: Vec::new(),
             overlay_rows: Vec::new(),
             int8,
+            timings: GenerationTimings::default(),
         }
+    }
+
+    /// Active model-stage timings for the current or most recently completed utterance.
+    #[must_use]
+    pub const fn timings(&self) -> GenerationTimings {
+        self.timings
     }
 
     /// Talker positions currently cached, exposed for geometry tests.
@@ -934,6 +962,8 @@ impl FrameGenerator for QwenGenerator<'_> {
         prepared: &PreparedText,
         mode: UtteranceStart,
     ) -> Result<(), GenerationError> {
+        self.timings = GenerationTimings::default();
+        let prefill_started = Instant::now();
         if matches!(mode, UtteranceStart::Continuation)
             && (self.prompt_mode.clone_mode == CloneMode::Icl || !self.prompt_mode.streaming())
         {
@@ -992,6 +1022,7 @@ impl FrameGenerator for QwenGenerator<'_> {
             utterance.continuation = true;
             utterance.text_finished = false;
         }
+        self.timings.prefill = prefill_started.elapsed();
         Ok(())
     }
 
@@ -1099,6 +1130,7 @@ impl FrameGenerator for QwenGenerator<'_> {
         // production SAMPLES every residual depth exactly as upstream's subtalker_dosample=true
         // does — greedy residuals under a sampled talker sit in a measured silence attractor
         // (frankentts-p7r; the reference reproduces it in that mismatched configuration).
+        let microdecoder_started = Instant::now();
         let sampler = &mut self.sampler;
         let sampling_mode = self.sampling_mode;
         // A non-finite residual logit (corrupt checkpoint, numeric blowup) must surface as a
@@ -1146,6 +1178,8 @@ impl FrameGenerator for QwenGenerator<'_> {
         if let Some(error) = sampler_failure {
             return Err(generation_error(error));
         }
+        self.timings.microdecoder += microdecoder_started.elapsed();
+        let feedback_started = Instant::now();
         let mut codes = Vec::with_capacity(CODE_GROUP_COUNT);
         codes.push(primary);
         codes.extend(residuals.iter().map(|&code| code as u32));
@@ -1220,6 +1254,9 @@ impl FrameGenerator for QwenGenerator<'_> {
             ));
         }
 
+        self.timings.feedback += feedback_started.elapsed();
+        let talker_started = Instant::now();
+
         let (cos, sin) = talker::mrope_rows(
             &[utterance.next_position as i64],
             self.talker_config.head_dim,
@@ -1255,6 +1292,9 @@ impl FrameGenerator for QwenGenerator<'_> {
                 &mut logits,
             ),
         }
+
+        self.timings.talker += talker_started.elapsed();
+        self.timings.frames += 1;
 
         utterance.pending_hidden = next_input;
         utterance.pending_logits = logits;

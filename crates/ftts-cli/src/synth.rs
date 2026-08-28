@@ -43,9 +43,11 @@ use ftts_model_qwen::speaker::{
 };
 use ftts_model_qwen::talker::TalkerConfig;
 use ftts_model_qwen::tokenizer::{QwenTokenizer, TokenizerFiles};
+use std::cell::Cell;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -1675,6 +1677,57 @@ pub struct SynthesizedAudio {
     pub ttfa_audible: Option<std::time::Duration>,
 }
 
+/// Low-overhead attribution for the most recent synthesis on this thread.
+///
+/// `codec_active` overlaps `generation`: the codec runs concurrently on its own worker, so these
+/// fields are diagnostic durations rather than values that should be summed into `call`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SynthesisProfile {
+    /// Wall time inside [`synthesize`], excluding model hydration.
+    pub call: Duration,
+    /// Wall time occupied by the engine generation loop.
+    pub generation: Duration,
+    /// Text projection, prompt assembly, and talker prefill.
+    pub prefill: Duration,
+    /// The fifteen dependent residual-code steps for emitted frames.
+    pub microdecoder: Duration,
+    /// Feedback-row gathering and assembly.
+    pub feedback: Duration,
+    /// Single-position talker forwards after emitted frames.
+    pub talker: Duration,
+    /// Active codec decode time on the concurrent worker.
+    pub codec_active: Duration,
+    /// Frames emitted during this run.
+    pub frames: u64,
+    /// Int8 worker partitions used for this run.
+    pub team_partitions: usize,
+}
+
+impl SynthesisProfile {
+    const EMPTY: Self = Self {
+        call: Duration::ZERO,
+        generation: Duration::ZERO,
+        prefill: Duration::ZERO,
+        microdecoder: Duration::ZERO,
+        feedback: Duration::ZERO,
+        talker: Duration::ZERO,
+        codec_active: Duration::ZERO,
+        frames: 0,
+        team_partitions: 0,
+    };
+}
+
+thread_local! {
+    static LAST_SYNTHESIS_PROFILE: Cell<SynthesisProfile> =
+        const { Cell::new(SynthesisProfile::EMPTY) };
+}
+
+/// Returns the most recent [`synthesize`] profile recorded on this thread.
+#[must_use]
+pub fn last_synthesis_profile() -> SynthesisProfile {
+    LAST_SYNTHESIS_PROFILE.with(Cell::get)
+}
+
 /// Receives each decoded PCM packet on the codec worker thread, the moment it exists.
 ///
 /// `samples` are one packet's mono 24 kHz samples in `[-1, 1]` — `frames` × 1,920 of them,
@@ -1726,6 +1779,8 @@ pub fn synthesize(
     text_feed: Option<&ftts_core::BoundedReceiver<ftts_core::TextControl>>,
     pcm_sink: Option<&mut dyn PcmPacketSink>,
 ) -> Result<SynthesizedAudio, FttsError> {
+    LAST_SYNTHESIS_PROFILE.with(|slot| slot.set(SynthesisProfile::EMPTY));
+    let call_started = Instant::now();
     if packet_frames == 0 {
         return Err(FttsError::Usage(
             "packet_frames must be at least 1 (one 80 ms codec frame)".to_owned(),
@@ -1896,9 +1951,9 @@ pub fn synthesize(
     let preparer = PreparedPassThrough { prepared };
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ftts_core::CodeFrame>(256);
     let codec = &model.codec;
-    let synthesis_started = std::time::Instant::now();
-    let (result, decoded) = std::thread::scope(
-        |scope| -> Result<(ftts_core::SynthesisResult, DecodedAudio), FttsError> {
+    let synthesis_started = Instant::now();
+    let (result, decoded, generation) = std::thread::scope(
+        |scope| -> Result<(ftts_core::SynthesisResult, DecodedAudio, Duration), FttsError> {
             let mut pcm_sink = pcm_sink;
             let worker = scope.spawn(move || -> Result<DecodedAudio, FttsError> {
                 // Overlap for real: this thread's int8 ops run serially on a spare core
@@ -1913,6 +1968,7 @@ pub fn synthesize(
                 let mut buffered_frames = 0_usize;
                 let mut first_audio_at: Option<std::time::Duration> = None;
                 let mut first_audible_at: Option<std::time::Duration> = None;
+                let mut codec_active = Duration::ZERO;
                 // One decoded packet leaves the worker: live delivery first (a blocking or
                 // failing sink is the flow-control/abort contract on `PcmPacketSink`), then
                 // the whole-utterance buffer, then the TTFA marks — so with a sink attached
@@ -1959,9 +2015,12 @@ pub fn synthesize(
                     }
                     buffered_frames += 1;
                     if buffered_frames == packet_frames {
-                        codec
+                        let codec_started = Instant::now();
+                        let outcome = codec
                             .stream_push(&mut state, &packet, buffered_frames, &mut packet_pcm)
-                            .map_err(checkpoint_error)?;
+                            .map_err(checkpoint_error);
+                        codec_active += codec_started.elapsed();
+                        outcome?;
                         emit_packet(
                             &mut pcm_sink,
                             &mut pcm,
@@ -1975,9 +2034,12 @@ pub fn synthesize(
                     }
                 }
                 if buffered_frames > 0 {
-                    codec
+                    let codec_started = Instant::now();
+                    let outcome = codec
                         .stream_push(&mut state, &packet, buffered_frames, &mut packet_pcm)
-                        .map_err(checkpoint_error)?;
+                        .map_err(checkpoint_error);
+                    codec_active += codec_started.elapsed();
+                    outcome?;
                     emit_packet(
                         &mut pcm_sink,
                         &mut pcm,
@@ -1991,6 +2053,7 @@ pub fn synthesize(
                     pcm,
                     ttfa: first_audio_at,
                     ttfa_audible: first_audible_at,
+                    codec_active,
                 })
             });
 
@@ -1999,6 +2062,7 @@ pub fn synthesize(
                 frames: frame_tx,
                 printed: 0,
             };
+            let generation_started = Instant::now();
             let result = engine
                 .synthesize(
                     request.clone(),
@@ -2009,6 +2073,7 @@ pub fn synthesize(
                     text_feed,
                 )
                 .map_err(engine_error);
+            let generation = generation_started.elapsed();
             drop(tee); // closes the channel; the worker drains the tail packet and exits
             let worker_outcome = worker.join().expect("codec worker must not panic");
             // A signal that landed mid-generation or mid-drain outranks every other
@@ -2028,7 +2093,7 @@ pub fn synthesize(
             match (result, worker_outcome) {
                 (_, Err(worker_error)) => Err(worker_error),
                 (Err(engine_failure), Ok(_)) => Err(engine_failure),
-                (Ok(result), Ok(decoded)) => Ok((result, decoded)),
+                (Ok(result), Ok(decoded)) => Ok((result, decoded, generation)),
             }
         },
     )?;
@@ -2041,6 +2106,21 @@ pub fn synthesize(
                 .to_owned(),
         ));
     }
+
+    let timings = generator.timings();
+    LAST_SYNTHESIS_PROFILE.with(|slot| {
+        slot.set(SynthesisProfile {
+            call: call_started.elapsed(),
+            generation,
+            prefill: timings.prefill,
+            microdecoder: timings.microdecoder,
+            feedback: timings.feedback,
+            talker: timings.talker,
+            codec_active: decoded.codec_active,
+            frames: timings.frames,
+            team_partitions: ftts_kernels::team::partitions(),
+        });
+    });
 
     Ok(SynthesizedAudio {
         frames: result.generated_frames,
@@ -2063,6 +2143,7 @@ struct DecodedAudio {
     pcm: Vec<f32>,
     ttfa: Option<std::time::Duration>,
     ttfa_audible: Option<std::time::Duration>,
+    codec_active: Duration,
 }
 
 /// Forwards a generator's frames unchanged while teeing each one to the codec worker.

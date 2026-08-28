@@ -33,7 +33,7 @@ use std::sync::OnceLock;
 
 use ftts_cli::synth::{
     DENOISE_ARTIFACT_RELPATH, LoadedModel, ModelBundle, ReferenceCleanup, VoiceConditioning,
-    denoise_pcm_24k, speaker_from_reference_pcm, synthesize,
+    denoise_pcm_24k, last_synthesis_profile, speaker_from_reference_pcm, synthesize,
 };
 use ftts_core::{CancellationToken, SynthesisRequest, TtsEngine};
 
@@ -95,6 +95,24 @@ pub struct FttsEngine {
     loaded: LoadedModel,
     engine: TtsEngine,
     bundle: ModelBundle,
+    last_profile_json: CString,
+}
+
+fn synthesis_profile_json() -> CString {
+    let profile = last_synthesis_profile();
+    let millis = |duration: std::time::Duration| duration.as_secs_f64() * 1_000.0;
+    let value = serde_json::json!({
+        "total_ms": millis(profile.call),
+        "generation_ms": millis(profile.generation),
+        "prefill_ms": millis(profile.prefill),
+        "microdecoder_ms": millis(profile.microdecoder),
+        "feedback_ms": millis(profile.feedback),
+        "talker_ms": millis(profile.talker),
+        "codec_active_ms": millis(profile.codec_active),
+        "frames": profile.frames,
+        "team_partitions": profile.team_partitions,
+    });
+    CString::new(value.to_string()).expect("JSON serialization cannot contain NUL")
 }
 
 /// Runs a body, converting any panic into an error return value.
@@ -217,6 +235,7 @@ pub unsafe extern "C" fn ftts_engine_open(model_dir: *const c_char) -> *mut Ftts
             loaded,
             engine,
             bundle,
+            last_profile_json: CString::new("{}").expect("static JSON"),
         }))
     })
 }
@@ -304,6 +323,7 @@ pub unsafe extern "C" fn ftts_synthesize(
             None,
         ) {
             Ok(audio) => {
+                engine.last_profile_json = synthesis_profile_json();
                 let mut pcm = audio.pcm.into_boxed_slice();
                 let len = pcm.len();
                 let pointer = pcm.as_mut_ptr();
@@ -453,7 +473,10 @@ pub unsafe extern "C" fn ftts_synthesize_streaming(
             Some(&mut sink),
         );
         match result {
-            Ok(_) => 0,
+            Ok(_) => {
+                engine.last_profile_json = synthesis_profile_json();
+                0
+            }
             Err(_) if sink.cancelled_by_callback => FTTS_SYNTH_CANCELLED,
             Err(error) => {
                 set_error(error.to_string());
@@ -461,6 +484,28 @@ pub unsafe extern "C" fn ftts_synthesize_streaming(
             }
         }
     })
+}
+
+/// JSON attribution for the most recent successful synthesis on this engine.
+///
+/// The pointer remains valid until the next successful synthesis or engine close. A null engine
+/// returns an empty JSON object so diagnostics never need to manufacture a sentinel allocation.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+/// # Safety
+/// `engine` must be null or a live pointer from [`ftts_engine_open`]. The caller serializes access.
+pub unsafe extern "C" fn ftts_last_synthesis_profile_json(
+    engine: *const FttsEngine,
+) -> *const c_char {
+    if engine.is_null() {
+        return b"{}\0".as_ptr().cast();
+    }
+    // SAFETY: the header requires a live engine and serialized access; this immutable borrow lasts
+    // only long enough to obtain the CString's stable pointer.
+    #[allow(unsafe_code)]
+    unsafe {
+        (&*engine).last_profile_json.as_ptr()
+    }
 }
 
 /// Releases a PCM buffer from [`ftts_synthesize`]. `len` must be the returned length.

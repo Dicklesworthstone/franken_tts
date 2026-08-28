@@ -45,6 +45,11 @@ int32_t ftts_synthesize(FttsEngine *engine, const char *text, const float *speak
                         size_t speaker_len, uint64_t seed, float **out_pcm,
                         size_t *out_len);
 
+/* JSON attribution for the most recent successful synthesis. The pointer remains valid
+ * until the next successful synthesis or engine close. Durations are milliseconds;
+ * codec_active_ms overlaps generation_ms because codec decode runs concurrently. */
+const char *ftts_last_synthesis_profile_json(const FttsEngine *engine);
+
 /* Releases a buffer from ftts_synthesize. len must be the returned length. */
 void ftts_pcm_free(float *pcm, size_t len);
 
