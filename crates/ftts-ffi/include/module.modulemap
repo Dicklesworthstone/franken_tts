@@ -1,0 +1,4 @@
+module FttsCore {
+    header "ftts_ffi.h"
+    export *
+}

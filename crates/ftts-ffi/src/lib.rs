@@ -26,10 +26,11 @@
 //! trusted only as far as the header documents them (the caller owns that contract).
 
 use std::cell::RefCell;
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use ftts_cli::synth::{
     DENOISE_ARTIFACT_RELPATH, LoadedModel, ModelBundle, ReferenceCleanup, VoiceConditioning,
@@ -39,6 +40,96 @@ use ftts_core::{CancellationToken, SynthesisRequest, TtsEngine};
 
 /// Floats in a speaker x-vector; the fixed width of every `.spk` file and enroll output.
 pub const SPEAKER_WIDTH: usize = 1024;
+
+/// Stable ABI version for [`FttsProgressEvent`].
+pub const FTTS_PROGRESS_ABI_VERSION: u32 = 1;
+pub const FTTS_PROGRESS_FLAG_TOTAL_IS_UPPER_BOUND: u32 = 1;
+pub const FTTS_PROGRESS_FLAG_INVALIDATES_OUTPUT: u32 = 2;
+
+pub const FTTS_PROGRESS_KIND_STAGE_STARTED: u32 = 1;
+pub const FTTS_PROGRESS_KIND_STAGE_FINISHED: u32 = 2;
+pub const FTTS_PROGRESS_KIND_UNIT: u32 = 3;
+pub const FTTS_PROGRESS_KIND_ADMISSION: u32 = 4;
+pub const FTTS_PROGRESS_KIND_HEALTH: u32 = 5;
+
+pub const FTTS_PROGRESS_STAGE_MODEL_BUNDLE: u32 = 1;
+pub const FTTS_PROGRESS_STAGE_MODEL_WEIGHTS: u32 = 2;
+pub const FTTS_PROGRESS_STAGE_RUNTIME: u32 = 3;
+pub const FTTS_PROGRESS_STAGE_SYNTHESIS: u32 = 4;
+pub const FTTS_PROGRESS_STAGE_TEXT: u32 = 5;
+pub const FTTS_PROGRESS_STAGE_FRAMES: u32 = 6;
+pub const FTTS_PROGRESS_STAGE_CODEC: u32 = 7;
+pub const FTTS_PROGRESS_STAGE_RESOURCE_ADMISSION: u32 = 8;
+pub const FTTS_PROGRESS_STAGE_HEALTH: u32 = 9;
+
+/// Privacy-safe scalar lifecycle event shared with native Apple clients.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FttsProgressEvent {
+    pub abi_version: u32,
+    pub kind: u32,
+    pub stage: u32,
+    pub flags: u32,
+    pub current: u64,
+    pub total: u64,
+    pub detail: u64,
+    pub elapsed_ms: f64,
+}
+
+impl FttsProgressEvent {
+    fn new(kind: u32, stage: u32) -> Self {
+        Self {
+            abi_version: FTTS_PROGRESS_ABI_VERSION,
+            kind,
+            stage,
+            flags: 0,
+            current: 0,
+            total: 0,
+            detail: 0,
+            elapsed_ms: 0.0,
+        }
+    }
+}
+
+/// C callback for progress delivery. A nonzero verdict requests cancellation.
+pub type FttsProgressFn =
+    unsafe extern "C" fn(ctx: *mut c_void, event: *const FttsProgressEvent) -> i32;
+
+#[derive(Clone)]
+struct ProgressEmitter {
+    callback: Option<FttsProgressFn>,
+    ctx: *mut c_void,
+    cancellation: Option<CancellationToken>,
+}
+
+// SAFETY: the header explicitly requires the callback/context pair to be callable from
+// engine threads. Rust never dereferences `ctx`; it only returns the pair to its owner.
+#[allow(unsafe_code)]
+unsafe impl Send for ProgressEmitter {}
+// SAFETY: same callback contract as the Send implementation. Calls are synchronous;
+// any callback-side synchronization is the caller's responsibility.
+#[allow(unsafe_code)]
+unsafe impl Sync for ProgressEmitter {}
+
+impl ProgressEmitter {
+    fn emit(&self, event: FttsProgressEvent) -> bool {
+        let Some(callback) = self.callback else {
+            return true;
+        };
+        // SAFETY: the function/context pair follows the contract documented in the C
+        // header. `event` remains alive and immutable for the complete synchronous call.
+        #[allow(unsafe_code)]
+        let verdict = unsafe { callback(self.ctx, &event) };
+        if verdict != 0 {
+            if let Some(cancellation) = &self.cancellation {
+                cancellation.cancel();
+            }
+            false
+        } else {
+            true
+        }
+    }
+}
 
 /// The built-in voices: the same preset files every other surface embeds.
 const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
@@ -196,11 +287,34 @@ pub unsafe extern "C" fn ftts_preset_vector(name: *const c_char, out: *mut f32) 
 /// # Safety
 /// `model_dir` must be a NUL-terminated UTF-8 path.
 pub unsafe extern "C" fn ftts_engine_open(model_dir: *const c_char) -> *mut FttsEngine {
+    // SAFETY: this forwards the identical pointer contract with progress disabled.
+    #[allow(unsafe_code)]
+    unsafe {
+        ftts_engine_open_with_progress(model_dir, None, std::ptr::null_mut())
+    }
+}
+
+/// Opens the engine while emitting truthful coarse load-stage events.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+/// # Safety
+/// `model_dir` must be NUL-terminated UTF-8. When present, `on_progress` and `ctx`
+/// follow the callback contract in `ftts_ffi.h` for the duration of this call.
+pub unsafe extern "C" fn ftts_engine_open_with_progress(
+    model_dir: *const c_char,
+    on_progress: Option<FttsProgressFn>,
+    ctx: *mut c_void,
+) -> *mut FttsEngine {
     guarded(std::ptr::null_mut(), || {
         if model_dir.is_null() {
             set_error("null model_dir");
             return std::ptr::null_mut();
         }
+        let progress = ProgressEmitter {
+            callback: on_progress,
+            ctx,
+            cancellation: None,
+        };
         // SAFETY: non-null, and the header requires a NUL-terminated UTF-8 path.
         #[allow(unsafe_code)]
         let dir = match unsafe { CStr::from_ptr(model_dir) }.to_str() {
@@ -210,6 +324,13 @@ pub unsafe extern "C" fn ftts_engine_open(model_dir: *const c_char) -> *mut Ftts
                 return std::ptr::null_mut();
             }
         };
+        if !progress.emit(FttsProgressEvent::new(
+            FTTS_PROGRESS_KIND_STAGE_STARTED,
+            FTTS_PROGRESS_STAGE_MODEL_BUNDLE,
+        )) {
+            set_error("engine open cancelled");
+            return std::ptr::null_mut();
+        }
         let bundle = match ModelBundle::resolve(Path::new(dir)) {
             Ok(bundle) => bundle,
             Err(error) => {
@@ -217,6 +338,20 @@ pub unsafe extern "C" fn ftts_engine_open(model_dir: *const c_char) -> *mut Ftts
                 return std::ptr::null_mut();
             }
         };
+        if !progress.emit(FttsProgressEvent::new(
+            FTTS_PROGRESS_KIND_STAGE_FINISHED,
+            FTTS_PROGRESS_STAGE_MODEL_BUNDLE,
+        )) {
+            set_error("engine open cancelled");
+            return std::ptr::null_mut();
+        }
+        if !progress.emit(FttsProgressEvent::new(
+            FTTS_PROGRESS_KIND_STAGE_STARTED,
+            FTTS_PROGRESS_STAGE_MODEL_WEIGHTS,
+        )) {
+            set_error("engine open cancelled");
+            return std::ptr::null_mut();
+        }
         let loaded = match LoadedModel::load(&bundle) {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -224,6 +359,20 @@ pub unsafe extern "C" fn ftts_engine_open(model_dir: *const c_char) -> *mut Ftts
                 return std::ptr::null_mut();
             }
         };
+        if !progress.emit(FttsProgressEvent::new(
+            FTTS_PROGRESS_KIND_STAGE_FINISHED,
+            FTTS_PROGRESS_STAGE_MODEL_WEIGHTS,
+        )) {
+            set_error("engine open cancelled");
+            return std::ptr::null_mut();
+        }
+        if !progress.emit(FttsProgressEvent::new(
+            FTTS_PROGRESS_KIND_STAGE_STARTED,
+            FTTS_PROGRESS_STAGE_RUNTIME,
+        )) {
+            set_error("engine open cancelled");
+            return std::ptr::null_mut();
+        }
         let engine = match TtsEngine::from_process_environment() {
             Ok(engine) => engine,
             Err(error) => {
@@ -231,6 +380,13 @@ pub unsafe extern "C" fn ftts_engine_open(model_dir: *const c_char) -> *mut Ftts
                 return std::ptr::null_mut();
             }
         };
+        if !progress.emit(FttsProgressEvent::new(
+            FTTS_PROGRESS_KIND_STAGE_FINISHED,
+            FTTS_PROGRESS_STAGE_RUNTIME,
+        )) {
+            set_error("engine open cancelled");
+            return std::ptr::null_mut();
+        }
         Box::into_raw(Box::new(FttsEngine {
             loaded,
             engine,
@@ -272,6 +428,41 @@ pub unsafe extern "C" fn ftts_synthesize(
     out_pcm: *mut *mut f32,
     out_len: *mut usize,
 ) -> i32 {
+    // SAFETY: forwards the identical pointer contract with progress disabled.
+    #[allow(unsafe_code)]
+    unsafe {
+        ftts_synthesize_with_progress(
+            engine,
+            text,
+            speaker,
+            speaker_len,
+            seed,
+            None,
+            std::ptr::null_mut(),
+            out_pcm,
+            out_len,
+        )
+    }
+}
+
+/// Synthesizes with the same ownership contract as [`ftts_synthesize`] while forwarding
+/// the engine's real privacy-safe lifecycle events to `on_progress`.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+/// # Safety
+/// As [`ftts_synthesize`]. When present, `on_progress` and `ctx` follow the callback
+/// contract in `ftts_ffi.h` for the complete synchronous call.
+pub unsafe extern "C" fn ftts_synthesize_with_progress(
+    engine: *mut FttsEngine,
+    text: *const c_char,
+    speaker: *const f32,
+    speaker_len: usize,
+    seed: u64,
+    on_progress: Option<FttsProgressFn>,
+    ctx: *mut c_void,
+    out_pcm: *mut *mut f32,
+    out_len: *mut usize,
+) -> i32 {
     guarded(1, || {
         if engine.is_null()
             || text.is_null()
@@ -305,7 +496,107 @@ pub unsafe extern "C" fn ftts_synthesize(
         };
         let request = SynthesisRequest::new(text.to_owned());
         let cancellation = CancellationToken::new();
-        let observer = |_event: ftts_core::SynthesisEvent| {};
+        let progress = ProgressEmitter {
+            callback: on_progress,
+            ctx,
+            cancellation: Some(cancellation.clone()),
+        };
+        let predicted_max_frames = Arc::new(AtomicU64::new(0));
+        let decoded_frames = Arc::new(AtomicU64::new(0));
+        let observer_progress = progress.clone();
+        let observer_predicted = Arc::clone(&predicted_max_frames);
+        let observer_decoded = Arc::clone(&decoded_frames);
+        let observer = move |event: ftts_core::SynthesisEvent| {
+            use ftts_core::SynthesisEvent;
+
+            let translated = match event {
+                SynthesisEvent::Admission { accepted } => {
+                    let mut event = FttsProgressEvent::new(
+                        FTTS_PROGRESS_KIND_ADMISSION,
+                        FTTS_PROGRESS_STAGE_SYNTHESIS,
+                    );
+                    event.current = if accepted { 1 } else { 0 };
+                    event.total = 1;
+                    Some(event)
+                }
+                SynthesisEvent::ResourceAdmission {
+                    admitted,
+                    predicted_max_frames,
+                    predicted_peak_bytes,
+                    budget_bytes,
+                } => {
+                    observer_predicted.store(predicted_max_frames, Ordering::Release);
+                    let mut event = FttsProgressEvent::new(
+                        FTTS_PROGRESS_KIND_ADMISSION,
+                        FTTS_PROGRESS_STAGE_RESOURCE_ADMISSION,
+                    );
+                    event.current = predicted_peak_bytes;
+                    event.total = budget_bytes;
+                    event.detail = predicted_max_frames;
+                    if !admitted {
+                        event.flags |= FTTS_PROGRESS_FLAG_INVALIDATES_OUTPUT;
+                    }
+                    Some(event)
+                }
+                SynthesisEvent::StageStarted { .. } => Some(FttsProgressEvent::new(
+                    FTTS_PROGRESS_KIND_STAGE_STARTED,
+                    FTTS_PROGRESS_STAGE_SYNTHESIS,
+                )),
+                SynthesisEvent::StageFinished { elapsed, .. } => {
+                    let mut event = FttsProgressEvent::new(
+                        FTTS_PROGRESS_KIND_STAGE_FINISHED,
+                        FTTS_PROGRESS_STAGE_SYNTHESIS,
+                    );
+                    event.elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
+                    Some(event)
+                }
+                SynthesisEvent::FrameProgress { frame } => {
+                    let mut event =
+                        FttsProgressEvent::new(FTTS_PROGRESS_KIND_UNIT, FTTS_PROGRESS_STAGE_FRAMES);
+                    event.current = frame.saturating_add(1);
+                    event.total = observer_predicted.load(Ordering::Acquire);
+                    event.flags |= FTTS_PROGRESS_FLAG_TOTAL_IS_UPPER_BOUND;
+                    Some(event)
+                }
+                SynthesisEvent::TextPrepared { token_count, .. } => {
+                    let mut event =
+                        FttsProgressEvent::new(FTTS_PROGRESS_KIND_UNIT, FTTS_PROGRESS_STAGE_TEXT);
+                    event.current = token_count as u64;
+                    Some(event)
+                }
+                SynthesisEvent::PacketEmitted {
+                    frame_count,
+                    sample_count,
+                } => {
+                    let current = observer_decoded
+                        .fetch_add(u64::from(frame_count), Ordering::AcqRel)
+                        + u64::from(frame_count);
+                    let mut event =
+                        FttsProgressEvent::new(FTTS_PROGRESS_KIND_UNIT, FTTS_PROGRESS_STAGE_CODEC);
+                    event.current = current;
+                    event.total = observer_predicted.load(Ordering::Acquire);
+                    event.detail = sample_count as u64;
+                    event.flags |= FTTS_PROGRESS_FLAG_TOTAL_IS_UPPER_BOUND;
+                    Some(event)
+                }
+                SynthesisEvent::Health { event: health } => {
+                    let mut event = FttsProgressEvent::new(
+                        FTTS_PROGRESS_KIND_HEALTH,
+                        FTTS_PROGRESS_STAGE_HEALTH,
+                    );
+                    if health.invalidates_output() {
+                        event.flags |= FTTS_PROGRESS_FLAG_INVALIDATES_OUTPUT;
+                    }
+                    Some(event)
+                }
+                SynthesisEvent::TextUnderrun { .. }
+                | SynthesisEvent::TextStallEnded { .. }
+                | SynthesisEvent::TextAppendRejected { .. } => None,
+            };
+            if let Some(event) = translated {
+                observer_progress.emit(event);
+            }
+        };
         match synthesize(
             &engine.loaded,
             &engine.engine,
@@ -323,6 +614,9 @@ pub unsafe extern "C" fn ftts_synthesize(
             None,
         ) {
             Ok(audio) => {
+                if cancellation.is_cancelled() {
+                    return FTTS_SYNTH_CANCELLED;
+                }
                 engine.last_profile_json = synthesis_profile_json();
                 let mut pcm = audio.pcm.into_boxed_slice();
                 let len = pcm.len();
@@ -336,6 +630,7 @@ pub unsafe extern "C" fn ftts_synthesize(
                 }
                 0
             }
+            Err(_) if cancellation.is_cancelled() => FTTS_SYNTH_CANCELLED,
             Err(error) => {
                 set_error(error.to_string());
                 1
@@ -818,6 +1113,38 @@ pub unsafe extern "C" fn ftts_video_close(renderer: *mut FttsVideoRenderer) {
 #[allow(unsafe_code)] // tests exercise the C ABI exactly as a caller would
 mod tests {
     use super::*;
+
+    unsafe extern "C" fn record_and_cancel_progress(
+        ctx: *mut c_void,
+        event: *const FttsProgressEvent,
+    ) -> i32 {
+        // SAFETY: the test passes a unique pointer to a live Vec and a pointer to a
+        // stack event that remains valid for this synchronous callback.
+        #[allow(unsafe_code)]
+        let (events, event) = unsafe { (&mut *ctx.cast::<Vec<FttsProgressEvent>>(), *event) };
+        events.push(event);
+        1
+    }
+
+    #[test]
+    fn progress_event_is_versioned_and_callback_can_cancel() {
+        let cancellation = CancellationToken::new();
+        let mut events: Vec<FttsProgressEvent> = Vec::new();
+        let emitter = ProgressEmitter {
+            callback: Some(record_and_cancel_progress),
+            ctx: (&raw mut events).cast(),
+            cancellation: Some(cancellation.clone()),
+        };
+        let mut event = FttsProgressEvent::new(FTTS_PROGRESS_KIND_UNIT, FTTS_PROGRESS_STAGE_FRAMES);
+        event.current = 7;
+        event.total = 12;
+        event.flags = FTTS_PROGRESS_FLAG_TOTAL_IS_UPPER_BOUND;
+
+        assert!(!emitter.emit(event));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(events, vec![event]);
+        assert_eq!(events[0].abi_version, FTTS_PROGRESS_ABI_VERSION);
+    }
 
     #[test]
     fn every_preset_is_exactly_one_speaker_vector() {

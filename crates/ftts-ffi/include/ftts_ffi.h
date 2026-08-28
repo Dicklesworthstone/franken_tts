@@ -24,6 +24,47 @@ extern "C" {
 
 typedef struct FttsEngine FttsEngine;
 
+/* Versioned, privacy-safe lifecycle telemetry. No event contains text, voice data,
+ * token ids, audio samples, or other user content. `current` is always measured;
+ * `total` is zero when unknown. FTTS_PROGRESS_FLAG_TOTAL_IS_UPPER_BOUND marks a
+ * predicted ceiling rather than an exact terminal total. */
+#define FTTS_PROGRESS_ABI_VERSION 1
+#define FTTS_PROGRESS_FLAG_TOTAL_IS_UPPER_BOUND 1
+#define FTTS_PROGRESS_FLAG_INVALIDATES_OUTPUT 2
+
+#define FTTS_PROGRESS_KIND_STAGE_STARTED 1
+#define FTTS_PROGRESS_KIND_STAGE_FINISHED 2
+#define FTTS_PROGRESS_KIND_UNIT 3
+#define FTTS_PROGRESS_KIND_ADMISSION 4
+#define FTTS_PROGRESS_KIND_HEALTH 5
+
+#define FTTS_PROGRESS_STAGE_MODEL_BUNDLE 1
+#define FTTS_PROGRESS_STAGE_MODEL_WEIGHTS 2
+#define FTTS_PROGRESS_STAGE_RUNTIME 3
+#define FTTS_PROGRESS_STAGE_SYNTHESIS 4
+#define FTTS_PROGRESS_STAGE_TEXT 5
+#define FTTS_PROGRESS_STAGE_FRAMES 6
+#define FTTS_PROGRESS_STAGE_CODEC 7
+#define FTTS_PROGRESS_STAGE_RESOURCE_ADMISSION 8
+#define FTTS_PROGRESS_STAGE_HEALTH 9
+
+typedef struct FttsProgressEvent {
+    uint32_t abi_version;
+    uint32_t kind;
+    uint32_t stage;
+    uint32_t flags;
+    uint64_t current;
+    uint64_t total;
+    uint64_t detail;
+    double elapsed_ms;
+} FttsProgressEvent;
+
+/* Called synchronously on whichever engine thread emitted the event. Return promptly.
+ * Returning nonzero requests cooperative cancellation. The event pointer is valid only
+ * for the duration of the callback. The callback must not call back into the same engine
+ * and must not throw/unwind. A NULL callback disables progress delivery. */
+typedef int32_t (*FttsProgressFn)(void *ctx, const FttsProgressEvent *event);
+
 /* Last failure on this thread, as UTF-8. Never NULL. */
 const char *ftts_last_error_message(void);
 
@@ -36,6 +77,11 @@ int32_t ftts_preset_vector(const char *name, float *out);
 /* Opens the engine over a complete model directory. NULL on failure. */
 FttsEngine *ftts_engine_open(const char *model_dir);
 
+/* As above, with truthful coarse load-stage events. Cancellation is checked between
+ * bundle resolution, model hydration, and runtime construction. */
+FttsEngine *ftts_engine_open_with_progress(const char *model_dir,
+                                           FttsProgressFn on_progress, void *ctx);
+
 /* Releases an engine. NULL is a no-op. */
 void ftts_engine_close(FttsEngine *engine);
 
@@ -44,6 +90,15 @@ void ftts_engine_close(FttsEngine *engine);
 int32_t ftts_synthesize(FttsEngine *engine, const char *text, const float *speaker,
                         size_t speaker_len, uint64_t seed, float **out_pcm,
                         size_t *out_len);
+
+/* As above, with the engine's real privacy-safe observer events. Frame `current` is
+ * exact; its `total` is a predicted maximum and carries TOTAL_IS_UPPER_BOUND. Codec
+ * units are actual decoded frame/sample counts. A callback-requested cancellation
+ * returns FTTS_SYNTH_CANCELLED and does not publish PCM. */
+int32_t ftts_synthesize_with_progress(FttsEngine *engine, const char *text,
+                                      const float *speaker, size_t speaker_len,
+                                      uint64_t seed, FttsProgressFn on_progress,
+                                      void *ctx, float **out_pcm, size_t *out_len);
 
 /* JSON attribution for the most recent successful synthesis. The pointer remains valid
  * until the next successful synthesis or engine close. Durations are milliseconds;
