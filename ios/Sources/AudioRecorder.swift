@@ -73,7 +73,7 @@ private final class CaptureSink: @unchecked Sendable {
 @MainActor
 @Observable
 final class AudioRecorder {
-    static let targetRate: Double = 24_000
+    nonisolated static let targetRate: Double = 24_000
 
     var isRecording = false
     var seconds: Double = 0

@@ -1,4 +1,5 @@
 import ActivityKit
+import Foundation
 import SwiftUI
 import WidgetKit
 
@@ -41,7 +42,7 @@ struct FrankenTTSForgeWidget: Widget {
                 .widgetURL(URL(string: "frankentts://forge"))
         }
         .configurationDisplayName("Voice Forge")
-        .description("See private model readiness and jump into the Voice Forge.")
+        .description("See recent private synthesis status and jump into the Voice Forge.")
         .supportedFamilies([.systemSmall, .systemMedium, .accessoryInline, .accessoryRectangular])
     }
 }
@@ -111,9 +112,7 @@ struct FrankenTTSLiveActivity: Widget {
                         .foregroundStyle(forgeGreen)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    Text(timerInterval: context.attributes.startedAt...Date.distantFuture, countsDown: false)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                    ForgeElapsedView(context: context)
                 }
                 DynamicIslandExpandedRegion(.center) {
                     Text(context.state.stage)
@@ -175,11 +174,34 @@ private struct ForgeLockScreenView: View {
                 ForgeUnitRail(state: context.state)
             }
             Spacer(minLength: 4)
+            ForgeElapsedView(context: context)
+        }
+        .padding(15)
+    }
+}
+
+private struct ForgeElapsedView: View {
+    let context: ActivityViewContext<FrankenTTSRunActivityAttributes>
+
+    @ViewBuilder
+    var body: some View {
+        if context.state.status == .complete
+            || context.state.status == .cancelled
+            || context.state.status == .failed
+        {
+            Text(Self.clock(context.state.elapsedSeconds))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        } else {
             Text(timerInterval: context.attributes.startedAt...Date.distantFuture, countsDown: false)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
-        .padding(15)
+    }
+
+    private static func clock(_ seconds: Int) -> String {
+        let value = max(0, seconds)
+        return String(format: "%d:%02d", value / 60, value % 60)
     }
 }
 
@@ -187,7 +209,7 @@ private struct ForgeUnitRail: View {
     let state: FrankenTTSRunActivityAttributes.ContentState
 
     var body: some View {
-        if state.totalUnits > 0 {
+        if state.totalUnits > 0, !state.totalIsUpperBound {
             ProgressView(value: Double(state.completedUnits), total: Double(state.totalUnits))
                 .tint(forgeGreen)
         } else if state.status == .running || state.status == .preparing {

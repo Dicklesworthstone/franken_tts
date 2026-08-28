@@ -18,6 +18,17 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.frankentts.FrankenTTS</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>frankentts</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
@@ -28,6 +39,12 @@
 	<string>Your recording is processed entirely on this device into a 4 KB voice fingerprint for synthesis, then discarded. Nothing is uploaded.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Saving keeps your voice card in Photos so you can send it from any app. The card holds only the 4 KB voice fingerprint, never a recording.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>com.frankentts.voice-forge</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

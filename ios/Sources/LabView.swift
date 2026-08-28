@@ -109,7 +109,7 @@ final class LabModel {
     // runs on the main actor and nothing else contends), but a dedicated-thread executor is
     // the right refinement if background work ever grows.
     func synthesize() {
-        guard !isSynthesizing else { return }
+        guard canSynthesizeFromCommand else { return }
         isSynthesizing = true
         lastError = nil
         lastProfile = nil
@@ -119,8 +119,11 @@ final class LabModel {
         activity.begin()
         let text = self.text
         let seed = self.seed
+        let runStartedAt = Date()
         let ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.synthesisSeconds += 0.5 }
+            Task { @MainActor in
+                self?.synthesisSeconds = Date().timeIntervalSince(runStartedAt)
+            }
         }
         // The screen must not sleep mid-run: suspension kills a minutes-long synthesis.
         UIApplication.shared.isIdleTimerDisabled = true
@@ -176,7 +179,7 @@ final class LabModel {
                     detail: "No partial audio was published"
                 )
             } catch {
-                isEngineWarm = false
+                isEngineWarm = await engine.isLoaded
                 forge.phase = .failed
                 lastError = error.localizedDescription
                 activity.finish(
@@ -333,6 +336,7 @@ final class LabModel {
     /// Frees the ~2.3 GB engine heap; the next synthesis reloads it.
     func unloadEngineForMemoryPressure() {
         guard !isSynthesizing else { return }
+        engine.cancelCurrentWork()
         engineWarmTask?.cancel()
         engineWarmTask = nil
         isEngineWarm = false
@@ -367,6 +371,9 @@ final class LabModel {
                 try Task.checkCancellation()
                 self.isEngineWarm = true
                 if !self.isSynthesizing { self.forge.phase = .idle }
+            } catch EngineError.cancelled {
+                self.isEngineWarm = false
+                self.forge.phase = .cancelled
             } catch is CancellationError {
                 self.isEngineWarm = false
                 self.forge.phase = .cancelled
@@ -445,6 +452,10 @@ struct LabView: View {
     @FocusState private var focusedField: EditorFocus?
 
     var body: some View {
+        systemIntegrationView
+    }
+
+    private var workspaceView: some View {
         GeometryReader { geometry in
             ZStack {
                 LaboratoryBackground()
@@ -480,6 +491,10 @@ struct LabView: View {
                 .padding(.vertical, 16)
             }
         }
+    }
+
+    private var keyboardAwareView: some View {
+        workspaceView
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
@@ -498,6 +513,10 @@ struct LabView: View {
                     if !tappedEditor { focusedField = nil }
                 }
         )
+    }
+
+    private var sheetView: some View {
+        keyboardAwareView
         .sheet(isPresented: $showEnrollment) {
             EnrollmentSheet(model: model)
         }
@@ -537,6 +556,10 @@ struct LabView: View {
         .sheet(item: $cardVoice) { voice in
             VoiceCardSheet(voice: voice)
         }
+    }
+
+    private var importView: some View {
+        sheetView
         .fileImporter(
             isPresented: $showDesktopImporter,
             allowedContentTypes: [.plainText, .image],
@@ -585,6 +608,10 @@ struct LabView: View {
                 }
             }
         }
+    }
+
+    private var voiceManagementView: some View {
+        importView
         .alert(
             "Rename voice", isPresented: Binding(
                 get: { renameTarget != nil },
@@ -605,6 +632,10 @@ struct LabView: View {
         .onChange(of: renameTarget) { _, target in
             if let target { renameText = target.name }
         }
+    }
+
+    private var lifecycleView: some View {
+        voiceManagementView
         .onReceive(
             NotificationCenter.default.publisher(
                 for: UIApplication.didReceiveMemoryWarningNotification)
@@ -630,6 +661,10 @@ struct LabView: View {
         .onAppear(perform: debugVideoHook)
         .task { model.warmEngineIfPossible() }
         .task { consumeStagedText() }
+    }
+
+    private var systemIntegrationView: some View {
+        lifecycleView
         .onOpenURL(perform: handleDeepLink)
         .onAppear {
             #if DEBUG

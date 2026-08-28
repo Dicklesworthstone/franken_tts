@@ -28,7 +28,8 @@ done
 HEADERS=$(mktemp -d /tmp/ftts-ffi-headers.XXXXXX)
 cp crates/ftts-ffi/include/ftts_ffi.h crates/ftts-ffi/include/module.modulemap "$HEADERS/"
 
-CATALYST_LIB=$(mktemp /tmp/libftts_ffi-maccatalyst.XXXXXX)
+CATALYST_ROOT=$(mktemp -d /tmp/ftts-ffi-maccatalyst.XXXXXX)
+CATALYST_LIB="$CATALYST_ROOT/libftts_ffi.a"
 lipo -create \
   "$TARGET_DIR/aarch64-apple-ios-macabi/release/libftts_ffi.a" \
   "$TARGET_DIR/x86_64-apple-ios-macabi/release/libftts_ffi.a" \

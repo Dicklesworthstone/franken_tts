@@ -279,7 +279,7 @@ struct GalvanicVoiceForge: View {
             style: StrokeStyle(lineWidth: 1.4, dash: [3, 7])
         )
 
-        let tokenCount = max(1, min(8, Int(telemetry.preparedTokens)))
+        let tokenCount = min(8, Int(telemetry.preparedTokens))
         for index in 0..<tokenCount {
             let angle = (Double(index) / Double(tokenCount)) * Double.pi * 2 + phase * 0.18
             let radius = 23.0 + Double(index % 3) * 4
@@ -335,19 +335,25 @@ struct GalvanicVoiceForge: View {
             )
         }
 
-        var waveform = Path()
-        let amplitude = 8 + min(20, CGFloat(telemetry.decodedFrames) * 0.7)
-        let startX = max(coilX + 48, rightX - 54)
-        waveform.move(to: CGPoint(x: startX, y: midY))
-        let width = max(1, size.width - startX - 16)
-        for sample in 1...36 {
-            let f = CGFloat(sample) / 36
-            let x = startX + width * f
-            let envelope = sin(f * .pi)
-            let y = midY + sin(Double(sample) * 0.88 + phase * 2.4) * amplitude * envelope
-            waveform.addLine(to: CGPoint(x: x, y: y))
+        if telemetry.decodedFrames > 0 {
+            var waveform = Path()
+            let amplitude = 8 + min(20, CGFloat(telemetry.decodedFrames) * 0.7)
+            let startX = max(coilX + 48, rightX - 54)
+            waveform.move(to: CGPoint(x: startX, y: midY))
+            let width = max(1, size.width - startX - 16)
+            for sample in 1...36 {
+                let f = CGFloat(sample) / 36
+                let x = startX + width * f
+                let envelope = sin(f * .pi)
+                let y = midY + sin(Double(sample) * 0.88 + phase * 2.4) * amplitude * envelope
+                waveform.addLine(to: CGPoint(x: x, y: y))
+            }
+            context.stroke(
+                waveform,
+                with: .color(Lab.emerald.opacity(0.82 * activeAlpha)),
+                lineWidth: 1.7
+            )
         }
-        context.stroke(waveform, with: .color(Lab.emerald.opacity(0.82 * activeAlpha)), lineWidth: 1.7)
 
         let labels: [(String, CGPoint)] = [
             ("UTTERANCE", CGPoint(x: leftX, y: size.height - 20)),

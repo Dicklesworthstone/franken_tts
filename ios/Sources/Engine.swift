@@ -170,7 +170,7 @@ enum EngineError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .native(let message): message
-        case .cancelled: "synthesis cancelled"
+        case .cancelled: "operation cancelled"
         }
     }
 
@@ -217,6 +217,7 @@ actor Engine {
             nativeProgressCallback,
             context
         ) else {
+            if callback.callbackVerdict() != 0 { throw EngineError.cancelled }
             throw EngineError.lastFromNative()
         }
         handle = opened

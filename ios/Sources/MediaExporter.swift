@@ -8,6 +8,53 @@ import AVFoundation
 import FttsCore
 import Foundation
 
+/// The audio side of one AVAssetWriter session.
+///
+/// AVFoundation's writer/reader classes predate Swift concurrency and are not
+/// annotated Sendable, even though a writer is explicitly designed to accept
+/// its independent media inputs concurrently. This context has one owner and
+/// confines the reader, reader output, and audio input to exactly one async
+/// feed. The video path shares only the writer's documented thread-safe status
+/// and error reporting, so the unchecked conformance records that invariant in
+/// one audited place instead of scattering warning suppressions through the
+/// export loop.
+private final class AudioFeedContext: @unchecked Sendable {
+    private let reader: AVAssetReader
+    private let readerOutput: AVAssetReaderTrackOutput
+    private let audioInput: AVAssetWriterInput
+    private let writer: AVAssetWriter
+
+    init(
+        reader: AVAssetReader,
+        readerOutput: AVAssetReaderTrackOutput,
+        audioInput: AVAssetWriterInput,
+        writer: AVAssetWriter
+    ) {
+        self.reader = reader
+        self.readerOutput = readerOutput
+        self.audioInput = audioInput
+        self.writer = writer
+    }
+
+    func feed() async throws {
+        while let sample = readerOutput.copyNextSampleBuffer() {
+            while !audioInput.isReadyForMoreMediaData {
+                try await Task.sleep(for: .milliseconds(4))
+            }
+            guard audioInput.append(sample) else {
+                throw writer.error ?? EngineError.native("appending audio failed")
+            }
+        }
+        audioInput.markAsFinished()
+        // nil from copyNextSampleBuffer means EITHER end-of-track or failure;
+        // only the status separates a finished read from truncated audio.
+        if reader.status == .failed {
+            throw reader.error
+                ?? EngineError.native("reading the share WAV failed midway")
+        }
+    }
+}
+
 enum MediaExporter {
     /// Transcode the played WAV into an AAC .m4a (an order of magnitude smaller).
     ///
@@ -103,23 +150,13 @@ enum MediaExporter {
         // stops accepting more until audio for those timestamps arrives. Feeding all
         // video first deadlocks at the buffer depth — the "stuck at 19%" bug.
         do {
-            async let audioDone: Void = {
-                while let sample = readerOutput.copyNextSampleBuffer() {
-                    while !audioInput.isReadyForMoreMediaData {
-                        try await Task.sleep(for: .milliseconds(4))
-                    }
-                    guard audioInput.append(sample) else {
-                        throw writer.error ?? EngineError.native("appending audio failed")
-                    }
-                }
-                audioInput.markAsFinished()
-                // nil from copyNextSampleBuffer means EITHER end-of-track or failure;
-                // only the status separates a finished read from truncated audio.
-                if reader.status == .failed {
-                    throw reader.error
-                        ?? EngineError.native("reading the share WAV failed midway")
-                }
-            }()
+            let audioFeed = AudioFeedContext(
+                reader: reader,
+                readerOutput: readerOutput,
+                audioInput: audioInput,
+                writer: writer
+            )
+            async let audioDone: Void = audioFeed.feed()
 
             // The Rust renderer is a pure function of (frame, immutable state), so a
             // chunk of frames renders in parallel across cores — straight into BGRA

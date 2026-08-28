@@ -93,6 +93,9 @@ targets:
       - path: Sources/PrivacyInfo.xcprivacy
     entitlements:
       path: FrankenTTSWidgets.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.frankentts.FrankenTTS
     info:
       path: Widget/Info.plist
       properties:
@@ -117,6 +120,9 @@ targets:
       - path: Sources/PrivacyInfo.xcprivacy
     entitlements:
       path: FrankenTTSShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.frankentts.FrankenTTS
     info:
       path: Share/Info.plist
       properties:

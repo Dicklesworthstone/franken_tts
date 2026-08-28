@@ -79,7 +79,7 @@ final class ShareViewController: UIViewController {
             case let value as Data:
                 text = String(data: value, encoding: .utf8)
             case let value as URL:
-                text = try? String(contentsOf: value, encoding: .utf8)
+                text = try? Self.readTextPrefix(from: value)
             default:
                 text = nil
             }
@@ -90,11 +90,21 @@ final class ShareViewController: UIViewController {
                     self.showFailure("That share did not contain readable text.")
                     return
                 }
-                FrankenTTSSharedStore.stage(text: String(cleaned.prefix(600)))
+                FrankenTTSSharedStore.stage(text: cleaned)
                 self.statusLabel.text = "Text secured locally. The Voice Forge is charged and ready."
                 self.openButton.isEnabled = true
             }
         }
+    }
+
+    /// A provider-supplied URL can name a very large document. The app accepts
+    /// at most 600 characters, so never read an unbounded file into the share
+    /// extension's much smaller memory budget just to discard almost all of it.
+    private static func readTextPrefix(from url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: 32 * 1024) ?? Data()
+        return String(decoding: data, as: UTF8.self)
     }
 
     private func showFailure(_ message: String) {

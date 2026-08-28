@@ -10,6 +10,7 @@ final class VoiceForgeActivityController {
     static let shared = VoiceForgeActivityController()
 
     private var activity: Activity<FrankenTTSRunActivityAttributes>?
+    private var startedAt: Date?
     private var lastPublishedStage = ""
     private var lastPublishedUnits: UInt64 = 0
 
@@ -17,28 +18,31 @@ final class VoiceForgeActivityController {
 
     func begin() {
         finish(status: .cancelled, headline: "Previous run ended", detail: "Ready for a new voice")
-        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
-        let attributes = FrankenTTSRunActivityAttributes(runID: UUID(), startedAt: .now)
+        let start = Date.now
+        startedAt = start
+        let attributes = FrankenTTSRunActivityAttributes(runID: UUID(), startedAt: start)
         let state = FrankenTTSRunActivityAttributes.ContentState(
             stage: "Charging the Voice Forge",
             detail: "Preparing the private on-device engine",
             completedUnits: 0,
             totalUnits: 0,
+            totalIsUpperBound: false,
             elapsedSeconds: 0,
             status: .preparing
         )
-        activity = try? Activity.request(
-            attributes: attributes,
-            content: ActivityContent(state: state, staleDate: nil),
-            pushType: nil
-        )
+        if ActivityAuthorizationInfo().areActivitiesEnabled {
+            activity = try? Activity.request(
+                attributes: attributes,
+                content: ActivityContent(state: state, staleDate: nil),
+                pushType: nil
+            )
+        }
         lastPublishedStage = state.stage
         lastPublishedUnits = 0
         publishWidget(.working, headline: state.stage, detail: state.detail)
     }
 
     func update(from telemetry: VoiceForgeTelemetry, elapsed: TimeInterval) {
-        guard let activity else { return }
         let completed = max(telemetry.generatedFrames, telemetry.decodedFrames)
         // Native callbacks can arrive quickly. A stage change is always visible;
         // within a stage, update at useful unit boundaries rather than per callback.
@@ -54,10 +58,13 @@ final class VoiceForgeActivityController {
             detail: telemetry.factualDetail,
             completedUnits: completed,
             totalUnits: telemetry.predictedMaximumFrames,
+            totalIsUpperBound: telemetry.predictedMaximumFrames > 0,
             elapsedSeconds: max(0, Int(elapsed.rounded(.down))),
             status: status
         )
-        Task { await activity.update(ActivityContent(state: state, staleDate: nil)) }
+        if let activity {
+            Task { await activity.update(ActivityContent(state: state, staleDate: nil)) }
+        }
         publishWidget(.working, headline: state.stage, detail: state.detail)
     }
 
@@ -66,19 +73,30 @@ final class VoiceForgeActivityController {
         headline: String,
         detail: String
     ) {
-        guard let current = activity else { return }
+        guard activity != nil || startedAt != nil else { return }
+        let current = activity
+        let start = current?.attributes.startedAt ?? startedAt ?? .now
         activity = nil
+        startedAt = nil
         let state = FrankenTTSRunActivityAttributes.ContentState(
             stage: headline,
             detail: detail,
             completedUnits: lastPublishedUnits,
             totalUnits: lastPublishedUnits,
-            elapsedSeconds: max(0, Int(Date().timeIntervalSince(current.attributes.startedAt))),
+            totalIsUpperBound: false,
+            elapsedSeconds: max(0, Int(Date().timeIntervalSince(start))),
             status: status
         )
         let dismissal: ActivityUIDismissalPolicy = status == .complete ? .after(.now + 45) : .immediate
-        Task { await current.end(ActivityContent(state: state, staleDate: nil), dismissalPolicy: dismissal) }
-        let readiness: FrankenTTSWidgetSnapshot.Readiness = status == .complete ? .complete : .ready
+        if let current {
+            Task { await current.end(ActivityContent(state: state, staleDate: nil), dismissalPolicy: dismissal) }
+        }
+        let readiness: FrankenTTSWidgetSnapshot.Readiness
+        switch status {
+        case .complete: readiness = .complete
+        case .failed: readiness = .needsAttention
+        default: readiness = .ready
+        }
         publishWidget(readiness, headline: headline, detail: detail)
     }
 
@@ -126,7 +144,10 @@ struct SpeakTextIntent: AppIntent {
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !value.isEmpty { FrankenTTSSharedStore.stage(text: value) }
+        guard !value.isEmpty else {
+            return .result(dialog: "Add some text before opening the Voice Forge.")
+        }
+        FrankenTTSSharedStore.stage(text: value)
         return .result(dialog: "Ready in the Voice Forge.")
     }
 }

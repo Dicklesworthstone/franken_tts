@@ -4,8 +4,10 @@ import Foundation
 import ActivityKit
 #endif
 
-/// Privacy-safe state shared with WidgetKit and Live Activities. Source text,
-/// cloned-voice names, and generated audio never enter the shared container.
+/// Privacy-safe state shared with WidgetKit and Live Activities. Their status
+/// payloads never contain source text, cloned-voice names, or generated audio.
+/// A separate, length-limited text slot exists only for an explicit Share or
+/// App Intent handoff and expires if the app does not consume it promptly.
 struct FrankenTTSRunContentState: Codable, Hashable {
     enum Status: String, Codable, Hashable {
         case preparing
@@ -20,6 +22,7 @@ struct FrankenTTSRunContentState: Codable, Hashable {
     var detail: String
     var completedUnits: UInt64
     var totalUnits: UInt64
+    var totalIsUpperBound: Bool
     var elapsedSeconds: Int
     var status: Status
 }
@@ -55,8 +58,8 @@ struct FrankenTTSWidgetSnapshot: Codable, Hashable {
 
     static let placeholder = FrankenTTSWidgetSnapshot(
         readiness: .ready,
-        headline: "Voice Forge ready",
-        detail: "Private, on-device speech",
+        headline: "Open the Voice Forge",
+        detail: "Create private, on-device speech",
         updatedAt: .now
     )
 }
@@ -65,6 +68,9 @@ enum FrankenTTSSharedStore {
     static let suiteName = "group.com.frankentts.FrankenTTS"
     private static let snapshotKey = "widget.snapshot.v1"
     private static let stagedTextKey = "intent.staged-text.v1"
+    private static let stagedTextDateKey = "intent.staged-text-date.v1"
+    private static let stagedTextLifetime: TimeInterval = 60 * 60
+    private static let maximumTextLength = 600
 
     static func loadSnapshot() -> FrankenTTSWidgetSnapshot {
         guard let defaults = UserDefaults(suiteName: suiteName),
@@ -82,14 +88,27 @@ enum FrankenTTSSharedStore {
     }
 
     static func stage(text: String) {
-        UserDefaults(suiteName: suiteName)?.set(text, forKey: stagedTextKey)
+        guard let defaults = UserDefaults(suiteName: suiteName) else { return }
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            defaults.removeObject(forKey: stagedTextKey)
+            defaults.removeObject(forKey: stagedTextDateKey)
+            return
+        }
+        defaults.set(String(value.prefix(maximumTextLength)), forKey: stagedTextKey)
+        defaults.set(Date().timeIntervalSince1970, forKey: stagedTextDateKey)
     }
 
     static func consumeStagedText() -> String? {
         guard let defaults = UserDefaults(suiteName: suiteName),
               let text = defaults.string(forKey: stagedTextKey)
         else { return nil }
+        let stagedAt = defaults.double(forKey: stagedTextDateKey)
         defaults.removeObject(forKey: stagedTextKey)
+        defaults.removeObject(forKey: stagedTextDateKey)
+        let age = Date().timeIntervalSince1970 - stagedAt
+        guard stagedAt > 0, age >= 0, age <= stagedTextLifetime
+        else { return nil }
         return text
     }
 }
