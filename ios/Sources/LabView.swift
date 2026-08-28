@@ -35,6 +35,143 @@ private extension View {
     }
 }
 
+/// A deliberately conservative, device-local synthesis forecast.  The first run is
+/// seeded from broad memory-tier measurements; completed runs replace that prior with
+/// an exponentially weighted measurement from this exact device.  A number is not
+/// published until the native engine emits a real semantic frame.
+private struct TTSAdaptiveETA {
+    private static let version = "v1"
+    private static let framesPerWordKey = "eta.\(version).framesPerWord"
+    private static let denoiseSecondsKey = "eta.\(version).denoiseSeconds"
+
+    private var words = 1
+    private var beganWarm = true
+    private var expectedFrames = 0.0
+    private var predictedFinishElapsed: TimeInterval?
+    private var hasMeasuredWork = false
+    private var denoiseStartedAt: TimeInterval?
+
+    mutating func reset(text: String, warm: Bool) {
+        words = max(1, text.split(whereSeparator: { $0.isWhitespace }).count)
+        beganWarm = warm
+        expectedFrames = learnedFramesPerWord * Double(words)
+        predictedFinishElapsed = nil
+        hasMeasuredWork = false
+        denoiseStartedAt = nil
+    }
+
+    mutating func observe(_ event: EngineProgress, elapsed: TimeInterval) {
+        guard elapsed > 0 else { return }
+
+        let priorTotal = learnedSecondsPerWord * Double(words)
+        var fraction: Double?
+
+        if event.kind == .unit, event.stage == .frames, event.current > 0 {
+            hasMeasuredWork = true
+            let current = Double(event.current)
+            let ceiling = event.total > 0 ? Double(event.total) : .greatestFiniteMagnitude
+            if expectedFrames <= 0 {
+                expectedFrames = current * 1.25
+            }
+            expectedFrames = min(ceiling, max(expectedFrames, current * 1.08))
+            let frameFraction = min(0.985, current / max(current, expectedFrames))
+            fraction = 0.10 + 0.80 * frameFraction
+        } else if event.kind == .unit, event.stage == .codec, event.current > 0 {
+            hasMeasuredWork = true
+            let current = Double(event.current)
+            if expectedFrames <= 0 {
+                expectedFrames = max(current * 1.08, learnedFramesPerWord * Double(words))
+            }
+            let codecFraction = min(0.985, current / max(current, expectedFrames))
+            fraction = 0.90 + 0.085 * codecFraction
+        } else if event.kind == .stageFinished, event.stage == .synthesis {
+            hasMeasuredWork = true
+            fraction = 0.985
+        }
+
+        guard let fraction else { return }
+        let observedTotal = elapsed / max(0.04, fraction)
+        // Real progress earns most of the vote quickly, while the learned device prior
+        // prevents the first few frames from producing a wildly unstable forecast.
+        let observedWeight = min(0.88, 0.38 + fraction * 0.52)
+        let candidate = max(elapsed + 0.75, priorTotal * (1 - observedWeight) + observedTotal * observedWeight)
+        if let old = predictedFinishElapsed {
+            let smoothed = old * 0.68 + candidate * 0.32
+            // Permit honest upward revision, but prevent a single noisy callback from
+            // making the displayed countdown jump by tens of seconds.
+            predictedFinishElapsed = min(smoothed, old + 3.0)
+        } else {
+            predictedFinishElapsed = candidate
+        }
+    }
+
+    mutating func beginDenoise(elapsed: TimeInterval) {
+        denoiseStartedAt = elapsed
+        let learned = UserDefaults.standard.double(forKey: Self.denoiseSecondsKey)
+        let tail = learned > 0 ? learned : 1.5
+        predictedFinishElapsed = max(predictedFinishElapsed ?? elapsed, elapsed + tail)
+    }
+
+    func remainingSeconds(at elapsed: TimeInterval) -> Int? {
+        guard hasMeasuredWork, let predictedFinishElapsed else { return nil }
+        return max(1, Int(ceil(predictedFinishElapsed - elapsed)))
+    }
+
+    mutating func finish(elapsed: TimeInterval, frames: UInt64) {
+        let defaults = UserDefaults.standard
+        let secondsSample = elapsed / Double(words)
+        Self.update(
+            key: secondsPerWordKey,
+            sample: secondsSample,
+            in: defaults
+        )
+        if frames > 0 {
+            Self.update(
+                key: Self.framesPerWordKey,
+                sample: Double(frames) / Double(words),
+                in: defaults
+            )
+        }
+        if let denoiseStartedAt, elapsed > denoiseStartedAt {
+            Self.update(
+                key: Self.denoiseSecondsKey,
+                sample: elapsed - denoiseStartedAt,
+                in: defaults
+            )
+        }
+        predictedFinishElapsed = elapsed
+    }
+
+    private var secondsPerWordKey: String {
+        "eta.\(Self.version).secondsPerWord.\(beganWarm ? "warm" : "cold")"
+    }
+
+    private var learnedSecondsPerWord: Double {
+        let learned = UserDefaults.standard.double(forKey: secondsPerWordKey)
+        if learned > 0 { return learned }
+
+        let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let warmSeed: Double
+        switch gib {
+        case 8...: warmSeed = 1.05
+        case 6..<8: warmSeed = 1.25
+        default: warmSeed = 1.65
+        }
+        return warmSeed + (beganWarm ? 0 : 0.28)
+    }
+
+    private var learnedFramesPerWord: Double {
+        let learned = UserDefaults.standard.double(forKey: Self.framesPerWordKey)
+        return learned > 0 ? learned : 4.6
+    }
+
+    private static func update(key: String, sample: Double, in defaults: UserDefaults) {
+        guard sample.isFinite, sample > 0 else { return }
+        let old = defaults.double(forKey: key)
+        defaults.set(old > 0 ? old * 0.72 + sample * 0.28 : sample, forKey: key)
+    }
+}
+
 @MainActor
 @Observable
 final class LabModel {
@@ -60,6 +197,7 @@ final class LabModel {
     var isLoadingModel = false
     var isEngineWarm = false
     var synthesisSeconds = 0.0
+    var estimatedRemainingSeconds: Int?
     var lastError: String?
     var lastAudio: [Float]?
     var lastRealTimeFactor: Double?
@@ -77,6 +215,7 @@ final class LabModel {
     private var synthesisGeneration = 0
     private var engineWarmTask: Task<Void, Never>?
     private let activity = VoiceForgeActivityController.shared
+    private var eta = TTSAdaptiveETA()
 
     var lowMemoryDevice: Bool {
         ProcessInfo.processInfo.physicalMemory < 6 * 1024 * 1024 * 1024
@@ -114,15 +253,22 @@ final class LabModel {
         lastError = nil
         lastProfile = nil
         synthesisSeconds = 0
+        estimatedRemainingSeconds = nil
         nativeProgressEvents.removeAll(keepingCapacity: true)
-        forge.reset(for: isEngineWarm ? .checkingMemory : .readingBundle)
+        let beganWarm = isEngineWarm
+        forge.reset(for: beganWarm ? .checkingMemory : .readingBundle)
+        eta.reset(text: text, warm: beganWarm)
         activity.begin()
         let text = self.text
         let seed = self.seed
         let runStartedAt = Date()
         let ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.synthesisSeconds = Date().timeIntervalSince(runStartedAt)
+                guard let self else { return }
+                self.synthesisSeconds = Date().timeIntervalSince(runStartedAt)
+                self.estimatedRemainingSeconds = self.eta.remainingSeconds(
+                    at: self.synthesisSeconds
+                )
             }
         }
         // The screen must not sleep mid-run: suspension kills a minutes-long synthesis.
@@ -161,8 +307,15 @@ final class LabModel {
                 // failure just keeps the original audio.
                 if await engine.denoiseAvailable {
                     forge.phase = .denoising
+                    eta.beginDenoise(elapsed: Date().timeIntervalSince(runStartedAt))
                     pcm = (try? await engine.denoise(pcm: pcm)) ?? pcm
                 }
+                synthesisSeconds = Date().timeIntervalSince(runStartedAt)
+                eta.finish(
+                    elapsed: synthesisSeconds,
+                    frames: output.profile?.frames ?? forge.generatedFrames
+                )
+                estimatedRemainingSeconds = nil
                 lastAudio = pcm
                 try startPlayback(of: pcm)
                 forge.phase = .complete
@@ -190,6 +343,7 @@ final class LabModel {
             }
             isLoadingModel = false
             isSynthesizing = false
+            estimatedRemainingSeconds = nil
         }
     }
 
@@ -201,6 +355,8 @@ final class LabModel {
 
     private func receive(_ event: EngineProgress) {
         forge.apply(event)
+        eta.observe(event, elapsed: synthesisSeconds)
+        estimatedRemainingSeconds = eta.remainingSeconds(at: synthesisSeconds)
         activity.update(from: forge, elapsed: synthesisSeconds)
         nativeProgressEvents.append(event)
         if nativeProgressEvents.count > 160 {
@@ -473,11 +629,11 @@ struct LabView: View {
 
                         ScrollView(.vertical) {
                             utteranceCard(compact: true)
-                                .frame(maxWidth: 820)
+                                .frame(maxWidth: .infinity, alignment: .topLeading)
                         }
                         .scrollIndicators(.hidden)
                     }
-                    .frame(maxWidth: 1180, maxHeight: .infinity, alignment: .top)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(.horizontal, 24)
                     .padding(.vertical, 14)
                 } else {
@@ -1152,6 +1308,7 @@ struct LabView: View {
                     GalvanicVoiceForge(
                         telemetry: model.forge,
                         elapsed: model.synthesisSeconds,
+                        estimatedRemainingSeconds: model.estimatedRemainingSeconds,
                         compact: compact,
                         cancel: model.isSynthesizing ? { model.cancelSynthesis() } : nil
                     )

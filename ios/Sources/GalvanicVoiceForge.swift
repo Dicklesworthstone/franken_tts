@@ -158,6 +158,7 @@ struct VoiceForgeTelemetry: Sendable, Equatable {
 struct GalvanicVoiceForge: View {
     let telemetry: VoiceForgeTelemetry
     let elapsed: TimeInterval
+    var estimatedRemainingSeconds: Int?
     var compact = false
     var cancel: (() -> Void)?
 
@@ -191,10 +192,20 @@ struct GalvanicVoiceForge: View {
                 }
                 Spacer(minLength: 8)
                 if telemetry.phase.isActive {
-                    Text(Self.elapsed(elapsed))
-                        .font(.system(.caption, design: .monospaced, weight: .semibold))
-                        .foregroundStyle(Lab.textSecondary)
-                        .monospacedDigit()
+                    VStack(alignment: .trailing, spacing: 3) {
+                        Text(Self.elapsed(elapsed))
+                            .foregroundStyle(Lab.textSecondary)
+                        if let estimatedRemainingSeconds {
+                            Text("≈ \(estimatedRemainingSeconds)s left")
+                                .foregroundStyle(phaseColor)
+                                .contentTransition(.numericText())
+                                .accessibilityLabel(
+                                    "About \(estimatedRemainingSeconds) seconds remaining"
+                                )
+                        }
+                    }
+                    .font(.system(.caption, design: .monospaced, weight: .semibold))
+                    .monospacedDigit()
                 }
             }
 
