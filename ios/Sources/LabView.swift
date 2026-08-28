@@ -28,10 +28,12 @@ final class LabModel {
 
     var isSynthesizing = false
     var isLoadingModel = false
+    var isEngineWarm = false
     var synthesisSeconds = 0.0
     var lastError: String?
     var lastAudio: [Float]?
     var lastRealTimeFactor: Double?
+    var lastProfile: SynthesisProfile?
     var player: AVAudioPlayer?
     /// The playback WAV (internal); shares go out as M4A and MP4.
     var wavUrl: URL?
@@ -41,6 +43,7 @@ final class LabModel {
     var videoProgress = 0.0
     /// Bumped per synthesis so a slow export cannot stamp its output onto a newer clip.
     private var synthesisGeneration = 0
+    private var engineWarmTask: Task<Void, Never>?
 
     /// Estimated synthesis progress. Expected speech duration comes from the text
     /// length (spoken English runs ~14 chars/s), expected wall time from the last
@@ -79,6 +82,7 @@ final class LabModel {
         guard !isSynthesizing else { return }
         isSynthesizing = true
         lastError = nil
+        lastProfile = nil
         synthesisSeconds = 0
         let text = self.text
         let seed = self.seed
@@ -98,10 +102,17 @@ final class LabModel {
                     isLoadingModel = true
                     try await engine.load(modelDirectory: store.modelDirectory)
                 }
+                isEngineWarm = true
                 isLoadingModel = false
                 synthesisSeconds = 0
                 let started = Date()
-                var pcm = try await engine.synthesize(text: text, speaker: speaker, seed: seed)
+                let output = try await engine.synthesize(
+                    text: text,
+                    speaker: speaker,
+                    seed: seed
+                )
+                var pcm = output.pcm
+                lastProfile = output.profile
                 let elapsed = Date().timeIntervalSince(started)
                 let factor = (Double(pcm.count) / Double(WavWriter.sampleRate)) / elapsed
                 lastRealTimeFactor = factor
@@ -115,6 +126,7 @@ final class LabModel {
                 lastAudio = pcm
                 try startPlayback(of: pcm)
             } catch {
+                isEngineWarm = false
                 lastError = error.localizedDescription
             }
             isSynthesizing = false
@@ -244,11 +256,57 @@ final class LabModel {
     /// Frees the ~2.3 GB engine heap; the next synthesis reloads it.
     func unloadEngineForMemoryPressure() {
         guard !isSynthesizing else { return }
+        engineWarmTask?.cancel()
+        engineWarmTask = nil
+        isEngineWarm = false
+        isLoadingModel = false
         Task { await engine.unload() }
+    }
+
+    /// Hydrate as soon as verified model files are present. Users should wait
+    /// for the model once at app/foreground entry, not discover the same cold
+    /// start only after pressing Synthesize.
+    func warmEngineIfPossible() {
+        guard store.phase == .ready,
+              !isEngineWarm,
+              engineWarmTask == nil,
+              !isSynthesizing
+        else { return }
+
+        isLoadingModel = true
+        engineWarmTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.isLoadingModel = false
+                self.engineWarmTask = nil
+            }
+            do {
+                if await !self.engine.isLoaded {
+                    try await self.engine.load(modelDirectory: self.store.modelDirectory)
+                }
+                try Task.checkCancellation()
+                self.isEngineWarm = true
+            } catch is CancellationError {
+                self.isEngineWarm = false
+            } catch {
+                self.isEngineWarm = false
+                self.lastError = "Could not warm the model: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func clearModel() {
+        unloadEngineForMemoryPressure()
+        store.clear()
     }
 }
 
 struct LabView: View {
+    private enum EditorFocus: Hashable {
+        case utterance
+        case seed
+    }
+
     @State private var model = LabModel()
     @State private var showConsent = false
     @State private var showEnrollment = false
@@ -262,7 +320,7 @@ struct LabView: View {
     /// Bumped to refresh the play/pause icon, which tracks external playback state.
     @State private var playbackTick = 0
     @Environment(\.scenePhase) private var scenePhase
-    @FocusState private var focusedField: Bool
+    @FocusState private var focusedField: EditorFocus?
 
     var body: some View {
         ZStack {
@@ -281,7 +339,7 @@ struct LabView: View {
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
-                Button("Done") { focusedField = false }
+                Button("Done") { focusedField = nil }
             }
         }
         .sheet(isPresented: $showEnrollment) {
@@ -356,7 +414,14 @@ struct LabView: View {
             model.unloadEngineForMemoryPressure()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .background { model.unloadEngineForMemoryPressure() }
+            if phase == .background {
+                model.unloadEngineForMemoryPressure()
+            } else if phase == .active {
+                model.warmEngineIfPossible()
+            }
+        }
+        .onChange(of: model.store.phase) { _, phase in
+            if phase == .ready { model.warmEngineIfPossible() }
         }
         .sensoryFeedback(.selection, trigger: model.selectedVoice)
         .sensoryFeedback(.success, trigger: model.lastAudio?.count)
@@ -364,6 +429,7 @@ struct LabView: View {
         .sensoryFeedback(.success, trigger: importCount) { _, count in count > 0 }
         .onAppear(perform: debugCardHook)
         .onAppear(perform: debugVideoHook)
+        .task { model.warmEngineIfPossible() }
         .onAppear {
             #if DEBUG
                 // Screenshot harness: FTTS_DEBUG_GALAXY=1 opens the constellation.
@@ -452,14 +518,36 @@ struct LabView: View {
                         .font(.system(size: 12, design: .monospaced))
                         .foregroundStyle(Lab.textSecondary)
                 case .ready:
-                    HStack {
-                        Image(systemName: "checkmark.seal.fill").foregroundStyle(Lab.emerald)
-                        Text("Model on device · \(Self.gigabytes(model.store.cachedBytes)) GB")
-                            .font(.system(size: 13, design: .monospaced))
-                            .foregroundStyle(Lab.textPrimary)
-                        Spacer()
-                        Button("Clear") { model.store.clear() }
-                            .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                    VStack(alignment: .leading, spacing: 9) {
+                        HStack {
+                            Image(systemName: "checkmark.seal.fill").foregroundStyle(Lab.emerald)
+                            Text("Model on device · \(Self.gigabytes(model.store.cachedBytes)) GB")
+                                .font(.system(size: 13, design: .monospaced))
+                                .foregroundStyle(Lab.textPrimary)
+                            Spacer()
+                            Button("Clear") { model.clearModel() }
+                                .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                        }
+                        HStack(spacing: 8) {
+                            if model.isLoadingModel {
+                                ProgressView().tint(Lab.emerald).controlSize(.small)
+                            } else {
+                                Image(systemName: model.isEngineWarm
+                                      ? "bolt.circle.fill" : "bolt.circle")
+                                    .foregroundStyle(model.isEngineWarm
+                                                     ? Lab.emerald : Lab.textSecondary)
+                            }
+                            Text(
+                                model.isLoadingModel
+                                    ? "Warming automatically…"
+                                    : (model.isEngineWarm
+                                       ? "Engine warm · ready to synthesize"
+                                       : "Engine will warm automatically")
+                            )
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(model.isEngineWarm
+                                             ? Lab.emerald : Lab.textSecondary)
+                        }
                     }
                 case .failed(let message):
                     Text(message).font(.system(size: 13)).foregroundStyle(Lab.danger)
@@ -545,18 +633,58 @@ struct LabView: View {
     private var utteranceCard: some View {
         LabPanel {
             VStack(alignment: .leading, spacing: 12) {
-                LabLabel(text: "03 · The Utterance")
-                TextEditor(text: Binding(
-                    get: { model.text },
-                    set: { model.text = String($0.prefix(600)) }
-                ))
-                .scrollContentBackground(.hidden)
-                .frame(minHeight: 110)
-                .padding(8)
+                HStack(spacing: 8) {
+                    LabLabel(text: "03 · The Utterance")
+                    Spacer()
+                    Button("Select all") { selectAllUtterance() }
+                        .buttonStyle(GhostButtonStyle())
+                        .disabled(model.text.isEmpty)
+                        .accessibilityHint("Selects the entire utterance so typing replaces it")
+                    Button {
+                        model.text = ""
+                        focusedField = .utterance
+                    } label: {
+                        Label("Clear", systemImage: "xmark.circle.fill")
+                    }
+                    .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                    .disabled(model.text.isEmpty)
+                    .accessibilityHint("Removes the current utterance")
+                }
+
+                ZStack(alignment: .topLeading) {
+                    if model.text.isEmpty {
+                        Text("Type or paste what FrankenTTS should say…")
+                            .font(.system(size: 16))
+                            .foregroundStyle(Lab.textSecondary.opacity(0.72))
+                            .padding(.horizontal, 13)
+                            .padding(.vertical, 16)
+                            .allowsHitTesting(false)
+                    }
+                    TextEditor(text: Binding(
+                        get: { model.text },
+                        set: { model.text = String($0.prefix(600)) }
+                    ))
+                    .scrollContentBackground(.hidden)
+                    .padding(8)
+                    .foregroundStyle(Lab.textPrimary)
+                    .font(.system(size: 16))
+                    .lineSpacing(4)
+                    .focused($focusedField, equals: .utterance)
+                    .textInputAutocapitalization(.sentences)
+                    .autocorrectionDisabled(false)
+                }
+                // More vertical room makes drag handles and the magnifier
+                // practical on a phone instead of fighting a three-line box.
+                .frame(minHeight: 170, maxHeight: 260)
                 .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
-                .foregroundStyle(Lab.textPrimary)
-                .font(.system(size: 15))
-                .focused($focusedField)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(
+                            focusedField == .utterance
+                                ? Lab.emerald.opacity(0.62) : Color.clear,
+                            lineWidth: 1
+                        )
+                )
                 HStack {
                     Text("\(model.text.count) / 600")
                         .font(.system(size: 11, design: .monospaced))
@@ -573,7 +701,7 @@ struct LabView: View {
                         )
                     )
                     .keyboardType(.numberPad)
-                    .focused($focusedField)
+                    .focused($focusedField, equals: .seed)
                     .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(Lab.textPrimary)
                     .frame(width: 74)
@@ -590,18 +718,26 @@ struct LabView: View {
                     .accessibilityLabel("Randomize seed")
                 }
                 Button {
-                    focusedField = false
+                    focusedField = nil
                     model.synthesize()
                 } label: {
                     HStack(spacing: 8) {
                         if model.isSynthesizing {
                             ProgressView().tint(.white).controlSize(.small)
                         }
-                        Text(model.isSynthesizing ? "Synthesizing" : "⚡ Synthesize")
+                        Text(
+                            model.isSynthesizing
+                                ? "Synthesizing"
+                                : (model.isLoadingModel ? "Warming model…" : "⚡ Synthesize")
+                        )
                     }
                 }
                 .buttonStyle(PrimaryButtonStyle())
-                .disabled(model.isSynthesizing || model.store.phase != .ready)
+                .disabled(
+                    model.isSynthesizing
+                        || model.isLoadingModel
+                        || model.store.phase != .ready
+                )
                 if model.isSynthesizing {
                     if model.isLoadingModel {
                         Text("waking the model…")
@@ -667,18 +803,83 @@ struct LabView: View {
                         }
                         Spacer()
                         if let factor = model.lastRealTimeFactor {
-                            Text(String(format: "%.2f× real time on this phone", factor))
+                            Text(
+                                factor >= 1
+                                    ? String(format: "%.2f× real-time speed", factor)
+                                    : String(
+                                        format: "%.2f× speed · %.1fs per 1s audio",
+                                        factor, 1 / max(factor, 0.001)
+                                    )
+                            )
                                 .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(Lab.textSecondary)
+                                .foregroundStyle(factor >= 1 ? Lab.emerald : Lab.textSecondary)
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.7)
                         }
+                    }
+                    if let profile = model.lastProfile {
+                        synthesisProfile(profile)
                     }
                 }
                 if let error = model.lastError {
                     Text(error).font(.system(size: 13)).foregroundStyle(Lab.danger)
                 }
             }
+        }
+    }
+
+    private func synthesisProfile(_ profile: SynthesisProfile) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("ON-DEVICE PROFILE")
+                    .foregroundStyle(Lab.emerald)
+                Spacer()
+                Text("\(profile.teamPartitions)-way · \(profile.frames) frames")
+                    .foregroundStyle(Lab.textSecondary)
+            }
+            Text(
+                String(
+                    format: "total %.0f ms · generation %.0f ms · codec active %.0f ms (overlapped)",
+                    profile.totalMs,
+                    profile.generationMs,
+                    profile.codecActiveMs
+                )
+            )
+            .foregroundStyle(Lab.textPrimary)
+            Text(
+                String(
+                    format: "prefill %.0f · talker %.0f · residual %.0f · feedback %.0f · other %.0f ms",
+                    profile.prefillMs,
+                    profile.talkerMs,
+                    profile.microdecoderMs,
+                    profile.feedbackMs,
+                    profile.otherGenerationMs
+                )
+            )
+            .foregroundStyle(Lab.textSecondary)
+        }
+        .font(.system(size: 10, design: .monospaced))
+        .padding(10)
+        .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 9))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "On-device synthesis profile. \(profile.teamPartitions) workers, "
+                + "\(profile.frames) frames, total \(Int(profile.totalMs)) milliseconds."
+        )
+    }
+
+    private func selectAllUtterance() {
+        focusedField = .utterance
+        // Focus lands on the underlying UITextView on the next main-loop turn.
+        // Sending the standard responder action preserves UIKit's native
+        // selection handles, edit menu, undo stack, and replacement behavior.
+        DispatchQueue.main.async {
+            UIApplication.shared.sendAction(
+                #selector(UIResponder.selectAll(_:)),
+                to: nil,
+                from: nil,
+                for: nil
+            )
         }
     }
 

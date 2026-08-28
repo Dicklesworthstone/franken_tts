@@ -10,6 +10,39 @@ struct Preset: Identifiable, Decodable {
     var id: String { name }
 }
 
+struct SynthesisProfile: Decodable {
+    let totalMs: Double
+    let generationMs: Double
+    let prefillMs: Double
+    let microdecoderMs: Double
+    let feedbackMs: Double
+    let talkerMs: Double
+    let codecActiveMs: Double
+    let frames: UInt64
+    let teamPartitions: Int
+
+    enum CodingKeys: String, CodingKey {
+        case totalMs = "total_ms"
+        case generationMs = "generation_ms"
+        case prefillMs = "prefill_ms"
+        case microdecoderMs = "microdecoder_ms"
+        case feedbackMs = "feedback_ms"
+        case talkerMs = "talker_ms"
+        case codecActiveMs = "codec_active_ms"
+        case frames
+        case teamPartitions = "team_partitions"
+    }
+
+    var otherGenerationMs: Double {
+        max(0, generationMs - prefillMs - microdecoderMs - feedbackMs - talkerMs)
+    }
+}
+
+struct SynthesisOutput {
+    let pcm: [Float]
+    let profile: SynthesisProfile?
+}
+
 enum EngineError: LocalizedError {
     case native(String)
     var errorDescription: String? {
@@ -61,7 +94,7 @@ actor Engine {
         handle = nil
     }
 
-    func synthesize(text: String, speaker: [Float], seed: UInt64) throws -> [Float] {
+    func synthesize(text: String, speaker: [Float], seed: UInt64) throws -> SynthesisOutput {
         guard let handle else { throw EngineError.native("engine not loaded") }
         guard speaker.count == Self.speakerWidth else {
             throw EngineError.native("speaker vector has wrong width")
@@ -73,7 +106,15 @@ actor Engine {
         }
         guard code == 0, let pcm else { throw EngineError.lastFromNative() }
         defer { ftts_pcm_free(pcm, length) }
-        return Array(UnsafeBufferPointer(start: pcm, count: length))
+        let profileJSON = String(cString: ftts_last_synthesis_profile_json(handle))
+        let profile = try? JSONDecoder().decode(
+            SynthesisProfile.self,
+            from: Data(profileJSON.utf8)
+        )
+        return SynthesisOutput(
+            pcm: Array(UnsafeBufferPointer(start: pcm, count: length)),
+            profile: profile
+        )
     }
 
     /// Whether the neural denoiser artifact is in the model directory — asked of the
