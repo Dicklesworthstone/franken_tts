@@ -22,20 +22,32 @@ targets:
     platform: iOS
     settings:
       base:
-        TARGETED_DEVICE_FAMILY: "1"
-        SUPPORTS_MACCATALYST: false
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: true
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: false
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: false
+        MACCATALYST_USE_NATIVE_DESIGN: true
     sources:
       - Sources
+      - Shared
       - Assets.xcassets
     dependencies:
       - framework: FttsCore.xcframework
         embed: false
+      - target: FrankenTTSWidgets
+        embed: true
+        platformFilter: iOS
+      - target: FrankenTTSShare
+        embed: true
+        platformFilter: iOS
     entitlements:
       path: FrankenTTS.entitlements
       properties:
         # 8 GB devices grant ~4-5 GB with this instead of the ~3.3 GB default; the
         # engine's synthesis heap is ~2.3 GB (docs/IOS_APP_PLAN.md §3).
         com.apple.developer.kernel.increased-memory-limit: true
+        com.apple.security.application-groups:
+          - group.com.frankentts.FrankenTTS
     info:
       path: Sources/Info.plist
       properties:
@@ -43,7 +55,14 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         ITSAppUsesNonExemptEncryption: false
+        NSSupportsLiveActivities: true
         UILaunchScreen: {}
+        CFBundleURLTypes:
+          - CFBundleURLName: com.frankentts.FrankenTTS
+            CFBundleURLSchemes:
+              - frankentts
+        NSUserActivityTypes:
+          - com.frankentts.voice-forge
         NSMicrophoneUsageDescription: >-
           Your recording is processed entirely on this device into a 4 KB voice
           fingerprint for synthesis, then discarded. Nothing is uploaded.
@@ -52,3 +71,61 @@ targets:
           The card holds only the 4 KB voice fingerprint, never a recording.
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        LSApplicationCategoryType: public.app-category.entertainment
+  FrankenTTSWidgets:
+    type: app-extension
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankentts.FrankenTTS.widgets
+        PRODUCT_NAME: FrankenTTS Widgets
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+        SUPPORTS_MACCATALYST: false
+    sources:
+      - Widget
+      - Shared
+      - path: Sources/PrivacyInfo.xcprivacy
+    entitlements:
+      path: FrankenTTSWidgets.entitlements
+    info:
+      path: Widget/Info.plist
+      properties:
+        CFBundleDisplayName: FrankenTTS Widgets
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+  FrankenTTSShare:
+    type: app-extension
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankentts.FrankenTTS.share
+        PRODUCT_NAME: Speak with FrankenTTS
+        APPLICATION_EXTENSION_API_ONLY: true
+        SKIP_INSTALL: true
+        SUPPORTS_MACCATALYST: false
+    sources:
+      - Share
+      - Shared
+      - path: Sources/PrivacyInfo.xcprivacy
+    entitlements:
+      path: FrankenTTSShare.entitlements
+    info:
+      path: Share/Info.plist
+      properties:
+        CFBundleDisplayName: Speak with FrankenTTS
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsText: true

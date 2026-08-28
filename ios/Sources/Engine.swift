@@ -43,11 +43,135 @@ struct SynthesisOutput {
     let profile: SynthesisProfile?
 }
 
+struct EngineProgress: Sendable, Equatable {
+    enum Kind: UInt32, Sendable {
+        case stageStarted = 1
+        case stageFinished = 2
+        case unit = 3
+        case admission = 4
+        case health = 5
+    }
+
+    enum Stage: UInt32, Sendable {
+        case modelBundle = 1
+        case modelWeights = 2
+        case runtime = 3
+        case synthesis = 4
+        case text = 5
+        case frames = 6
+        case codec = 7
+        case resourceAdmission = 8
+        case health = 9
+
+        var shortLabel: String {
+            switch self {
+            case .modelBundle: "Reading specimen map"
+            case .modelWeights: "Hydrating neural tissue"
+            case .runtime: "Charging the runtime"
+            case .synthesis: "Forging the voice"
+            case .text: "Binding the utterance"
+            case .frames: "Growing semantic frames"
+            case .codec: "Turning frames into sound"
+            case .resourceAdmission: "Checking memory headroom"
+            case .health: "Watching signal health"
+            }
+        }
+    }
+
+    static let totalIsUpperBound: UInt32 = 1
+    static let invalidatesOutput: UInt32 = 2
+
+    let kind: Kind
+    let stage: Stage
+    let flags: UInt32
+    let current: UInt64
+    let total: UInt64
+    let detail: UInt64
+    let elapsedMilliseconds: Double
+
+    var hasEstimatedTotal: Bool { flags & Self.totalIsUpperBound != 0 }
+    var outputInvalid: Bool { flags & Self.invalidatesOutput != 0 }
+
+    init?(_ native: FttsProgressEvent) {
+        guard native.abi_version == UInt32(FTTS_PROGRESS_ABI_VERSION),
+              let kind = Kind(rawValue: native.kind),
+              let stage = Stage(rawValue: native.stage)
+        else { return nil }
+        self.kind = kind
+        self.stage = stage
+        flags = native.flags
+        current = native.current
+        total = native.total
+        detail = native.detail
+        elapsedMilliseconds = native.elapsed_ms
+    }
+}
+
+private final class ProgressCallbackBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancellationRequested = false
+    let publish: @Sendable (EngineProgress) -> Void
+
+    init(publish: @escaping @Sendable (EngineProgress) -> Void) {
+        self.publish = publish
+    }
+
+    func requestCancellation() {
+        lock.lock()
+        cancellationRequested = true
+        lock.unlock()
+    }
+
+    func callbackVerdict() -> Int32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationRequested ? 1 : 0
+    }
+}
+
+private final class EngineCancellationController: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var active: ProgressCallbackBox?
+
+    func begin(_ box: ProgressCallbackBox) {
+        lock.lock()
+        active = box
+        lock.unlock()
+    }
+
+    func end(_ box: ProgressCallbackBox) {
+        lock.lock()
+        if active === box { active = nil }
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        let box = active
+        lock.unlock()
+        box?.requestCancellation()
+    }
+}
+
+private let nativeProgressCallback: @convention(c) (
+    UnsafeMutableRawPointer?, UnsafePointer<FttsProgressEvent>?
+) -> Int32 = { context, eventPointer in
+    guard let context, let eventPointer else { return 0 }
+    let box = Unmanaged<ProgressCallbackBox>.fromOpaque(context).takeUnretainedValue()
+    if let progress = EngineProgress(eventPointer.pointee) {
+        box.publish(progress)
+    }
+    return box.callbackVerdict()
+}
+
 enum EngineError: LocalizedError {
     case native(String)
+    case cancelled
     var errorDescription: String? {
-        if case .native(let message) = self { return message }
-        return nil
+        switch self {
+        case .native(let message): message
+        case .cancelled: "synthesis cancelled"
+        }
     }
 
     static func lastFromNative() -> EngineError {
@@ -60,6 +184,7 @@ enum EngineError: LocalizedError {
 actor Engine {
     static let speakerWidth = Int(FTTS_SPEAKER_WIDTH)
     private var handle: OpaquePointer?
+    nonisolated private let cancellationController = EngineCancellationController()
 
     static func presets() -> [Preset] {
         let json = String(cString: ftts_presets_json())
@@ -78,9 +203,20 @@ actor Engine {
     var isLoaded: Bool { handle != nil }
 
     /// Hydrates the model. Multi-second; callers show progress copy of their own.
-    func load(modelDirectory: URL) throws {
+    func load(
+        modelDirectory: URL,
+        onProgress: @escaping @Sendable (EngineProgress) -> Void = { _ in }
+    ) throws {
         guard handle == nil else { return }
-        guard let opened = ftts_engine_open(modelDirectory.path) else {
+        let callback = ProgressCallbackBox(publish: onProgress)
+        cancellationController.begin(callback)
+        defer { cancellationController.end(callback) }
+        let context = Unmanaged.passUnretained(callback).toOpaque()
+        guard let opened = ftts_engine_open_with_progress(
+            modelDirectory.path,
+            nativeProgressCallback,
+            context
+        ) else {
             throw EngineError.lastFromNative()
         }
         handle = opened
@@ -94,16 +230,36 @@ actor Engine {
         handle = nil
     }
 
-    func synthesize(text: String, speaker: [Float], seed: UInt64) throws -> SynthesisOutput {
+    func synthesize(
+        text: String,
+        speaker: [Float],
+        seed: UInt64,
+        onProgress: @escaping @Sendable (EngineProgress) -> Void = { _ in }
+    ) throws -> SynthesisOutput {
         guard let handle else { throw EngineError.native("engine not loaded") }
         guard speaker.count == Self.speakerWidth else {
             throw EngineError.native("speaker vector has wrong width")
         }
         var pcm: UnsafeMutablePointer<Float>?
         var length = 0
+        let callback = ProgressCallbackBox(publish: onProgress)
+        cancellationController.begin(callback)
+        defer { cancellationController.end(callback) }
+        let context = Unmanaged.passUnretained(callback).toOpaque()
         let code = speaker.withUnsafeBufferPointer { buffer in
-            ftts_synthesize(handle, text, buffer.baseAddress, buffer.count, seed, &pcm, &length)
+            ftts_synthesize_with_progress(
+                handle,
+                text,
+                buffer.baseAddress,
+                buffer.count,
+                seed,
+                nativeProgressCallback,
+                context,
+                &pcm,
+                &length
+            )
         }
+        if code == FTTS_SYNTH_CANCELLED { throw EngineError.cancelled }
         guard code == 0, let pcm else { throw EngineError.lastFromNative() }
         defer { ftts_pcm_free(pcm, length) }
         let profileJSON = String(cString: ftts_last_synthesis_profile_json(handle))
@@ -115,6 +271,12 @@ actor Engine {
             pcm: Array(UnsafeBufferPointer(start: pcm, count: length)),
             profile: profile
         )
+    }
+
+    /// Thread-safe and nonisolated so a main-actor Cancel button can signal a native
+    /// synchronous call while the engine actor itself is occupied by that call.
+    nonisolated func cancelCurrentWork() {
+        cancellationController.cancel()
     }
 
     /// Whether the neural denoiser artifact is in the model directory — asked of the

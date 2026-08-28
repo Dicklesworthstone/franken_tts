@@ -4,6 +4,36 @@ import AVFoundation
 import PhotosUI
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
+
+private enum VoiceForgeTextEntry: Hashable {
+    case utterance
+    case seed
+}
+
+private struct VoiceForgeTextEntryFrameKey: PreferenceKey {
+    static let defaultValue: [VoiceForgeTextEntry: CGRect] = [:]
+
+    static func reduce(
+        value: inout [VoiceForgeTextEntry: CGRect],
+        nextValue: () -> [VoiceForgeTextEntry: CGRect]
+    ) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private extension View {
+    func reportVoiceForgeTextEntry(_ entry: VoiceForgeTextEntry) -> some View {
+        background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: VoiceForgeTextEntryFrameKey.self,
+                    value: [entry: proxy.frame(in: .named("voice-forge-text-space"))]
+                )
+            }
+        }
+    }
+}
 
 @MainActor
 @Observable
@@ -34,6 +64,8 @@ final class LabModel {
     var lastAudio: [Float]?
     var lastRealTimeFactor: Double?
     var lastProfile: SynthesisProfile?
+    var forge = VoiceForgeTelemetry()
+    var nativeProgressEvents: [EngineProgress] = []
     var player: AVAudioPlayer?
     /// The playback WAV (internal); shares go out as M4A and MP4.
     var wavUrl: URL?
@@ -44,19 +76,17 @@ final class LabModel {
     /// Bumped per synthesis so a slow export cannot stamp its output onto a newer clip.
     private var synthesisGeneration = 0
     private var engineWarmTask: Task<Void, Never>?
-
-    /// Estimated synthesis progress. Expected speech duration comes from the text
-    /// length (spoken English runs ~14 chars/s), expected wall time from the last
-    /// measured real-time factor on THIS phone; capped so it never claims done early.
-    var synthesisProgress: Double {
-        let speechSeconds = max(Double(text.count) / 14.0, 1.5)
-        let factor = UserDefaults.standard.double(forKey: "measuredRealTimeFactor")
-        let expectedWall = speechSeconds / max(factor > 0 ? factor : 0.3, 0.05)
-        return min(synthesisSeconds / expectedWall, 0.97)
-    }
+    private let activity = VoiceForgeActivityController.shared
 
     var lowMemoryDevice: Bool {
         ProcessInfo.processInfo.physicalMemory < 6 * 1024 * 1024 * 1024
+    }
+
+    var canSynthesizeFromCommand: Bool {
+        !isSynthesizing
+            && !isLoadingModel
+            && store.phase == .ready
+            && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     func speakerVector() throws -> [Float] {
@@ -84,6 +114,9 @@ final class LabModel {
         lastError = nil
         lastProfile = nil
         synthesisSeconds = 0
+        nativeProgressEvents.removeAll(keepingCapacity: true)
+        forge.reset(for: isEngineWarm ? .checkingMemory : .readingBundle)
+        activity.begin()
         let text = self.text
         let seed = self.seed
         let ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -100,17 +133,20 @@ final class LabModel {
                 let speaker = try speakerVector()
                 if await !engine.isLoaded {
                     isLoadingModel = true
-                    try await engine.load(modelDirectory: store.modelDirectory)
+                    try await engine.load(modelDirectory: store.modelDirectory) { [weak self] event in
+                        Task { @MainActor in self?.receive(event) }
+                    }
                 }
                 isEngineWarm = true
                 isLoadingModel = false
-                synthesisSeconds = 0
                 let started = Date()
                 let output = try await engine.synthesize(
                     text: text,
                     speaker: speaker,
                     seed: seed
-                )
+                ) { [weak self] event in
+                    Task { @MainActor in self?.receive(event) }
+                }
                 var pcm = output.pcm
                 lastProfile = output.profile
                 let elapsed = Date().timeIntervalSince(started)
@@ -121,15 +157,51 @@ final class LabModel {
                 // strips residual hiss (especially audible with cloned voices) and a
                 // failure just keeps the original audio.
                 if await engine.denoiseAvailable {
+                    forge.phase = .denoising
                     pcm = (try? await engine.denoise(pcm: pcm)) ?? pcm
                 }
                 lastAudio = pcm
                 try startPlayback(of: pcm)
+                forge.phase = .complete
+                activity.finish(
+                    status: .complete,
+                    headline: "Voice alive",
+                    detail: "Your private on-device audio is ready"
+                )
+            } catch EngineError.cancelled {
+                forge.phase = .cancelled
+                activity.finish(
+                    status: .cancelled,
+                    headline: "Forge stopped",
+                    detail: "No partial audio was published"
+                )
             } catch {
                 isEngineWarm = false
+                forge.phase = .failed
                 lastError = error.localizedDescription
+                activity.finish(
+                    status: .failed,
+                    headline: "Voice Forge needs attention",
+                    detail: "Open FrankenTTS to retry"
+                )
             }
+            isLoadingModel = false
             isSynthesizing = false
+        }
+    }
+
+    func cancelSynthesis() {
+        guard isSynthesizing else { return }
+        forge.phase = .cancelling
+        engine.cancelCurrentWork()
+    }
+
+    private func receive(_ event: EngineProgress) {
+        forge.apply(event)
+        activity.update(from: forge, elapsed: synthesisSeconds)
+        nativeProgressEvents.append(event)
+        if nativeProgressEvents.count > 160 {
+            nativeProgressEvents.removeFirst(nativeProgressEvents.count - 160)
         }
     }
 
@@ -154,6 +226,11 @@ final class LabModel {
             let converted = try? await MediaExporter.exportM4A(fromWav: url)
             if generation == synthesisGeneration { m4aUrl = converted }
         }
+    }
+
+    func togglePlayback() {
+        guard let player else { return }
+        if player.isPlaying { player.pause() } else { player.play() }
     }
 
     /// The label stamped on the video's voice pill.
@@ -282,14 +359,20 @@ final class LabModel {
             }
             do {
                 if await !self.engine.isLoaded {
-                    try await self.engine.load(modelDirectory: self.store.modelDirectory)
+                    self.forge.reset(for: .readingBundle)
+                    try await self.engine.load(modelDirectory: self.store.modelDirectory) { [weak self] event in
+                        Task { @MainActor in self?.receive(event) }
+                    }
                 }
                 try Task.checkCancellation()
                 self.isEngineWarm = true
+                if !self.isSynthesizing { self.forge.phase = .idle }
             } catch is CancellationError {
                 self.isEngineWarm = false
+                self.forge.phase = .cancelled
             } catch {
                 self.isEngineWarm = false
+                self.forge.phase = .failed
                 self.lastError = "Could not warm the model: \(error.localizedDescription)"
             }
         }
@@ -298,6 +381,40 @@ final class LabModel {
     func clearModel() {
         unloadEngineForMemoryPressure()
         store.clear()
+    }
+
+    func importDesktopFile(_ url: URL) {
+        let supportedText = ["txt", "md", "markdown"]
+        let ext = url.pathExtension.lowercased()
+        let scoped = url.startAccessingSecurityScopedResource()
+        Task {
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let data = try await Task.detached(priority: .userInitiated) {
+                    try Data(contentsOf: url, options: .mappedIfSafe)
+                }.value
+                if supportedText.contains(ext) {
+                    guard let imported = String(data: data, encoding: .utf8) else {
+                        throw EngineError.native("that text file is not UTF-8")
+                    }
+                    text = String(imported.prefix(600))
+                    return
+                }
+                guard let (name, vector) = await Task.detached(priority: .userInitiated, operation: {
+                    VoicePrintCard.decode(data)
+                }).value else {
+                    throw EngineError.native("that image does not contain a FrankenTTS voice card")
+                }
+                if let existing = library.voices.first(where: { $0.vector == vector }) {
+                    selectedVoice = "voice:\(existing.id.uuidString)"
+                } else {
+                    let voice = try library.add(name: name, vector: vector)
+                    selectedVoice = "voice:\(voice.id.uuidString)"
+                }
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
     }
 }
 
@@ -311,29 +428,56 @@ struct LabView: View {
     @State private var showConsent = false
     @State private var showEnrollment = false
     @State private var showGalaxy = false
+    @State private var showSpecimen = false
+    @State private var showVoiceLab = false
     @State private var renameTarget: EnrolledVoice?
     @State private var renameText = ""
     @State private var cardVoice: EnrolledVoice?
     @State private var importItem: PhotosPickerItem?
     @State private var importFailed = false
     @State private var importCount = 0
+    @State private var showDesktopImporter = false
+    @State private var textEntryFrames: [VoiceForgeTextEntry: CGRect] = [:]
     /// Bumped to refresh the play/pause icon, which tracks external playback state.
     @State private var playbackTick = 0
+    @State private var showMachineProfile = false
     @Environment(\.scenePhase) private var scenePhase
     @FocusState private var focusedField: EditorFocus?
 
     var body: some View {
-        ZStack {
-            Lab.background.ignoresSafeArea()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 26) {
-                    header
-                    specimenCard
-                    voicesCard
-                    utteranceCard
-                    footer
+        GeometryReader { geometry in
+            ZStack {
+                LaboratoryBackground()
+                ScrollView {
+                    if geometry.size.width >= 860 {
+                        HStack(alignment: .top, spacing: 22) {
+                            VStack(alignment: .leading, spacing: 16) {
+                                header
+                                modelStatusButton
+                                compactVoiceSelector(vertical: true)
+                                footer
+                            }
+                            .frame(width: min(320, geometry.size.width * 0.34))
+                            .frame(maxHeight: .infinity, alignment: .top)
+
+                            utteranceCard
+                                .frame(maxWidth: 820)
+                        }
+                        .frame(maxWidth: 1180, alignment: .center)
+                    } else {
+                        VStack(alignment: .leading, spacing: 18) {
+                            header
+                            modelStatusButton
+                            compactVoiceSelector(vertical: false)
+                            utteranceCard
+                            footer
+                        }
+                        .frame(maxWidth: 760)
+                    }
                 }
-                .padding(16)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, geometry.size.width >= 860 ? 28 : 14)
+                .padding(.vertical, 16)
             }
         }
         .toolbar {
@@ -342,14 +486,68 @@ struct LabView: View {
                 Button("Done") { focusedField = nil }
             }
         }
+        .coordinateSpace(name: "voice-forge-text-space")
+        .onPreferenceChange(VoiceForgeTextEntryFrameKey.self) { frames in
+            textEntryFrames = frames
+        }
+        .simultaneousGesture(
+            SpatialTapGesture(coordinateSpace: .named("voice-forge-text-space"))
+                .onEnded { tap in
+                    guard focusedField != nil else { return }
+                    let tappedEditor = textEntryFrames.values.contains { $0.contains(tap.location) }
+                    if !tappedEditor { focusedField = nil }
+                }
+        )
         .sheet(isPresented: $showEnrollment) {
             EnrollmentSheet(model: model)
+        }
+        .sheet(isPresented: $showSpecimen) {
+            NavigationStack {
+                ScrollView { specimenCard.padding(18) }
+                    .background(LaboratoryBackground())
+                    .navigationTitle("Model & storage")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showSpecimen = false }
+                        }
+                    }
+            }
+            .preferredColorScheme(.dark)
+            .presentationDetents([.medium, .large])
+        }
+        .sheet(isPresented: $showVoiceLab) {
+            NavigationStack {
+                ScrollView { voicesCard.padding(18) }
+                    .background(LaboratoryBackground())
+                    .navigationTitle("Voice laboratory")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showVoiceLab = false }
+                        }
+                    }
+            }
+            .preferredColorScheme(.dark)
+            .presentationDetents([.large])
         }
         .sheet(isPresented: $showGalaxy) {
             VoiceGalaxyView(presets: model.presets, enrolled: model.library.voices)
         }
         .sheet(item: $cardVoice) { voice in
             VoiceCardSheet(voice: voice)
+        }
+        .fileImporter(
+            isPresented: $showDesktopImporter,
+            allowedContentTypes: [.plainText, .image],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { model.importDesktopFile(url) }
+            case .failure(let error):
+                model.lastError = error.localizedDescription
+            }
         }
         .alert(
             "No voice in that picture", isPresented: $importFailed
@@ -418,6 +616,7 @@ struct LabView: View {
                 model.unloadEngineForMemoryPressure()
             } else if phase == .active {
                 model.warmEngineIfPossible()
+                consumeStagedText()
             }
         }
         .onChange(of: model.store.phase) { _, phase in
@@ -430,6 +629,8 @@ struct LabView: View {
         .onAppear(perform: debugCardHook)
         .onAppear(perform: debugVideoHook)
         .task { model.warmEngineIfPossible() }
+        .task { consumeStagedText() }
+        .onOpenURL(perform: handleDeepLink)
         .onAppear {
             #if DEBUG
                 // Screenshot harness: FTTS_DEBUG_GALAXY=1 opens the constellation.
@@ -439,22 +640,55 @@ struct LabView: View {
             #endif
         }
         .scrollDismissesKeyboard(.interactively)
+        .userActivity("com.frankentts.voice-forge") { activity in
+            activity.title = "FrankenTTS Voice Forge"
+            activity.isEligibleForHandoff = true
+            activity.userInfo = ["route": "forge"]
+        }
+        .onContinueUserActivity("com.frankentts.voice-forge") { _ in
+            consumeStagedText()
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first else { return false }
+            model.importDesktopFile(url)
+            return true
+        }
+        .focusedSceneValue(
+            \.voiceForgeCommands,
+            VoiceForgeCommandActions(
+                importFile: { showDesktopImporter = true },
+                synthesize: {
+                    focusedField = nil
+                    model.synthesize()
+                },
+                stop: { model.cancelSynthesis() },
+                togglePlayback: {
+                    model.togglePlayback()
+                    playbackTick += 1
+                },
+                canSynthesize: model.canSynthesizeFromCommand,
+                canStop: model.isSynthesizing,
+                canTogglePlayback: model.player != nil && focusedField == nil
+            )
+        )
+    }
+
+    private func consumeStagedText() {
+        guard let staged = FrankenTTSSharedStore.consumeStagedText(), !staged.isEmpty else { return }
+        model.text = String(staged.prefix(600))
+        focusedField = .utterance
+    }
+
+    private func handleDeepLink(_ url: URL) {
+        guard url.scheme == "frankentts" else { return }
+        if url.host == "cancel" { model.cancelSynthesis() }
+        consumeStagedText()
     }
 
     private var header: some View {
         HStack(spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(
-                        LinearGradient(
-                            colors: [Lab.emeraldDeep, Lab.emerald], startPoint: .bottomLeading,
-                            endPoint: .topTrailing))
-                    .frame(width: 42, height: 42)
-                Text("F")
-                    .font(.system(size: 24, weight: .black, design: .monospaced))
-                    .foregroundStyle(.black)
-            }
-            .overlay(alignment: .topLeading) { Bolt().offset(x: -4, y: -4) }
+            MonsterStatusMark(mood: monsterMood, instrument: .voice)
+                .frame(width: 52, height: 52)
             VStack(alignment: .leading, spacing: 2) {
                 Text("FrankenTTS")
                     .font(.system(size: 22, weight: .black))
@@ -468,6 +702,131 @@ struct LabView: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("FrankenTTS, the monster voice engine")
+    }
+
+    private var monsterMood: MonsterMood {
+        if model.lastError != nil { return .error }
+        if model.isSynthesizing { return .working }
+        if model.isLoadingModel { return .waking }
+        if model.lastAudio != nil { return .success }
+        return .idle
+    }
+
+    private var modelStatusButton: some View {
+        Button { showSpecimen = true } label: {
+            StatusCapsule(
+                title: modelStatusTitle,
+                detail: modelStatusDetail,
+                systemImage: modelStatusImage,
+                tint: model.store.phase == .ready ? Lab.emerald : Lab.amber
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens model download, storage, and readiness details")
+    }
+
+    private var modelStatusTitle: String {
+        switch model.store.phase {
+        case .ready:
+            model.isEngineWarm ? "Voice core warm" : (model.isLoadingModel ? "Voice core waking" : "Model on device")
+        case .downloading: "Downloading the local model"
+        case .verifying: "Verifying the local model"
+        case .failed: "Model needs attention"
+        case .idle: "Model required"
+        }
+    }
+
+    private var modelStatusDetail: String {
+        switch model.store.phase {
+        case .ready:
+            model.isEngineWarm ? "Private · ready to synthesize" : "Private · warming automatically"
+        case .downloading(_, let done, let total, _):
+            "\(Self.gigabytes(done)) of \(Self.gigabytes(total)) GB"
+        case .verifying(let asset): "Checking \(asset)"
+        case .failed: "Tap to inspect and retry"
+        case .idle: "One-time 2.0 GB download"
+        }
+    }
+
+    private var modelStatusImage: String {
+        switch model.store.phase {
+        case .ready: model.isEngineWarm ? "bolt.fill" : "brain.head.profile"
+        case .downloading: "arrow.down.circle"
+        case .verifying: "checkmark.shield"
+        case .failed: "exclamationmark.triangle"
+        case .idle: "externaldrive.badge.plus"
+        }
+    }
+
+    @ViewBuilder
+    private func compactVoiceSelector(vertical: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                LabLabel(text: "Voice specimen")
+                Spacer()
+                Button("Manage") { showVoiceLab = true }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Lab.emerald)
+                    .buttonStyle(.plain)
+            }
+
+            if vertical {
+                Button { showVoiceLab = true } label: {
+                    HStack(spacing: 12) {
+                        VoiceOrb(name: model.currentVoiceLabel, selected: true)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(model.currentVoiceLabel)
+                                .font(.headline)
+                                .foregroundStyle(Lab.textPrimary)
+                            Text("Selected voice · tap to open the library")
+                                .font(.caption)
+                                .foregroundStyle(Lab.textSecondary)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Lab.textSecondary)
+                    }
+                    .padding(12)
+                    .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .strokeBorder(Lab.emerald.opacity(0.28), lineWidth: 1)
+                    }
+                }
+                .buttonStyle(.plain)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 9) {
+                        ForEach(model.presets) { preset in
+                            CompactVoiceChip(
+                                name: preset.name,
+                                selected: model.selectedVoice == preset.name
+                            ) { model.selectedVoice = preset.name }
+                        }
+                        ForEach(model.library.voices) { voice in
+                            CompactVoiceChip(
+                                name: voice.name,
+                                selected: model.enrolledSelection() == voice.id,
+                                isPersonal: true
+                            ) { model.selectedVoice = "voice:\(voice.id.uuidString)" }
+                        }
+                        Button { openEnrollment(target: nil) } label: {
+                            Label("Clone", systemImage: "waveform.badge.plus")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Lab.emerald)
+                                .padding(.horizontal, 13)
+                                .frame(height: 42)
+                                .background(Lab.emerald.opacity(0.08), in: Capsule())
+                                .overlay(Capsule().strokeBorder(Lab.emerald.opacity(0.25), lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.vertical, 2)
+                }
+                .scrollClipDisabled()
+            }
+        }
     }
 
     private var specimenCard: some View {
@@ -578,8 +937,7 @@ struct LabView: View {
                             select: { model.selectedVoice = "voice:\(voice.id.uuidString)" },
                             rename: { renameTarget = voice },
                             reRecord: {
-                                model.enrollmentTarget = voice.id
-                                showEnrollment = true
+                                openEnrollment(target: voice.id)
                             },
                             share: { cardVoice = voice },
                             delete: {
@@ -596,8 +954,7 @@ struct LabView: View {
                         accent: true
                     ) {
                         if model.store.phase == .ready {
-                            model.enrollmentTarget = nil
-                            showEnrollment = true
+                            openEnrollment(target: nil)
                         }
                     }
                 }
@@ -670,6 +1027,7 @@ struct LabView: View {
                     .font(.system(size: 16))
                     .lineSpacing(4)
                     .focused($focusedField, equals: .utterance)
+                    .reportVoiceForgeTextEntry(.utterance)
                     .textInputAutocapitalization(.sentences)
                     .autocorrectionDisabled(false)
                 }
@@ -702,6 +1060,7 @@ struct LabView: View {
                     )
                     .keyboardType(.numberPad)
                     .focused($focusedField, equals: .seed)
+                    .reportVoiceForgeTextEntry(.seed)
                     .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(Lab.textPrimary)
                     .frame(width: 74)
@@ -734,23 +1093,13 @@ struct LabView: View {
                 }
                 .buttonStyle(PrimaryButtonStyle())
                 .disabled(
-                    model.isSynthesizing
-                        || model.isLoadingModel
-                        || model.store.phase != .ready
+                    !model.canSynthesizeFromCommand
                 )
-                if model.isSynthesizing {
-                    if model.isLoadingModel {
-                        Text("waking the model…")
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(Lab.textSecondary)
-                    } else {
-                        ProgressView(value: model.synthesisProgress)
-                            .tint(Lab.emerald)
-                        Text("\(Int(model.synthesisProgress * 100))%")
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(Lab.textSecondary)
-                    }
-                }
+                GalvanicVoiceForge(
+                    telemetry: model.forge,
+                    elapsed: model.synthesisSeconds,
+                    cancel: model.isSynthesizing ? { model.cancelSynthesis() } : nil
+                )
                 if let audio = model.lastAudio {
                     WaveformView(samples: audio)
                     HStack(spacing: 10) {
@@ -818,7 +1167,23 @@ struct LabView: View {
                         }
                     }
                     if let profile = model.lastProfile {
-                        synthesisProfile(profile)
+                        DisclosureGroup(isExpanded: $showMachineProfile) {
+                            synthesisProfile(profile)
+                                .padding(.top, 8)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "xray")
+                                    .foregroundStyle(Lab.cyan)
+                                Text("Inside the machine")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(Lab.textPrimary)
+                                Spacer()
+                                Text("timings · kernels · frames")
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(Lab.textSecondary)
+                            }
+                        }
+                        .tint(Lab.cyan)
                     }
                 }
                 if let error = model.lastError {
@@ -880,6 +1245,21 @@ struct LabView: View {
                 from: nil,
                 for: nil
             )
+        }
+    }
+
+    private func openEnrollment(target: UUID?) {
+        guard model.store.phase == .ready else {
+            showSpecimen = true
+            return
+        }
+        model.enrollmentTarget = target
+        showVoiceLab = false
+        Task { @MainActor in
+            // Let a presented voice-library sheet dismiss before asking SwiftUI to
+            // present the recorder; otherwise the request can be dropped on iPhone.
+            try? await Task.sleep(for: .milliseconds(180))
+            showEnrollment = true
         }
     }
 
@@ -984,6 +1364,73 @@ struct LabView: View {
 
     private static func gigabytes(_ bytes: Int64) -> String {
         String(format: "%.2f", Double(bytes) / 1_073_741_824.0)
+    }
+}
+
+private struct VoiceOrb: View {
+    let name: String
+    let selected: Bool
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(
+                    AngularGradient(
+                        colors: [Lab.emeraldDeep, Lab.emerald, Lab.cyan, Lab.emeraldDeep],
+                        center: .center
+                    )
+                )
+            Circle()
+                .fill(Color.black.opacity(0.62))
+                .padding(3)
+            Text(String(name.prefix(1)).uppercased())
+                .font(.system(size: 14, weight: .black, design: .rounded))
+                .foregroundStyle(selected ? Lab.emerald : Lab.textPrimary)
+        }
+        .frame(width: 40, height: 40)
+        .shadow(color: selected ? Lab.emerald.opacity(0.36) : .clear, radius: 9)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct CompactVoiceChip: View {
+    let name: String
+    let selected: Bool
+    var isPersonal = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                VoiceOrb(name: name, selected: selected)
+                    .frame(width: 30, height: 30)
+                    .scaleEffect(0.75)
+                    .frame(width: 26, height: 26)
+                Text(name.capitalized)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                if isPersonal {
+                    Image(systemName: "person.wave.2.fill")
+                        .font(.system(size: 9, weight: .bold))
+                }
+            }
+            .foregroundStyle(selected ? Lab.textPrimary : Lab.textSecondary)
+            .padding(.horizontal, 10)
+            .frame(height: 42)
+            .background(
+                selected ? Lab.emerald.opacity(0.14) : Color.black.opacity(0.34),
+                in: Capsule()
+            )
+            .overlay {
+                Capsule().strokeBorder(
+                    selected ? Lab.emerald.opacity(0.52) : Color.white.opacity(0.07),
+                    lineWidth: 1
+                )
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(name) voice")
+        .accessibilityValue(selected ? "Selected" : "Not selected")
     }
 }
 
