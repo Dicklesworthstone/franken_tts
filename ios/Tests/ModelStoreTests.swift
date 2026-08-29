@@ -19,20 +19,42 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertFalse(valid)
     }
 
-    func testFttsqHeaderAcceptsCanonicalMagic() async throws {
+    func testFttsqHeaderAcceptsCanonicalDirectory() async throws {
+        let contents = try fttsqFixture()
         let file = ModelFile(
             asset: "fixture.fttsq",
             relativePath: "fixture.fttsq",
-            bytes: 32,
+            bytes: Int64(contents.count),
             sha256: "unused"
         )
         let url = temporaryURL(extension: "fttsq")
         defer { try? FileManager.default.removeItem(at: url) }
-        try (Data("FTTSQ\0\0\0".utf8) + Data(repeating: 0, count: 24)).write(to: url)
+        try contents.write(to: url)
 
         let valid = try await ModelStore.hasValidContainerHeader(file: file, at: url)
 
         XCTAssertTrue(valid)
+    }
+
+    func testFttsqHeaderRejectsMagicFollowedByMalformedDirectoryJSON() async throws {
+        var contents = Data("FTTSQ\0\0\0".utf8)
+        appendLittleEndian(UInt32(1), to: &contents)
+        appendLittleEndian(UInt64(4), to: &contents)
+        contents.append(Data("nope".utf8))
+        contents.append(Data(repeating: 0, count: 4_096 - contents.count))
+        let file = ModelFile(
+            asset: "fixture.fttsq",
+            relativePath: "fixture.fttsq",
+            bytes: Int64(contents.count),
+            sha256: "unused"
+        )
+        let url = temporaryURL(extension: "fttsq")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try contents.write(to: url)
+
+        let valid = try await ModelStore.hasValidContainerHeader(file: file, at: url)
+
+        XCTAssertFalse(valid)
     }
 
     func testSafetensorsHeaderRequiresAJsonTensorDirectory() async throws {
@@ -42,22 +64,74 @@ final class ModelStoreTests: XCTestCase {
             try? FileManager.default.removeItem(at: validURL)
             try? FileManager.default.removeItem(at: invalidURL)
         }
-        let validData = safetensorsFixture(header: "{\"voice.weight\":{}}")
-        let invalidData = Data(repeating: 0, count: validData.count)
+        let validData = safetensorsFixture(
+            header: "{\"voice.weight\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[0,16]}}"
+        )
+        let invalidData = safetensorsFixture(header: "{\"voice.weight\":{}}")
         try validData.write(to: validURL)
         try invalidData.write(to: invalidURL)
-        let file = ModelFile(
+        let validFile = ModelFile(
             asset: "fixture.safetensors",
             relativePath: "fixture.safetensors",
             bytes: Int64(validData.count),
             sha256: "unused"
         )
+        let invalidFile = ModelFile(
+            asset: "fixture.safetensors",
+            relativePath: "fixture.safetensors",
+            bytes: Int64(invalidData.count),
+            sha256: "unused"
+        )
 
-        let valid = try await ModelStore.hasValidContainerHeader(file: file, at: validURL)
-        let invalid = try await ModelStore.hasValidContainerHeader(file: file, at: invalidURL)
+        let valid = try await ModelStore.hasValidContainerHeader(file: validFile, at: validURL)
+        let invalid = try await ModelStore.hasValidContainerHeader(file: invalidFile, at: invalidURL)
 
         XCTAssertTrue(valid)
         XCTAssertFalse(invalid)
+    }
+
+    private func fttsqFixture() throws -> Data {
+        let payloadOffset = 2_048
+        let fileLength = 4_096
+        let directory: [String: Any] = [
+            "format_version": 1,
+            "model_family": "fixture",
+            "source_sha256": String(repeating: "a", count: 64),
+            "license_notice": "fixture notice",
+            "sections": [[
+                "name": "weights",
+                "access_class": "METADATA",
+                "offset": payloadOffset,
+                "length": 4,
+                "sha256": String(repeating: "0", count: 64),
+            ]],
+            "tensors": [[
+                "name": "voice.weight",
+                "section": "weights",
+                "dtype": "f32",
+                "shape": [1],
+                "offset": 0,
+                "length": 4,
+            ]],
+        ]
+        let directoryData = try JSONSerialization.data(
+            withJSONObject: directory,
+            options: [.sortedKeys]
+        )
+        XCTAssertLessThan(20 + directoryData.count, payloadOffset)
+        var data = Data("FTTSQ\0\0\0".utf8)
+        appendLittleEndian(UInt32(1), to: &data)
+        appendLittleEndian(UInt64(directoryData.count), to: &data)
+        data.append(directoryData)
+        data.append(Data(repeating: 0, count: payloadOffset - data.count))
+        data.append(Data(repeating: 0, count: 4))
+        data.append(Data(repeating: 0, count: fileLength - data.count))
+        return data
+    }
+
+    private func appendLittleEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
     }
 
     private func safetensorsFixture(header: String) -> Data {

@@ -38,7 +38,9 @@ private final class AudioFeedContext: @unchecked Sendable {
 
     func feed() async throws {
         while let sample = readerOutput.copyNextSampleBuffer() {
+            try Task.checkCancellation()
             while !audioInput.isReadyForMoreMediaData {
+                try Task.checkCancellation()
                 guard writer.status == .writing else {
                     throw writer.error
                         ?? EngineError.native("video writer stopped while waiting for audio")
@@ -75,7 +77,9 @@ enum MediaExporter {
         session.outputFileType = .m4a
         session.outputURL = output
         await session.export()
-        if let error = session.error { throw error }
+        guard session.status == .completed else {
+            throw session.error ?? EngineError.native("M4A export did not complete")
+        }
         return output
     }
 
@@ -130,14 +134,15 @@ enum MediaExporter {
                 AVNumberOfChannelsKey: 1,
             ])
         audioInput.expectsMediaDataInRealTime = false
+        guard writer.canAdd(videoInput), writer.canAdd(audioInput) else {
+            throw EngineError.native("this device cannot combine the video and audio tracks")
+        }
         writer.add(videoInput)
         writer.add(audioInput)
-        guard writer.startWriting() else {
-            throw writer.error ?? EngineError.native("video writer failed to start")
-        }
-        writer.startSession(atSourceTime: .zero)
 
-        // Audio reader, set up before feeding starts. One asset instance throughout: a
+        // Prepare the reader before starting the writer. If track loading or reader setup
+        // fails, no half-open writer session or partial output is left behind. One asset
+        // instance is used throughout: a
         // reader can only consume tracks belonging to the exact asset it was created
         // over, not an equal asset at the same URL.
         let audioAsset = AVURLAsset(url: wavUrl)
@@ -147,10 +152,18 @@ enum MediaExporter {
         let readerOutput = AVAssetReaderTrackOutput(
             track: track,
             outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
+        guard reader.canAdd(readerOutput) else {
+            throw EngineError.native("cannot decode the share WAV for video export")
+        }
         reader.add(readerOutput)
         guard reader.startReading() else {
             throw reader.error ?? EngineError.native("cannot read the share WAV")
         }
+        guard writer.startWriting() else {
+            reader.cancelReading()
+            throw writer.error ?? EngineError.native("video writer failed to start")
+        }
+        writer.startSession(atSourceTime: .zero)
 
         // Audio and video MUST feed concurrently: with two inputs the writer
         // interleaves media, so after buffering a fraction of a second of video it
@@ -198,6 +211,7 @@ enum MediaExporter {
                         throw EngineError.native("frame \(frame) went missing")
                     }
                     while !videoInput.isReadyForMoreMediaData {
+                        try Task.checkCancellation()
                         guard writer.status == .writing else {
                             throw writer.error
                                 ?? EngineError.native("video writer stopped while waiting for frames")
@@ -222,6 +236,14 @@ enum MediaExporter {
                             throw EngineError.native("video pixel buffer has no writable storage")
                         }
                         let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+                        let availableBytes = CVPixelBufferGetDataSize(pixelBuffer)
+                        let requiredBytes = stride.multipliedReportingOverflow(by: height)
+                        guard stride >= bgraStride,
+                              !requiredBytes.overflow,
+                              requiredBytes.partialValue <= availableBytes
+                        else {
+                            throw EngineError.native("video pixel buffer has invalid row geometry")
+                        }
                         bgra.withUnsafeBufferPointer { source in
                             if stride == bgraStride {
                                 base.copyMemory(
@@ -248,6 +270,7 @@ enum MediaExporter {
             videoInput.markAsFinished()
             try await audioDone
         } catch {
+            reader.cancelReading()
             writer.cancelWriting()
             throw error
         }

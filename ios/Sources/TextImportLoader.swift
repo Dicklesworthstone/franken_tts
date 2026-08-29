@@ -147,8 +147,11 @@ enum TextImportLoader {
 
     private static func isReadableText(_ text: String) -> Bool {
         guard !text.isEmpty else { return false }
+        // The synth ABI accepts a C string. A NUL anywhere in imported text would
+        // silently truncate the utterance at that byte, even when the first 4 KiB
+        // looked perfectly textual.
+        if text.unicodeScalars.contains(where: { $0.value == 0 }) { return false }
         let sample = text.unicodeScalars.prefix(4_096)
-        if sample.contains(where: { $0.value == 0 }) { return false }
         let disallowed = sample.reduce(into: 0) { count, scalar in
             let isC0Control = scalar.value < 0x20
                 && scalar != "\n" && scalar != "\r" && scalar != "\t"
@@ -172,6 +175,7 @@ enum TextImportLoader {
         case unreadablePDF
         case pdfHasNoText
         case pdfTooLarge
+        case extractionTimedOut
 
         var errorDescription: String? {
             switch self {
@@ -187,6 +191,8 @@ enum TextImportLoader {
                 "That PDF has no embedded text to extract."
             case .pdfTooLarge:
                 "That PDF is larger than the 32 MB URL-import safety limit. Download it to Files and import it there instead."
+            case .extractionTimedOut:
+                "That web page took too long to turn into readable text. Try a simpler page or import a downloaded document instead."
             }
         }
     }

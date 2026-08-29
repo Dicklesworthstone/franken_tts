@@ -41,6 +41,16 @@ final class TextImportTests: XCTestCase {
         XCTAssertThrowsError(try TextImportLoader.readTextFile(from: url))
     }
 
+    func testNulAfterTheReadabilitySampleIsStillRejected() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("frankentts-late-nul-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try (String(repeating: "A", count: 5_000) + "\0hidden tail")
+            .write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(try TextImportLoader.readTextFile(from: url))
+    }
+
     func testPDFKitExtractsTextInPageOrder() throws {
         let renderer = UIGraphicsPDFRenderer(
             bounds: CGRect(x: 0, y: 0, width: 612, height: 792)
@@ -83,5 +93,42 @@ final class TextImportTests: XCTestCase {
         XCTAssertTrue(text.contains("first substantial paragraph"))
         XCTAssertFalse(text.contains("PRICING ACCOUNT"))
         XCTAssertFalse(text.contains("Privacy Terms"))
+    }
+
+    @MainActor
+    func testReadableHTMLExtractionHonorsCancellation() async {
+        let html = "<html><body><article>" + String(repeating: "laboratory ", count: 20_000)
+            + "</article></body></html>"
+        let task = Task { @MainActor in
+            try await ReadableTextExtractor.extract(from: html)
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("a cancelled extraction must not publish text")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+    }
+
+    @MainActor
+    func testReadableHTMLExtractionTimesOutInsteadOfHanging() async {
+        let html = "<html><body><article>" + String(repeating: "laboratory ", count: 20_000)
+            + "</article></body></html>"
+
+        do {
+            _ = try await ReadableTextExtractor.extract(
+                from: html,
+                timeout: .milliseconds(1)
+            )
+            XCTFail("the deliberately tiny deadline should expire")
+        } catch TextImportLoader.ImportError.extractionTimedOut {
+            // Expected.
+        } catch {
+            XCTFail("expected extractionTimedOut, got \(error)")
+        }
     }
 }

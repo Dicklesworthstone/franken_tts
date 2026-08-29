@@ -85,6 +85,9 @@ final class AudioRecorder {
     private var timer: Timer?
 
     func start() throws {
+        guard !isRecording else {
+            throw EngineError.native("voice capture is already running")
+        }
         let session = AVAudioSession.sharedInstance()
         // .default keeps the system input chain, including automatic gain control.
         // .measurement disables it and hands over raw low-gain samples: on a phone held
@@ -97,6 +100,7 @@ final class AudioRecorder {
         let input = audioEngine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard let sink = CaptureSink(from: inputFormat) else {
+            try? session.setCategory(.playback)
             throw EngineError.native("cannot build the 24 kHz capture pipeline")
         }
         self.sink = sink
@@ -104,7 +108,17 @@ final class AudioRecorder {
             sink.consume(buffer)
         }
         audioEngine.prepare()
-        try audioEngine.start()
+        do {
+            try audioEngine.start()
+        } catch {
+            // `installTap` succeeds before the engine starts. Leaving it installed on
+            // this error path makes the next retry raise an Objective-C exception for
+            // installing a second tap on the same bus.
+            input.removeTap(onBus: 0)
+            self.sink = nil
+            try? session.setCategory(.playback)
+            throw error
+        }
         isRecording = true
         seconds = 0
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
@@ -118,6 +132,7 @@ final class AudioRecorder {
 
     /// Stops and returns the captured 24 kHz mono PCM.
     func stop() -> [Float] {
+        guard isRecording else { return [] }
         timer?.invalidate()
         timer = nil
         audioEngine.inputNode.removeTap(onBus: 0)

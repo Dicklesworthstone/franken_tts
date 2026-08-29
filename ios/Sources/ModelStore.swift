@@ -9,6 +9,7 @@
 // and final digest is validated. Storage is Application Support, excluded from backup.
 
 import CryptoKit
+import CoreFoundation
 import Foundation
 
 struct ModelFile {
@@ -226,6 +227,14 @@ final class ModelStore {
             let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? nil
             return size == file.bytes
         }
+    }
+
+    /// Waits for the bounded launch integrity check that owns the transition from
+    /// `.verifying` to `.ready`. Hidden benchmark lanes must not bypass this gate merely
+    /// because every artifact happens to have the expected byte count.
+    func waitForLaunchValidation() async {
+        let pending = launchValidationTask
+        await pending?.value
     }
 
     func refreshCachedBytes() {
@@ -542,9 +551,37 @@ final class ModelStore {
         try await Task.detached(priority: .utility) {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
+            guard file.bytes >= 0,
+                  try handle.seekToEnd() == UInt64(file.bytes)
+            else { return false }
+            try handle.seek(toOffset: 0)
 
             if file.asset.hasSuffix(".fttsq") {
-                return try handle.read(upToCount: 8) == Data("FTTSQ\0\0\0".utf8)
+                guard let prefix = try handle.read(upToCount: 20),
+                      prefix.count == 20,
+                      prefix.prefix(8) == Data("FTTSQ\0\0\0".utf8)
+                else { return false }
+                let version = prefix[8..<12].withUnsafeBytes { raw -> UInt32 in
+                    raw.loadUnaligned(as: UInt32.self).littleEndian
+                }
+                let directoryLength = prefix[12..<20].withUnsafeBytes { raw -> UInt64 in
+                    raw.loadUnaligned(as: UInt64.self).littleEndian
+                }
+                guard version == 1,
+                      directoryLength > 0,
+                      directoryLength <= 64 * 1_024 * 1_024,
+                      directoryLength <= UInt64(file.bytes - 20),
+                      let directory = try handle.read(upToCount: Int(directoryLength)),
+                      directory.count == Int(directoryLength),
+                      let json = try? JSONSerialization.jsonObject(with: directory),
+                      let object = json as? [String: Any]
+                else { return false }
+                return validFttsqDirectory(
+                    object,
+                    version: UInt64(version),
+                    directoryEnd: 20 + directoryLength,
+                    fileLength: UInt64(file.bytes)
+                )
             }
             if file.asset.hasSuffix(".safetensors") {
                 guard let prefix = try handle.read(upToCount: 8), prefix.count == 8 else {
@@ -559,12 +596,187 @@ final class ModelStore {
                 else { return false }
                 guard let header = try handle.read(upToCount: Int(headerLength)),
                       header.count == Int(headerLength),
-                      let object = try JSONSerialization.jsonObject(with: header) as? [String: Any]
+                      let json = try? JSONSerialization.jsonObject(with: header),
+                      let object = json as? [String: Any]
                 else { return false }
-                return object.keys.contains { $0 != "__metadata__" }
+                return validSafetensorsDirectory(
+                    object,
+                    payloadLength: UInt64(file.bytes) - 8 - headerLength
+                )
             }
             return false
         }.value
+    }
+
+    private nonisolated static func validFttsqDirectory(
+        _ object: [String: Any],
+        version: UInt64,
+        directoryEnd: UInt64,
+        fileLength: UInt64
+    ) -> Bool {
+        guard unsignedInteger(object["format_version"]) == version,
+              nonemptyString(object["model_family"]) != nil,
+              nonemptyString(object["source_sha256"]) != nil,
+              let licenseNotice = nonemptyString(object["license_notice"]),
+              !licenseNotice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let sectionObjects = object["sections"] as? [[String: Any]],
+              !sectionObjects.isEmpty,
+              sectionObjects.count <= 64,
+              let tensorObjects = object["tensors"] as? [[String: Any]],
+              !tensorObjects.isEmpty,
+              tensorObjects.count <= 16_384
+        else { return false }
+
+        let accessClasses: Set<String> = [
+            "HOT_RECURRENT_MICRODECODER", "HOT_RECURRENT_TALKER",
+            "HOT_CODEC_DECODER", "COLD_TEXT_EMBEDDING",
+            "ENROLLMENT_SPEAKER_ENCODER", "ENROLLMENT_CODEC_ENCODER", "METADATA",
+        ]
+        var sectionLengths: [String: UInt64] = [:]
+        var sectionRanges: [(UInt64, UInt64)] = []
+        for section in sectionObjects {
+            guard let name = nonemptyString(section["name"]),
+                  sectionLengths[name] == nil,
+                  let accessClass = nonemptyString(section["access_class"]),
+                  accessClasses.contains(accessClass),
+                  let offset = unsignedInteger(section["offset"]),
+                  let length = unsignedInteger(section["length"]),
+                  offset >= directoryEnd,
+                  let end = checkedSum(offset, length),
+                  end <= fileLength,
+                  isSHA256(section["sha256"])
+            else { return false }
+            sectionLengths[name] = length
+            sectionRanges.append((offset, end))
+        }
+        sectionRanges.sort { $0.0 < $1.0 }
+        for index in 1..<sectionRanges.count
+        where sectionRanges[index - 1].1 > sectionRanges[index].0 {
+            return false
+        }
+
+        let dtypes: Set<String> = ["bf16", "f32", "q8", "q4"]
+        var tensorNames = Set<String>()
+        var rangesBySection: [String: [(UInt64, UInt64)]] = [:]
+        for tensor in tensorObjects {
+            guard let name = nonemptyString(tensor["name"]),
+                  tensorNames.insert(name).inserted,
+                  let section = nonemptyString(tensor["section"]),
+                  let sectionLength = sectionLengths[section],
+                  let dtype = nonemptyString(tensor["dtype"]),
+                  dtypes.contains(dtype),
+                  let rawShape = tensor["shape"] as? [Any],
+                  rawShape.count <= 8,
+                  let shape = integerShape(rawShape),
+                  let offset = unsignedInteger(tensor["offset"]),
+                  let length = unsignedInteger(tensor["length"]),
+                  let end = checkedSum(offset, length),
+                  end <= sectionLength,
+                  storageByteCount(shape: shape, dtype: dtype) == length
+            else { return false }
+            rangesBySection[section, default: []].append((offset, end))
+        }
+        for var ranges in rangesBySection.values {
+            ranges.sort { $0.0 < $1.0 }
+            for index in 1..<ranges.count where ranges[index - 1].1 > ranges[index].0 {
+                return false
+            }
+        }
+        return true
+    }
+
+    private nonisolated static func validSafetensorsDirectory(
+        _ object: [String: Any],
+        payloadLength: UInt64
+    ) -> Bool {
+        let entries = object.filter { $0.key != "__metadata__" }
+        guard !entries.isEmpty, entries.count <= 16_384 else { return false }
+        var ranges: [(UInt64, UInt64)] = []
+        for (name, value) in entries {
+            guard !name.isEmpty,
+                  let entry = value as? [String: Any],
+                  let dtype = entry["dtype"] as? String,
+                  dtype == "BF16" || dtype == "F32",
+                  let rawShape = entry["shape"] as? [Any],
+                  rawShape.count <= 8,
+                  let shape = integerShape(rawShape),
+                  let offsets = entry["data_offsets"] as? [Any],
+                  offsets.count == 2,
+                  let begin = unsignedInteger(offsets[0]),
+                  let end = unsignedInteger(offsets[1]),
+                  begin <= end,
+                  end <= payloadLength,
+                  storageByteCount(shape: shape, dtype: dtype) == end - begin
+            else { return false }
+            ranges.append((begin, end))
+        }
+        ranges.sort { $0.0 < $1.0 }
+        for index in 1..<ranges.count where ranges[index - 1].1 > ranges[index].0 {
+            return false
+        }
+        return true
+    }
+
+    private nonisolated static func nonemptyString(_ value: Any?) -> String? {
+        guard let value = value as? String, !value.isEmpty else { return nil }
+        return value
+    }
+
+    private nonisolated static func unsignedInteger(_ value: Any?) -> UInt64? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else { return nil }
+        let signed = number.int64Value
+        guard signed >= 0, number.doubleValue == Double(signed) else { return nil }
+        return UInt64(signed)
+    }
+
+    private nonisolated static func integerShape(_ values: [Any]) -> [UInt64]? {
+        var shape: [UInt64] = []
+        shape.reserveCapacity(values.count)
+        for value in values {
+            guard let dimension = unsignedInteger(value), dimension <= 1 << 32 else {
+                return nil
+            }
+            shape.append(dimension)
+        }
+        return shape
+    }
+
+    private nonisolated static func checkedSum(_ lhs: UInt64, _ rhs: UInt64) -> UInt64? {
+        let result = lhs.addingReportingOverflow(rhs)
+        return result.overflow ? nil : result.partialValue
+    }
+
+    private nonisolated static func checkedProduct(_ lhs: UInt64, _ rhs: UInt64) -> UInt64? {
+        let result = lhs.multipliedReportingOverflow(by: rhs)
+        return result.overflow ? nil : result.partialValue
+    }
+
+    private nonisolated static func storageByteCount(
+        shape: [UInt64],
+        dtype: String
+    ) -> UInt64? {
+        var elements: UInt64 = 1
+        for dimension in shape {
+            let product = elements.multipliedReportingOverflow(by: dimension)
+            guard !product.overflow else { return nil }
+            elements = product.partialValue
+        }
+        switch dtype {
+        case "BF16", "bf16": return checkedProduct(elements, 2)
+        case "F32", "f32": return checkedProduct(elements, 4)
+        case "q8": return elements
+        case "q4": return checkedSum(elements, 1).map { $0 / 2 }
+        default: return nil
+        }
+    }
+
+    private nonisolated static func isSHA256(_ value: Any?) -> Bool {
+        guard let text = value as? String, text.utf8.count == 64 else { return false }
+        return text.utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (97...102).contains(byte)
+        }
     }
 
     /// Streaming SHA-256 of a file, 8 MiB at a time, off the main actor.

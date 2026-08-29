@@ -34,15 +34,20 @@ final class VoiceLibrary {
             contents
             .filter { $0.pathExtension == "json" }
             .compactMap { url in
-                (try? Data(contentsOf: url)).flatMap {
-                    try? JSONDecoder().decode(EnrolledVoice.self, from: $0)
-                }
+                guard let data = try? Data(contentsOf: url),
+                      let voice = try? JSONDecoder().decode(EnrolledVoice.self, from: data),
+                      url.deletingPathExtension().lastPathComponent
+                        .caseInsensitiveCompare(voice.id.uuidString) == .orderedSame
+                else { return nil }
+                return voice
             }
             // A truncated or hand-edited file must not reach the engine or the card
             // renderer; both require exactly the speaker width, all finite.
             .filter { voice in
                 voice.vector.count == Engine.speakerWidth
                     && voice.vector.allSatisfy(\.isFinite)
+                    && !voice.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !voice.name.utf8.contains(0)
             }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
@@ -60,14 +65,31 @@ final class VoiceLibrary {
     }
 
     func rename(id: UUID, to name: String) throws {
-        guard var voice = voice(id: id) else { return }
+        guard var voice = voice(id: id) else {
+            throw EngineError.native("that saved voice no longer exists")
+        }
         voice.name = name
         try persist(voice)
         reload()
     }
 
     func replaceVector(id: UUID, with vector: [Float]) throws {
-        guard var voice = voice(id: id) else { return }
+        guard var voice = voice(id: id) else {
+            throw EngineError.native("that saved voice no longer exists")
+        }
+        voice.vector = vector
+        try persist(voice)
+        reload()
+    }
+
+    /// Replace an enrollment and its label with one atomic file write. Keeping these
+    /// together prevents a failed rename from leaving the new fingerprint stored under
+    /// the old identity while the UI reports that enrollment failed.
+    func update(id: UUID, name: String, vector: [Float]) throws {
+        guard var voice = voice(id: id) else {
+            throw EngineError.native("that saved voice no longer exists")
+        }
+        voice.name = name
         voice.vector = vector
         try persist(voice)
         reload()
@@ -83,6 +105,16 @@ final class VoiceLibrary {
     }
 
     private func persist(_ voice: EnrolledVoice) throws {
+        guard voice.vector.count == Engine.speakerWidth,
+              voice.vector.allSatisfy(\.isFinite)
+        else {
+            throw EngineError.native("voice fingerprint is damaged or has the wrong size")
+        }
+        guard !voice.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !voice.name.utf8.contains(0)
+        else {
+            throw EngineError.native("voice name must contain visible text without NUL characters")
+        }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try JSONEncoder().encode(voice).write(to: url(for: voice.id), options: .atomic)
     }

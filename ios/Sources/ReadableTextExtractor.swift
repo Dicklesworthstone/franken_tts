@@ -4,6 +4,7 @@ import WebKit
 @MainActor
 final class ReadableTextExtractor: NSObject, WKNavigationDelegate {
     private var continuation: CheckedContinuation<String, Error>?
+    private var timeoutTask: Task<Void, Never>?
     private let webView: WKWebView
 
     override init() {
@@ -15,12 +16,15 @@ final class ReadableTextExtractor: NSObject, WKNavigationDelegate {
         webView.navigationDelegate = self
     }
 
-    static func extract(from html: String) async throws -> String {
+    static func extract(
+        from html: String,
+        timeout: Duration = .seconds(15)
+    ) async throws -> String {
         let extractor = ReadableTextExtractor()
-        return try await extractor.extract(html)
+        return try await extractor.extract(html, timeout: timeout)
     }
 
-    private func extract(_ html: String) async throws -> String {
+    private func extract(_ html: String, timeout: Duration) async throws -> String {
         let policy = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\">"
         let inertHTML = html.replacingOccurrences(
             of: #"(?is)<meta\b[^>]*>"#,
@@ -36,23 +40,41 @@ final class ReadableTextExtractor: NSObject, WKNavigationDelegate {
             sealedHTML = "<html><head>\(policy)</head><body>\(inertHTML)</body></html>"
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            self.continuation = continuation
-            webView.loadHTMLString(sealedHTML, baseURL: nil)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                // A task can already be cancelled before the handler installs its
+                // continuation. In that ordering the onCancel closure has nothing to
+                // resume, so refuse here rather than starting a web view that survives
+                // until the extraction timeout.
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                self.continuation = continuation
+                timeoutTask = Task { [weak self] in
+                    try? await Task.sleep(for: timeout)
+                    guard !Task.isCancelled else { return }
+                    self?.finish(with: TextImportLoader.ImportError.extractionTimedOut)
+                }
+                webView.loadHTMLString(sealedHTML, baseURL: nil)
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.finish(with: CancellationError())
+            }
         }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         webView.evaluateJavaScript(Self.readerScript) { [weak self] value, error in
-            guard let self, let continuation = self.continuation else { return }
-            self.continuation = nil
+            guard let self else { return }
             if let error {
-                continuation.resume(throwing: error)
+                self.finish(with: error)
             } else if let text = value as? String,
                       !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                continuation.resume(returning: text)
+                self.finish(returning: text)
             } else {
-                continuation.resume(throwing: TextImportLoader.ImportError.notText)
+                self.finish(with: TextImportLoader.ImportError.notText)
             }
         }
     }
@@ -80,7 +102,19 @@ final class ReadableTextExtractor: NSObject, WKNavigationDelegate {
     private func finish(with error: Error) {
         guard let continuation else { return }
         self.continuation = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        webView.stopLoading()
         continuation.resume(throwing: error)
+    }
+
+    private func finish(returning text: String) {
+        guard let continuation else { return }
+        self.continuation = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        webView.stopLoading()
+        continuation.resume(returning: text)
     }
 
     private static let readerScript = #"""

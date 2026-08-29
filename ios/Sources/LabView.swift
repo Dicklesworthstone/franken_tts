@@ -273,6 +273,8 @@ final class LabModel {
     private var cancellationRequested = false
     private var completedSynthesisFrames: UInt64 = 0
     private var engineWarmTask: Task<Void, Never>?
+    /// Fences native callbacks from completed/cancelled warm and synthesis runs.
+    private var progressGeneration = 0
     private let activity = VoiceForgeActivityController.shared
     private var eta = TTSAdaptiveETA()
 
@@ -313,6 +315,8 @@ final class LabModel {
         guard !chunks.isEmpty else { return }
         player?.pause()
         isSynthesizing = true
+        progressGeneration &+= 1
+        let progressRun = progressGeneration
         cancellationRequested = false
         completedSynthesisFrames = 0
         synthesisChunkIndex = 1
@@ -349,7 +353,9 @@ final class LabModel {
                 if await !engine.isLoaded {
                     isLoadingModel = true
                     try await engine.load(modelDirectory: store.modelDirectory) { [weak self] event in
-                        Task { @MainActor in self?.receive(event) }
+                        DispatchQueue.main.async {
+                            self?.receive(event, generation: progressRun)
+                        }
                     }
                 }
                 isEngineWarm = true
@@ -372,11 +378,12 @@ final class LabModel {
                         speaker: speaker,
                         seed: seed &+ UInt64(index)
                     ) { [weak self] event in
-                        Task { @MainActor in
+                        DispatchQueue.main.async {
                             self?.receive(
                                 event,
                                 chunkOrdinal: index + 1,
-                                frameOffset: frameOffset
+                                frameOffset: frameOffset,
+                                generation: progressRun
                             )
                         }
                     }
@@ -439,6 +446,7 @@ final class LabModel {
                 estimatedRemainingSeconds = nil
                 lastAudio = pcm
                 try startPlayback(of: pcm)
+                progressGeneration &+= 1
                 forge.phase = .complete
                 activity.finish(
                     status: .complete,
@@ -446,6 +454,7 @@ final class LabModel {
                     detail: "Your private on-device audio is ready"
                 )
             } catch EngineError.cancelled {
+                progressGeneration &+= 1
                 forge.phase = .cancelled
                 activity.finish(
                     status: .cancelled,
@@ -453,6 +462,7 @@ final class LabModel {
                     detail: "No partial audio was published"
                 )
             } catch {
+                progressGeneration &+= 1
                 isEngineWarm = await engine.isLoaded
                 forge.phase = .failed
                 lastError = error.localizedDescription
@@ -507,8 +517,9 @@ final class LabModel {
         }
 
         do {
-            guard store.isComplete else {
-                throw EngineError.native("profiling requires the complete downloaded model")
+            await store.waitForLaunchValidation()
+            guard store.phase == .ready else {
+                throw EngineError.native("profiling requires a verified downloaded model")
             }
             let speaker = try Engine.presetVector(named: voice)
             try appendReceipt([
@@ -614,8 +625,12 @@ final class LabModel {
     private func receive(
         _ event: EngineProgress,
         chunkOrdinal: Int? = nil,
-        frameOffset: UInt64 = 0
+        frameOffset: UInt64 = 0,
+        generation: Int
     ) {
+        guard generation == progressGeneration,
+              !(isSynthesizing && cancellationRequested)
+        else { return }
         if let chunkOrdinal, chunkOrdinal != synthesisChunkIndex { return }
         forge.apply(event)
         if synthesisChunkCount > 1, chunkOrdinal != nil {
@@ -741,8 +756,7 @@ final class LabModel {
                 let vector = try await engine.enroll(pcm: pcm)
                 let selected: UUID
                 if let target = enrollmentTarget {
-                    try library.replaceVector(id: target, with: vector)
-                    try library.rename(id: target, to: trimmedName)
+                    try library.update(id: target, name: trimmedName, vector: vector)
                     selected = target
                 } else {
                     selected = try library.add(name: trimmedName, vector: vector).id
@@ -783,6 +797,9 @@ final class LabModel {
     /// Frees the ~2.3 GB engine heap; the next synthesis reloads it.
     func unloadEngineForMemoryPressure() {
         guard !isSynthesizing else { return }
+        // A callback already queued onto the main actor can outlive cancellation of
+        // the warm task. Fence it before changing the visible warm/loading state.
+        progressGeneration &+= 1
         engine.cancelCurrentWork()
         engineWarmTask?.cancel()
         engineWarmTask = nil
@@ -802,6 +819,8 @@ final class LabModel {
         else { return }
 
         isLoadingModel = true
+        progressGeneration &+= 1
+        let progressRun = progressGeneration
         engineWarmTask = Task { [weak self] in
             guard let self else { return }
             defer {
@@ -812,19 +831,25 @@ final class LabModel {
                 if await !self.engine.isLoaded {
                     self.forge.reset(for: .readingBundle)
                     try await self.engine.load(modelDirectory: self.store.modelDirectory) { [weak self] event in
-                        Task { @MainActor in self?.receive(event) }
+                        DispatchQueue.main.async {
+                            self?.receive(event, generation: progressRun)
+                        }
                     }
                 }
                 try Task.checkCancellation()
+                self.progressGeneration &+= 1
                 self.isEngineWarm = true
                 if !self.isSynthesizing { self.forge.phase = .idle }
             } catch EngineError.cancelled {
+                self.progressGeneration &+= 1
                 self.isEngineWarm = false
                 self.forge.phase = .cancelled
             } catch is CancellationError {
+                self.progressGeneration &+= 1
                 self.isEngineWarm = false
                 self.forge.phase = .cancelled
             } catch {
+                self.progressGeneration &+= 1
                 self.isEngineWarm = false
                 self.forge.phase = .failed
                 self.lastError = "Could not warm the model: \(error.localizedDescription)"

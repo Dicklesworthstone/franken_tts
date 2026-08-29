@@ -122,7 +122,8 @@ struct EngineProgress: Sendable, Equatable {
 }
 
 private final class ProgressCallbackBox: @unchecked Sendable {
-    private let lock = NSLock()
+    private let stateLock = NSLock()
+    private let publicationLock = NSLock()
     private var cancellationRequested = false
     let publish: @Sendable (EngineProgress) -> Void
 
@@ -131,15 +132,26 @@ private final class ProgressCallbackBox: @unchecked Sendable {
     }
 
     func requestCancellation() {
-        lock.lock()
+        stateLock.lock()
         cancellationRequested = true
-        lock.unlock()
+        stateLock.unlock()
     }
 
     func callbackVerdict() -> Int32 {
-        lock.lock()
-        defer { lock.unlock() }
+        stateLock.lock()
+        defer { stateLock.unlock() }
         return cancellationRequested ? 1 : 0
+    }
+
+    func publishAndReturnVerdict(_ progress: EngineProgress) -> Int32 {
+        // Generation and codec progress can arrive from different native threads.
+        // Serialize publication so hosts observe one stable event order rather than
+        // two racing callback streams. Cancellation has a separate lock: an app callback
+        // must never be able to delay or deadlock the user's Cancel button.
+        publicationLock.lock()
+        publish(progress)
+        publicationLock.unlock()
+        return callbackVerdict()
     }
 }
 
@@ -173,7 +185,7 @@ private let nativeProgressCallback: @convention(c) (
     guard let context, let eventPointer else { return 0 }
     let box = Unmanaged<ProgressCallbackBox>.fromOpaque(context).takeUnretainedValue()
     if let progress = EngineProgress(eventPointer.pointee) {
-        box.publish(progress)
+        return box.publishAndReturnVerdict(progress)
     }
     return box.callbackVerdict()
 }
@@ -251,6 +263,9 @@ actor Engine {
         seed: UInt64,
         onProgress: @escaping @Sendable (EngineProgress) -> Void = { _ in }
     ) throws -> SynthesisOutput {
+        guard !text.utf8.contains(0) else {
+            throw EngineError.native("utterance contains an unsupported NUL character")
+        }
         guard let handle else { throw EngineError.native("engine not loaded") }
         guard speaker.count == Self.speakerWidth else {
             throw EngineError.native("speaker vector has wrong width")
