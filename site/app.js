@@ -252,6 +252,17 @@ const PRESETS = [
   { name: "judy", character: "bright, articulate, feminine" },
   { name: "aria", character: "clear, warm, feminine" },
   { name: "ember", character: "aria's character, a few semitones deeper" },
+  { name: "liam", character: "thoughtful, engaging, masculine" },
+  { name: "anthony", character: "authoritative, articulate, masculine" },
+  { name: "russell", character: "rich, warm, masculine" },
+  { name: "steve", character: "direct, energetic, masculine" },
+  { name: "daniel", character: "clear, calm, masculine" },
+  { name: "meryl", character: "expressive, poised, feminine" },
+  { name: "laurence", character: "deep, measured, masculine" },
+  { name: "jack", character: "crisp, confident, masculine" },
+  { name: "michael", character: "warm, dynamic, masculine" },
+  { name: "jodie", character: "warm, expressive, feminine" },
+  { name: "denzel", character: "commanding, charismatic, masculine" },
 ];
 
 let clonedVector = null;

@@ -168,6 +168,61 @@ const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
         "aria's character, a few semitones deeper",
         include_bytes!("../../ftts-cli/presets/ember.spk"),
     ),
+    (
+        "liam",
+        "thoughtful, engaging, masculine",
+        include_bytes!("../../ftts-cli/presets/liam.spk"),
+    ),
+    (
+        "anthony",
+        "authoritative, articulate, masculine",
+        include_bytes!("../../ftts-cli/presets/anthony.spk"),
+    ),
+    (
+        "russell",
+        "rich, warm, masculine",
+        include_bytes!("../../ftts-cli/presets/russell.spk"),
+    ),
+    (
+        "steve",
+        "direct, energetic, masculine",
+        include_bytes!("../../ftts-cli/presets/steve.spk"),
+    ),
+    (
+        "daniel",
+        "clear, calm, masculine",
+        include_bytes!("../../ftts-cli/presets/daniel.spk"),
+    ),
+    (
+        "meryl",
+        "expressive, poised, feminine",
+        include_bytes!("../../ftts-cli/presets/meryl.spk"),
+    ),
+    (
+        "laurence",
+        "deep, measured, masculine",
+        include_bytes!("../../ftts-cli/presets/laurence.spk"),
+    ),
+    (
+        "jack",
+        "crisp, confident, masculine",
+        include_bytes!("../../ftts-cli/presets/jack.spk"),
+    ),
+    (
+        "michael",
+        "warm, dynamic, masculine",
+        include_bytes!("../../ftts-cli/presets/michael.spk"),
+    ),
+    (
+        "jodie",
+        "warm, expressive, feminine",
+        include_bytes!("../../ftts-cli/presets/jodie.spk"),
+    ),
+    (
+        "denzel",
+        "commanding, charismatic, masculine",
+        include_bytes!("../../ftts-cli/presets/denzel.spk"),
+    ),
 ];
 
 thread_local! {

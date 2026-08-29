@@ -49,7 +49,7 @@ ftts pull                              # one-time: fetch the quantized model (~2
 ftts say "Now is the time for all good men to come to the aid of the agents" out.m4a
 ```
 
-That speaks immediately with **matt**, the built-in default voice. Seven built-ins ship in the binary — `matt` (the default), `james`, `leo`, and `robert` (masculine), plus `judy`, `aria`, and `ember` (feminine) — selectable by name with `--voice`:
+That speaks immediately with **matt**, the built-in default voice. Eighteen built-ins ship in the binary — `matt` (the default), `james`, `leo`, `robert`, `liam`, `anthony`, `russell`, `steve`, `daniel`, `laurence`, `jack`, `michael`, and `denzel` (masculine), plus `judy`, `aria`, `ember`, `meryl`, and `jodie` (feminine) — selectable by name with `--voice`:
 
 ```bash
 ftts say --voice james "Uh, excuse me, I was here first." test.m4a && afplay test.m4a

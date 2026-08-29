@@ -80,6 +80,61 @@ const PRESET_VOICES: &[(&str, &str, &[u8])] = &[
         "bright, articulate, feminine",
         include_bytes!("../presets/judy.spk"),
     ),
+    (
+        "liam",
+        "thoughtful, engaging, masculine",
+        include_bytes!("../presets/liam.spk"),
+    ),
+    (
+        "anthony",
+        "authoritative, articulate, masculine",
+        include_bytes!("../presets/anthony.spk"),
+    ),
+    (
+        "russell",
+        "rich, warm, masculine",
+        include_bytes!("../presets/russell.spk"),
+    ),
+    (
+        "steve",
+        "direct, energetic, masculine",
+        include_bytes!("../presets/steve.spk"),
+    ),
+    (
+        "daniel",
+        "clear, calm, masculine",
+        include_bytes!("../presets/daniel.spk"),
+    ),
+    (
+        "meryl",
+        "expressive, poised, feminine",
+        include_bytes!("../presets/meryl.spk"),
+    ),
+    (
+        "laurence",
+        "deep, measured, masculine",
+        include_bytes!("../presets/laurence.spk"),
+    ),
+    (
+        "jack",
+        "crisp, confident, masculine",
+        include_bytes!("../presets/jack.spk"),
+    ),
+    (
+        "michael",
+        "warm, dynamic, masculine",
+        include_bytes!("../presets/michael.spk"),
+    ),
+    (
+        "jodie",
+        "warm, expressive, feminine",
+        include_bytes!("../presets/jodie.spk"),
+    ),
+    (
+        "denzel",
+        "commanding, charismatic, masculine",
+        include_bytes!("../presets/denzel.spk"),
+    ),
 ];
 
 /// The preset used when `--voice`, `FTTS_DEFAULT_VOICE`, and an enrolled default voice
@@ -325,7 +380,7 @@ struct SayArgs {
 
     /// Voice source: a .spk vector, a voice-card image (PNG/JPEG), reference
     /// audio, or a built-in voice name
-    /// (matt, james, leo, robert, judy, aria, ember).
+    /// (matt, james, leo, robert, judy, aria, ember, liam, anthony, russell, steve, daniel, meryl, laurence, jack, michael, jodie, denzel).
     /// Default: the enrolled default voice (MODEL_DIR/default.ftvoice, else legacy
     /// default.spk), else the built-in "matt".
     #[arg(long, value_name = "PATH|NAME")]
@@ -383,7 +438,7 @@ struct MakeVideoArgs {
 
     /// Voice source: a .spk vector, a voice-card image (PNG/JPEG), reference
     /// audio, or a built-in voice name
-    /// (matt, james, leo, robert, judy, aria, ember).
+    /// (matt, james, leo, robert, judy, aria, ember, liam, anthony, russell, steve, daniel, meryl, laurence, jack, michael, jodie, denzel).
     #[arg(long, value_name = "PATH|NAME")]
     voice: Option<PathBuf>,
 
@@ -3728,7 +3783,7 @@ enum CardCommand {
     /// Render a voice as a shareable card PNG (mosaic + lossless chunk).
     Export {
         /// Voice source: a .spk vector file or a built-in voice name
-        /// (matt, james, leo, robert, judy, aria, ember).
+        /// (matt, james, leo, robert, judy, aria, ember, liam, anthony, russell, steve, daniel, meryl, laurence, jack, michael, jodie, denzel).
         #[arg(value_name = "PATH|NAME")]
         voice: String,
         /// Name written INTO the card (shown on phones at import).

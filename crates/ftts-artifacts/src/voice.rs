@@ -207,16 +207,23 @@ pub struct EnrollmentDiagnostics {
 
 impl EnrollmentDiagnostics {
     fn to_json(&self) -> serde_json::Value {
+        let finite_or_null = |value: f64| {
+            if value.is_finite() {
+                serde_json::Value::from(value)
+            } else {
+                serde_json::Value::Null
+            }
+        };
         serde_json::json!({
             "clipping_fraction": self.clipping_fraction,
             "longest_clip_run": self.longest_clip_run,
             "intersample_overshoot_db": self.intersample_overshoot_db,
             "snr_estimate_db": self.snr_estimate_db,
-            "pause_floor_dbfs": self.pause_floor_dbfs,
+            "pause_floor_dbfs": finite_or_null(self.pause_floor_dbfs),
             "reverb_time_s": self.reverb_time_s,
             "music_bed_likelihood": self.music_bed_likelihood,
             "stationarity_drift": self.stationarity_drift,
-            "loudness_rms_dbfs": self.loudness_rms_dbfs,
+            "loudness_rms_dbfs": finite_or_null(self.loudness_rms_dbfs),
             "voice_activity_ratio": self.voice_activity_ratio,
         })
     }
@@ -234,6 +241,15 @@ impl EnrollmentDiagnostics {
                 expected: "a number".to_owned(),
             })
         };
+        let f64_or_null = |name: &str| -> Result<f64, FtVoiceError> {
+            match field(name)? {
+                serde_json::Value::Null => Ok(f64::NEG_INFINITY),
+                other => other.as_f64().ok_or_else(|| FtVoiceError::Field {
+                    path: format!("diagnostics.{name}"),
+                    expected: "a number or null".to_owned(),
+                }),
+            }
+        };
         let usize_field = |name: &str| -> Result<usize, FtVoiceError> {
             field(name)?
                 .as_u64()
@@ -250,11 +266,11 @@ impl EnrollmentDiagnostics {
             longest_clip_run: usize_field("longest_clip_run")?,
             intersample_overshoot_db: f64_field("intersample_overshoot_db")?,
             snr_estimate_db: option_f64("snr_estimate_db")?,
-            pause_floor_dbfs: f64_field("pause_floor_dbfs")?,
+            pause_floor_dbfs: f64_or_null("pause_floor_dbfs")?,
             reverb_time_s: option_f64("reverb_time_s")?,
             music_bed_likelihood: f64_field("music_bed_likelihood")?,
             stationarity_drift: f64_field("stationarity_drift")?,
-            loudness_rms_dbfs: f64_field("loudness_rms_dbfs")?,
+            loudness_rms_dbfs: f64_or_null("loudness_rms_dbfs")?,
             voice_activity_ratio: f64_field("voice_activity_ratio")?,
         })
     }
