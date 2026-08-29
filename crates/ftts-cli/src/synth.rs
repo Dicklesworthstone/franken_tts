@@ -1993,7 +1993,10 @@ pub fn synthesize_prepared_xvector(
     )
 }
 
-fn ensure_prepared_model_identity(plan_identity: u64, model_identity: u64) -> Result<(), FttsError> {
+fn ensure_prepared_model_identity(
+    plan_identity: u64,
+    model_identity: u64,
+) -> Result<(), FttsError> {
     if plan_identity == model_identity {
         Ok(())
     } else {
@@ -2511,7 +2514,10 @@ mod tests {
         assert!(ensure_prepared_model_identity(17, 17).is_ok());
         let error = ensure_prepared_model_identity(17, 18)
             .expect_err("cross-model prepared embeddings and KV must be refused");
-        assert!(error.to_string().contains("different loaded model"), "{error}");
+        assert!(
+            error.to_string().contains("different loaded model"),
+            "{error}"
+        );
     }
 
     /// Audio already at the pinned rate must come back untouched — the resample path is additive
