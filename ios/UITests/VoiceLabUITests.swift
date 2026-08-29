@@ -71,10 +71,17 @@ final class VoiceBrowserUITests: XCTestCase {
         app.launch()
 
         XCTAssertTrue(app.navigationBars["Voice Library"].waitForExistence(timeout: 8))
-        let name = app.staticTexts[
-            "voice-library-name-A11CE000-0000-4000-8000-000000000001"
-        ]
-        XCTAssertTrue(name.waitForExistence(timeout: 3))
+        let names = app.staticTexts.matching(
+            NSPredicate(format: "label == %@", "Alexandria-Cassandra Nightingale")
+        )
+        XCTAssertTrue(names.firstMatch.waitForExistence(timeout: 3))
+        let visibleNames = names.allElementsBoundByIndex.filter {
+            $0.exists && !$0.frame.isEmpty
+        }
+        guard let name = visibleNames.max(by: { $0.frame.minY < $1.frame.minY }) else {
+            XCTFail("The long personal voice tile was not visible")
+            return
+        }
         XCTAssertLessThan(
             name.frame.height,
             32,

@@ -2570,6 +2570,7 @@ struct LabView: View {
             )
             model.library.installDebugVoices([voice])
             model.selectedVoice = "voice:\(voice.id.uuidString)"
+            voiceLibraryFilter = .personal
             showVoiceLab = true
         #endif
     }
@@ -2933,7 +2934,6 @@ struct EnrolledVoiceTile: View {
                             .minimumScaleFactor(0.62)
                             .allowsTightening(true)
                             .layoutPriority(1)
-                            .accessibilityIdentifier("voice-library-name-\(voice.id.uuidString)")
                         Text("PRIVATE VOICEPRINT")
                             .font(.system(size: Lab.typeSize(7), weight: .black, design: .monospaced))
                             .foregroundStyle(Lab.emerald)
