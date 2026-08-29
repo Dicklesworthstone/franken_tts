@@ -172,7 +172,10 @@ struct GalvanicVoiceForge: View {
                     Circle()
                         .fill(phaseColor.opacity(0.13))
                         .frame(width: 42, height: 42)
-                    Image(systemName: telemetry.phase.systemImage)
+                    // Keep the hero glyph spatially stable for the entire run. Rapidly
+                    // swapping SF Symbols at native progress boundaries read as flashing,
+                    // especially while the engine crossed several short setup stages.
+                    Image(systemName: "bolt.horizontal.fill")
                         .font(.system(size: Lab.typeSize(17), weight: .bold))
                         .foregroundStyle(phaseColor)
                         .symbolEffect(
@@ -182,13 +185,12 @@ struct GalvanicVoiceForge: View {
                         )
                 }
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(telemetry.phase.title)
+                    Text("Forging your voice")
                         .font(.headline.weight(.semibold))
                         .foregroundStyle(Lab.textPrimary)
-                    Text(telemetry.factualDetail)
+                    Text("Text becomes speech here — nothing leaves this device")
                         .font(.subheadline)
                         .foregroundStyle(Lab.textSecondary)
-                        .monospacedDigit()
                         .lineLimit(1)
                         .minimumScaleFactor(0.82)
                 }
@@ -209,6 +211,8 @@ struct GalvanicVoiceForge: View {
                     .monospacedDigit()
                 }
             }
+
+            stageRail
 
             forgeCanvas
                 .frame(height: compact ? 126 : 190)
@@ -249,6 +253,63 @@ struct GalvanicVoiceForge: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Galvanic Voice Forge")
         .accessibilityValue(telemetry.accessibilitySummary)
+    }
+
+    /// All stage names remain visible for the full synthesis. Native events only move
+    /// the emphasis, so a burst of short engine phases conveys progress without making
+    /// labels pop in, wrap, or reflow under the user's eyes.
+    private var stageRail: some View {
+        let stages = [
+            ("PREPARE", "brain.head.profile"),
+            ("VOICE", "waveform.path.ecg"),
+            ("AUDIO", "waveform"),
+            ("POLISH", "sparkles"),
+        ]
+        return HStack(spacing: 7) {
+            ForEach(Array(stages.enumerated()), id: \.offset) { index, stage in
+                HStack(spacing: compact ? 4 : 6) {
+                    Image(systemName: stage.1)
+                        .font(.system(size: Lab.typeSize(compact ? 9 : 10), weight: .bold))
+                    Text(stage.0)
+                        .font(.system(size: Lab.typeSize(compact ? 8 : 9), weight: .black, design: .monospaced))
+                        .kerning(compact ? 0.3 : 0.7)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                }
+                .foregroundStyle(index <= currentStageIndex ? phaseColor : Lab.textSecondary.opacity(0.48))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, compact ? 7 : 8)
+                .background(
+                    index == currentStageIndex ? phaseColor.opacity(0.13) : Color.white.opacity(0.025),
+                    in: Capsule()
+                )
+                .overlay {
+                    Capsule().strokeBorder(
+                        index == currentStageIndex
+                            ? phaseColor.opacity(0.42) : Color.white.opacity(0.045),
+                        lineWidth: 1
+                    )
+                }
+            }
+        }
+        .animation(.easeInOut(duration: 0.28), value: currentStageIndex)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Synthesis stage")
+        .accessibilityValue(stages[currentStageIndex].0.capitalized)
+    }
+
+    private var currentStageIndex: Int {
+        switch telemetry.phase {
+        case .readingBundle, .hydratingWeights, .chargingRuntime, .checkingMemory,
+             .bindingText, .idle:
+            0
+        case .forgingFrames:
+            1
+        case .decodingAudio:
+            2
+        case .denoising, .cancelling, .cancelled, .complete, .failed:
+            3
+        }
     }
 
     private var forgeCanvas: some View {

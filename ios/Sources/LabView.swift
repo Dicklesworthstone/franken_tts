@@ -755,7 +755,7 @@ struct LabView: View {
     @State private var showEnrollment = false
     @State private var showGalaxy = false
     @State private var showSpecimen = false
-    @State private var showVoiceLab = false
+    @State private var showVoiceLab = ProcessInfo.processInfo.environment["FTTS_OPEN_VOICE_LIBRARY"] == "1"
     @State private var renameTarget: EnrolledVoice?
     @State private var renameText = ""
     @State private var cardVoice: EnrolledVoice?
@@ -1383,69 +1383,275 @@ struct LabView: View {
     }
 
     private var voicesCard: some View {
-        LabPanel {
-            VStack(alignment: .leading, spacing: 12) {
-                LabLabel(text: "02 · The Voice")
-                VoiceEnrollmentCallout(
-                    isReady: model.store.phase == .ready,
-                    compact: false
-                ) {
-                    openEnrollment(target: nil)
-                }
-                LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10
-                ) {
-                    ForEach(model.presets) { preset in
-                        VoiceTile(
-                            name: preset.name, character: preset.character,
-                            selected: model.selectedVoice == preset.name
-                        ) { model.selectedVoice = preset.name }
-                    }
-                    ForEach(model.library.voices) { voice in
-                        EnrolledVoiceTile(
-                            voice: voice,
-                            selected: model.enrolledSelection() == voice.id,
-                            select: { model.selectedVoice = "voice:\(voice.id.uuidString)" },
-                            rename: { renameTarget = voice },
-                            reRecord: {
-                                openEnrollment(target: voice.id)
-                            },
-                            share: { cardVoice = voice },
-                            delete: {
-                                model.library.delete(id: voice.id)
-                                if model.enrolledSelection() == voice.id {
-                                    model.selectedVoice = "matt"
-                                }
-                            })
-                    }
-                }
-                .animation(.snappy, value: model.library.voices)
-                PhotosPicker(
-                    selection: $importItem, matching: .images, photoLibrary: .shared()
-                ) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "photo.badge.plus")
-                        Text("Add a voice from a picture")
-                        Spacer()
-                    }
-                    .font(.system(size: Lab.typeSize(14), weight: .semibold))
-                    .foregroundStyle(Lab.emerald)
-                    .padding(.vertical, 8)
-                    .padding(.horizontal, 10)
-                    .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(Lab.emerald.opacity(0.35), lineWidth: 1))
-                }
-                .accessibilityHint(
-                    "Pick a voice card someone sent you; the voice joins your library")
-                Text(
-                    "Cloning runs the speaker encoder on this device; the recording is discarded once the 4 KB voice vector exists. A voice card someone sends you works the same way: the picture holds their voiceprint, and importing it never touches the internet. Clone or import only voices you have the right to use."
+        VStack(alignment: .leading, spacing: 18) {
+            voiceArchiveHero
+            VoiceEnrollmentCallout(
+                isReady: model.store.phase == .ready,
+                compact: false
+            ) {
+                openEnrollment(target: nil)
+            }
+            voiceSearchField
+            voiceFilterBar
+
+            if voiceLibraryFilter != .personal {
+                voiceSectionHeader(
+                    "BUILT-IN SPECIMENS",
+                    detail: "\(filteredPresetVoices.count) of \(model.presets.count) voices"
                 )
-                .font(.system(size: Lab.typeSize(12)))
-                .foregroundStyle(Lab.textSecondary)
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 190), spacing: 12)],
+                    spacing: 12
+                ) {
+                    ForEach(filteredPresetVoices) { preset in
+                        VoiceTile(
+                            name: preset.name,
+                            character: preset.character,
+                            selected: model.selectedVoice == preset.name
+                        ) {
+                            withAnimation(.snappy) { model.selectedVoice = preset.name }
+                        }
+                    }
+                }
+            }
+
+            if voiceLibraryFilter == .all || voiceLibraryFilter == .personal {
+                voiceSectionHeader(
+                    "YOUR VOICEPRINTS",
+                    detail: model.library.voices.isEmpty
+                        ? "private · ready when you are"
+                        : "\(filteredPersonalVoices.count) saved on this device"
+                )
+                if filteredPersonalVoices.isEmpty {
+                    personalVoiceEmptyState
+                } else {
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 190), spacing: 12)],
+                        spacing: 12
+                    ) {
+                        ForEach(filteredPersonalVoices) { voice in
+                            EnrolledVoiceTile(
+                                voice: voice,
+                                selected: model.enrolledSelection() == voice.id,
+                                select: { model.selectedVoice = "voice:\(voice.id.uuidString)" },
+                                rename: { renameTarget = voice },
+                                reRecord: { openEnrollment(target: voice.id) },
+                                share: { cardVoice = voice },
+                                delete: {
+                                    model.library.delete(id: voice.id)
+                                    if model.enrolledSelection() == voice.id {
+                                        model.selectedVoice = "matt"
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    .animation(.snappy, value: model.library.voices)
+                }
+            }
+
+            if filteredPresetVoices.isEmpty, filteredPersonalVoices.isEmpty {
+                Label("No voices match that search", systemImage: "waveform.badge.magnifyingglass")
+                    .font(.system(size: Lab.typeSize(14), weight: .bold))
+                    .foregroundStyle(Lab.textSecondary)
+                    .frame(maxWidth: .infinity, minHeight: 110)
+                    .background(Color.black.opacity(0.32), in: RoundedRectangle(cornerRadius: 18))
+            }
+
+            PhotosPicker(
+                selection: $importItem, matching: .images, photoLibrary: .shared()
+            ) {
+                HStack(spacing: 12) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 12).fill(Lab.cyan.opacity(0.12))
+                        Image(systemName: "photo.badge.plus")
+                            .font(.system(size: 22, weight: .bold))
+                            .foregroundStyle(Lab.cyan)
+                    }
+                    .frame(width: 46, height: 46)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Import a voice card")
+                            .font(.system(size: Lab.typeSize(15), weight: .black))
+                            .foregroundStyle(Lab.textPrimary)
+                        Text("The picture itself carries the private 4 KB voiceprint")
+                            .font(.system(size: Lab.typeSize(11), weight: .medium))
+                            .foregroundStyle(Lab.textSecondary)
+                            .multilineTextAlignment(.leading)
+                    }
+                    Spacer()
+                    Image(systemName: "arrow.right.circle.fill")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(Lab.cyan)
+                }
+                .padding(14)
+                .background(Color.black.opacity(0.42), in: RoundedRectangle(cornerRadius: 17))
+                .overlay(RoundedRectangle(cornerRadius: 17).stroke(Lab.cyan.opacity(0.28)))
+            }
+            .accessibilityHint("Pick a voice card someone sent you; the voice joins your library")
+
+            Label(
+                "Everything here stays on this device. Recordings are discarded after the 4 KB voiceprint exists. Clone or import only voices you have the right to use.",
+                systemImage: "lock.shield.fill"
+            )
+            .font(.system(size: Lab.typeSize(11), weight: .medium))
+            .foregroundStyle(Lab.textSecondary)
+            .padding(.horizontal, 4)
+            .padding(.bottom, 16)
+        }
+        .frame(maxWidth: 1_180, alignment: .leading)
+        .frame(maxWidth: .infinity)
+    }
+
+    private var filteredPresetVoices: [Preset] {
+        let query = voiceSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.presets.filter { preset in
+            voiceLibraryFilter.includes(preset)
+                && (query.isEmpty
+                    || preset.name.localizedCaseInsensitiveContains(query)
+                    || preset.character.localizedCaseInsensitiveContains(query))
+        }
+    }
+
+    private var filteredPersonalVoices: [EnrolledVoice] {
+        guard voiceLibraryFilter == .all || voiceLibraryFilter == .personal else { return [] }
+        let query = voiceSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.library.voices.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    private var selectedVoiceCharacter: String {
+        if model.enrolledSelection() != nil { return "Your private, locally cloned voiceprint" }
+        return model.presets.first(where: { $0.name == model.selectedVoice })?.character
+            ?? "Ready to become the voice of your next utterance"
+    }
+
+    private var voiceArchiveHero: some View {
+        ZStack(alignment: .trailing) {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [Lab.emeraldDeep.opacity(0.78), Color.black.opacity(0.88), Lab.cyan.opacity(0.08)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(RoundedRectangle(cornerRadius: 24).stroke(Lab.emerald.opacity(0.38)))
+
+            VoiceLibraryHalo()
+                .frame(width: 240)
+                .opacity(0.8)
+                .allowsHitTesting(false)
+
+            HStack(spacing: 18) {
+                VoiceOrb(name: model.currentVoiceLabel, selected: true)
+                    .scaleEffect(1.65)
+                    .frame(width: 74, height: 74)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("\(model.presets.count) BUILT-IN VOICES · \(model.library.voices.count) YOURS")
+                        .font(.system(size: Lab.typeSize(9), weight: .black, design: .monospaced))
+                        .kerning(1.2)
+                        .foregroundStyle(Lab.emerald)
+                    Text(model.currentVoiceLabel.capitalized)
+                        .font(.system(size: Lab.typeSize(28), weight: .black, design: .rounded))
+                        .foregroundStyle(.white)
+                    Text(selectedVoiceCharacter)
+                        .font(.system(size: Lab.typeSize(12), weight: .medium))
+                        .foregroundStyle(Lab.textPrimary.opacity(0.78))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("CURRENT SPECIMEN")
+                        .font(.system(size: Lab.typeSize(8), weight: .black, design: .monospaced))
+                        .foregroundStyle(Lab.cyan)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(20)
+        }
+        .frame(minHeight: 170)
+        .shadow(color: Lab.emerald.opacity(0.15), radius: 24, y: 10)
+    }
+
+    private var voiceSearchField: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(Lab.emerald)
+            TextField("Search by name or character", text: $voiceSearchText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .foregroundStyle(Lab.textPrimary)
+            if !voiceSearchText.isEmpty {
+                Button { voiceSearchText = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(Lab.textSecondary)
+                }
+                .buttonStyle(.plain)
             }
         }
+        .padding(.horizontal, 14)
+        .frame(height: 50)
+        .background(Color.black.opacity(0.46), in: RoundedRectangle(cornerRadius: 15))
+        .overlay(RoundedRectangle(cornerRadius: 15).stroke(Lab.stroke))
+    }
+
+    private var voiceFilterBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(VoiceLibraryFilter.allCases) { filter in
+                    Button {
+                        withAnimation(.snappy) { voiceLibraryFilter = filter }
+                    } label: {
+                        Label(filter.rawValue, systemImage: filter.symbol)
+                            .font(.system(size: Lab.typeSize(11), weight: .bold))
+                            .foregroundStyle(voiceLibraryFilter == filter ? Color.black : Lab.textPrimary)
+                            .padding(.horizontal, 13)
+                            .frame(height: 38)
+                            .background(
+                                voiceLibraryFilter == filter ? Lab.emerald : Color.black.opacity(0.38),
+                                in: Capsule()
+                            )
+                            .overlay(Capsule().stroke(voiceLibraryFilter == filter ? .clear : Lab.stroke))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .scrollClipDisabled()
+    }
+
+    private func voiceSectionHeader(_ title: String, detail: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            LabLabel(text: title)
+            Spacer()
+            Text(detail)
+                .font(.system(size: Lab.typeSize(9), weight: .bold, design: .monospaced))
+                .foregroundStyle(Lab.textSecondary)
+        }
+    }
+
+    private var personalVoiceEmptyState: some View {
+        Button { openEnrollment(target: nil) } label: {
+            HStack(spacing: 13) {
+                Image(systemName: "person.crop.circle.badge.plus")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundStyle(Lab.emerald)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("No personal voiceprints yet")
+                        .font(.system(size: Lab.typeSize(15), weight: .black))
+                        .foregroundStyle(Lab.textPrimary)
+                    Text("Thirty seconds of reading creates one—privately, on this device.")
+                        .font(.system(size: Lab.typeSize(11), weight: .medium))
+                        .foregroundStyle(Lab.textSecondary)
+                        .multilineTextAlignment(.leading)
+                }
+                Spacer()
+                Image(systemName: "arrow.right")
+                    .fontWeight(.black)
+                    .foregroundStyle(Lab.emerald)
+            }
+            .padding(15)
+            .background(Color.black.opacity(0.36), in: RoundedRectangle(cornerRadius: 17))
+            .overlay(RoundedRectangle(cornerRadius: 17).stroke(Lab.emerald.opacity(0.22)))
+        }
+        .buttonStyle(.plain)
     }
 
     private func utteranceCard(compact: Bool) -> some View {
@@ -2022,6 +2228,47 @@ private struct VoiceOrb: View {
     }
 }
 
+private struct VoiceLibraryHalo: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 24.0, paused: reduceMotion)) { timeline in
+            Canvas { context, size in
+                let center = CGPoint(x: size.width * 0.58, y: size.height / 2)
+                let time = timeline.date.timeIntervalSinceReferenceDate
+                for ring in 0..<4 {
+                    let radius = CGFloat(30 + ring * 22)
+                    let circle = CGRect(
+                        x: center.x - radius,
+                        y: center.y - radius,
+                        width: radius * 2,
+                        height: radius * 2
+                    )
+                    let tint = ring.isMultiple(of: 2) ? Lab.emerald : Lab.cyan
+                    context.stroke(
+                        Path(ellipseIn: circle),
+                        with: .color(tint.opacity(0.1)),
+                        lineWidth: 1
+                    )
+                }
+                for index in 0..<7 {
+                    let angle = Double(index) / 7 * .pi * 2 + time * 0.12
+                    let orbit = CGFloat(index.isMultiple(of: 2) ? 92 : 68)
+                    let point = CGPoint(
+                        x: center.x + CGFloat(cos(angle)) * orbit,
+                        y: center.y + CGFloat(sin(angle)) * orbit
+                    )
+                    let tint = index.isMultiple(of: 2) ? Lab.emerald : Lab.cyan
+                    let node = CGRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8)
+                    context.fill(Path(ellipseIn: node), with: .color(tint.opacity(0.55)))
+                }
+            }
+        }
+        .mask(LinearGradient(colors: [.clear, .white], startPoint: .leading, endPoint: .trailing))
+        .accessibilityHidden(true)
+    }
+}
+
 private struct CompactVoiceChip: View {
     let name: String
     let selected: Bool
@@ -2072,27 +2319,60 @@ struct VoiceTile: View {
 
     var body: some View {
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(name)
-                    .font(.system(size: 15, weight: .black))
-                    .foregroundStyle(Lab.textPrimary)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    VoiceOrb(name: name, selected: selected)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(name.capitalized)
+                            .font(.system(size: Lab.typeSize(16), weight: .black))
+                            .foregroundStyle(Lab.textPrimary)
+                        Text(character.localizedCaseInsensitiveContains("feminine") ? "FEMININE" : "MASCULINE")
+                            .font(.system(size: Lab.typeSize(7), weight: .black, design: .monospaced))
+                            .kerning(1)
+                            .foregroundStyle(selected ? Lab.emerald : Lab.textSecondary)
+                    }
+                    Spacer()
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 19, weight: .bold))
+                        .foregroundStyle(selected ? Lab.emerald : Lab.textSecondary.opacity(0.38))
+                }
                 Text(character)
-                    .font(.system(size: 11))
+                    .font(.system(size: Lab.typeSize(11), weight: .medium))
                     .foregroundStyle(Lab.textSecondary)
                     .multilineTextAlignment(.leading)
-                    .frame(minHeight: 28, alignment: .top)
+                    .frame(minHeight: 32, alignment: .top)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Text(selected ? "SELECTED" : "TAP TO SELECT")
+                        .font(.system(size: Lab.typeSize(8), weight: .black, design: .monospaced))
+                    Spacer()
+                    Image(systemName: "waveform")
+                }
+                .foregroundStyle(selected ? Lab.emerald : Lab.textSecondary)
             }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+            .padding(14)
+            .frame(maxWidth: .infinity, minHeight: 154, alignment: .leading)
+            .background(
+                LinearGradient(
+                    colors: [
+                        selected ? Lab.emerald.opacity(0.13) : Color.black.opacity(0.48),
+                        Color.black.opacity(0.42)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                in: RoundedRectangle(cornerRadius: 17, style: .continuous)
+            )
             .overlay(
-                RoundedRectangle(cornerRadius: 12)
+                RoundedRectangle(cornerRadius: 17)
                     .stroke(
                         selected
                             ? Lab.emerald
                             : (accent ? Lab.emerald.opacity(0.35) : Lab.stroke),
-                        lineWidth: selected ? 1.5 : 1))
+                        lineWidth: selected ? 1.5 : 1)
+            )
         }
+        .buttonStyle(.plain)
         .accessibilityLabel("\(name): \(character)\(selected ? ", selected" : "")")
     }
 }
@@ -2109,19 +2389,26 @@ struct EnrolledVoiceTile: View {
     @State private var confirmDelete = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 9) {
             Button(action: select) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(voice.name)
-                        .font(.system(size: 15, weight: .black))
-                        .foregroundStyle(Lab.textPrimary)
-                        .lineLimit(1)
-                    Text("locally cloned")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Lab.textSecondary)
+                HStack(spacing: 10) {
+                    VoiceOrb(name: voice.name, selected: selected)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(voice.name)
+                            .font(.system(size: Lab.typeSize(15), weight: .black))
+                            .foregroundStyle(Lab.textPrimary)
+                            .lineLimit(1)
+                        Text("PRIVATE VOICEPRINT")
+                            .font(.system(size: Lab.typeSize(7), weight: .black, design: .monospaced))
+                            .foregroundStyle(Lab.emerald)
+                    }
+                    Spacer()
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(selected ? Lab.emerald : Lab.textSecondary.opacity(0.35))
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .buttonStyle(.plain)
             // Four controls must fit the narrowest two-column tile (~146 pt of
             // content width on an SE-class phone): 4 × 32 + 3 × 4 = 140.
             HStack(spacing: 4) {
@@ -2154,10 +2441,13 @@ struct EnrolledVoiceTile: View {
             .font(.system(size: 13))
             .foregroundStyle(Lab.textSecondary)
         }
-        .padding(10)
-        .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+        .padding(13)
+        .background(
+            selected ? Lab.emerald.opacity(0.11) : Color.black.opacity(0.45),
+            in: RoundedRectangle(cornerRadius: 17)
+        )
         .overlay(
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: 17)
                 .stroke(
                     selected ? Lab.emerald : Lab.emerald.opacity(0.35),
                     lineWidth: selected ? 1.5 : 1))
