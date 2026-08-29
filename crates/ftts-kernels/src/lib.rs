@@ -56,15 +56,42 @@ pub mod test_alloc {
     /// The counting pass-through allocator.
     pub struct CountingAlloc;
 
+    struct CountingScope {
+        previous_active: bool,
+        previous_count: usize,
+    }
+
+    impl CountingScope {
+        fn begin() -> Self {
+            Self {
+                previous_active: ACTIVE.with(|active| active.replace(true)),
+                previous_count: COUNT.with(|count| count.replace(0)),
+            }
+        }
+    }
+
+    impl Drop for CountingScope {
+        fn drop(&mut self) {
+            let scoped_count = COUNT.with(Cell::get);
+            ACTIVE.with(|active| active.set(self.previous_active));
+            COUNT.with(|count| {
+                count.set(if self.previous_active {
+                    self.previous_count.saturating_add(scoped_count)
+                } else {
+                    self.previous_count
+                });
+            });
+        }
+    }
+
     impl CountingAlloc {
         /// Runs `f` with this thread's allocation counting enabled; returns
         /// the closure's value and the number of allocations it performed.
         pub fn with_counting<T>(f: impl FnOnce() -> T) -> (T, usize) {
-            ACTIVE.with(|a| a.set(true));
-            COUNT.with(|c| c.set(0));
+            let scope = CountingScope::begin();
             let out = f();
-            ACTIVE.with(|a| a.set(false));
             let count = COUNT.with(Cell::get);
+            drop(scope);
             (out, count)
         }
     }
@@ -73,22 +100,63 @@ pub mod test_alloc {
     // a thread-local counter increment when the canonical-parity tests have
     // counting enabled.
     unsafe impl GlobalAlloc for CountingAlloc {
+        // SAFETY: `GlobalAlloc` callers provide a valid layout; this wrapper forwards it
+        // unchanged to the system allocator and does not dereference the returned pointer.
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             if ACTIVE.with(Cell::get) {
-                COUNT.with(|c| c.set(c.get() + 1));
+                COUNT.with(|c| c.set(c.get().saturating_add(1)));
             }
+            // SAFETY: the caller-provided valid layout is forwarded unchanged to `System`.
             unsafe { System.alloc(layout) }
         }
 
+        // SAFETY: `GlobalAlloc` callers guarantee that `ptr` and `layout` describe a live
+        // allocation from this allocator, whose allocation operation delegates to `System`.
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: this wrapper allocates through `System` and forwards the original pair.
             unsafe { System.dealloc(ptr, layout) }
         }
 
+        // SAFETY: `GlobalAlloc` callers provide a live allocation pair and a valid new size;
+        // allocation and deallocation both delegate to the same `System` allocator.
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             if ACTIVE.with(Cell::get) {
-                COUNT.with(|c| c.set(c.get() + 1));
+                COUNT.with(|c| c.set(c.get().saturating_add(1)));
             }
+            // SAFETY: the live pointer/layout pair and requested size are forwarded unchanged.
             unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{ACTIVE, COUNT, CountingAlloc};
+        use std::cell::Cell;
+
+        #[test]
+        fn counting_scope_restores_state_after_a_caught_panic() {
+            ACTIVE.with(|active| active.set(false));
+            COUNT.with(|count| count.set(17));
+            let outcome = std::panic::catch_unwind(|| {
+                CountingAlloc::with_counting(|| panic!("contained measurement failure"));
+            });
+            assert!(outcome.is_err());
+            assert!(!ACTIVE.with(Cell::get));
+            assert_eq!(COUNT.with(Cell::get), 17);
+        }
+
+        #[test]
+        fn nested_counting_scope_restores_and_accumulates_outer_count() {
+            let (_, outer_count) = CountingAlloc::with_counting(|| {
+                COUNT.with(|count| count.set(3));
+                let (_, inner_count) = CountingAlloc::with_counting(|| {
+                    COUNT.with(|count| count.set(2));
+                });
+                assert_eq!(inner_count, 2);
+                assert_eq!(COUNT.with(Cell::get), 5);
+            });
+            assert_eq!(outer_count, 5);
+            assert!(!ACTIVE.with(Cell::get));
         }
     }
 }

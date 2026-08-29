@@ -2,9 +2,9 @@
 //!
 //! The hash-stability half of `frankentts-v-metamorphic-0wq`'s invariant list. Enrollment
 //! is a pure function of the reference audio and the pinned model weights — decode,
-//! optional cleanup, log-mel, speaker encoder, raw little-endian serialization carry no
+//! optional cleanup, log-mel, speaker encoder, and canonical pack serialization carry no
 //! clock, no randomness, and no paths — so enrolling the SAME reference twice MUST
-//! produce byte-identical `.spk` files. A single differing byte means hidden state
+//! produce byte-identical `.ftvoice` files. A single differing byte means hidden state
 //! (thread-count-dependent reductions, uninitialized scratch, time-based fields) leaked
 //! into the pipeline, and every future voice-card or provenance feature that hashes the
 //! pack would inherit the flake.
@@ -32,7 +32,7 @@ fn emit_skip(test: &str, reason: &str) {
 /// Canonical locations first (FTTS_MODEL_DIR, then ~/.cache/franken_tts/model), then the
 /// git-ignored in-tree truth-pack snapshot that rsyncs to workers — enrollment must be
 /// measurable wherever its checkpoint already is.
-fn model_dir() -> Option<PathBuf> {
+fn model_path() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(dir) = std::env::var("FTTS_MODEL_DIR") {
         candidates.push(PathBuf::from(dir));
@@ -44,7 +44,7 @@ fn model_dir() -> Option<PathBuf> {
     }
     candidates
         .push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/truth-pack/snapshots/hf"));
-    candidates.into_iter().find(|root| {
+    candidates.into_iter().find_map(|root| {
         [
             "vocab.json",
             "merges.txt",
@@ -53,8 +53,15 @@ fn model_dir() -> Option<PathBuf> {
         ]
         .iter()
         .all(|required| root.join(required).is_file())
-            && (root.join("qwen3-tts-12hz-0.6b-base.fttsq").is_file()
-                || root.join("model.safetensors").is_file())
+        .then(|| {
+            [
+                root.join("qwen3-tts-12hz-0.6b-base.fttsq"),
+                root.join("model.safetensors"),
+            ]
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+        })
+        .flatten()
     })
 }
 
@@ -73,7 +80,9 @@ fn scratch_dir(label: &str) -> PathBuf {
 
 /// Writes a mono 24 kHz WAV with a deterministic synthesized contour: `seed` picks the
 /// harmonics so different seeds produce genuinely different voice-shaped signals while
-/// the same seed reproduces the exact same PCM.
+/// the same seed reproduces the exact same PCM. The syllabic envelope supplies a genuine
+/// pause floor; a constant-energy tone is a tonal bed rather than speech and the enrollment
+/// VAD correctly refuses it.
 fn write_reference_wav(path: &std::path::Path, seconds: usize, seed: u64) {
     let sample_rate = ftts_core::audio::SAMPLE_RATE_HZ as usize;
     let samples: Vec<f32> = (0..sample_rate * seconds)
@@ -83,10 +92,12 @@ fn write_reference_wav(path: &std::path::Path, seconds: usize, seed: u64) {
             let wobble = (2.0 * std::f32::consts::PI * 3.0 * t).sin() * 12.0;
             let f0 = base + wobble;
             let phase = 2.0 * std::f32::consts::PI * f0 * t;
-            0.35 * phase.sin()
+            let carrier = 0.35 * phase.sin()
                 + 0.18 * (2.0 * phase).sin()
                 + 0.09 * (3.0 * phase).sin()
-                + 0.04 * ((index % 97) as f32 / 97.0 - 0.5)
+                + 0.04 * ((index % 97) as f32 / 97.0 - 0.5);
+            let envelope = (2.0 * std::f32::consts::PI * 2.5 * t).sin().powi(2);
+            carrier * envelope
         })
         .collect();
     let file = std::fs::File::create(path).expect("reference wav");
@@ -94,7 +105,7 @@ fn write_reference_wav(path: &std::path::Path, seconds: usize, seed: u64) {
     writer.write_samples(&samples).expect("write samples");
     writer.finish().expect("finish wav");
 }
-fn enroll(reference: &std::path::Path, output: &std::path::Path) {
+fn enroll(reference: &std::path::Path, output: &std::path::Path, model: &Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_ftts"))
         .args([
             "enroll",
@@ -102,12 +113,11 @@ fn enroll(reference: &std::path::Path, output: &std::path::Path) {
             "-o",
             output.to_str().expect("utf8 output"),
             "--no-denoise",
+            "--mode",
+            "quick",
+            "--consent-attest",
             "--model",
-            // The in-tree staged snapshot: the same resolution the gating above found.
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../docs/truth-pack/snapshots/hf/qwen3-tts-12hz-0.6b-base.fttsq")
-                .to_str()
-                .expect("utf8 model"),
+            model.to_str().expect("utf8 model"),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -125,29 +135,33 @@ fn enroll(reference: &std::path::Path, output: &std::path::Path) {
 #[test]
 fn identical_reference_enrolls_byte_identical_voice_bytes() {
     const TEST: &str = "identical_reference_enrolls_byte_identical_voice_bytes";
-    if model_dir().is_none() {
+    let Some(model) = model_path() else {
         emit_skip(TEST, "model not present");
         return;
-    }
+    };
 
     let scratch = scratch_dir("same");
     let reference = scratch.join("reference.wav");
     write_reference_wav(&reference, 4, 11);
 
     // Enroll the SAME input twice, into separate outputs, in separate processes.
-    let first = scratch.join("first.spk");
-    let second = scratch.join("second.spk");
-    enroll(&reference, &first);
-    enroll(&reference, &second);
+    let first = scratch.join("first.ftvoice");
+    let second = scratch.join("second.ftvoice");
+    enroll(&reference, &first, &model);
+    enroll(&reference, &second, &model);
 
-    let first_bytes = std::fs::read(&first).expect("first spk");
-    let second_bytes = std::fs::read(&second).expect("second spk");
+    let first_bytes = std::fs::read(&first).expect("first voice pack");
+    let second_bytes = std::fs::read(&second).expect("second voice pack");
+    let first_pack = ftts_artifacts::voice::parse_voice_pack(&first_bytes)
+        .expect("first enrollment must be a valid voice pack");
+    let second_pack = ftts_artifacts::voice::parse_voice_pack(&second_bytes)
+        .expect("second enrollment must be a valid voice pack");
     assert_eq!(
-        first_bytes.len(),
-        ftts_cli::synth::SPEAKER_VECTOR_BYTES,
-        "enrolled voice is not a raw {}-byte vector",
-        ftts_cli::synth::SPEAKER_VECTOR_BYTES
+        first_pack.embedding.len(),
+        ftts_artifacts::voice::SPEAKER_EMBEDDING_LEN,
+        "enrolled pack does not carry a complete speaker embedding"
     );
+    assert_eq!(first_pack.embedding, second_pack.embedding);
     assert_eq!(
         first_bytes, second_bytes,
         "identical reference produced DIFFERENT voice bytes — nondeterminism leaked into \
@@ -156,13 +170,15 @@ fn identical_reference_enrolls_byte_identical_voice_bytes() {
 
     // Negative control: a different voice-shaped input must not enroll to the same bytes.
     let other = scratch.join("other.wav");
-    write_reference_wav(&other, 4, 9001);
-    let third = scratch.join("third.spk");
-    enroll(&other, &third);
-    let third_bytes = std::fs::read(&third).expect("third spk");
+    write_reference_wav(&other, 4, 19);
+    let third = scratch.join("third.ftvoice");
+    enroll(&other, &third, &model);
+    let third_bytes = std::fs::read(&third).expect("third voice pack");
+    let third_pack = ftts_artifacts::voice::parse_voice_pack(&third_bytes)
+        .expect("third enrollment must be a valid voice pack");
     assert_ne!(
-        first_bytes, third_bytes,
-        "different references produced IDENTICAL voice bytes; the equality check above \
+        first_pack.embedding, third_pack.embedding,
+        "different references produced IDENTICAL embeddings; the equality check above \
          would have been vacuous"
     );
 

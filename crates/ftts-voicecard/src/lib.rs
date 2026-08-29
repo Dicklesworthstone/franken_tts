@@ -212,10 +212,11 @@ struct FinderCandidate {
 /// intact mosaic is found.
 #[must_use]
 pub fn decode(pixels: &[u8], width: usize, height: usize) -> Option<(String, Vec<f32>)> {
-    if width < GRID_N || height < GRID_N || pixels.len() < width * height * 3 {
+    let required_bytes = width.checked_mul(height)?.checked_mul(3)?;
+    if width < GRID_N || height < GRID_N || pixels.len() < required_bytes {
         return None;
     }
-    let mut luma = vec![0_f32; width * height];
+    let mut luma = vec![0_f32; required_bytes / 3];
     let mut min_luma = 255.0_f64;
     let mut max_luma = 0.0_f64;
     for (index, slot) in luma.iter_mut().enumerate() {
@@ -787,7 +788,17 @@ const CHUNK_MAGIC: &[u8] = b"FTTSVOICE1";
 #[must_use]
 pub fn embed_chunk(name: &str, vector: &[f32], png: &[u8]) -> Option<Vec<u8>> {
     const SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-    if png.len() < 20 || png[..8] != SIGNATURE {
+    // The payload layout is fixed-width, and inserting before an arbitrary final
+    // twelve bytes would manufacture a corrupt PNG from a merely signature-shaped
+    // input. Validate both boundaries before constructing the ancillary chunk.
+    if vector.len() != VECTOR_WIDTH
+        || vector.iter().any(|value| !value.is_finite())
+        || png.len() < 20
+        || png[..8] != SIGNATURE
+        || png[png.len() - 12..png.len() - 8] != [0, 0, 0, 0]
+        || png[png.len() - 8..png.len() - 4] != *b"IEND"
+        || png[png.len() - 4..] != crc32(b"IEND").to_be_bytes()
+    {
         return None;
     }
     let mut payload = CHUNK_MAGIC.to_vec();
@@ -1229,6 +1240,10 @@ mod tests {
             *byte = (state >> 32) as u8;
         }
         assert!(decode(&noise, 800, 600).is_none());
+        assert!(
+            decode(&[], usize::MAX, usize::MAX).is_none(),
+            "hostile dimensions must be rejected before size arithmetic wraps"
+        );
     }
 
     #[test]
@@ -1253,5 +1268,17 @@ mod tests {
         assert_eq!(name, "Chunk Voice");
         assert_eq!(decoded, vector);
         assert!(decode_chunk(&png).is_none(), "plain PNG carries no voice");
+
+        assert!(
+            embed_chunk("short", &vector[..VECTOR_WIDTH - 1], &png).is_none(),
+            "a malformed-width vector must not create an unreadable card"
+        );
+        let mut not_iend = png.clone();
+        let iend_type = not_iend.len() - 8..not_iend.len() - 4;
+        not_iend[iend_type].copy_from_slice(b"JUNK");
+        assert!(
+            embed_chunk("voice", &vector, &not_iend).is_none(),
+            "a signature-shaped buffer without a terminal IEND is not a PNG"
+        );
     }
 }

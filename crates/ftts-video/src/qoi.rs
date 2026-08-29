@@ -20,6 +20,9 @@ pub fn decode(data: &[u8]) -> Result<Image, String> {
     }
     let width = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
     let height = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+    if !matches!(data[12], 3 | 4) || data[13] > 1 {
+        return Err("invalid QOI channels or colorspace".to_owned());
+    }
     let pixels = (width as usize)
         .checked_mul(height as usize)
         .ok_or("QOI dimensions overflow")?;
@@ -157,6 +160,12 @@ mod tests {
             "a run past the pixel count must refuse, not write out of bounds"
         );
         assert!(decode(&stream(0, 5, &[])).is_err(), "zero dimension");
+        let mut invalid_header = stream(1, 1, &[0xC0]);
+        invalid_header[12] = 2;
+        assert!(decode(&invalid_header).is_err(), "invalid channel count");
+        invalid_header[12] = 4;
+        invalid_header[13] = 2;
+        assert!(decode(&invalid_header).is_err(), "invalid colorspace");
     }
 
     #[test]

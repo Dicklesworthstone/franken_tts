@@ -516,7 +516,7 @@ struct EnrollArgs {
     #[arg(long, value_name = "PATH")]
     model: Option<PathBuf>,
 
-    /// Write the enrolled raw 1,024-wide x-vector here. Refuses to overwrite an existing file.
+    /// Write the enrolled portable `.ftvoice` pack here. Refuses to overwrite an existing file.
     #[arg(short = 'o', long, value_name = "PATH", conflicts_with = "default")]
     output: Option<PathBuf>,
 
@@ -534,7 +534,7 @@ struct EnrollArgs {
     /// Replace an existing voice at the destination without asking.
     ///
     /// Interactive runs are asked to confirm instead; this is how a script or an agent gives that
-    /// consent up front. The displaced voice is copied to `<name>.spk.bak` either way.
+    /// consent up front. The displaced voice is copied to `<path>.bak` either way.
     #[arg(long)]
     overwrite: bool,
 
@@ -973,6 +973,7 @@ fn run_talk_command(
     args: &TalkArgs,
     environment: &Environment,
 ) -> Result<(), FttsError> {
+    install_talk_signal_handler();
     let model = resolve_model(args.model.as_deref(), environment)?;
     let bundle = synth::ModelBundle::resolve(Path::new(&model))?;
     let voices = |name: &str| -> Result<Vec<f32>, FttsError> {
@@ -1544,6 +1545,17 @@ fn install_cancel_handler(state: std::sync::Arc<CancelState>) {
     *ACTIVE_CANCEL.lock().expect("cancel-state mutex poisoned") = Some(state);
 }
 
+/// Arm the process-wide signal hook for a `talk` session.
+///
+/// Unlike one-shot `say`, talk has no [`CancelState`] to install: its first strike travels through
+/// [`TALK_SIGNAL_INBOX`] to the session router. The hook still has to be forced before model load,
+/// otherwise the operating system retains its default SIGINT disposition and kills the process
+/// before the router can settle `speak_cancelled` and `session_end` receipts.
+fn install_talk_signal_handler() {
+    TALK_STRIKES.store(0, std::sync::atomic::Ordering::Relaxed);
+    LazyLock::force(&SIGNAL_HOOK);
+}
+
 /// Record the cancellation and trip whichever engine token is currently serving.
 fn trip_active_cancel() {
     let Ok(guard) = ACTIVE_CANCEL.lock() else {
@@ -2083,10 +2095,17 @@ fn run_say_events(
     // path, so those runs pay the in-process load instead.
     let use_resident =
         resident::enabled(args.no_resident) && !raw_stream && voice_conditioning.is_xvector();
+    let load_inline = || {
+        if style::is_interactive() && !args.robot && !raw_stream {
+            synth::LoadedModel::load_with_human_progress(&bundle)
+        } else {
+            synth::LoadedModel::load(&bundle)
+        }
+    };
     let loaded = if use_resident {
         None
     } else {
-        Some(synth::LoadedModel::load(&bundle)?)
+        Some(load_inline()?)
     };
     emit_stage(run, emit, "load", "end", &mut seq)?;
 
@@ -2159,7 +2178,7 @@ fn run_say_events(
             let loaded = match loaded {
                 Some(loaded) => loaded,
                 // The resident path was requested but no daemon could serve it.
-                None => synth::LoadedModel::load(&bundle)?,
+                None => load_inline()?,
             };
             let engine = ftts_core::TtsEngine::from_process_environment()
                 .map_err(|error| FttsError::Generic(format!("cannot start the engine: {error}")))?;
@@ -3286,7 +3305,9 @@ fn write_voice_pack_new(path: &Path, bytes: &[u8]) -> Result<(), FttsError> {
 
 /// Replaces an existing `.ftvoice`, keeping the displaced pack alongside it as `<path>.bak`.
 fn replace_voice_pack(path: &Path, bytes: &[u8]) -> Result<PathBuf, FttsError> {
-    let backup = path.with_extension("bak");
+    let mut backup_name = path.as_os_str().to_owned();
+    backup_name.push(".bak");
+    let backup = PathBuf::from(backup_name);
     std::fs::copy(path, &backup).map_err(|error| {
         FttsError::Input(format!(
             "cannot back up displaced voice {}: {error}",
@@ -5645,13 +5666,13 @@ mod tests {
     }
 
     #[test]
-    fn pack_writers_stage_and_back_up_like_the_vector_writers() {
+    fn pack_writers_stage_and_back_up_without_replacing_the_extension() {
         let dir = std::env::temp_dir().join(format!("enroll-writer-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("w.ftvoice");
         write_voice_pack_new(&path, b"first").expect("first write");
         let backup = replace_voice_pack(&path, b"second").expect("replace");
-        assert_eq!(backup, dir.join("w.bak"));
+        assert_eq!(backup, dir.join("w.ftvoice.bak"));
         assert_eq!(std::fs::read(&backup).unwrap(), b"first");
         assert_eq!(std::fs::read(&path).unwrap(), b"second");
         // No partial staging files left behind.

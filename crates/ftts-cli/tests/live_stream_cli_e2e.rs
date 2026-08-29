@@ -445,7 +445,10 @@ fn interactive_profile_delivers_one_frame_packets() {
 /// time-THROTTLED, so even their indices vary with machine speed — they are dropped whole.
 /// Everything that remains (stage names and sequence numbers, text shape, chunk byte geometry,
 /// run_complete's frames/samples/token counts/exit code) is deterministic for a pinned seed and
-/// must not drift when someone refactors the emitter. Regenerate deliberately with
+/// ENGINE BUILD and must not drift when someone refactors the emitter. Debug and release use
+/// separate fixtures because floating-point code generation may legitimately change sampled
+/// choices between those builds; conflating them made the mandatory debug suite compare itself
+/// against a release capture. Regenerate the active profile deliberately with
 /// `UPDATE_GOLDENS=1 cargo test --release --test live_stream_cli_e2e robot_run_content_matches_its_scrubbed_golden`,
 /// which fails while writing the new fixture — a change must be seen by a human, never absorbed
 /// silently.
@@ -507,7 +510,14 @@ fn robot_run_content_matches_its_scrubbed_golden() {
     );
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let fixture = std::path::Path::new(manifest_dir).join("tests/fixtures/robot_run_golden.ndjson");
+    let fixture_name = if cfg!(debug_assertions) {
+        "robot_run_golden.debug.ndjson"
+    } else {
+        "robot_run_golden.ndjson"
+    };
+    let fixture = std::path::Path::new(manifest_dir)
+        .join("tests/fixtures")
+        .join(fixture_name);
     let actual = scrubbed.join("\n") + "\n";
     if std::env::var_os("UPDATE_GOLDENS").is_some_and(|value| value != "0") {
         std::fs::create_dir_all(fixture.parent().expect("fixture parent")).expect("fixtures dir");

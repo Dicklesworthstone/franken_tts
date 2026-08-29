@@ -519,12 +519,20 @@ pub unsafe extern "C" fn ftts_synthesize_with_progress(
     out_len: *mut usize,
 ) -> i32 {
     guarded(1, || {
-        if engine.is_null()
-            || text.is_null()
-            || speaker.is_null()
-            || out_pcm.is_null()
-            || out_len.is_null()
-        {
+        if out_pcm.is_null() || out_len.is_null() {
+            set_error("null pointer to ftts_synthesize");
+            return 1;
+        }
+        // A failed call never leaves caller-owned sentinel values looking like a
+        // successful allocation. This also makes retry/error paths safe for C hosts
+        // that unconditionally inspect the output pair after the status code.
+        // SAFETY: both output pointers were checked non-null immediately above.
+        #[allow(unsafe_code)]
+        unsafe {
+            *out_pcm = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        if engine.is_null() || text.is_null() || speaker.is_null() {
             set_error("null pointer to ftts_synthesize");
             return 1;
         }
@@ -824,11 +832,14 @@ pub unsafe extern "C" fn ftts_synthesize_streaming(
             Some(&mut sink),
         );
         match result {
+            // A callback request owns the outcome even if it arrived on the final
+            // packet and the generator had no later checkpoint at which to turn its
+            // otherwise-successful return into a cancellation error.
+            _ if sink.cancelled_by_callback => FTTS_SYNTH_CANCELLED,
             Ok(_) => {
                 engine.last_profile_json = synthesis_profile_json();
                 0
             }
-            Err(_) if sink.cancelled_by_callback => FTTS_SYNTH_CANCELLED,
             Err(error) => {
                 set_error(error.to_string());
                 1
@@ -849,7 +860,7 @@ pub unsafe extern "C" fn ftts_last_synthesis_profile_json(
     engine: *const FttsEngine,
 ) -> *const c_char {
     if engine.is_null() {
-        return b"{}\0".as_ptr().cast();
+        return c"{}".as_ptr();
     }
     // SAFETY: the header requires a live engine and serialized access; this immutable borrow lasts
     // only long enough to obtain the CString's stable pointer.
@@ -908,7 +919,16 @@ pub unsafe extern "C" fn ftts_denoise(
     out_pcm: *mut *mut f32,
 ) -> i32 {
     guarded(1, || {
-        if engine.is_null() || pcm.is_null() || out_pcm.is_null() {
+        if out_pcm.is_null() {
+            set_error("null pointer to ftts_denoise");
+            return 1;
+        }
+        // SAFETY: the output slot was checked non-null immediately above.
+        #[allow(unsafe_code)]
+        unsafe {
+            *out_pcm = std::ptr::null_mut();
+        }
+        if engine.is_null() || pcm.is_null() {
             set_error("null pointer to ftts_denoise");
             return 1;
         }
@@ -1133,14 +1153,14 @@ pub unsafe extern "C" fn ftts_video_render_frame_bgra(
             set_error("stride narrower than a BGRA row");
             return 1;
         }
+        let Some(buffer_len) = stride.checked_mul(ftts_video::HEIGHT) else {
+            set_error("BGRA buffer size overflow");
+            return 1;
+        };
         // SAFETY: per the contract above.
         #[allow(unsafe_code)]
-        let (renderer, bgra) = unsafe {
-            (
-                &*renderer,
-                std::slice::from_raw_parts_mut(out, stride * ftts_video::HEIGHT),
-            )
-        };
+        let (renderer, bgra) =
+            unsafe { (&*renderer, std::slice::from_raw_parts_mut(out, buffer_len)) };
         if frame >= renderer.inner.total_frames() {
             set_error("frame index past the end of the clip");
             return 1;
@@ -1264,6 +1284,39 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(message.contains("nobody"), "{message}");
+    }
+
+    #[test]
+    fn failing_buffer_abis_clear_their_output_slots() {
+        let text = CString::new("hello").unwrap();
+        let speaker = [0.0_f32; SPEAKER_WIDTH];
+        let input = [0.0_f32; 8];
+        let mut pcm = std::ptr::dangling_mut::<f32>();
+        let mut len = usize::MAX;
+
+        // SAFETY: the input and output pointers are live for each call. A null engine is
+        // deliberately supplied to exercise the value-error path before any model access.
+        let synth_code = unsafe {
+            ftts_synthesize(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                speaker.as_ptr(),
+                speaker.len(),
+                0,
+                &raw mut pcm,
+                &raw mut len,
+            )
+        };
+        assert_eq!(synth_code, 1);
+        assert!(pcm.is_null());
+        assert_eq!(len, 0);
+
+        pcm = std::ptr::dangling_mut::<f32>();
+        // SAFETY: as above; `input` is a live slice and the output slot is writable.
+        let denoise_code =
+            unsafe { ftts_denoise(std::ptr::null(), input.as_ptr(), input.len(), &raw mut pcm) };
+        assert_eq!(denoise_code, 1);
+        assert!(pcm.is_null());
     }
 
     #[test]
@@ -1399,6 +1452,14 @@ mod tests {
             unsafe { ftts_video_render_frame(renderer, frames, rgb.as_mut_ptr()) },
             1,
             "past-the-end frame must refuse"
+        );
+        let mut one_byte = 0_u8;
+        // SAFETY: the hostile stride is rejected before the callee constructs a slice or
+        // touches the one-byte output. The live renderer/frame satisfy the other preconditions.
+        assert_eq!(
+            unsafe { ftts_video_render_frame_bgra(renderer, 0, &raw mut one_byte, usize::MAX,) },
+            1,
+            "overflowing BGRA geometry must be rejected"
         );
         // SAFETY: one close for one successful open, with no render in flight.
         unsafe { ftts_video_close(renderer) };

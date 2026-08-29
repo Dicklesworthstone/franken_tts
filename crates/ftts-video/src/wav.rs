@@ -32,11 +32,14 @@ pub fn decode(data: &[u8]) -> Result<MonoAudio, String> {
     while at + 8 <= data.len() {
         let id = &data[at..at + 4];
         let size = le_u32(data, at + 4).ok_or("chunk header truncated")? as usize;
+        let body_start = at.checked_add(8).ok_or("chunk offset overflow")?;
+        let body_end = body_start.checked_add(size);
         // Streaming writers leave a placeholder size in the final data chunk;
         // clamp it to what is actually present instead of refusing the file.
-        let body = match data.get(at + 8..at + 8 + size) {
+        let clamped_final_data = body_end.is_none_or(|end| end > data.len()) && id == b"data";
+        let body = match body_end.and_then(|end| data.get(body_start..end)) {
             Some(body) => body,
-            None if id == b"data" => &data[at + 8..],
+            None if clamped_final_data => &data[body_start..],
             None => return Err("chunk body truncated".to_owned()),
         };
         match id {
@@ -57,8 +60,14 @@ pub fn decode(data: &[u8]) -> Result<MonoAudio, String> {
             b"data" => payload = Some(body),
             _ => {}
         }
+        if clamped_final_data {
+            break;
+        }
         // Chunks are word-aligned; odd sizes carry a pad byte.
-        at += 8 + size + (size & 1);
+        at = body_start
+            .checked_add(size)
+            .and_then(|next| next.checked_add(size & 1))
+            .ok_or("chunk offset overflow")?;
     }
     let (tag, channels, sample_rate, bits) = format.ok_or("missing fmt chunk")?;
     let payload = payload.ok_or("missing data chunk")?;
@@ -69,6 +78,20 @@ pub fn decode(data: &[u8]) -> Result<MonoAudio, String> {
         return Err(format!("implausible WAV sample rate {sample_rate}"));
     }
     let channels = usize::from(channels);
+    let bytes_per_sample = match (tag, bits) {
+        (1, 16) => 2,
+        (1, 24) => 3,
+        (1, 32) | (3, 32) => 4,
+        _ => {
+            return Err(format!(
+                "unsupported WAV encoding (format tag {tag}, {bits}-bit); \
+                 supply uncompressed PCM s16/s24/s32 or IEEE f32"
+            ));
+        }
+    };
+    if !payload.len().is_multiple_of(bytes_per_sample) {
+        return Err("WAV data ends with a partial sample".to_owned());
+    }
 
     let frames: Vec<f32> = match (tag, bits) {
         (1, 16) => payload
@@ -98,13 +121,12 @@ pub fn decode(data: &[u8]) -> Result<MonoAudio, String> {
             .iter()
             .map(|b| f32::from_le_bytes(*b))
             .collect(),
-        _ => {
-            return Err(format!(
-                "unsupported WAV encoding (format tag {tag}, {bits}-bit); \
-                 supply uncompressed PCM s16/s24/s32 or IEEE f32"
-            ));
-        }
+        _ => unreachable!("encoding was validated above"),
     };
+
+    if !frames.len().is_multiple_of(channels) {
+        return Err("WAV data ends with a partial channel frame".to_owned());
+    }
 
     let samples = if channels == 1 {
         frames
@@ -228,5 +250,13 @@ mod tests {
             "compressed encodings are a typed refusal"
         );
         assert!(decode(&wav(1, 1, 24000, 16, &[])).is_err(), "no samples");
+        assert!(
+            decode(&wav(1, 1, 24000, 16, &[0, 0, 1])).is_err(),
+            "partial samples must not be silently discarded"
+        );
+        assert!(
+            decode(&wav(1, 2, 24000, 16, &[0, 0])).is_err(),
+            "partial channel frames must not be silently discarded"
+        );
     }
 }

@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use ftts_core::audio::WavWriter;
 
@@ -22,6 +23,16 @@ fn emit_skip(test: &str, reason: &str) {
         "receipt: {{\"test\":\"{test}\",\"outcome\":\"skipped\",\"reason\":\"{reason}\",\
          \"contract\":\"ICL/pack-say-e2e\",\"seam\":\"enroll.icl_say\"}}"
     );
+}
+
+/// Each real-model case creates its own native kernel team. Running both cases concurrently
+/// oversubscribes small CI workers and can make a healthy suite trip an inactivity watchdog.
+fn model_test_guard() -> MutexGuard<'static, ()> {
+    static MODEL_TEST: OnceLock<Mutex<()>> = OnceLock::new();
+    MODEL_TEST
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Same resolution order as the other model-gated CLI e2es: FTTS_MODEL_DIR, then the user
@@ -52,10 +63,16 @@ fn model_dir() -> Option<PathBuf> {
     })
 }
 
-fn scratch_dir() -> PathBuf {
-    // FIXED path during debugging so artifacts survive for post-mortem tooling.
-    let dir = PathBuf::from("/tmp/ftts-icl-say-e2e-artifacts");
-    let _ = std::fs::remove_dir_all(&dir);
+fn scratch_dir(label: &str) -> PathBuf {
+    // Keep artifacts for post-mortem inspection, but never let Cargo's parallel test runner
+    // make one case delete or overwrite another case's live model output.
+    let dir = std::env::temp_dir().join(format!(
+        "ftts-icl-say-e2e-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
 }
@@ -89,13 +106,17 @@ fn write_reference_wav(path: &Path, seconds: usize, seed: u64) {
 
 /// `--model`, `--no-resident`: both are PER-SUBCOMMAND flags and go AFTER the subcommand.
 fn run(mut command: Command, what: &str) -> std::process::Output {
-    command
+    eprintln!("starting ICL end-to-end phase: {what}");
+    let output = command
         .output()
-        .unwrap_or_else(|error| panic!("spawn {what}: {error}"))
+        .unwrap_or_else(|error| panic!("spawn {what}: {error}"));
+    eprintln!("finished ICL end-to-end phase: {what} ({})", output.status);
+    output
 }
 
 #[test]
 fn quality_pack_enrolls_inspects_and_synthesizes_end_to_end() {
+    let _model_test = model_test_guard();
     const TEST: &str = "quality_pack_enrolls_inspects_and_synthesizes_end_to_end";
     let Some(model_root) = model_dir() else {
         emit_skip(TEST, "no pinned model weights on this host");
@@ -106,7 +127,7 @@ fn quality_pack_enrolls_inspects_and_synthesizes_end_to_end() {
     } else {
         model_root.join("model.safetensors")
     };
-    let dir = scratch_dir();
+    let dir = scratch_dir("quality");
 
     // 1. Reference audio with real spectral structure.
     let reference = dir.join("reference.wav");
@@ -170,9 +191,6 @@ fn quality_pack_enrolls_inspects_and_synthesizes_end_to_end() {
     let say = run(
         {
             let mut c = Command::new(env!("CARGO_BIN_EXE_ftts"));
-            // Diagnostics probe: unnamed threads size from RUST_MIN_STACK. If 32MB makes
-            // the abort disappear, the synthesis spawn needs an explicit stack budget.
-            c.env("FTTS_ICL_DEBUG", "1");
             let say_stdout = dir.join("say.stdout.ndjson");
             c.stdout(std::fs::File::create(&say_stdout).expect("say stdout file"));
             c.args([
@@ -212,6 +230,7 @@ fn quality_pack_enrolls_inspects_and_synthesizes_end_to_end() {
 
 #[test]
 fn quick_pack_control_synthesizes_without_icl() {
+    let _model_test = model_test_guard();
     // CONTROL for the ICL overflow: identical fixture and flow, but QUICK mode —
     // embedding-only conditioning. If this passes while the ICL test aborts, the fault is
     // in the streaming-ICL path, not in enrollment or the shared pipeline.
@@ -225,7 +244,7 @@ fn quick_pack_control_synthesizes_without_icl() {
     } else {
         model_root.join("model.safetensors")
     };
-    let dir = scratch_dir();
+    let dir = scratch_dir("quick");
     let reference = dir.join("reference.wav");
     write_reference_wav(&reference, 4, 7);
     let pack = dir.join("quick.ftvoice");

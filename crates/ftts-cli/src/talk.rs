@@ -312,7 +312,7 @@ pub fn run_talk(
     let mut audio = open_audio_channel(pcm_out)?;
     // Eager load, announced by session_start: a conversation's first turn must not pay
     // the multi-second hydration silently. Memory-sensitive callers use one-shot `say`.
-    let loaded = LoadedModel::load(bundle)?;
+    let loaded = LoadedModel::load_with_human_progress(bundle)?;
     let engine = TtsEngine::from_process_environment()
         .map_err(|error| FttsError::Generic(format!("cannot start the engine: {error}")))?;
     let sid = session_id();

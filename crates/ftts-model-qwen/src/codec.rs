@@ -132,7 +132,10 @@ impl MaterializedCodebook {
         rows: usize,
         dim: usize,
     ) -> Result<Self, CodecError> {
-        if embedding_sum.len() != rows * dim || cluster_usage.len() != rows {
+        let Some(expected_entries) = rows.checked_mul(dim) else {
+            return Err(CodecError::CodebookShape);
+        };
+        if embedding_sum.len() != expected_entries || cluster_usage.len() != rows {
             return Err(CodecError::CodebookShape);
         }
         let mut entries = vec![0.0f32; embedding_sum.len()];
@@ -2439,6 +2442,14 @@ mod tests {
                 .expect("well-shaped table materializes");
         assert_eq!(&table.entries()[..2], &[1.0, 2.0]);
         assert_eq!(&table.entries()[2..], &[300_000.0, 600_000.0]);
+    }
+
+    #[test]
+    fn codebook_materialization_refuses_overflowing_geometry() {
+        assert_eq!(
+            MaterializedCodebook::from_unnormalized(&[], &[], usize::MAX, 2),
+            Err(CodecError::CodebookShape)
+        );
     }
 
     #[test]

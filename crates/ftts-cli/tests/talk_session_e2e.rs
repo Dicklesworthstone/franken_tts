@@ -131,11 +131,13 @@ impl Session {
     }
 
     /// Waits for the next event satisfying `want`, recording everything seen.
+    ///
+    /// `EVENT_TIMEOUT` is an inactivity bound, not a whole-operation deadline. A long
+    /// debug-profile utterance may emit hundreds of healthy audio events for longer than two
+    /// minutes; every event proves the child is live and therefore restarts the idle clock.
     fn wait_for(&mut self, what: &str, mut want: impl FnMut(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + EVENT_TIMEOUT;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match self.events.recv_timeout(remaining) {
+            match self.events.recv_timeout(EVENT_TIMEOUT) {
                 Ok(event) => {
                     self.seen.push(event.clone());
                     if want(&event) {
@@ -606,9 +608,9 @@ fn sigint_cancels_the_utterance_settles_the_receipt_and_exits_6() {
     };
     let mut session = Session::spawn("sigint");
     session.wait_for("session_start", |event| event["event"] == "session_start");
-    session.send(
-        json!({"op":"speak","context":"a","text":"The quick brown fox jumps over the lazy dog while the interrupt arrives midstream."}),
-    );
+    session.send(json!({"op":"open","context":"a","voice":"matt","seed":1,"id":"o"}));
+    session.wait_for("context_open", |event| event["event"] == "context_open");
+    session.send(json!({"op":"say","context":"a","text":LONG_TEXT,"continue":false}));
     // Land the strike while audio is actually flowing, so the cancelled utterance
     // has delivered bytes to account for in the audit.
     session.wait_for("first audio packet", |event| event["event"] == "audio");

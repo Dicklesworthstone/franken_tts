@@ -164,6 +164,14 @@ thread_local! {
     static TEAM_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+struct TeamBypassReset(bool);
+
+impl Drop for TeamBypassReset {
+    fn drop(&mut self) {
+        TEAM_BYPASS.with(|cell| cell.set(self.0));
+    }
+}
+
 /// Partitions the armed team runs with, or 1 when execution is serial.
 ///
 /// Exposed so a host with no environment variables — a browser — can report whether threading
@@ -191,9 +199,11 @@ pub fn bypass_team_on_this_thread() {
 pub fn with_team_bypassed<R>(body: impl FnOnce() -> R) -> R {
     let previous = TEAM_BYPASS.with(std::cell::Cell::get);
     TEAM_BYPASS.with(|cell| cell.set(true));
-    let result = body();
-    TEAM_BYPASS.with(|cell| cell.set(previous));
-    result
+    // Restoration must survive an unwind: the autotuner deliberately contains probe
+    // failures, and leaving this thread bypassed after one would silently route every
+    // later kernel through the serial path.
+    let _reset = TeamBypassReset(previous);
+    body()
 }
 
 /// Whether the current thread opted out of team dispatch.
@@ -873,6 +883,19 @@ mod tests {
             partitions,
             dispatch_gate: Mutex::new(()),
         }
+    }
+
+    #[test]
+    fn scoped_team_bypass_restores_state_after_a_caught_panic() {
+        TEAM_BYPASS.with(|cell| cell.set(false));
+        let outcome = std::panic::catch_unwind(|| {
+            with_team_bypassed(|| {
+                assert!(thread_bypassed());
+                panic!("contained probe failure");
+            });
+        });
+        assert!(outcome.is_err());
+        assert!(!thread_bypassed());
     }
 
     #[test]

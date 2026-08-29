@@ -168,6 +168,26 @@ pub struct LoadedModel {
     int8_route: std::sync::OnceLock<Option<std::sync::Arc<Int8Route>>>,
 }
 
+static DIGEST_PROGRESS_USERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static DIGEST_PROGRESS_PERCENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+struct DigestProgressGuard;
+
+impl DigestProgressGuard {
+    fn begin() -> Self {
+        DIGEST_PROGRESS_PERCENT.store(0, std::sync::atomic::Ordering::Relaxed);
+        DIGEST_PROGRESS_USERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for DigestProgressGuard {
+    fn drop(&mut self) {
+        DIGEST_PROGRESS_USERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 impl LoadedModel {
     /// Hydrate the bundle. This reads gigabytes and is the slow step of a cold run.
     ///
@@ -175,24 +195,39 @@ impl LoadedModel {
     ///
     /// If any checkpoint or tokenizer file is unreadable or not the pinned model.
     pub fn load(bundle: &ModelBundle) -> Result<Self, FttsError> {
+        Self::load_inner(bundle)
+    }
+
+    /// Hydrate while showing the slow digest pass on a human console.
+    ///
+    /// Machine-facing callers must use [`Self::load`]: arbitrary status text on
+    /// stderr corrupts the strict NDJSON error channel used by `say --robot`, raw
+    /// streaming, pipes, and cancellation recovery.
+    pub fn load_with_human_progress(bundle: &ModelBundle) -> Result<Self, FttsError> {
+        let _progress = DigestProgressGuard::begin();
+        Self::load_inner(bundle)
+    }
+
+    fn load_inner(bundle: &ModelBundle) -> Result<Self, FttsError> {
         // Digest verification over the multi-GB artifact is the longest silent
         // stretch of a cold run; under heavy ambient load it can run for many
         // minutes (bead frankentts-9dwj). Surface per-section progress on
         // stderr — throttled to 10% steps so a normal load prints one or two
         // lines and a contended one shows the run is alive.
-        let last_reported = std::sync::atomic::AtomicU8::new(0);
         ftts_artifacts::fttsq::set_digest_progress_sink(Box::new(move |progress| {
-            if progress.bytes_total == 0 {
+            if progress.bytes_total == 0
+                || DIGEST_PROGRESS_USERS.load(std::sync::atomic::Ordering::Acquire) == 0
+            {
                 return;
             }
             let pct = ((progress.bytes_done as f64 / progress.bytes_total as f64) * 100.0) as u8;
-            let last = last_reported.load(std::sync::atomic::Ordering::Relaxed);
+            let last = DIGEST_PROGRESS_PERCENT.load(std::sync::atomic::Ordering::Relaxed);
             if pct >= last + 10 || pct == 100 {
                 eprintln!(
                     "[load] verifying artifact digests: {}% ({})",
                     pct, progress.section
                 );
-                last_reported.store(pct, std::sync::atomic::Ordering::Relaxed);
+                DIGEST_PROGRESS_PERCENT.store(pct, std::sync::atomic::Ordering::Relaxed);
             }
         }));
         let read = |name: &str| -> Result<String, FttsError> {
@@ -1875,10 +1910,6 @@ pub fn synthesize(
         }
     };
     let tts_eos = model.talker.tts_eos(&table);
-    if std::env::var_os("FTTS_ICL_DEBUG").is_some() {
-        eprintln!("[icl-dbg] header/mode/reference resolved");
-    }
-
     // 4. Borrowed weights for the generator.
     let talker_layers = model.talker.talker_layer_weights();
     let micro_layers = model.talker.microdecoder_layer_weights();
@@ -1933,23 +1964,20 @@ pub fn synthesize(
             .map(std::sync::Arc::new)
     });
     let mut generator = QwenGenerator::new_with_prepared_int8(generator_config, int8.clone());
-    if std::env::var_os("FTTS_ICL_DEBUG").is_some() {
-        eprintln!(
-            "[icl-dbg] generator built; cached_positions={}",
-            generator.cached_positions()
-        );
-    }
-
     // 5. The engine owns admission, the budget, cancellation, and the frame loop — and the
     // codec decodes IN PARALLEL with it: a tee on the generator feeds every produced frame
     // through a bounded channel to a scoped codec worker driving the streaming decoder.
     // Streamed output is bit-identical to offline decode under every packet schedule (the
     // standing streaming==batch gate), so this overlap changes wall time and nothing else.
     // Deadlock shape: the worker only ever blocks on `recv` (it always drains), and the
-    // generator only ever blocks on `send` when the worker is more than 256 frames behind —
-    // bounded, and covered by the engine's rolling frame budget if the worker wedges.
+    // generator hands each completed frame directly to the worker through a rendezvous channel.
+    // The zero-capacity handoff is part of the cancellation contract: once a stop lands, the
+    // worker finishes only the frame the generator was already computing and the engine closes
+    // the channel at its next frame-boundary checkpoint. Generation and codec work still overlap,
+    // but no completed frame can sit queued where we would have to choose between losing it and
+    // making a cancelled caller wait behind avoidable codec work.
     let preparer = PreparedPassThrough { prepared };
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ftts_core::CodeFrame>(256);
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ftts_core::CodeFrame>(0);
     let codec = &model.codec;
     let synthesis_started = Instant::now();
     let (result, decoded, generation) = std::thread::scope(
@@ -1997,13 +2025,11 @@ pub fn synthesize(
                     Ok(())
                 };
                 while let Ok(frame) = frame_rx.recv() {
-                    // A strike during generation or the end-of-stream drain must not leave
-                    // the client parked while this worker grinds through the queued backlog
-                    // (bead frankentts-say-sigint-latency-resident-g4zq): stop decoding where
-                    // we are and keep only what was already delivered through the sink.
-                    if cancellation.is_cancelled() {
-                        break;
-                    }
+                    // Do not discard frames merely because cancellation has landed. Every frame
+                    // returned by the generator was already reported through `FrameProgress` and
+                    // must reach the sink exactly once. The engine observes the shared token at
+                    // its next frame boundary, closes the rendezvous channel, and lets the worker
+                    // settle the single in-flight tail before returning Cancelled.
                     if frame.codes.len() != 16 {
                         return Err(FttsError::Generic(format!(
                             "generated frame carries {} codes, expected 16",
