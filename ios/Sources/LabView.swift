@@ -12,6 +12,33 @@ private enum VoiceForgeTextEntry: Hashable {
     case seed
 }
 
+private enum VoiceLibraryFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case feminine = "Feminine"
+    case masculine = "Masculine"
+    case personal = "My voices"
+
+    var id: Self { self }
+
+    var symbol: String {
+        switch self {
+        case .all: "waveform"
+        case .feminine: "sparkles"
+        case .masculine: "waveform.path"
+        case .personal: "person.wave.2.fill"
+        }
+    }
+
+    func includes(_ preset: Preset) -> Bool {
+        switch self {
+        case .all: true
+        case .feminine: preset.character.localizedCaseInsensitiveContains("feminine")
+        case .masculine: preset.character.localizedCaseInsensitiveContains("masculine")
+        case .personal: false
+        }
+    }
+}
+
 private struct VoiceForgeTextEntryFrameKey: PreferenceKey {
     static let defaultValue: [VoiceForgeTextEntry: CGRect] = [:]
 
@@ -736,6 +763,8 @@ struct LabView: View {
     @State private var importFailed = false
     @State private var importCount = 0
     @State private var showDesktopImporter = false
+    @State private var voiceSearchText = ""
+    @State private var voiceLibraryFilter: VoiceLibraryFilter = .all
     @State private var textEntryFrames: [VoiceForgeTextEntry: CGRect] = [:]
     /// Bumped to refresh the play/pause icon, which tracks external playback state.
     @State private var playbackTick = 0
@@ -849,11 +878,11 @@ struct LabView: View {
             .preferredColorScheme(.dark)
             .presentationDetents([.medium, .large])
         }
-        .sheet(isPresented: $showVoiceLab) {
+        .fullScreenCover(isPresented: $showVoiceLab) {
             NavigationStack {
-                ScrollView { voicesCard.padding(18) }
+                ScrollView { voicesCard.padding(.horizontal, 18).padding(.vertical, 20) }
                     .background(LaboratoryBackground())
-                    .navigationTitle("Voice laboratory")
+                    .navigationTitle("Voice Library")
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
                         ToolbarItem(placement: .confirmationAction) {
@@ -862,7 +891,6 @@ struct LabView: View {
                     }
             }
             .preferredColorScheme(.dark)
-            .presentationDetents([.large])
         }
         .sheet(isPresented: $showGalaxy) {
             VoiceGalaxyView(presets: model.presets, enrolled: model.library.voices)
