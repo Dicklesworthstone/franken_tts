@@ -7,6 +7,11 @@ license-file.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Full-model numerical/oracle certification. Kept out of the default test graph because these
+# binaries perform many complete syntheses and can take well over an hour on a busy host.
+ultra-tests = ["ftts-cli/ultra-tests"]
+
 [dependencies]
 ftts-artifacts = { path = "../ftts-artifacts" }
 ftts-cli = { path = "../ftts-cli" }

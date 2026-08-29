@@ -24,6 +24,8 @@
 //! squeeze-excitation gate — cannot pass it, because every one of those is an O(1) relative move
 //! while f32 reduction-order drift over these K values is not.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_conformance::{
     compare::compare_f32,
     oracle::{CPU_FP32_ORACLE_CLASS, OracleFixtures, SeamRef},

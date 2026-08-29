@@ -8,6 +8,8 @@
 //! Model-gated twice over — it needs both the fixture set and the pinned checkpoint — and skips
 //! with SUCCESS and a named reason when either is absent, never folding a skip into green.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_conformance::npy::NpyArray;
 use ftts_conformance::{

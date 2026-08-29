@@ -31,6 +31,8 @@
 //! What this test does **not** prove: that our layers reproduce the oracle's hidden states. That
 //! needs the checkpoint and is the weight-gated half of `frankentts-p1-microdecoder-xst`.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_conformance::{
     npy,
     oracle::{CPU_FP32_ORACLE_CLASS, OracleFixtures, SeamRef},

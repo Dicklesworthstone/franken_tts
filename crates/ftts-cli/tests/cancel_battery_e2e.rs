@@ -25,6 +25,7 @@
 //! on non-unix cross-target checks it compiles as an empty test binary instead
 //! of a wall of dead-code warnings against the gate's -D pass.
 #![cfg(unix)]
+#![cfg(feature = "ultra-tests")]
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

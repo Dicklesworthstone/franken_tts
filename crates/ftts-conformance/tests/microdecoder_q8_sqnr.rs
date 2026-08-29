@@ -16,6 +16,8 @@
 //!
 //! Model-gated: without the pinned checkpoint each check reports its skip and passes.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::{Path, PathBuf};
 
 use ftts_artifacts::converter::quantize_output_channel_q8;

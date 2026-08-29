@@ -9,6 +9,8 @@
 //!
 //! Model-gated; weights absent reports an honest skip.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

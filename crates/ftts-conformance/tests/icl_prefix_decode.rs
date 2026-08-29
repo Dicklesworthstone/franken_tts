@@ -15,6 +15,8 @@
 //! synthetic ids exercise it as strongly as sampled ones. Model-gated: without the pinned
 //! speech-tokenizer checkpoint the tests report the skip and pass.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::PathBuf;
 
 use ftts_model_qwen::checkpoint::CodecCheckpoint;

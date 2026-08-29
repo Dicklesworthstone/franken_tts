@@ -16,6 +16,8 @@
 //!    drives 100 utterances and asserts flat RSS via `ps` samples plus per-utterance wall
 //!    times on stdout.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::PathBuf;
 use std::time::Instant;
 

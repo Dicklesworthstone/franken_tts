@@ -17,6 +17,8 @@
 //!
 //! Model-gated; each absence reports an honest skip.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::PathBuf;
 
 use ftts_cli::preset_voice_path;

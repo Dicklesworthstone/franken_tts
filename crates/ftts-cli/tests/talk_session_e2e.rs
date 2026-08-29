@@ -13,6 +13,8 @@
 //!
 //! Receipts: `receipt: {...}` NDJSON on stderr per case.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};

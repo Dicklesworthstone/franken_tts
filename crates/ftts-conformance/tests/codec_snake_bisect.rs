@@ -63,6 +63,8 @@
 //! free. `fused_scale_multiply_add` is 4x worse by element count, confirming by measurement that the
 //! un-fused `scale * (sine * sine)` association the production code already argues for is correct.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_conformance::npy::NpyArray;
 use ftts_conformance::{

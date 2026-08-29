@@ -18,6 +18,8 @@
 //! and the cv% across decode steps, because a row with cv > 5 is not admissible under the
 //! ledger's own rules and must be re-measured in a quiet window instead of recorded.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_conformance::npy::NpyArray;
 use ftts_conformance::oracle::{CPU_FP32_ORACLE_CLASS, OracleFixtures, SeamRef};

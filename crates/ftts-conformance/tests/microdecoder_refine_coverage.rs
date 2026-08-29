@@ -13,6 +13,8 @@
 //! everywhere, and the worst observed coarse rank is reported so the window has a measured
 //! margin, not a vibe. Model-gated: skips honestly without checkpoint or fixtures.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::{Path, PathBuf};
 
 use ftts_artifacts::safetensors::SafetensorsFile;

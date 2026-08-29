@@ -16,6 +16,8 @@
 //! Model-gated: without `speech_tokenizer/model.safetensors` the test reports the skip
 //! and passes (skip-honest, like every model-backed suite here).
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::PathBuf;
 
 use ftts_model_qwen::speech_encoder::SpeechEncoder;

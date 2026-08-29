@@ -1615,6 +1615,7 @@ mod tests {
     }
 
     /// Model-gated end-to-end smoke: open, synthesize a word, free, close.
+    #[cfg(feature = "ultra-tests")]
     #[test]
     fn synthesizes_through_the_c_abi_when_the_model_is_present() {
         #[allow(deprecated)]

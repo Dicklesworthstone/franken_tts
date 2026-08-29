@@ -26,6 +26,8 @@
 //!
 //! Model-gated twice (fixture pack + main checkpoint); either absent produces a loud skip receipt.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_conformance::{
     npy,
     oracle::{CPU_TIER_TOLERANCE, CPU_TIER_TOLERANCE_SOURCE, OracleFixtures, SeamRef},

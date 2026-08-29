@@ -19,6 +19,8 @@
 //! Every case logs an NDJSON receipt line to stderr (`receipt: {...}`) with the seam,
 //! seed, and measured values, per the ftts-conformance observability convention.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

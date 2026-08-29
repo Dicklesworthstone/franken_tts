@@ -21,6 +21,8 @@
 //! skip and passes. When `FTTS_PQ_REPORT` names a path, `<path>.distributional.json`
 //! holds the metric table for the release scorecard to consume.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::PathBuf;
 
 use ftts_artifacts::safetensors::SafetensorsFile;

@@ -37,6 +37,8 @@
 //!
 //! Model-gated twice (fixture pack + checkpoint bundle); either absent produces a loud skip.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_cli::synth::{LoadedModel, ModelBundle, SPEAKER_VECTOR_BYTES, synthesize};
 use ftts_conformance::{
     oracle::{CPU_TIER_TOLERANCE, CPU_TIER_TOLERANCE_SOURCE, OracleFixtures, SeamRef},

@@ -18,6 +18,8 @@
 //! Model-gated twice over: needs both the pinned checkpoint and the ft7 fixture pack;
 //! each absence reports an honest skip and passes.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::{Path, PathBuf};
 
 use ftts_artifacts::converter::quantize_output_channel_q8;

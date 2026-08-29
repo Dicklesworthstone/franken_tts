@@ -8,6 +8,10 @@ repository.workspace = true
 description = "franken_tts C ABI: the native engine behind the iOS app"
 publish = false
 
+[features]
+# Real-model ABI parity/streaming certification; enabled by `scripts/check.sh --ultra`.
+ultra-tests = ["ftts-cli/ultra-tests"]
+
 [lib]
 crate-type = ["staticlib", "rlib"]
 

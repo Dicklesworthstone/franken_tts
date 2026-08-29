@@ -29,6 +29,8 @@
 //! Model-gated; scorer absence skips only the transcription families, honestly. When
 //! `FTTS_PQ_REPORT` names a path, results land in `<path>.free_running.json`.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::{Path, PathBuf};
 
 use ftts_cli::preset_voice_path;

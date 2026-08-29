@@ -12,6 +12,8 @@
 //! by contract (no unwinding exists on that side), and Rust's extern "C" aborts on
 //! unwind by construction — `guarded` covers the Rust side of the boundary.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::ffi::{CString, c_void};
 use std::path::PathBuf;
 

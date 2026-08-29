@@ -8,6 +8,8 @@
 //! 3. Key-tuple invalidation strictly rejects caches built under any differing parameter.
 //! 4. Caches are limited to the maximal target-text-INDEPENDENT prefix proven in OQ-10 §5.1.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::collections::BTreeMap;
 
 use ftts_artifacts::voice::{FtVoiceCacheKey, parse_ftvoice_cache, serialize_ftvoice_cache};

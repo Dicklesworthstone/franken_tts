@@ -38,6 +38,8 @@
 //! shift is checked explicitly as a negative control, because it is the subtlest of the five and
 //! the one a reader is most entitled to doubt.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_conformance::{
     compare::compare_f32,
     npy,

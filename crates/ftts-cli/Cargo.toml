@@ -10,6 +10,11 @@ keywords = ["tts", "speech", "qwen", "voice", "audio"]
 categories = ["multimedia::audio"]
 autobins = false
 
+[features]
+# Multi-minute real-model integration batteries are opt-in. `scripts/check.sh --ultra` enables
+# this feature; ordinary `cargo test` remains a bounded edit-loop gate even when weights exist.
+ultra-tests = []
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = { version = "3.5.2", features = ["termination"] }

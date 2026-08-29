@@ -58,6 +58,8 @@
 
 #![feature(float_erf)]
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_conformance::npy::NpyArray;
 use ftts_conformance::{

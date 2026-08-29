@@ -16,6 +16,8 @@
 //!
 //! Receipts: each test prints `receipt: {...}` NDJSON to stderr with measured values.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

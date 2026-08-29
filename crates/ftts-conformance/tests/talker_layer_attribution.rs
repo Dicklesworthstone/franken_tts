@@ -25,6 +25,8 @@
 //! Model-gated: skips with SUCCESS and a named reason when the fixtures or the pinned checkpoint
 //! are absent, never folding a skip into green.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_conformance::npy::NpyArray;
 use ftts_conformance::{

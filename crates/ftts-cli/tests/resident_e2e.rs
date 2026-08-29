@@ -11,6 +11,8 @@
 //!    voice), so the resident path changes nothing but latency;
 //! 4. the daemon exits by itself after the idle period and removes its state file.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};

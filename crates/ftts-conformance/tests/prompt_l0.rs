@@ -4,6 +4,8 @@
 //! material.  Its absence emits an honest skip receipt; when supplied, every token comparison here
 //! has tolerance zero because wrapper ids and prompt geometry are discrete contracts.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::{
     env, fs,
     path::{Path, PathBuf},

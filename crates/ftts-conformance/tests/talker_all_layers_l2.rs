@@ -17,6 +17,8 @@
 //! projection, a dropped QK-Norm or a wrong mask is O(1) relative and collapses cosine. The two are
 //! separated by decades, so this gate catches wiring without chasing an unreachable bit-exactness.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_conformance::{
     compare::compare_f32,

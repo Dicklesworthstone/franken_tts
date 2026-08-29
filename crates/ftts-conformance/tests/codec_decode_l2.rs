@@ -3,6 +3,7 @@
 // The float literals in this file are pinned observed divergences; truncating them to clippy's
 // taste would un-pin the measurements (AGENTS.md doctrine #8: no silent numerics changes).
 #![allow(clippy::excessive_precision)]
+#![cfg(feature = "ultra-tests")]
 //!
 //! The ft7 pack captures the codec decoder at stage granularity: the SplitRVQ input codes, each of
 //! the eight pre-transformer layers, both latent upsample stages, all seven `decoder.*` children,

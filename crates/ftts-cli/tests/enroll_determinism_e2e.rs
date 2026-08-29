@@ -15,6 +15,8 @@
 //! Model-gated: enrollment needs the real speaker encoder; absence reports an honest
 //! skip and passes.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 

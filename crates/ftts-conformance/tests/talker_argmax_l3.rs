@@ -21,6 +21,8 @@
 //!
 //! Model-gated twice (fixtures + pinned checkpoint); absent inputs produce a loud skip receipt.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_conformance::npy::NpyArray;
 use ftts_conformance::oracle::{CPU_FP32_ORACLE_CLASS, OracleFixtures, SeamRef};

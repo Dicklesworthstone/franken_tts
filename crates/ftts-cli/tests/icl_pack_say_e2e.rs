@@ -12,6 +12,8 @@
 //! of the clone is explicitly NOT claimed here — this pins MECHANISM (runs, emits parseable
 //! WAV, deterministic exit codes), while listening-tier quality belongs to its own protocol.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};

@@ -14,6 +14,8 @@
 //! Model-gated twice: needs the pinned checkpoint and the ft7 fixture pack;
 //! each absence reports an honest skip and passes.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::{Path, PathBuf};
 
 use ftts_artifacts::awq::{awq_best_alpha, gptq_inverse_hessian, gptq_round_matrix};

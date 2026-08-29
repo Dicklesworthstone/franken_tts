@@ -35,6 +35,8 @@
 //! regeneration, or a matching accumulation order — the unexpected pass fails loudly and this
 //! ledger entry gets retired instead of quietly rotting.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_conformance::{
     npy,

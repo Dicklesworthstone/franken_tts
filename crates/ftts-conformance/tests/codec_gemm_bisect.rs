@@ -13,6 +13,8 @@
 //!
 //! It is a reporting probe, not a gate: it asserts only that the candidates ran.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_conformance::npy::NpyArray;
 use ftts_conformance::{

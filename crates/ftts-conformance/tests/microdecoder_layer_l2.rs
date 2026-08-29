@@ -22,6 +22,8 @@
 //! a transposed projection, a missing QK-Norm, a wrong mask — could not pass it. Cosine is
 //! asserted too, because a wiring error collapses it while rounding does not.
 
+#![cfg(feature = "ultra-tests")]
+
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_conformance::{
     compare::compare_f32,

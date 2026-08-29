@@ -15,6 +15,8 @@
 //! * `reverberant(clean, rt60)` convolves with a noise IR decaying at the exact rate that
 //!   yields `rt60` (60 dB drop), so the estimator's job is to recover that constant.
 
+#![cfg(feature = "ultra-tests")]
+
 use std::path::Path;
 use std::path::PathBuf;
 
