@@ -34,6 +34,14 @@ private enum VoiceLibraryFilter: String, CaseIterable, Identifiable {
     }
 }
 
+private struct PhoneWorkspaceHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 /// UIKit owns the mature text-editing behaviors that matter for a long utterance:
 /// selection handles, edit menus, undo, dictation, marked text, and cursor-preserving
 /// replacement. A SwiftUI `TextEditor` whose binding rewrites the entire string on
@@ -51,7 +59,6 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
     func makeUIView(context: Context) -> UITextView {
         let textView = UITextView()
         textView.delegate = context.coordinator
-        context.coordinator.textView = textView
         textView.backgroundColor = .clear
         textView.textColor = UIColor(Lab.textPrimary)
         textView.tintColor = UIColor(Lab.emerald)
@@ -66,7 +73,6 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
         textView.textContainerInset = UIEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
         textView.textContainer.lineFragmentPadding = 0
         textView.accessibilityIdentifier = "utteranceEditor"
-        textView.inputAccessoryView = context.coordinator.makeAccessoryView()
         textView.text = text
         return textView
     }
@@ -103,31 +109,10 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
     final class Coordinator: NSObject, UITextViewDelegate {
         var parent: NativeUtteranceEditor
         var lastFocusRequest: Int
-        weak var textView: UITextView?
 
         init(parent: NativeUtteranceEditor) {
             self.parent = parent
             lastFocusRequest = parent.focusRequest
-        }
-
-        func makeAccessoryView() -> UIView {
-            let toolbar = UIToolbar()
-            toolbar.sizeToFit()
-            toolbar.items = [
-                UIBarButtonItem(systemItem: .flexibleSpace),
-                UIBarButtonItem(
-                    title: "Done",
-                    style: .done,
-                    target: self,
-                    action: #selector(finishEditing)
-                ),
-            ]
-            toolbar.tintColor = UIColor(Lab.emerald)
-            return toolbar
-        }
-
-        @objc private func finishEditing() {
-            textView?.resignFirstResponder()
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
@@ -1175,6 +1160,7 @@ struct LabView: View {
     @State private var voiceSearchText = ""
     @State private var voiceLibraryFilter: VoiceLibraryFilter = .all
     @State private var utteranceFocusRequest = 0
+    @State private var phoneWorkspaceHeight: CGFloat = 0
     /// Bumped to refresh the play/pause icon, which tracks external playback state.
     @State private var playbackTick = 0
     @State private var showMachineProfile = false
@@ -1221,22 +1207,42 @@ struct LabView: View {
                     .padding(.horizontal, 24)
                     .padding(.vertical, 14)
                 } else {
-                    ViewThatFits(in: .vertical) {
-                        // The normal ready-state phone experience is a single,
-                        // stable instrument panel. Do not make the whole app feel
-                        // like a web page when its controls fit on the display.
-                        phoneWorkspace(compact: true)
-
-                        // Download details, generated audio, the live forge, very
-                        // small displays, and large accessibility type can exceed
-                        // the viewport. Preserve access to every control without
-                        // exposing a bright system scroll indicator over the dark
-                        // laboratory chrome.
+                    ScrollViewReader { proxy in
                         ScrollView {
-                            phoneWorkspace(compact: false)
+                            phoneWorkspace(compact: true)
+                                .background {
+                                    GeometryReader { contentGeometry in
+                                        Color.clear.preference(
+                                            key: PhoneWorkspaceHeightKey.self,
+                                            value: contentGeometry.size.height
+                                        )
+                                    }
+                                }
                         }
                         .scrollIndicators(.hidden)
                         .scrollDismissesKeyboard(.interactively)
+                        // Keep the normal ready screen as a fixed instrument panel.
+                        // Scrolling switches on only for genuinely taller content or
+                        // while editing, without replacing the UIKit editor hierarchy.
+                        .scrollDisabled(
+                            focusedField == nil
+                                && phoneWorkspaceHeight <= geometry.size.height + 1
+                        )
+                        .onPreferenceChange(PhoneWorkspaceHeightKey.self) { height in
+                            phoneWorkspaceHeight = height
+                        }
+                        .onChange(of: focusedField) { _, field in
+                            guard field == .utterance else { return }
+                            Task { @MainActor in
+                                // Wait for the keyboard's safe-area animation, then
+                                // keep the complete composer (not merely its cursor)
+                                // visible above it.
+                                try? await Task.sleep(for: .milliseconds(260))
+                                withAnimation(.snappy(duration: 0.22)) {
+                                    proxy.scrollTo("utterance-card", anchor: .bottom)
+                                }
+                            }
+                        }
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, 14)
@@ -1269,12 +1275,6 @@ struct LabView: View {
 
     private var keyboardAwareView: some View {
         workspaceView
-        .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button("Done") { dismissKeyboard() }
-            }
-        }
     }
 
     private var sheetView: some View {
@@ -2105,6 +2105,15 @@ struct LabView: View {
                 HStack(spacing: 8) {
                     LabLabel(text: "03 · The Utterance")
                     Spacer()
+                    if focusedField == .utterance {
+                        Button {
+                            dismissKeyboard()
+                        } label: {
+                            Label("Done", systemImage: "checkmark")
+                        }
+                        .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+                        .accessibilityHint("Finishes editing and hides the keyboard")
+                    }
                     Button("Select all") { selectAllUtterance() }
                         .buttonStyle(GhostButtonStyle())
                         .disabled(model.text.isEmpty)
@@ -2358,6 +2367,7 @@ struct LabView: View {
                 }
             }
         }
+        .id("utterance-card")
     }
 
     private func synthesisProfile(_ profile: SynthesisProfile) -> some View {
