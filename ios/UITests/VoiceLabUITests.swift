@@ -32,6 +32,10 @@ final class VoiceLabUITests: XCTestCase {
             .matching(NSPredicate(format: "identifier BEGINSWITH 'voice-lab-signal-'"))
             .firstMatch
         XCTAssertTrue(signal.waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            app.staticTexts["0:00 / 0:05"].waitForExistence(timeout: 2),
+            "A completed preview must show its known duration before first playback"
+        )
         keepScreenshot(named: "voice-lab-complete-spectrogram")
 
         play.tap()
