@@ -229,6 +229,44 @@ private final class MultiVoiceCallbackBox: EngineCancellationTarget, @unchecked 
     }
 }
 
+/// Streaming packet accumulation for first-audio measurement. The native packet
+/// callback runs on the engine's decode thread; it copies each borrowed packet out
+/// under a lock and records the monotonic timestamp of the first arrival.
+private final class StreamingPacketBox: EngineCancellationTarget, @unchecked Sendable {
+    private let lock = NSLock()
+    private var packets: [[Float]] = []
+    private var firstPacketUptimeNanos: UInt64 = 0
+    private var cancellationRequested = false
+
+    func accept(_ samples: UnsafeBufferPointer<Float>) {
+        let copy = Array(samples)
+        let now = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        if firstPacketUptimeNanos == 0 { firstPacketUptimeNanos = now }
+        if !cancellationRequested { packets.append(copy) }
+        lock.unlock()
+    }
+
+    func requestCancellation() {
+        lock.lock()
+        cancellationRequested = true
+        lock.unlock()
+    }
+
+    func packetVerdict() -> Int32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationRequested ? 1 : 0
+    }
+
+    /// Joined PCM and the first packet's monotonic uptime (0 when none arrived).
+    func receipt() -> (pcm: [Float], firstPacketUptimeNanos: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (packets.flatMap { $0 }, firstPacketUptimeNanos)
+    }
+}
+
 private let nativeProgressCallback: @convention(c) (
     UnsafeMutableRawPointer?, UnsafePointer<FttsProgressEvent>?
 ) -> Int32 = { context, eventPointer in
@@ -267,6 +305,15 @@ private let nativeMultiVoiceResultCallback: @convention(c) (
         profile: profile
     )
     return box.publishAndReturnVerdict(index: voiceIndex, output: output)
+}
+
+private let nativeStreamingPacketCallback: @convention(c) (
+    UnsafeMutableRawPointer?, UnsafePointer<Float>?, Int, UInt64
+) -> Int32 = { context, samples, length, _ in
+    guard let context, let samples, length > 0 else { return 1 }
+    let box = Unmanaged<StreamingPacketBox>.fromOpaque(context).takeUnretainedValue()
+    box.accept(UnsafeBufferPointer(start: samples, count: length))
+    return box.packetVerdict()
 }
 
 enum EngineError: LocalizedError {
@@ -381,6 +428,53 @@ actor Engine {
         return SynthesisOutput(
             pcm: Array(UnsafeBufferPointer(start: pcm, count: length)),
             profile: profile
+        )
+    }
+
+    /// Streaming synthesis for first-audio measurement: every decoded packet is
+    /// copied out the moment it exists. Returns the joined PCM and the elapsed
+    /// monotonic time to the first packet. Profile instrumentation only — the
+    /// product UI still plays whole-buffer results.
+    func synthesizeStreaming(
+        text: String,
+        speaker: [Float],
+        seed: UInt64,
+        packetFrames: Int
+    ) throws -> (pcm: [Float], firstAudioNanos: UInt64) {
+        guard !Task.isCancelled else { throw EngineError.cancelled }
+        guard !text.utf8.contains(0) else {
+            throw EngineError.native("utterance contains an unsupported NUL character")
+        }
+        guard let handle else { throw EngineError.native("engine not loaded") }
+        guard speaker.count == Self.speakerWidth else {
+            throw EngineError.native("speaker vector has wrong width")
+        }
+        let box = StreamingPacketBox()
+        cancellationController.begin(box)
+        defer { cancellationController.end(box) }
+        let startUptime = DispatchTime.now().uptimeNanoseconds
+        let context = Unmanaged.passUnretained(box).toOpaque()
+        let code = speaker.withUnsafeBufferPointer { buffer in
+            ftts_synthesize_streaming(
+                handle,
+                text,
+                buffer.baseAddress,
+                buffer.count,
+                seed,
+                packetFrames,
+                nativeStreamingPacketCallback,
+                context
+            )
+        }
+        if code == FTTS_SYNTH_CANCELLED { throw EngineError.cancelled }
+        guard code == 0 else { throw EngineError.lastFromNative() }
+        let receipt = box.receipt()
+        guard receipt.firstPacketUptimeNanos > 0 else {
+            throw EngineError.native("streaming synthesis delivered no packets")
+        }
+        return (
+            pcm: receipt.pcm,
+            firstAudioNanos: receipt.firstPacketUptimeNanos - startUptime
         )
     }
 

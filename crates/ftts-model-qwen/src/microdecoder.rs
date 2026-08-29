@@ -1036,6 +1036,30 @@ fn score_head_refined(
     mode: QuantLinearMode,
     logits: &mut [f32],
 ) {
+    let mut scratch = HeadScoreScratch::default();
+    score_head_refined_with_scratch(head_q8, head_f32, normed, mode, logits, &mut scratch);
+}
+
+/// Reusable storage for refined residual-head scoring. Artifact-native Q8
+/// hydration deliberately elides the widened heads, so the old shipping path
+/// allocated 96 temporary dequantized rows at each of 15 residual depths.
+#[derive(Default, Debug)]
+struct HeadScoreScratch {
+    coarse: Vec<f32>,
+    candidates: Vec<usize>,
+    kept: Vec<bool>,
+    dequantized: Vec<f32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_head_refined_with_scratch(
+    head_q8: &QuantizedMatrix,
+    head_f32: Option<&[f32]>,
+    normed: &[f32],
+    mode: QuantLinearMode,
+    logits: &mut [f32],
+    scratch: &mut HeadScoreScratch,
+) {
     let hidden = normed.len();
     let vocab = head_q8.n;
     // The f32 route's matvec asserts its geometry; this route must too, or a truncated or
@@ -1057,40 +1081,49 @@ fn score_head_refined(
         head_q8.k, hidden,
         "refined q8 head reduction width mismatch"
     );
-    let mut coarse = vec![0.0_f32; vocab];
-    quant_linear(mode, normed, head_q8, None, 1, &mut coarse);
+    resize_filled(&mut scratch.coarse, vocab);
+    quant_linear(mode, normed, head_q8, None, 1, &mut scratch.coarse);
 
     // Top-M indices by coarse logit: selection sort over a running boundary is O(vocab * M)
     // with M=96 — cheaper and simpler than sorting 2,048 floats, and allocation-light.
-    let mut candidates: Vec<usize> = Vec::with_capacity(HEAD_REFINE_CANDIDATES);
-    let mut kept = vec![false; vocab];
+    scratch.candidates.clear();
+    scratch.candidates.reserve(HEAD_REFINE_CANDIDATES);
+    scratch.kept.clear();
+    scratch.kept.resize(vocab, false);
     for _ in 0..HEAD_REFINE_CANDIDATES.min(vocab) {
         let mut best: Option<usize> = None;
         for token in 0..vocab {
-            if !kept[token] && best.is_none_or(|current| coarse[token] > coarse[current]) {
+            if !scratch.kept[token]
+                && best.is_none_or(|current| scratch.coarse[token] > scratch.coarse[current])
+            {
                 best = Some(token);
             }
         }
         let token = best.expect("vocab is non-empty");
-        kept[token] = true;
-        candidates.push(token);
+        scratch.kept[token] = true;
+        scratch.candidates.push(token);
     }
 
     logits.fill(f32::NEG_INFINITY);
-    for &token in &candidates {
+    for &token in &scratch.candidates {
         // The reference matvec's per-row arithmetic: one left-to-right scalar dot. Against a
         // widened head the refined value is exactly that head's row value; against a
         // Q8-native head it is exactly the dequantized stored row's value — self-consistent
         // with the coarse pass either way.
-        let dequantized;
         let row: &[f32] = match head_f32 {
             Some(head) => &head[token * hidden..(token + 1) * hidden],
             None => {
-                dequantized = head_q8.data[token * hidden..(token + 1) * hidden]
-                    .iter()
-                    .map(|&value| value as f32 * head_q8.scales[token])
-                    .collect::<Vec<f32>>();
-                &dequantized
+                resize_filled(&mut scratch.dequantized, hidden);
+                let start = token * hidden;
+                let scale = head_q8.scales[token];
+                for (slot, &value) in scratch
+                    .dequantized
+                    .iter_mut()
+                    .zip(&head_q8.data[start..start + hidden])
+                {
+                    *slot = value as f32 * scale;
+                }
+                &scratch.dequantized
             }
         };
         let mut sum = 0.0_f32;
@@ -1872,9 +1905,9 @@ pub fn decode_frame_with_selector(
 /// Panics when `quant` does not cover every layer, or as [`decode_frame_with_selector`] does.
 #[allow(clippy::too_many_arguments)]
 /// The ResidualCodeDecoder engine (frankentts-k-rcd-engine-6e3 increment 1):
-/// the fixed 16-position/5-layer microdecoder walk with every buffer
-/// pre-allocated at construction — [`Self::decode_frame_into`] performs zero
-/// allocations in steady state. Same ops, same order as
+/// the fixed 16-position/5-layer microdecoder walk with its outer hidden,
+/// norm, logits, codes, and KV buffers pre-allocated at construction. Same ops,
+/// same order as
 /// [`decode_frame_with_selector_q8`]: bit-identical codes (pinned by the
 /// in-crate parity tests).
 pub struct ResidualCodeDecoder<'a> {
@@ -1882,6 +1915,18 @@ pub struct ResidualCodeDecoder<'a> {
     rope: &'a RopeTable,
     weights: &'a MicrodecoderWeights<'a>,
     quant: Option<MicroQuantRoute<'a>>,
+    scratch: ResidualCodeScratch,
+}
+
+/// Reusable storage for the authoritative 16-position residual-code walk.
+///
+/// Unlike [`ResidualCodeDecoder`], this type borrows no model weights. That lets
+/// an owner such as `QwenGenerator` keep the scratch beside its borrowed model
+/// views without constructing a self-referential struct. Supplying the route on
+/// each call is only a handful of copied slice references; the large buffers and
+/// per-layer KV state stay resident across every emitted semantic frame.
+#[derive(Debug)]
+pub struct ResidualCodeScratch {
     state: FrameState,
     /// The current position's embedding / running layer output.
     hidden_buf: Vec<f32>,
@@ -1891,29 +1936,24 @@ pub struct ResidualCodeDecoder<'a> {
     normed_buf: Vec<f32>,
     /// The per-depth head logits, per scored position.
     logits_buf: Vec<f32>,
+    /// Coarse logits, top-candidate bookkeeping, and one widened Q8 row.
+    head_score: HeadScoreScratch,
 }
 
-impl<'a> ResidualCodeDecoder<'a> {
-    /// Allocates the engine's fixed buffers once. `decode_frame_into` never
-    /// allocates.
+impl ResidualCodeScratch {
+    /// Allocates the fixed outer-loop buffers once. Layer-internal scratch has
+    /// a separate allocation gate, so this deliberately makes no whole-call
+    /// zero-allocation claim.
     #[must_use]
-    pub fn new(
-        config: &MicrodecoderConfig,
-        rope: &'a RopeTable,
-        weights: &'a MicrodecoderWeights<'a>,
-        quant: Option<MicroQuantRoute<'a>>,
-    ) -> Self {
+    pub fn new(config: &MicrodecoderConfig) -> Self {
         let hidden = config.hidden_size;
         Self {
             state: FrameState::new(config),
-            rope,
-            weights,
-            quant,
-            config: *config,
             hidden_buf: vec![0.0_f32; hidden],
             next_buf: vec![0.0_f32; hidden],
             normed_buf: vec![0.0_f32; hidden],
             logits_buf: vec![0.0_f32; RESIDUAL_VOCAB],
+            head_score: HeadScoreScratch::default(),
         }
     }
 
@@ -1923,27 +1963,54 @@ impl<'a> ResidualCodeDecoder<'a> {
     }
 
     /// Decodes one frame's fifteen residual codes into `codes_out` (cleared
-    /// first). `talker_hidden` is the talker's frame conditioning; the walk,
-    /// KV state, and selector contract match
-    /// [`decode_frame_with_selector_q8`] exactly.
+    /// first), reusing all buffers and the per-layer KV allocation.
     ///
-    /// # Panics
-    ///
-    /// Panics on the same shape mismatches as the sequential baseline.
+    /// `quant` selects the same body and head route as
+    /// [`decode_frame_with_selector_inner`]. Passing it explicitly keeps this
+    /// scratch independent of model lifetimes while preserving identical
+    /// arithmetic and selector behavior.
+    #[allow(clippy::too_many_arguments)]
     pub fn decode_frame_into(
         &mut self,
+        config: &MicrodecoderConfig,
+        rope: &RopeTable,
+        weights: &MicrodecoderWeights<'_>,
+        quant: Option<&MicroQuantRoute<'_>>,
         talker_hidden: &[f32],
         primary_code: usize,
         mut select: impl FnMut(&[f32]) -> usize,
         codes_out: &mut Vec<usize>,
     ) {
+        assert_frame_shapes(config, weights, talker_hidden);
         assert_eq!(
             talker_hidden.len(),
-            self.config.hidden_size,
+            config.hidden_size,
             "talker conditioning width"
         );
+        if let Some(route) = quant {
+            assert_eq!(
+                route.layers.len(),
+                config.num_layers,
+                "the quantized route needs every microdecoder layer quantized"
+            );
+            if let Some(heads) = route.heads {
+                assert_eq!(
+                    heads.len(),
+                    RESIDUAL_DEPTHS,
+                    "the quantized head route needs every per-depth head quantized"
+                );
+            }
+        }
         self.state.reset();
         codes_out.clear();
+        let probe_draft =
+            spec_probe_enabled().then(|| PROBE_DRAFTER.with(|drafter| drafter.borrow().draft()));
+        if crate::taps::taps_active() {
+            crate::taps::tap_emit(&format!(
+                "ftts-tapM0 h={:016x} pc={primary_code}",
+                crate::taps::tap_hash_f32(talker_hidden),
+            ));
+        }
         let mut previous_code = primary_code;
         for position in 0..FRAME_POSITIONS {
             let role = position_role(position);
@@ -1952,25 +2019,24 @@ impl<'a> ResidualCodeDecoder<'a> {
                     self.hidden_buf.copy_from_slice(talker_hidden);
                 }
                 PositionRole::PrimaryCodeEmbedding { .. } => {
-                    let start = previous_code * self.config.hidden_size;
-                    let row = &self.weights.talker_codec_embedding
-                        [start..start + self.config.hidden_size];
+                    let start = previous_code * config.hidden_size;
+                    let row = &weights.talker_codec_embedding[start..start + config.hidden_size];
                     self.hidden_buf.copy_from_slice(row);
                 }
                 PositionRole::ResidualEmbedding { table, .. } => {
-                    self.weights.residual_embeddings.row_into(
+                    weights.residual_embeddings.row_into(
                         table,
                         previous_code,
-                        self.config.hidden_size,
+                        config.hidden_size,
                         &mut self.hidden_buf,
                     );
                 }
             }
-            for (index, layer) in self.weights.layers.iter().enumerate() {
-                let (cos, sin) = self.rope.row(position);
-                match &self.quant {
+            for (index, layer) in weights.layers.iter().enumerate() {
+                let (cos, sin) = rope.row(position);
+                match quant {
                     Some(route) => layer_step_q8_into(
-                        &self.config,
+                        config,
                         layer,
                         &route.layers[index],
                         cos,
@@ -1982,8 +2048,8 @@ impl<'a> ResidualCodeDecoder<'a> {
                     ),
                     None => {
                         let stepped = layer_step(
-                            &self.config,
-                            self.rope,
+                            config,
+                            rope,
                             layer,
                             &self.hidden_buf,
                             position,
@@ -2001,19 +2067,105 @@ impl<'a> ResidualCodeDecoder<'a> {
             };
             rms_norm_into(
                 &self.hidden_buf,
-                self.weights.final_norm,
-                self.config.rms_eps,
+                weights.final_norm,
+                config.rms_eps,
                 &mut self.normed_buf,
             );
-            matvec(
-                self.weights.heads[head],
-                &self.normed_buf,
-                &mut self.logits_buf,
-            );
+            match quant.and_then(|route| route.heads.map(|heads| (heads, route.mode))) {
+                Some((heads, mode)) => score_head_refined_with_scratch(
+                    &heads[head],
+                    weights
+                        .heads
+                        .get(head)
+                        .copied()
+                        .filter(|row| !row.is_empty()),
+                    &self.normed_buf,
+                    mode,
+                    &mut self.logits_buf,
+                    &mut self.head_score,
+                ),
+                None => matvec(weights.heads[head], &self.normed_buf, &mut self.logits_buf),
+            }
+            if let Some(draft) = &probe_draft {
+                let depth = position - 1;
+                let acceptance =
+                    crate::sampler::production_probability(&self.logits_buf, draft[depth]);
+                eprintln!("{{\"probe\":\"spec\",\"depth\":{depth},\"p_draft\":{acceptance:.6}}}");
+            }
+            if crate::taps::taps_active() {
+                crate::taps::tap_emit(&format!(
+                    "ftts-tapM d={} lg={:016x}",
+                    codes_out.len(),
+                    crate::taps::tap_hash_f32(&self.logits_buf),
+                ));
+            }
             let code = select(&self.logits_buf);
+            if crate::taps::taps_active() {
+                crate::taps::tap_emit(&format!("ftts-tapM d={} c={code}", codes_out.len(),));
+            }
+            assert!(
+                code < RESIDUAL_VOCAB,
+                "selector returned {code}, outside the residual vocab"
+            );
             codes_out.push(code);
             previous_code = code;
         }
+        if probe_draft.is_some()
+            && let Ok(frame_codes) = <[usize; RESIDUAL_DEPTHS]>::try_from(codes_out.as_slice())
+        {
+            PROBE_DRAFTER.with(|drafter| drafter.borrow_mut().observe(&frame_codes));
+        }
+    }
+}
+
+impl<'a> ResidualCodeDecoder<'a> {
+    /// Allocates the engine's fixed outer-loop buffers once.
+    #[must_use]
+    pub fn new(
+        config: &MicrodecoderConfig,
+        rope: &'a RopeTable,
+        weights: &'a MicrodecoderWeights<'a>,
+        quant: Option<MicroQuantRoute<'a>>,
+    ) -> Self {
+        Self {
+            rope,
+            weights,
+            quant,
+            config: *config,
+            scratch: ResidualCodeScratch::new(config),
+        }
+    }
+
+    /// Clears the per-frame KV caches.
+    pub fn reset_frame(&mut self) {
+        self.scratch.reset_frame();
+    }
+
+    /// Decodes one frame's fifteen residual codes into `codes_out` (cleared
+    /// first). `talker_hidden` is the talker's frame conditioning; the walk,
+    /// KV state, and selector contract match
+    /// [`decode_frame_with_selector_q8`] exactly.
+    ///
+    /// # Panics
+    ///
+    /// Panics on the same shape mismatches as the sequential baseline.
+    pub fn decode_frame_into(
+        &mut self,
+        talker_hidden: &[f32],
+        primary_code: usize,
+        select: impl FnMut(&[f32]) -> usize,
+        codes_out: &mut Vec<usize>,
+    ) {
+        self.scratch.decode_frame_into(
+            &self.config,
+            self.rope,
+            self.weights,
+            self.quant.as_ref(),
+            talker_hidden,
+            primary_code,
+            select,
+            codes_out,
+        );
     }
 }
 
@@ -2976,7 +3128,6 @@ mod tests {
             .iter()
             .map(|layer| MicroLayerQuant::quantize(&config, layer))
             .collect();
-
         for tier in ftts_kernels::int8::Int8Tier::available() {
             let q8 = MicroQuantRoute {
                 layers: &quant,
@@ -3576,6 +3727,10 @@ mod tests {
             .iter()
             .map(|layer| MicroLayerQuant::quantize(&config, layer))
             .collect();
+        let quant_heads: Vec<QuantizedMatrix> = heads
+            .iter()
+            .map(|head| QuantizedMatrix::quantize(head, RESIDUAL_VOCAB, config.hidden_size))
+            .collect();
 
         let mut routes: Vec<(&'static str, Option<MicroQuantRoute<'_>>)> = vec![("f32", None)];
         for tier in ftts_kernels::int8::Int8Tier::available() {
@@ -3584,6 +3739,14 @@ mod tests {
                 Some(MicroQuantRoute {
                     layers: &quant,
                     heads: None,
+                    mode: QuantLinearMode::W8A8(KernelPlanV0::pinned(tier)),
+                }),
+            ));
+            routes.push((
+                concat!("q8+heads/", stringify!(tier)),
+                Some(MicroQuantRoute {
+                    layers: &quant,
+                    heads: Some(&quant_heads),
                     mode: QuantLinearMode::W8A8(KernelPlanV0::pinned(tier)),
                 }),
             ));

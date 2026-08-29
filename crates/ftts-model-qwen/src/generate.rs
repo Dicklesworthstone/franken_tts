@@ -15,8 +15,8 @@ use ftts_core::{
 };
 
 use crate::microdecoder::{
-    self, FrameState, MicroLayerQuant, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_VOCAB,
-    RopeTable,
+    self, MicroLayerQuant, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_VOCAB,
+    ResidualCodeScratch, RopeTable,
 };
 use crate::prompt::{
     self, CloneMode, HiddenState, PromptAssemblyInput, PromptError, PromptHeader, PromptMode,
@@ -569,7 +569,12 @@ pub struct QwenGenerator<'a> {
     sampler: QwenSampler,
     sampling_mode: SamplingMode,
     kv: TalkerKvCache,
-    frame_state: FrameState,
+    /// Reusable storage for the 16-position residual-code walk. The old shipping
+    /// path allocated a hidden vector per layer and fresh norm/logit vectors per
+    /// residual depth; these outer-loop buffers stay resident for the generator's
+    /// life. Layer-internal scratch has its own independent allocation gate.
+    microdecoder_scratch: ResidualCodeScratch,
+    microdecoder_codes: Vec<usize>,
     utterance: Option<UtteranceState>,
     /// Shared rather than owned: the engine builds these once during hydration and lends the
     /// same tables to every utterance, which is what lets the artifact they came from be dropped.
@@ -697,7 +702,7 @@ impl<'a> QwenGenerator<'a> {
         );
 
         let microdecoder_rope = RopeTable::new(&config.microdecoder_config);
-        let frame_state = FrameState::new(&config.microdecoder_config);
+        let microdecoder_scratch = ResidualCodeScratch::new(&config.microdecoder_config);
 
         // Staged levers 2a+2b: runtime W8A8, armed only by the explicit kill-switch. The default
         // path quantizes nothing and calls the untouched f32 reference functions.
@@ -719,7 +724,8 @@ impl<'a> QwenGenerator<'a> {
             sampler: QwenSampler::seeded(config.seed),
             sampling_mode: config.sampling_mode,
             kv: TalkerKvCache::new(),
-            frame_state,
+            microdecoder_scratch,
+            microdecoder_codes: Vec::with_capacity(microdecoder::RESIDUAL_DEPTHS),
             utterance: None,
             cold_rows: config.cold_rows,
             overlay_ids: Vec::new(),
@@ -1150,31 +1156,25 @@ impl FrameGenerator for QwenGenerator<'_> {
                 }
             }
         };
-        let residuals = match self.int8.as_ref().filter(|route| !route.micro.is_empty()) {
-            Some(route) => microdecoder::decode_frame_with_selector_q8(
-                &self.microdecoder_config,
-                &self.microdecoder_rope,
-                &self.microdecoder_weights,
-                &microdecoder::MicroQuantRoute {
-                    layers: &route.micro,
-                    heads: (!route.micro_heads.is_empty()).then_some(route.micro_heads.as_slice()),
-                    mode: route.mode,
-                },
-                &mut self.frame_state,
-                &utterance.pending_hidden,
-                primary as usize,
-                select,
-            ),
-            None => microdecoder::decode_frame_with_selector(
-                &self.microdecoder_config,
-                &self.microdecoder_rope,
-                &self.microdecoder_weights,
-                &mut self.frame_state,
-                &utterance.pending_hidden,
-                primary as usize,
-                select,
-            ),
-        };
+        let quant = self
+            .int8
+            .as_ref()
+            .filter(|route| !route.micro.is_empty())
+            .map(|route| microdecoder::MicroQuantRoute {
+                layers: &route.micro,
+                heads: (!route.micro_heads.is_empty()).then_some(route.micro_heads.as_slice()),
+                mode: route.mode,
+            });
+        self.microdecoder_scratch.decode_frame_into(
+            &self.microdecoder_config,
+            &self.microdecoder_rope,
+            &self.microdecoder_weights,
+            quant.as_ref(),
+            &utterance.pending_hidden,
+            primary as usize,
+            select,
+            &mut self.microdecoder_codes,
+        );
         if let Some(error) = sampler_failure {
             return Err(generation_error(error));
         }
@@ -1182,7 +1182,7 @@ impl FrameGenerator for QwenGenerator<'_> {
         let feedback_started = Instant::now();
         let mut codes = Vec::with_capacity(CODE_GROUP_COUNT);
         codes.push(primary);
-        codes.extend(residuals.iter().map(|&code| code as u32));
+        codes.extend(self.microdecoder_codes.iter().map(|&code| code as u32));
 
         // Feedback: sum the 16 code embeddings onto one trailing-text hidden (or tts_pad).
         // Q8 tables dequantize each gathered row into `q8_rows` scratch — the same
@@ -1206,7 +1206,7 @@ impl FrameGenerator for QwenGenerator<'_> {
                 // Push every dequantized row BEFORE borrowing them into `rows`: rows
                 // holds immutable borrows of this scratch through form_frame_input.
                 q8_rows.reserve(codes.len() - 1);
-                for (index, &code) in residuals.iter().enumerate() {
+                for (index, &code) in self.microdecoder_codes.iter().enumerate() {
                     q8_rows.push(microdecoder::residual_embedding_row(
                         &tables[index],
                         code,

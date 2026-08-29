@@ -493,15 +493,26 @@ final class LabModel {
     /// Physical-device profiling lane. This is environment-triggered and absent
     /// from the product UI: it measures the app's exact FFI route repeatedly in
     /// an optimized app build without adding benchmark controls to the interface.
+
+    /// The two fixed benchmark utterances: a phonetically rich short sentence and a
+    /// connected-prose long paragraph, so cold/warm and voice scenarios stay comparable
+    /// across runs and trees.
+    private static let shortProfileText =
+        "Frankenstein listened carefully while the rain tapped softly against the laboratory window."
+    private static let longProfileText =
+        "The creature spoke slowly at first, choosing each word as though it had cost him years of listening to learn. Every sentence carried the weight of that long winter in the mountains, when he had watched the family through the crack in the wall and taught himself the music of human speech. By the time the rain stopped, he could shape grief and hope in the same breath, and the doctor's lamp burned low over the unfinished notes."
+
     func runProfilingBenchmarkIfRequested() async {
         let environment = ProcessInfo.processInfo.environment
         guard environment["FTTS_IOS_PROFILE"] == "1" else { return }
 
         let requestedRuns = Int(environment["FTTS_IOS_PROFILE_RUNS"] ?? "20") ?? 20
         let runs = max(1, min(100, requestedRuns))
+        let scenario = environment["FTTS_IOS_PROFILE_SCENARIO"] ?? "short"
         let benchmarkText = environment["FTTS_IOS_PROFILE_TEXT"]
-            ?? "Frankenstein listened carefully while the rain tapped softly against the laboratory window."
+            ?? (scenario == "long" ? Self.longProfileText : Self.shortProfileText)
         let voice = environment["FTTS_IOS_PROFILE_VOICE"] ?? "matt"
+        let streaming = environment["FTTS_IOS_PROFILE_STREAMING"] == "1"
         let benchmarkSeed = UInt64(environment["FTTS_IOS_PROFILE_SEED"] ?? "0") ?? 0
 
         let documents = FileManager.default.urls(
@@ -533,12 +544,28 @@ final class LabModel {
             guard store.phase == .ready else {
                 throw EngineError.native("profiling requires a verified downloaded model")
             }
-            let speaker = try Engine.presetVector(named: voice)
+            let speaker: [Float]
+            if voice.hasPrefix("enrolled") {
+                let wanted = voice.split(separator: ":").dropFirst().first.map(String.init)
+                let match = library.voices.first { candidate in
+                    wanted.map { candidate.name.caseInsensitiveCompare($0) == .orderedSame }
+                        ?? true
+                }
+                guard let match else {
+                    throw EngineError.native(
+                        wanted.map { "no enrolled voice named \($0) on this device" }
+                            ?? "no enrolled voice on this device; enroll one to profile the cloned-voice scenario"
+                    )
+                }
+                speaker = match.vector
+            } else {
+                speaker = try Engine.presetVector(named: voice)
+            }
             try appendReceipt([
                 "event": "run_start",
                 "schema_version": 1,
                 "runs": runs,
-                "text": benchmarkText,
+                "scenario": scenario,
                 "voice": voice,
                 "seed": benchmarkSeed,
                 "device_model": UIDevice.current.model,
@@ -589,6 +616,21 @@ final class LabModel {
                 }
                 let matchesFirstAudio = digest == firstDigest
                 allAudioIdentical = allAudioIdentical && matchesFirstAudio
+                var ttfaMs = 0.0
+                var streamingMatches = false
+                if streaming {
+                    let streamed = try await engine.synthesizeStreaming(
+                        text: benchmarkText,
+                        speaker: speaker,
+                        seed: benchmarkSeed,
+                        packetFrames: 1
+                    )
+                    ttfaMs = Double(streamed.firstAudioNanos) / 1_000_000
+                    let streamingWav = WavWriter.data(from: streamed.pcm)
+                    let streamingDigest = SHA256.hash(data: streamingWav)
+                        .map { String(format: "%02x", $0) }.joined()
+                    streamingMatches = streamingDigest == digest
+                }
                 try appendReceipt([
                     "event": "sample",
                     "index": index,
@@ -608,6 +650,9 @@ final class LabModel {
                     "frames": profile.frames,
                     "team_partitions": profile.teamPartitions,
                     "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+                    "ttfa_ms": ttfaMs,
+                    "streaming_measured": streaming,
+                    "streaming_matches_whole_buffer": streamingMatches,
                 ])
                 validRuns += 1
             }
