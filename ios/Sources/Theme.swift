@@ -131,28 +131,7 @@ struct LabLabel: View {
     }
 }
 
-/// One stitched bolt stud, the theme's signature.
-struct Bolt: View {
-    var body: some View {
-        ZStack {
-            Circle()
-                .fill(
-                    RadialGradient(
-                        colors: [Color(white: 0.42), Color(white: 0.08)],
-                        center: .topLeading, startRadius: 0, endRadius: 7))
-            Capsule()
-                .fill(Color.black.opacity(0.68))
-                .frame(width: 6, height: 1.15)
-                .rotationEffect(.degrees(-28))
-        }
-        .frame(width: 11, height: 11)
-        .overlay(Circle().stroke(Color.white.opacity(0.13), lineWidth: 0.7))
-        .shadow(color: Color.black.opacity(0.55), radius: 2, y: 1)
-        .accessibilityHidden(true)
-    }
-}
-
-/// The laboratory panel: dark card, hairline border, bolts on two corners.
+/// The laboratory panel: dark card with a restrained hairline border.
 struct LabPanel<Content: View>: View {
     @ViewBuilder var content: Content
     var body: some View {
@@ -181,8 +160,6 @@ struct LabPanel<Content: View>: View {
                         lineWidth: 1
                     )
             )
-            .overlay(alignment: .topLeading) { Bolt().offset(x: -5, y: -5) }
-            .overlay(alignment: .bottomTrailing) { Bolt().offset(x: 5, y: 5) }
             .shadow(color: .black.opacity(0.42), radius: 22, y: 12)
     }
 }

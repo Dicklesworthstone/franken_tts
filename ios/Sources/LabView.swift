@@ -1167,25 +1167,25 @@ struct LabView: View {
     }
 
     @ViewBuilder
-    private func compactVoiceSelector(vertical: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                LabLabel(text: "Voice specimen")
-                Spacer()
-                Button("Manage") { showVoiceLab = true }
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Lab.emerald)
-                    .buttonStyle(.plain)
-            }
+    private func compactVoiceSelector(vertical _: Bool) -> some View {
+        LabPanel {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    LabLabel(text: "Voice specimen")
+                    Spacer()
+                    Text("\(model.presets.count) BUILT-IN · \(model.library.voices.count) YOURS")
+                        .font(.system(size: Lab.typeSize(8), weight: .black, design: .monospaced))
+                        .kerning(0.8)
+                        .foregroundStyle(Lab.textSecondary)
+                }
 
-            VoiceEnrollmentCallout(
-                isReady: model.store.phase == .ready,
-                compact: true
-            ) {
-                openEnrollment(target: nil)
-            }
+                VoiceEnrollmentCallout(
+                    isReady: model.store.phase == .ready,
+                    compact: true
+                ) {
+                    openEnrollment(target: nil)
+                }
 
-            if vertical {
                 Button { showVoiceLab = true } label: {
                     HStack(spacing: 12) {
                         VoiceOrb(name: model.currentVoiceLabel, selected: true)
@@ -1193,14 +1193,20 @@ struct LabView: View {
                             Text(model.currentVoiceLabel)
                                 .font(.headline)
                                 .foregroundStyle(Lab.textPrimary)
-                            Text("Selected voice · tap to open the library")
+                            Text("Selected voice")
                                 .font(.caption)
                                 .foregroundStyle(Lab.textSecondary)
                         }
                         Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.caption.weight(.bold))
-                            .foregroundStyle(Lab.textSecondary)
+                        HStack(spacing: 5) {
+                            Text("BROWSE & MANAGE")
+                            Image(systemName: "chevron.right")
+                        }
+                        .font(.system(size: Lab.typeSize(9), weight: .black, design: .monospaced))
+                        .foregroundStyle(Color.black.opacity(0.84))
+                        .padding(.horizontal, 11)
+                        .frame(minHeight: 36)
+                        .background(Lab.emerald, in: Capsule())
                     }
                     .padding(12)
                     .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -1210,26 +1216,6 @@ struct LabView: View {
                     }
                 }
                 .buttonStyle(.plain)
-            } else {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 9) {
-                        ForEach(model.presets) { preset in
-                            CompactVoiceChip(
-                                name: preset.name,
-                                selected: model.selectedVoice == preset.name
-                            ) { model.selectedVoice = preset.name }
-                        }
-                        ForEach(model.library.voices) { voice in
-                            CompactVoiceChip(
-                                name: voice.name,
-                                selected: model.enrolledSelection() == voice.id,
-                                isPersonal: true
-                            ) { model.selectedVoice = "voice:\(voice.id.uuidString)" }
-                        }
-                    }
-                    .padding(.vertical, 2)
-                }
-                .scrollClipDisabled()
             }
         }
     }
@@ -2128,7 +2114,6 @@ private struct VoiceEnrollmentCallout: View {
                         lineWidth: 1.25
                     )
             }
-            .shadow(color: Lab.emerald.opacity(0.18), radius: 16, y: 7)
             .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
         .buttonStyle(VoiceEnrollmentCalloutStyle())
@@ -2209,7 +2194,7 @@ private struct VoiceEnrollmentCalloutStyle: ButtonStyle {
             .scaleEffect(configuration.isPressed ? 0.988 : 1)
             .brightness(configuration.isPressed ? -0.04 : 0)
             .animation(.easeOut(duration: 0.14), value: configuration.isPressed)
-            .hoverEffect(.lift)
+            .hoverEffect(.highlight)
     }
 }
 
@@ -2277,47 +2262,6 @@ private struct VoiceLibraryHalo: View {
         }
         .mask(LinearGradient(colors: [.clear, .white], startPoint: .leading, endPoint: .trailing))
         .accessibilityHidden(true)
-    }
-}
-
-private struct CompactVoiceChip: View {
-    let name: String
-    let selected: Bool
-    var isPersonal = false
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                VoiceOrb(name: name, selected: selected)
-                    .frame(width: 30, height: 30)
-                    .scaleEffect(0.75)
-                    .frame(width: 26, height: 26)
-                Text(name.capitalized)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-                if isPersonal {
-                    Image(systemName: "person.wave.2.fill")
-                        .font(.system(size: 9, weight: .bold))
-                }
-            }
-            .foregroundStyle(selected ? Lab.textPrimary : Lab.textSecondary)
-            .padding(.horizontal, 10)
-            .frame(height: 42)
-            .background(
-                selected ? Lab.emerald.opacity(0.14) : Color.black.opacity(0.34),
-                in: Capsule()
-            )
-            .overlay {
-                Capsule().strokeBorder(
-                    selected ? Lab.emerald.opacity(0.52) : Color.white.opacity(0.07),
-                    lineWidth: 1
-                )
-            }
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("\(name) voice")
-        .accessibilityValue(selected ? "Selected" : "Not selected")
     }
 }
 
