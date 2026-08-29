@@ -25,6 +25,7 @@ schemes:
     test:
       targets:
         - FrankenTTSTests
+        - FrankenTTSUITests
 targets:
   FrankenTTS:
     type: application
@@ -156,5 +157,16 @@ targets:
         GENERATE_INFOPLIST_FILE: true
     sources:
       - Tests
+    dependencies:
+      - target: FrankenTTS
+  FrankenTTSUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        TEST_TARGET_NAME: FrankenTTS
+    sources:
+      - UITests
     dependencies:
       - target: FrankenTTS

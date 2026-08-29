@@ -31,6 +31,40 @@ fileprivate enum VoiceComparisonStatus: Equatable {
     case failed(String)
 }
 
+/// Native synthesis can report many semantic-frame callbacks per second. Keeping
+/// only the newest one lets the engine run freely while SwiftUI renders at a calm,
+/// predictable cadence instead of rebuilding the whole voice grid for every frame.
+private final class VoiceComparisonProgressRelay: @unchecked Sendable {
+    struct Pending: Sendable {
+        let index: Int
+        let event: EngineProgress
+        let runID: UUID
+    }
+
+    private let lock = NSLock()
+    private var pending: Pending?
+
+    func offer(index: Int, event: EngineProgress, runID: UUID) {
+        lock.lock()
+        pending = Pending(index: index, event: event, runID: runID)
+        lock.unlock()
+    }
+
+    func take() -> Pending? {
+        lock.lock()
+        defer { lock.unlock() }
+        let value = pending
+        pending = nil
+        return value
+    }
+
+    func clear() {
+        lock.lock()
+        pending = nil
+        lock.unlock()
+    }
+}
+
 @MainActor
 @Observable
 final class VoiceComparisonSession {
@@ -57,9 +91,11 @@ final class VoiceComparisonSession {
 
     private var runTask: Task<Void, Never>?
     private var tickerTask: Task<Void, Never>?
+    private var progressTask: Task<Void, Never>?
     private var runID = UUID()
     private var observedVoiceSeconds = 0.0
     private var player: AVAudioPlayer?
+    private let progressRelay = VoiceComparisonProgressRelay()
 
     init(model: LabModel) {
         self.model = model
@@ -110,6 +146,8 @@ final class VoiceComparisonSession {
         stopPlayback()
         runTask?.cancel()
         tickerTask?.cancel()
+        progressTask?.cancel()
+        progressRelay.clear()
         removeTemporaryResults()
         runID = UUID()
         let thisRun = runID
@@ -136,9 +174,24 @@ final class VoiceComparisonSession {
             }
         }
 
+        progressTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(80))
+                guard let self, self.runID == thisRun, self.isRunning else { return }
+                if let progress = self.progressRelay.take() {
+                    self.receiveProgress(
+                        index: progress.index,
+                        event: progress.event,
+                        runID: progress.runID
+                    )
+                }
+            }
+        }
+
         let text = excerpt
         let inputs = candidates.map { MultiVoiceSynthesisInput(speaker: $0.speaker) }
         let seed = model.seed
+        let progressRelay = progressRelay
         UIApplication.shared.isIdleTimerDisabled = true
         runTask = Task { [weak self] in
             guard let self else { return }
@@ -146,6 +199,9 @@ final class VoiceComparisonSession {
                 UIApplication.shared.isIdleTimerDisabled = false
                 self.tickerTask?.cancel()
                 self.tickerTask = nil
+                self.progressTask?.cancel()
+                self.progressTask = nil
+                self.progressRelay.clear()
                 self.isRunning = false
                 self.isStopping = false
                 self.model.isComparingVoices = false
@@ -175,10 +231,8 @@ final class VoiceComparisonSession {
                     text: text,
                     voices: inputs,
                     seed: seed,
-                    onProgress: { [weak self] index, event in
-                        Task { @MainActor in
-                            self?.receiveProgress(index: index, event: event, runID: thisRun)
-                        }
+                    onProgress: { index, event in
+                        progressRelay.offer(index: index, event: event, runID: thisRun)
                     },
                     onVoice: { [weak self] index, output in
                         Task { @MainActor in
@@ -343,13 +397,20 @@ final class VoiceComparisonSession {
                     profile: output.profile
                 )
             }.result
-            guard let self, self.runID == runID else { return }
+            guard let self else {
+                if case .success(let result) = finished {
+                    try? FileManager.default.removeItem(at: result.url)
+                }
+                return
+            }
+            guard self.runID == runID else {
+                if case .success(let result) = finished {
+                    try? FileManager.default.removeItem(at: result.url)
+                }
+                return
+            }
             switch finished {
             case .success(let result):
-                guard self.runID == runID else {
-                    try? FileManager.default.removeItem(at: result.url)
-                    return
-                }
                 self.results[candidate.id] = result
                 self.status[candidate.id] = .ready
             case .failure(let error):
@@ -359,14 +420,22 @@ final class VoiceComparisonSession {
         }
     }
 
-    nonisolated private static func waveform(_ samples: [Float], bins: Int = 72) -> [Float] {
+    nonisolated private static func waveform(_ samples: [Float], bins: Int = 160) -> [Float] {
         guard !samples.isEmpty else { return [] }
-        let width = max(1, samples.count / bins)
+        // Partition by proportional boundaries so every source sample—including the
+        // tail—is represented even when the duration is not divisible by `bins`.
         return (0..<bins).map { bin in
-            let start = min(samples.count, bin * width)
-            let end = bin == bins - 1 ? samples.count : min(samples.count, start + width)
+            let start = min(samples.count, bin * samples.count / bins)
+            let end = min(samples.count, (bin + 1) * samples.count / bins)
             guard start < end else { return 0 }
-            return samples[start..<end].reduce(Float.zero) { max($0, abs($1)) }
+            var peak: Float = 0
+            var energy: Double = 0
+            for sample in samples[start..<end] {
+                peak = max(peak, abs(sample))
+                energy += Double(sample * sample)
+            }
+            let rms = Float(sqrt(energy / Double(end - start)))
+            return peak * 0.72 + rms * 0.28
         }
     }
 
@@ -381,6 +450,7 @@ final class VoiceComparisonSession {
 struct VoiceComparisonView: View {
     @State private var session: VoiceComparisonSession
     @State private var showFavoritesOnly = false
+    @State private var showLeaveConfirmation = false
     let dismiss: () -> Void
 
     init(model: LabModel, dismiss: @escaping () -> Void) {
@@ -412,10 +482,32 @@ struct VoiceComparisonView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
-                Button("Done") { dismiss() }
+                Button("Done") {
+                    if session.isRunning {
+                        showLeaveConfirmation = true
+                    } else {
+                        dismiss()
+                    }
+                }
+                .accessibilityHint(
+                    session.isRunning
+                        ? "Asks before stopping the active all-voice generation"
+                        : "Closes Voice Lab"
+                )
             }
         }
         .interactiveDismissDisabled(session.isRunning)
+        .alert("Voice Lab is still generating", isPresented: $showLeaveConfirmation) {
+            Button("Keep generating", role: .cancel) {}
+            Button("Stop and leave", role: .destructive) {
+                session.stop()
+                dismiss()
+            }
+        } message: {
+            Text(
+                "Leaving now stops the current run. Finished voice previews from this audition will be discarded."
+            )
+        }
         .onDisappear { session.cancelForDismissal() }
         .onReceive(Timer.publish(every: 0.35, on: .main, in: .common).autoconnect()) { _ in
             session.refreshPlayback()
@@ -537,6 +629,14 @@ struct VoiceComparisonView: View {
                     }
                     .font(.caption.monospaced())
                     .foregroundStyle(Lab.textSecondary)
+                    if session.isRunning {
+                        Label(
+                            "Generation protected — Voice Lab will confirm before leaving",
+                            systemImage: "lock.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(Lab.emerald.opacity(0.88))
+                    }
                     if let error = session.errorMessage {
                         Label(error, systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
@@ -608,6 +708,7 @@ private struct VoiceComparisonCard: View {
                         .font(.caption)
                         .foregroundStyle(Lab.textSecondary)
                         .lineLimit(2)
+                        .frame(minHeight: 30, alignment: .topLeading)
                 }
                 Spacer()
                 Button { session.toggleFavorite(candidate) } label: {
@@ -621,68 +722,78 @@ private struct VoiceComparisonCard: View {
                     session.favorites.contains(candidate.id) ? "Remove favorite" : "Favorite \(candidate.name)")
             }
 
-            if let result = session.results[candidate.id] {
-                MiniVoiceWaveform(
-                    samples: result.waveform,
-                    progress: session.playingID == candidate.id ? session.playbackFraction : 0,
-                    active: session.isPlaying(candidate)
-                )
-                    .frame(height: 42)
-                HStack(spacing: 8) {
-                    Button { session.togglePlayback(candidate) } label: {
-                        Label(
-                            session.isPlaying(candidate) ? "Pause" : "Play",
-                            systemImage: session.isPlaying(candidate) ? "pause.fill" : "play.fill"
+            Group {
+                if let result = session.results[candidate.id] {
+                    VStack(spacing: 8) {
+                        MiniVoiceWaveform(
+                            samples: result.waveform,
+                            progress: session.playingID == candidate.id
+                                ? session.playbackFraction : 0,
+                            active: session.isPlaying(candidate)
                         )
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 52)
+                        HStack(spacing: 8) {
+                            Button { session.togglePlayback(candidate) } label: {
+                                Label(
+                                    session.isPlaying(candidate) ? "Pause" : "Play",
+                                    systemImage: session.isPlaying(candidate)
+                                        ? "pause.fill" : "play.fill"
+                                )
+                            }
+                            .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+                            Button { session.useVoice(candidate) } label: {
+                                Label("Use voice", systemImage: "checkmark.circle")
+                            }
+                            .buttonStyle(GhostButtonStyle(
+                                tint: session.model.selectedVoice == candidate.selectionID
+                                    ? Lab.emerald : Lab.textSecondary))
+                            ShareLink(item: result.url) {
+                                Image(systemName: "square.and.arrow.up")
+                            }
+                            .buttonStyle(GhostButtonStyle())
+                            Spacer()
+                            Text(String(format: "%.1fs", result.duration))
+                                .font(.caption.monospaced())
+                                .foregroundStyle(Lab.textSecondary)
+                        }
                     }
-                    .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
-                    Button { session.useVoice(candidate) } label: {
-                        Label("Use voice", systemImage: "checkmark.circle")
+                } else {
+                    HStack(spacing: 8) {
+                        switch status {
+                        case .waiting:
+                            Image(systemName: "circle.dotted")
+                            Text("Waiting in the lab")
+                        case .forging:
+                            ProgressView().tint(Lab.emerald).controlSize(.small)
+                            Text("Speaker-conditioned generation")
+                        case .mastering:
+                            ProgressView().tint(Lab.cyan).controlSize(.small)
+                            Text("Leveling the finished audio")
+                        case .ready:
+                            Image(systemName: "checkmark.circle.fill")
+                            Text("Ready")
+                        case .failed(let message):
+                            Image(systemName: "exclamationmark.triangle.fill")
+                            Text(message).lineLimit(2)
+                        }
                     }
-                    .buttonStyle(GhostButtonStyle(
-                        tint: session.model.selectedVoice == candidate.selectionID
-                            ? Lab.emerald : Lab.textSecondary))
-                    ShareLink(item: result.url) {
-                        Image(systemName: "square.and.arrow.up")
-                    }
-                    .buttonStyle(GhostButtonStyle())
-                    Spacer()
-                    Text(String(format: "%.1fs", result.duration))
-                        .font(.caption.monospaced())
-                        .foregroundStyle(Lab.textSecondary)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(statusColor)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 }
-            } else {
-                HStack(spacing: 8) {
-                    switch status {
-                    case .waiting:
-                        Image(systemName: "circle.dotted")
-                        Text("Waiting in the lab")
-                    case .forging:
-                        ProgressView().tint(Lab.emerald).controlSize(.small)
-                        Text("Speaker-conditioned generation")
-                    case .mastering:
-                        ProgressView().tint(Lab.cyan).controlSize(.small)
-                        Text("Leveling the finished audio")
-                    case .ready:
-                        Image(systemName: "checkmark.circle.fill")
-                        Text("Ready")
-                    case .failed(let message):
-                        Image(systemName: "exclamationmark.triangle.fill")
-                        Text(message).lineLimit(2)
-                    }
-                }
-                .font(.caption.monospaced())
-                .foregroundStyle(statusColor)
-                .frame(minHeight: 42, alignment: .leading)
             }
+            // Every card reserves the result controls from the start. As earlier
+            // voices finish, later cards no longer jump dramatically up and down.
+            .frame(height: 106, alignment: .top)
         }
+        .frame(minHeight: 174, alignment: .top)
         .padding(15)
         .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(status == .forging ? Lab.emerald.opacity(0.8) : Lab.stroke, lineWidth: 1)
         }
-        .animation(.smooth(duration: 0.25), value: status)
     }
 
     private var statusColor: Color {
@@ -708,14 +819,26 @@ private struct VoiceComparisonOrb: View {
             Text(String(candidate.name.prefix(1)).uppercased())
                 .font(.headline.bold().monospaced())
                 .foregroundStyle(candidate.personal ? Lab.violet : Lab.emerald)
+            if active {
+                TimelineView(.animation(minimumInterval: 1 / 20)) { timeline in
+                    let phase = timeline.date.timeIntervalSinceReferenceDate
+                        .truncatingRemainder(dividingBy: 1.8) / 1.8
+                    Circle()
+                        .trim(from: 0.08, to: 0.42)
+                        .stroke(
+                            candidate.personal ? Lab.violet : Lab.cyan,
+                            style: StrokeStyle(lineWidth: 3, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(phase * 360))
+                        .padding(2)
+                }
+            }
         }
         .shadow(
             color: active ? (candidate.personal ? Lab.violet : Lab.emerald).opacity(0.5) : .clear,
             radius: 10)
-        .scaleEffect(active ? 1.04 : 1)
-        .animation(
-            active ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default,
-            value: active)
+        // The active treatment is painted inside this fixed frame. Never animate
+        // scale or position: that made the currently generating voice appear to jump.
     }
 }
 
@@ -768,7 +891,7 @@ private struct MiniVoiceWaveform: View {
             }
             context.stroke(
                 path,
-                with: .color(Lab.textSecondary.opacity(0.34)),
+                with: .color(Lab.textSecondary.opacity(0.58)),
                 style: StrokeStyle(lineWidth: max(1, step * 0.58), lineCap: .round))
             var played = context
             played.clip(to: Path(CGRect(
@@ -783,9 +906,11 @@ private struct MiniVoiceWaveform: View {
                     endPoint: CGPoint(x: size.width, y: 0)),
                 style: StrokeStyle(lineWidth: max(1, step * 0.58), lineCap: .round))
         }
+        .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Lab.stroke.opacity(0.8)))
+        .clipped()
         .opacity(active ? 1 : 0.72)
         .shadow(color: active ? Lab.cyan.opacity(0.5) : .clear, radius: 6)
-        .animation(.easeInOut(duration: 0.2), value: active)
         .accessibilityHidden(true)
     }
 }

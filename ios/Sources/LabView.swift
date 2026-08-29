@@ -7,11 +7,6 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-private enum VoiceForgeTextEntry: Hashable {
-    case utterance
-    case seed
-}
-
 private enum VoiceLibraryFilter: String, CaseIterable, Identifiable {
     case all = "All"
     case feminine = "Feminine"
@@ -39,26 +34,158 @@ private enum VoiceLibraryFilter: String, CaseIterable, Identifiable {
     }
 }
 
-private struct VoiceForgeTextEntryFrameKey: PreferenceKey {
-    static let defaultValue: [VoiceForgeTextEntry: CGRect] = [:]
+/// UIKit owns the mature text-editing behaviors that matter for a long utterance:
+/// selection handles, edit menus, undo, dictation, marked text, and cursor-preserving
+/// replacement. A SwiftUI `TextEditor` whose binding rewrites the entire string on
+/// every keystroke can disturb those behaviors, especially for large pastes and IMEs.
+private struct NativeUtteranceEditor: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+    let maximumLength: Int
+    let focusRequest: Int
 
-    static func reduce(
-        value: inout [VoiceForgeTextEntry: CGRect],
-        nextValue: () -> [VoiceForgeTextEntry: CGRect]
-    ) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
     }
-}
 
-private extension View {
-    func reportVoiceForgeTextEntry(_ entry: VoiceForgeTextEntry) -> some View {
-        background {
-            GeometryReader { proxy in
-                Color.clear.preference(
-                    key: VoiceForgeTextEntryFrameKey.self,
-                    value: [entry: proxy.frame(in: .named("voice-forge-text-space"))]
-                )
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView()
+        textView.delegate = context.coordinator
+        context.coordinator.textView = textView
+        textView.backgroundColor = .clear
+        textView.textColor = UIColor(Lab.textPrimary)
+        textView.tintColor = UIColor(Lab.emerald)
+        textView.font = .systemFont(ofSize: Lab.typeSize(16))
+        textView.adjustsFontForContentSizeCategory = true
+        textView.autocapitalizationType = .sentences
+        textView.autocorrectionType = .yes
+        textView.smartDashesType = .yes
+        textView.smartQuotesType = .yes
+        textView.keyboardDismissMode = .interactive
+        textView.keyboardAppearance = .dark
+        textView.textContainerInset = UIEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+        textView.textContainer.lineFragmentPadding = 0
+        textView.accessibilityIdentifier = "utteranceEditor"
+        textView.inputAccessoryView = context.coordinator.makeAccessoryView()
+        textView.text = text
+        return textView
+    }
+
+    func updateUIView(_ textView: UITextView, context: Context) {
+        context.coordinator.parent = self
+
+        // A delegate edit updates the binding before this method is called, so the
+        // strings normally match. Only assign for an external action (clear, joke,
+        // import), and never tear down an active IME composition.
+        if textView.text != text, textView.markedTextRange == nil {
+            let oldSelection = textView.selectedRange
+            textView.text = text
+            let utf16Count = (text as NSString).length
+            let location = min(oldSelection.location, utf16Count)
+            textView.selectedRange = NSRange(
+                location: location,
+                length: min(oldSelection.length, max(0, utf16Count - location))
+            )
+        }
+
+        // UIKit remains the source of truth for ordinary tap focus. SwiftUI view
+        // updates can arrive with a stale boolean during the same event; using that
+        // boolean to resign here made the editor visibly select text but reject typing.
+        // Only an explicit, monotonically increasing request may take focus.
+        if context.coordinator.lastFocusRequest != focusRequest {
+            context.coordinator.lastFocusRequest = focusRequest
+            DispatchQueue.main.async {
+                textView.becomeFirstResponder()
             }
+        }
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: NativeUtteranceEditor
+        var lastFocusRequest: Int
+        weak var textView: UITextView?
+
+        init(parent: NativeUtteranceEditor) {
+            self.parent = parent
+            lastFocusRequest = parent.focusRequest
+        }
+
+        func makeAccessoryView() -> UIView {
+            let toolbar = UIToolbar()
+            toolbar.sizeToFit()
+            toolbar.items = [
+                UIBarButtonItem(systemItem: .flexibleSpace),
+                UIBarButtonItem(
+                    title: "Done",
+                    style: .done,
+                    target: self,
+                    action: #selector(finishEditing)
+                ),
+            ]
+            toolbar.tintColor = UIColor(Lab.emerald)
+            return toolbar
+        }
+
+        @objc private func finishEditing() {
+            textView?.resignFirstResponder()
+        }
+
+        func textViewDidBeginEditing(_ textView: UITextView) {
+            if !parent.isFocused { parent.isFocused = true }
+        }
+
+        func textViewDidEndEditing(_ textView: UITextView) {
+            if parent.isFocused { parent.isFocused = false }
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            // Do not normalize or truncate marked text mid-composition. The delegate
+            // range gate below handles ordinary edits; this is a defensive backstop
+            // for input systems that commit marked text in one operation.
+            guard textView.markedTextRange == nil else { return }
+            let value = textView.text ?? ""
+            if value.count <= parent.maximumLength {
+                if parent.text != value { parent.text = value }
+                return
+            }
+
+            let selection = textView.selectedRange
+            let limited = String(value.prefix(parent.maximumLength))
+            textView.text = limited
+            textView.selectedRange = NSRange(
+                location: min(selection.location, (limited as NSString).length),
+                length: 0
+            )
+            if parent.text != limited { parent.text = limited }
+        }
+
+        func textView(
+            _ textView: UITextView,
+            shouldChangeTextIn range: NSRange,
+            replacementText replacement: String
+        ) -> Bool {
+            // Let marked-text composition proceed naturally. It is checked when the
+            // input method commits, avoiding broken accents and CJK entry.
+            if textView.markedTextRange != nil { return true }
+
+            let current = textView.text ?? ""
+            let candidate = (current as NSString).replacingCharacters(in: range, with: replacement)
+            if candidate.count <= parent.maximumLength { return true }
+
+            // Oversized pastes still insert everything that fits. Replace only the
+            // edited range so the rest of the document and its selection stay intact.
+            let withoutSelection = (current as NSString).replacingCharacters(in: range, with: "")
+            let available = max(0, parent.maximumLength - withoutSelection.count)
+            let accepted = String(replacement.prefix(available))
+            guard !accepted.isEmpty else { return false }
+
+            textView.textStorage.replaceCharacters(in: range, with: accepted)
+            textView.selectedRange = NSRange(
+                location: range.location + (accepted as NSString).length,
+                length: 0
+            )
+            textViewDidChange(textView)
+            return false
         }
     }
 }
@@ -1047,7 +1174,7 @@ struct LabView: View {
     @State private var importURLText = ""
     @State private var voiceSearchText = ""
     @State private var voiceLibraryFilter: VoiceLibraryFilter = .all
-    @State private var textEntryFrames: [VoiceForgeTextEntry: CGRect] = [:]
+    @State private var utteranceFocusRequest = 0
     /// Bumped to refresh the play/pause icon, which tracks external playback state.
     @State private var playbackTick = 0
     @State private var showMachineProfile = false
@@ -1069,6 +1196,8 @@ struct LabView: View {
         GeometryReader { geometry in
             ZStack {
                 LaboratoryBackground()
+                    .contentShape(Rectangle())
+                    .onTapGesture { dismissKeyboard() }
                 if usesDashboardLayout, geometry.size.width >= 680 {
                     HStack(alignment: .top, spacing: 18) {
                         VStack(alignment: .leading, spacing: 12) {
@@ -1086,6 +1215,7 @@ struct LabView: View {
                                 .frame(maxWidth: .infinity, alignment: .topLeading)
                         }
                         .scrollIndicators(.hidden)
+                        .scrollDismissesKeyboard(.interactively)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(.horizontal, 24)
@@ -1106,6 +1236,7 @@ struct LabView: View {
                             phoneWorkspace(compact: false)
                         }
                         .scrollIndicators(.hidden)
+                        .scrollDismissesKeyboard(.interactively)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, 14)
@@ -1141,21 +1272,9 @@ struct LabView: View {
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
-                Button("Done") { focusedField = nil }
+                Button("Done") { dismissKeyboard() }
             }
         }
-        .coordinateSpace(name: "voice-forge-text-space")
-        .onPreferenceChange(VoiceForgeTextEntryFrameKey.self) { frames in
-            textEntryFrames = frames
-        }
-        .simultaneousGesture(
-            SpatialTapGesture(coordinateSpace: .named("voice-forge-text-space"))
-                .onEnded { tap in
-                    guard focusedField != nil else { return }
-                    let tappedEditor = textEntryFrames.values.contains { $0.contains(tap.location) }
-                    if !tappedEditor { focusedField = nil }
-                }
-        )
     }
 
     private var sheetView: some View {
@@ -1992,7 +2111,7 @@ struct LabView: View {
                         .accessibilityHint("Selects the entire utterance so typing replaces it")
                     Button {
                         model.text = ""
-                        focusedField = .utterance
+                        focusUtteranceAfterCurrentTap()
                     } label: {
                         Label("Clear", systemImage: "xmark.circle.fill")
                     }
@@ -2010,26 +2129,27 @@ struct LabView: View {
                             .padding(.vertical, 16)
                             .allowsHitTesting(false)
                     }
-                    TextEditor(text: Binding(
-                        get: { model.text },
-                        set: { model.text = String($0.prefix(JokeLibrary.maximumUtteranceLength)) }
-                    ))
-                    .scrollContentBackground(.hidden)
-                    .padding(8)
-                    .foregroundStyle(Lab.textPrimary)
-                    .font(.system(size: Lab.typeSize(16)))
-                    .lineSpacing(4)
-                    .focused($focusedField, equals: .utterance)
-                    .reportVoiceForgeTextEntry(.utterance)
-                    .textInputAutocapitalization(.sentences)
-                    .autocorrectionDisabled(false)
+                    NativeUtteranceEditor(
+                        text: $model.text,
+                        isFocused: Binding(
+                            get: { focusedField == .utterance },
+                            set: { focused in
+                                if focused {
+                                    focusedField = .utterance
+                                } else if focusedField == .utterance {
+                                    focusedField = nil
+                                }
+                            }
+                        ),
+                        maximumLength: JokeLibrary.maximumUtteranceLength,
+                        focusRequest: utteranceFocusRequest
+                    )
                 }
                 // More vertical room makes drag handles and the magnifier
                 // practical on a phone instead of fighting a three-line box.
-                .frame(
-                    minHeight: compact ? 104 : 138,
-                    maxHeight: compact ? 132 : 190
-                )
+                // Never let keyboard-driven relayout stretch the empty editor into
+                // a large black void. Long utterances scroll inside this native field.
+                .frame(height: focusedField == .utterance ? 108 : (compact ? 104 : 138))
                 .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10)
@@ -2087,7 +2207,6 @@ struct LabView: View {
                     )
                     .keyboardType(.numberPad)
                     .focused($focusedField, equals: .seed)
-                    .reportVoiceForgeTextEntry(.seed)
                     .font(.system(size: Lab.typeSize(12), design: .monospaced))
                     .foregroundStyle(Lab.textPrimary)
                     .frame(width: 74)
@@ -2282,11 +2401,10 @@ struct LabView: View {
     }
 
     private func selectAllUtterance() {
-        focusedField = .utterance
-        // Focus lands on the underlying UITextView on the next main-loop turn.
-        // Sending the standard responder action preserves UIKit's native
-        // selection handles, edit menu, undo stack, and replacement behavior.
-        DispatchQueue.main.async {
+        // The parent tap gesture dismisses the keyboard for taps outside an editor.
+        // Restore focus after that gesture finishes, then wait one more run-loop turn
+        // for UIKit to install the text view as first responder before selecting.
+        focusUtteranceAfterCurrentTap {
             UIApplication.shared.sendAction(
                 #selector(UIResponder.selectAll(_:)),
                 to: nil,
@@ -2294,6 +2412,26 @@ struct LabView: View {
                 for: nil
             )
         }
+    }
+
+    private func focusUtteranceAfterCurrentTap(action: (() -> Void)? = nil) {
+        DispatchQueue.main.async {
+            focusedField = .utterance
+            utteranceFocusRequest &+= 1
+            DispatchQueue.main.async {
+                action?()
+            }
+        }
+    }
+
+    private func dismissKeyboard() {
+        focusedField = nil
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.resignFirstResponder),
+            to: nil,
+            from: nil,
+            for: nil
+        )
     }
 
     private func openEnrollment(target: UUID?) {
