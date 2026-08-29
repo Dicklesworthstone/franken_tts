@@ -188,7 +188,9 @@ struct GalvanicVoiceForge: View {
                     Text(telemetry.factualDetail)
                         .font(.subheadline)
                         .foregroundStyle(Lab.textSecondary)
-                        .contentTransition(.numericText())
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
                 }
                 Spacer(minLength: 8)
                 if telemetry.phase.isActive {
@@ -198,7 +200,6 @@ struct GalvanicVoiceForge: View {
                         if let estimatedRemainingSeconds {
                             Text("≈ \(estimatedRemainingSeconds)s left")
                                 .foregroundStyle(phaseColor)
-                                .contentTransition(.numericText())
                                 .accessibilityLabel(
                                     "About \(estimatedRemainingSeconds) seconds remaining"
                                 )
@@ -252,7 +253,10 @@ struct GalvanicVoiceForge: View {
 
     private var forgeCanvas: some View {
         TimelineView(.animation(minimumInterval: cadence, paused: !telemetry.phase.isActive || reduceMotion)) { timeline in
-            Canvas(opaque: false, colorMode: .linear, rendersAsynchronously: true) { context, size in
+            // Native progress can publish several semantic-frame updates between display
+            // refreshes. Synchronous drawing keeps an older asynchronous canvas from being
+            // presented after a newer telemetry state, which otherwise looks like flashing.
+            Canvas(opaque: false, colorMode: .linear, rendersAsynchronously: false) { context, size in
                 drawForge(
                     context: &context,
                     size: size,
@@ -308,16 +312,23 @@ struct GalvanicVoiceForge: View {
 
         for ring in 0..<4 {
             let radius = CGFloat(20 + ring * 10)
-            let pulse = reduceMotion ? 0 : CGFloat(sin(phase * 1.4 + Double(ring)) * 2.5)
+            // Keep the apparatus spatially stable. Energy is conveyed through a restrained
+            // luminance pulse rather than continuously resizing every ring (a visible wobble
+            // when frame-count updates also invalidate the canvas).
+            let pulse = reduceMotion ? 0 : sin(phase * 1.15 + Double(ring))
             let rect = CGRect(
-                x: coilX - radius - pulse,
-                y: midY - radius - pulse,
-                width: (radius + pulse) * 2,
-                height: (radius + pulse) * 2
+                x: coilX - radius,
+                y: midY - radius,
+                width: radius * 2,
+                height: radius * 2
             )
             context.stroke(
                 Path(ellipseIn: rect),
-                with: .color(phaseColor.opacity(0.16 + Double(ring) * 0.08)),
+                with: .color(
+                    phaseColor.opacity(
+                        0.16 + Double(ring) * 0.08 + Double(pulse) * 0.025
+                    )
+                ),
                 style: StrokeStyle(lineWidth: ring == 1 ? 2.2 : 1, dash: ring.isMultiple(of: 2) ? [] : [4, 5])
             )
         }
@@ -435,7 +446,7 @@ private struct ForgeMetric: View {
             Text(value)
                 .font(.system(size: Lab.typeSize(13), weight: .semibold, design: .monospaced))
                 .foregroundStyle(Lab.textPrimary)
-                .contentTransition(.numericText())
+                .monospacedDigit()
         }
         .accessibilityElement(children: .combine)
     }

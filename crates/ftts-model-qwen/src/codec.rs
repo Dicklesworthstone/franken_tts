@@ -241,8 +241,8 @@ impl SplitResidualVectorQuantizer<'_> {
         // `[512, 256, 1]`, not the 2-D shape an `nn.Linear` would. So they follow the convolution
         // rule measured in `causal_conv1d`: the reduction belongs to the platform BLAS. At kernel 1
         // the `im2col` unfolding is the identity, so the GEMM is issued directly on the codebook
-        // sums; both are bias-free, so it runs at `beta = 0`. Off macOS this degrades to the scalar
-        // reduction, which is what these calls did before.
+        // sums; both are bias-free, so it runs at `beta = 0`. Off Apple platforms this degrades to
+        // the scalar reduction, which is what these calls did before.
         let mut first_projected = vec![0.0f32; output.len()];
         let mut rest_projected = vec![0.0f32; output.len()];
         f32ref::linear_with_accumulation(
@@ -802,7 +802,8 @@ fn dense_linear(
         // `beta = 1` BLAS GEMM. The convolution sites measured that exact named form byte-exact
         // against the oracle while every scalar/laned reduction diverged (see the GEMM-bisect
         // table above `causal_conv`), so the f32 dense fall-through asks for the same reduction
-        // by name. Off macOS the request degrades to the scalar reference — correct, not exact.
+        // by name. Off Apple platforms the request degrades to the scalar reference — correct,
+        // not exact.
         f32ref::linear_with_accumulation(
             x,
             weight,
@@ -1031,9 +1032,10 @@ pub fn causal_conv1d(
     //
     // Only the last is exact, and the `beta = 0` row is what rules out "any BLAS will do": the
     // seeding is load-bearing, not incidental. The reduction order therefore belongs to the
-    // platform BLAS, so `linear_with_accumulation` is asked for it by name. Off macOS that request
-    // degrades to the scalar reduction, which is the first row above — correct, not exact. See
-    // `ftts-conformance/tests/codec_gemm_bisect.rs`, which is the probe that measured this.
+    // platform BLAS, so `linear_with_accumulation` is asked for it by name. Off Apple platforms
+    // that request degrades to the scalar reduction, which is the first row above — correct, not
+    // exact. See `ftts-conformance/tests/codec_gemm_bisect.rs`, which is the probe that measured
+    // this.
     let reduction = input_channels * kernel;
     let mut columns = vec![0.0f32; frames * reduction];
     for frame in 0..frames {
@@ -1137,7 +1139,8 @@ pub fn causal_transpose_conv1d(
     //
     // The column GEMM's reduction order belongs to the platform BLAS for the same measured reason
     // the forward convolution's does (see `causal_conv1d`); a scalar left-to-right sum over the
-    // input channels is correct but not bit-exact. Off macOS this degrades to that scalar sum.
+    // input channels is correct but not bit-exact. Off Apple platforms this degrades to that
+    // scalar sum.
     //
     // The reference's weight is `[in_channel, out_channel, tap]`, which is `[k, n]`; the GEMM
     // helper wants `[n, k]`, so the columns' operand is transposed once up front.

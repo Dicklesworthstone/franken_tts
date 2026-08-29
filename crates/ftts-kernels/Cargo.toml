@@ -14,8 +14,8 @@ default = ["native-mmap", "accelerate-sgemm", "neon-dotprod"]
 # The only audited OS-memory interface in this crate. Disabling it preserves correctness through
 # the owned-byte fallback, which is useful for targets without a supported mmap implementation.
 native-mmap = []
-# macOS-only f32 SGEMM probe for reproducing the pinned CPU-fp32 Torch backend. The normal
-# safe-Rust reference path remains selected unless the parity harness explicitly asks for it.
+# Apple-platform f32 SGEMM backend for the native codec and for reproducing the pinned CPU-fp32
+# Torch backend. The normal safe-Rust reference path remains available as the fallback/oracle.
 accelerate-sgemm = []
 # The audited aarch64 SDOT island in `int8.rs`. Compiles only on aarch64 targets, dispatches only
 # where the CPU reports FEAT_DotProd at runtime, and keeps a bit-identical portable fallback in

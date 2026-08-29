@@ -27,22 +27,22 @@ pub enum F32LinearAccumulation {
     FusedLanes4,
     /// Eight FMA partial accumulators, reduced in lane order.
     FusedLanes8,
-    /// macOS Accelerate SGEMM, selected only by the CPU-fp32 parity harness.
+    /// Apple Accelerate SGEMM, selected by the codec and CPU-fp32 parity harness.
     ///
-    /// On every other target, this deliberately falls back to [`Self::Scalar`].
+    /// On non-Apple targets, this deliberately falls back to [`Self::Scalar`].
     Accelerate,
     /// [`Self::Accelerate`], with M = 1 calls pinned onto the M >= 2 GEMM kernel.
     ///
     /// See [`Self::AccelerateBiasSeededRowInvariant`] for the streaming == offline rationale;
     /// this is the same pinning for the `beta = 0` route (the codec's RVQ projections).
     AccelerateRowInvariant,
-    /// macOS Accelerate SGEMM over a bias-seeded output, issued with `beta = 1`.
+    /// Apple Accelerate SGEMM over a bias-seeded output, issued with `beta = 1`.
     ///
     /// This is the exact call `slow_conv2d_update_output_frame` makes for a convolution with a
     /// bias, and it differs from [`Self::Accelerate`] — which adds the bias after a `beta = 0`
     /// product — whenever the BLAS blocks its reduction. Like the other lane orders, it exists so
     /// the CPU-fp32 fixture can attribute a convolution's divergence; it falls back to
-    /// [`Self::Scalar`] with a trailing bias on every non-macOS target.
+    /// [`Self::Scalar`] with a trailing bias on every target without Accelerate.
     AccelerateBiasSeeded,
     /// [`Self::AccelerateBiasSeeded`], with M = 1 calls pinned onto the M >= 2 GEMM kernel.
     ///
@@ -396,12 +396,27 @@ fn dot_with_accumulation(x: &[f32], weight: &[f32], accumulation: F32LinearAccum
     }
 }
 
-/// Attempts the same row-major SGEMM backend recorded by the pinned macOS CPU-fp32 oracle.
+/// Attempts the same row-major SGEMM backend recorded by the pinned Apple CPU-fp32 oracle.
 ///
-/// The test-only [`F32LinearAccumulation::Accelerate`] selector keeps this foreign call out of the
-/// normal safe-Rust reference path. Targets without the opt-in macOS backend return `false`, so
-/// their scalar fallback remains bit-for-bit the ordinary reference implementation.
-#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+/// The [`F32LinearAccumulation::Accelerate`] selector is used by the native codec as well as the
+/// parity harness; the ordinary safe-Rust route remains its correctness oracle and fallback.
+/// Targets without the opt-in Apple backend return `false`, so their scalar fallback remains
+/// bit-for-bit the ordinary reference implementation.
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
+static APPLE_ACCELERATE_SGEMM_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    !matches!(
+        std::env::var("FTTS_ACCELERATE_SGEMM").as_deref(),
+        Ok("0" | "false" | "off" | "no")
+    )
+});
+
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
 #[allow(clippy::too_many_arguments)]
 fn accelerate_sgemm(
     x: &[f32],
@@ -413,6 +428,13 @@ fn accelerate_sgemm(
     row_invariant: bool,
     out: &mut [f32],
 ) -> bool {
+    // Keep the accepted scalar oracle reachable in the exact same binary. This process-sticky
+    // kill switch makes device-side A/B/A/B runs reproducible without paying an environment lookup
+    // on every codec projection or rebuilding a second app artifact.
+    if !*APPLE_ACCELERATE_SGEMM_ENABLED {
+        return false;
+    }
+
     // Accelerate routes M = 1 to a GEMV kernel whose reduction order differs from its M >= 2
     // GEMM kernel in the last ulps, while M >= 2 is row-invariant (measured: M of 2, 3, 4 and 14
     // produce bit-identical rows). A streaming decode presents the same convolution at M = packet
@@ -464,7 +486,10 @@ fn accelerate_sgemm(
 // The stub must mirror the real Accelerate entry's eight parameters exactly so both cfg
 // arms are call-site identical; the arity is the contract, not a design smell.
 #[allow(clippy::too_many_arguments)]
-#[cfg(not(all(feature = "accelerate-sgemm", target_os = "macos")))]
+#[cfg(not(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+)))]
 fn accelerate_sgemm(
     _x: &[f32],
     _weight: &[f32],
@@ -478,14 +503,26 @@ fn accelerate_sgemm(
     false
 }
 
-#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
 const CBLAS_ROW_MAJOR: i32 = 101;
-#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
 const CBLAS_NO_TRANSPOSE: i32 = 111;
-#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
 const CBLAS_TRANSPOSE: i32 = 112;
 
-#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
     fn cblas_sgemm(
@@ -1511,12 +1548,15 @@ pub(crate) unsafe fn gqa_attention_head_range_into(
     });
 }
 
-/// Executes the two attention matrix products through the exact macOS SGEMM candidate.
+/// Executes the two attention matrix products through the exact Apple SGEMM candidate.
 ///
 /// This is intentionally an L2-parity probe rather than the normal attention route. The gather
 /// buffers present the strided GQA heads as the row-major matrices consumed by CBLAS; the scalar
 /// path above remains the cross-platform reference and the fallback when this candidate is off.
-#[cfg(all(feature = "accelerate-sgemm", target_os = "macos"))]
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
 #[allow(clippy::too_many_arguments)]
 fn accelerate_gqa_attention(
     queries: &[f32],
@@ -1599,7 +1639,10 @@ fn accelerate_gqa_attention(
     true
 }
 
-#[cfg(not(all(feature = "accelerate-sgemm", target_os = "macos")))]
+#[cfg(not(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+)))]
 #[allow(clippy::too_many_arguments)]
 fn accelerate_gqa_attention(
     _queries: &[f32],

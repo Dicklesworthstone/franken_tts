@@ -588,7 +588,6 @@ struct LabView: View {
     }
 
     @State private var model = LabModel()
-    @State private var showConsent = false
     @State private var showEnrollment = false
     @State private var showGalaxy = false
     @State private var showSpecimen = false
@@ -619,7 +618,7 @@ struct LabView: View {
                     HStack(alignment: .top, spacing: 18) {
                         VStack(alignment: .leading, spacing: 12) {
                             header
-                            modelStatusButton
+                            modelEntryView
                             compactVoiceSelector(vertical: true)
                             Spacer(minLength: 4)
                             footer
@@ -640,7 +639,7 @@ struct LabView: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 18) {
                             header
-                            modelStatusButton
+                            modelEntryView
                             compactVoiceSelector(vertical: false)
                             utteranceCard(compact: false)
                             footer
@@ -931,6 +930,16 @@ struct LabView: View {
         .accessibilityHint("Opens model download, storage, and readiness details")
     }
 
+    @ViewBuilder
+    private var modelEntryView: some View {
+        switch model.store.phase {
+        case .ready:
+            modelStatusButton
+        case .idle, .downloading, .verifying, .failed:
+            specimenCard
+        }
+    }
+
     private var modelStatusTitle: String {
         switch model.store.phase {
         case .ready:
@@ -1037,17 +1046,45 @@ struct LabView: View {
 
     private var specimenCard: some View {
         LabPanel {
-            VStack(alignment: .leading, spacing: 12) {
-                LabLabel(text: "01 · The Specimen (model)")
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .center, spacing: 10) {
+                    ZStack {
+                        Circle()
+                            .fill(Lab.emerald.opacity(0.12))
+                        Image(systemName: model.store.cachedBytes > 0
+                              ? "arrow.clockwise.circle.fill" : "brain.head.profile.fill")
+                            .font(.system(size: Lab.typeSize(19), weight: .bold))
+                            .foregroundStyle(Lab.emerald)
+                    }
+                    .frame(width: 40, height: 40)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.store.cachedBytes > 0 ? "FINISH VOICE SETUP" : "BRING THE VOICE CORE TO LIFE")
+                            .font(.system(size: Lab.typeSize(12), weight: .black, design: .monospaced))
+                            .kerning(0.7)
+                            .foregroundStyle(Lab.textPrimary)
+                        Text("One setup · then everything runs privately here")
+                            .font(.system(size: Lab.typeSize(11)))
+                            .foregroundStyle(Lab.textSecondary)
+                    }
+                }
+
                 switch model.store.phase {
                 case .idle:
                     Text(
                         model.store.cachedBytes > 0
-                            ? "Part of the model is already here; completing the download fetches only what is missing and re-verifies the rest."
-                            : "First use downloads static model files (≈2.0 GB) from the developer's GitHub release into this app's private storage. No text, recording, voice data, or generated media is sent; all AI runs locally. The files are verified against pinned digests, resumable, and kept until you clear them."
+                            ? "Your saved progress is intact. Resume the remaining static model files—completed pieces are never downloaded twice."
+                            : "FrankenTTS needs a one-time 2.0 GB voice model. It downloads from the FrankenTTS GitHub release, is cryptographically verified, and stays in this app's private storage."
                     )
                     .font(.system(size: Lab.typeSize(14)))
                     .foregroundStyle(Lab.textSecondary)
+
+                    HStack(spacing: 12) {
+                        ModelPromise(systemImage: "lock.shield", text: "No data sent")
+                        ModelPromise(systemImage: "arrow.clockwise", text: "Resumable")
+                        ModelPromise(systemImage: "checkmark.seal", text: "Verified")
+                    }
+
                     if model.lowMemoryDevice {
                         Text(
                             "This device reports under 6 GB of memory; the engine may not fit. A recent device with at least 6 GB is recommended."
@@ -1057,31 +1094,67 @@ struct LabView: View {
                     }
                     Button(
                         model.store.cachedBytes > 0
-                            ? "Complete the download" : "Download the 2.0 GB model"
-                    ) { showConsent = true }
+                            ? "Resume setup" : "Download & set up"
+                    ) { model.store.startDownload() }
                         .buttonStyle(PrimaryButtonStyle())
-                        .confirmationDialog(
-                            model.store.cachedBytes > 0
-                                ? "Fetch the missing static model files from GitHub now? No user content is sent. Existing files are kept and re-verified, not re-downloaded."
-                                : "Download 2.0 GB of static model files from GitHub now? No user content is sent. The files stay on this device, resume if interrupted, and Clear Model removes them.",
-                            isPresented: $showConsent, titleVisibility: .visible
-                        ) {
-                            Button("Start the download") { model.store.startDownload() }
-                            Button("Not now", role: .cancel) {}
-                        }
                 case .downloading(let asset, let done, let total, let eta):
+                    HStack(spacing: 14) {
+                        ZStack {
+                            Circle()
+                                .stroke(Lab.emerald.opacity(0.15), lineWidth: 6)
+                            Circle()
+                                .trim(from: 0, to: total > 0 ? Double(done) / Double(total) : 0)
+                                .stroke(
+                                    Lab.emerald,
+                                    style: StrokeStyle(lineWidth: 6, lineCap: .round)
+                                )
+                                .rotationEffect(.degrees(-90))
+                                .animation(.smooth, value: done)
+                            Text("\(Int((total > 0 ? Double(done) / Double(total) : 0) * 100))%")
+                                .font(.system(size: Lab.typeSize(11), weight: .bold, design: .monospaced))
+                                .foregroundStyle(Lab.textPrimary)
+                        }
+                        .frame(width: 58, height: 58)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(asset)
+                                .font(.system(size: Lab.typeSize(15), weight: .bold))
+                                .foregroundStyle(Lab.textPrimary)
+                            Text("Part \(max(1, model.store.currentFileIndex)) of \(model.store.currentFileCount)")
+                                .font(.system(size: Lab.typeSize(10), weight: .bold, design: .monospaced))
+                                .foregroundStyle(Lab.emerald)
+                            Text("\(Self.gigabytes(done)) of \(Self.gigabytes(total)) GB · \(eta)")
+                                .font(.system(size: Lab.typeSize(11)))
+                                .foregroundStyle(Lab.textSecondary)
+                            if model.store.downloadRateBytesPerSecond > 0 {
+                                Text(Self.downloadRate(model.store.downloadRateBytesPerSecond))
+                                    .font(.system(size: Lab.typeSize(10), design: .monospaced))
+                                    .foregroundStyle(Lab.textSecondary)
+                            }
+                        }
+                    }
                     ProgressView(value: Double(done), total: Double(total))
                         .tint(Lab.emerald)
-                    Text(
-                        "\(asset)  ·  \(Self.gigabytes(done)) / \(Self.gigabytes(total)) GB  ·  \(eta)"
-                    )
-                    .font(.system(size: Lab.typeSize(12), design: .monospaced))
-                    .foregroundStyle(Lab.textSecondary)
+                    HStack {
+                        Label("Progress is saved automatically", systemImage: "externaldrive.fill.badge.checkmark")
+                            .font(.system(size: Lab.typeSize(10)))
+                            .foregroundStyle(Lab.textSecondary)
+                        Spacer()
+                        Button("Pause") { model.store.pauseDownload() }
+                            .buttonStyle(GhostButtonStyle())
+                    }
                 case .verifying(let asset):
-                    ProgressView().tint(Lab.emerald)
-                    Text("verifying \(asset)…")
-                        .font(.system(size: Lab.typeSize(12), design: .monospaced))
-                        .foregroundStyle(Lab.textSecondary)
+                    HStack(spacing: 12) {
+                        ProgressView().tint(Lab.emerald).controlSize(.regular)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Securing \(asset)")
+                                .font(.system(size: Lab.typeSize(14), weight: .bold))
+                                .foregroundStyle(Lab.textPrimary)
+                            Text("Checking every byte before the engine can use it")
+                                .font(.system(size: Lab.typeSize(11)))
+                                .foregroundStyle(Lab.textSecondary)
+                        }
+                    }
                 case .ready:
                     VStack(alignment: .leading, spacing: 9) {
                         HStack {
@@ -1115,8 +1188,15 @@ struct LabView: View {
                         }
                     }
                 case .failed(let message):
-                    Text(message).font(.system(size: Lab.typeSize(13))).foregroundStyle(Lab.danger)
-                    Button("Retry") { model.store.startDownload() }
+                    Label("Setup paused", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: Lab.typeSize(14), weight: .bold))
+                        .foregroundStyle(Lab.danger)
+                    Text(message)
+                        .font(.system(size: Lab.typeSize(13)))
+                        .foregroundStyle(Lab.textSecondary)
+                    Button(model.store.cachedBytes > 0 ? "Resume setup" : "Try again") {
+                        model.store.startDownload()
+                    }
                         .buttonStyle(PrimaryButtonStyle())
                 }
             }
@@ -1579,6 +1659,33 @@ struct LabView: View {
 
     private static func gigabytes(_ bytes: Int64) -> String {
         String(format: "%.2f", Double(bytes) / 1_073_741_824.0)
+    }
+
+    private static func downloadRate(_ bytesPerSecond: Double) -> String {
+        let formatted = ByteCountFormatter.string(
+            fromByteCount: Int64(bytesPerSecond), countStyle: .file)
+        return "\(formatted)/s"
+    }
+}
+
+private struct ModelPromise: View {
+    let systemImage: String
+    let text: String
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Image(systemName: systemImage)
+                .font(.system(size: Lab.typeSize(13), weight: .bold))
+                .foregroundStyle(Lab.emerald)
+            Text(text)
+                .font(.system(size: Lab.typeSize(9), weight: .semibold))
+                .foregroundStyle(Lab.textSecondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
     }
 }
 

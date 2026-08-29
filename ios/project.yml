@@ -34,6 +34,10 @@ targets:
     dependencies:
       - framework: FttsCore.xcframework
         embed: false
+      # The Rust static library calls CBLAS directly on Apple platforms. Static
+      # archives cannot carry their framework dependency into Xcode's final
+      # link, so the app target names Accelerate explicitly.
+      - sdk: Accelerate.framework
       - target: FrankenTTSWidgets
         embed: true
         platformFilter: iOS

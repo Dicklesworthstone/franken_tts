@@ -2,9 +2,11 @@
 //
 // The manifest constants mirror site/model-manifest.js, which mirrors the CLI's pinned
 // manifest — those files are the source of truth and the three must move together if the
-// model release is ever re-pinned. Files download in 32 MiB HTTP ranges (resumable from
-// the bytes already on disk), hash incrementally as they arrive, and are refused on any
-// digest mismatch. Storage is Application Support, excluded from iCloud backup.
+// model release is ever re-pinned. Files download in small HTTP ranges to URLSession
+// temporary files, then append to the resumable file on disk. This is deliberately a
+// download-task path rather than `data(for:)`: a CDN that ignores Range must never make
+// iPadOS materialize a 1.3 GB response in the app's synthesis heap. Every response range
+// and final digest is validated. Storage is Application Support, excluded from backup.
 
 import CryptoKit
 import Foundation
@@ -58,7 +60,10 @@ enum ModelManifest {
     ]
 
     static let totalBytes = files.reduce(Int64(0)) { $0 + $1.bytes }
-    static let chunkBytes: Int64 = 32 * 1024 * 1024
+    /// Small enough to make progress feel live and retry cheaply on an interrupted iPad
+    /// connection. `URLSession.download(for:)` keeps even an unexpectedly large CDN
+    /// response out of the process heap.
+    static let chunkBytes: Int64 = 8 * 1024 * 1024
 }
 
 enum DownloadPhase: Equatable {
@@ -74,8 +79,20 @@ enum DownloadPhase: Equatable {
 final class ModelStore {
     var phase: DownloadPhase = .idle
     var cachedBytes: Int64 = 0
+    var downloadRateBytesPerSecond: Double = 0
+    var currentFileIndex = 0
+    var currentFileCount = ModelManifest.files.count
 
     private var task: Task<Void, Never>?
+    private var activeTaskID: UUID?
+    private let session: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 90
+        configuration.timeoutIntervalForResource = 60 * 60 * 24
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration)
+    }()
 
     let modelDirectory: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -145,55 +162,98 @@ final class ModelStore {
         cachedBytes = ModelManifest.files.reduce(Int64(0)) { total, file in
             let path = modelDirectory.appendingPathComponent(file.relativePath).path
             let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
-            return total + size
+            // Oversized/corrupt remnants will be replaced by `ensure`; do not let them
+            // produce a progress value above 100% in the meantime.
+            return total + (size <= file.bytes ? size : 0)
         }
     }
 
     func startDownload() {
         guard task == nil else { return }
+        refreshCachedBytes()
+        downloadRateBytesPerSecond = 0
+        currentFileIndex = firstIncompleteFileIndex
+        phase = .downloading(
+            asset: "Preparing the voice engine",
+            done: cachedBytes,
+            total: ModelManifest.totalBytes,
+            eta: "Checking storage…"
+        )
+        let taskID = UUID()
+        activeTaskID = taskID
         task = Task { [weak self] in
-            await self?.run()
+            await self?.run(taskID: taskID)
+            guard self?.activeTaskID == taskID else { return }
             self?.task = nil
+            self?.activeTaskID = nil
         }
+    }
+
+    func pauseDownload() {
+        task?.cancel()
+        task = nil
+        activeTaskID = nil
+        refreshCachedBytes()
+        downloadRateBytesPerSecond = 0
+        phase = .idle
     }
 
     func clear() {
         task?.cancel()
         task = nil
+        activeTaskID = nil
         try? FileManager.default.removeItem(at: modelDirectory)
         refreshCachedBytes()
         phase = .idle
     }
 
-    private func run() async {
+    private func run(taskID: UUID) async {
         do {
+            try requireActive(taskID)
             try FileManager.default.createDirectory(
                 at: modelDirectory, withIntermediateDirectories: true)
             var directory = modelDirectory
             var values = URLResourceValues()
             values.isExcludedFromBackup = true
             try? directory.setResourceValues(values)
+            try requireEnoughFreeStorage()
 
-            var doneBytes: Int64 = 0
-            for file in ModelManifest.files {
-                do {
-                    try await ensure(file: file, alreadyDone: doneBytes)
-                } catch where !file.required && !(error is CancellationError) {
-                    // The denoiser is an enhancement; a failed optional fetch must not
-                    // block a usable model. The next download attempt retries it.
-                }
-                doneBytes += file.bytes
+            let started = Date()
+            let startingBytes = cachedBytes
+            for (index, file) in ModelManifest.files.enumerated() {
+                try requireActive(taskID)
+                currentFileIndex = index + 1
+                try await ensure(
+                    file: file,
+                    started: started,
+                    startingBytes: startingBytes,
+                    taskID: taskID
+                )
                 refreshCachedBytes()
             }
+            try requireActive(taskID)
+            downloadRateBytesPerSecond = 0
             phase = .ready
         } catch is CancellationError {
+            guard activeTaskID == taskID else { return }
+            refreshCachedBytes()
+            downloadRateBytesPerSecond = 0
             phase = .idle
         } catch {
+            guard activeTaskID == taskID else { return }
+            refreshCachedBytes()
+            downloadRateBytesPerSecond = 0
             phase = .failed(error.localizedDescription)
         }
     }
 
-    private func ensure(file: ModelFile, alreadyDone: Int64) async throws {
+    private func ensure(
+        file: ModelFile,
+        started: Date,
+        startingBytes: Int64,
+        taskID: UUID
+    ) async throws {
+        try requireActive(taskID)
         let destination = modelDirectory.appendingPathComponent(file.relativePath)
         try FileManager.default.createDirectory(
             at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -203,8 +263,9 @@ final class ModelStore {
             ?? nil
         if existing == file.bytes {
             // Size-complete from an earlier session: verify once before trusting.
-            phase = .verifying(asset: file.asset)
+            phase = .verifying(asset: file.displayName)
             if try await digest(of: destination) == file.sha256 { return }
+            try requireActive(taskID)
             try FileManager.default.removeItem(at: destination)
         }
 
@@ -219,52 +280,179 @@ final class ModelStore {
             offset = 0
         }
 
-        let sink = try FileHandle(forWritingTo: destination)
-        defer { try? sink.close() }
-        try sink.seekToEnd()
-
-        // A resume cannot reuse a streamed hash for the prefix; hash the whole file after.
-        // A from-zero download hashes as it goes and needs no second read.
-        var live: SHA256? = offset == 0 ? SHA256() : nil
-        let started = Date()
-        let startedOffset = offset
+        phase = .downloading(
+            asset: file.displayName,
+            done: cachedBytes,
+            total: ModelManifest.totalBytes,
+            eta: downloadRateBytesPerSecond > 0 ? "Updating estimate…" : "Connecting…"
+        )
 
         while offset < file.bytes {
-            try Task.checkCancellation()
+            try requireActive(taskID)
             let end = min(offset + ModelManifest.chunkBytes, file.bytes) - 1
             var request = URLRequest(url: URL(string: ModelManifest.releaseBase + file.asset)!)
             request.setValue("bytes=\(offset)-\(end)", forHTTPHeaderField: "Range")
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse,
-                http.statusCode == 206 || (http.statusCode == 200 && offset == 0)
-            else {
-                throw EngineError.native("range fetch for \(file.asset) failed")
+            let (temporary, response) = try await downloadWithRetry(request)
+            try requireActive(taskID)
+            guard let http = response as? HTTPURLResponse else {
+                throw DownloadError.invalidResponse("The model server returned an unreadable response.")
             }
-            try sink.write(contentsOf: data)
-            live?.update(data: data)
-            offset += Int64(data.count)
 
-            let elapsed = Date().timeIntervalSince(started)
-            let rate = elapsed > 1 ? Double(offset - startedOffset) / elapsed : 0
-            let remaining = rate > 0 ? Double(ModelManifest.totalBytes - alreadyDone - offset) / rate : 0
-            let eta = rate > 0 ? Self.formatEta(seconds: remaining) : "estimating…"
-            phase = .downloading(
-                asset: file.asset, done: alreadyDone + offset, total: ModelManifest.totalBytes,
-                eta: eta)
-        }
-        try sink.close()
+            let temporaryBytes = try Self.fileSize(temporary)
+            if http.statusCode == 206 {
+                try Self.validatePartialResponse(
+                    http, requestedStart: offset, requestedEnd: end,
+                    expectedTotal: file.bytes, actualBytes: temporaryBytes)
+                try Self.appendFile(at: temporary, to: destination)
+                offset += temporaryBytes
+            } else if http.statusCode == 200, offset == 0 {
+                // Some CDNs ignore Range and send the whole asset. A download task keeps
+                // that response on disk; verify it before atomically adopting it.
+                guard temporaryBytes == file.bytes else {
+                    throw DownloadError.invalidResponse(
+                        "The model server ignored resume and returned the wrong file size.")
+                }
+                phase = .verifying(asset: file.displayName)
+                guard try await digest(of: temporary) == file.sha256 else {
+                    throw DownloadError.invalidResponse(
+                        "\(file.displayName) did not pass its security check. Please retry.")
+                }
+                try requireActive(taskID)
+                try Self.adoptDownloadedFile(temporary, at: destination)
+                offset = file.bytes
+            } else {
+                throw DownloadError.httpStatus(http.statusCode)
+            }
 
-        phase = .verifying(asset: file.asset)
-        let digestHex: String
-        if let live {
-            digestHex = live.finalize().map { String(format: "%02x", $0) }.joined()
-        } else {
-            digestHex = try await digest(of: destination)
+            refreshCachedBytes()
+            updateProgress(
+                asset: file.displayName,
+                started: started,
+                startingBytes: startingBytes
+            )
         }
+
+        phase = .verifying(asset: file.displayName)
+        let digestHex = try await digest(of: destination)
+        try requireActive(taskID)
         guard digestHex == file.sha256 else {
             try? FileManager.default.removeItem(at: destination)
-            throw EngineError.native("\(file.asset): digest mismatch; cleared for retry")
+            throw DownloadError.invalidResponse(
+                "\(file.displayName) did not pass its security check. Its partial copy was cleared; retry to fetch a clean copy.")
         }
+    }
+
+    private func downloadWithRetry(_ request: URLRequest) async throws -> (URL, URLResponse) {
+        var lastError: Error?
+        for attempt in 1...3 {
+            do {
+                return try await session.download(for: request)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                try Task.checkCancellation()
+                lastError = error
+                guard attempt < 3 else { break }
+                try await Task.sleep(for: .seconds(Double(attempt)))
+            }
+        }
+        throw DownloadError.network(lastError?.localizedDescription ?? "unknown network error")
+    }
+
+    private func requireActive(_ taskID: UUID) throws {
+        try Task.checkCancellation()
+        guard activeTaskID == taskID else { throw CancellationError() }
+    }
+
+    private func updateProgress(asset: String, started: Date, startingBytes: Int64) {
+        let elapsed = Date().timeIntervalSince(started)
+        let transferred = max(0, cachedBytes - startingBytes)
+        let measuredRate = elapsed > 0.8 ? Double(transferred) / elapsed : 0
+        if measuredRate > 0 {
+            downloadRateBytesPerSecond = downloadRateBytesPerSecond == 0
+                ? measuredRate
+                : downloadRateBytesPerSecond * 0.65 + measuredRate * 0.35
+        }
+        let remainingBytes = max(0, ModelManifest.totalBytes - cachedBytes)
+        let remaining = downloadRateBytesPerSecond > 0
+            ? Double(remainingBytes) / downloadRateBytesPerSecond
+            : 0
+        phase = .downloading(
+            asset: asset,
+            done: cachedBytes,
+            total: ModelManifest.totalBytes,
+            eta: remaining > 0 ? Self.formatEta(seconds: remaining) : "Estimating time…"
+        )
+    }
+
+    private var firstIncompleteFileIndex: Int {
+        guard let index = ModelManifest.files.firstIndex(where: { file in
+            let path = modelDirectory.appendingPathComponent(file.relativePath).path
+            let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
+            return size != file.bytes
+        }) else { return ModelManifest.files.count }
+        return index + 1
+    }
+
+    private func requireEnoughFreeStorage() throws {
+        refreshCachedBytes()
+        let remaining = max(0, ModelManifest.totalBytes - cachedBytes)
+        let safetyMargin: Int64 = 384 * 1024 * 1024
+        let values = try modelDirectory.resourceValues(forKeys: [
+            .volumeAvailableCapacityForImportantUsageKey
+        ])
+        guard let available = values.volumeAvailableCapacityForImportantUsage else { return }
+        guard available >= remaining + safetyMargin else {
+            let needed = Self.storageString(remaining + safetyMargin)
+            let free = Self.storageString(available)
+            throw DownloadError.insufficientStorage(needed: needed, available: free)
+        }
+    }
+
+    private nonisolated static func validatePartialResponse(
+        _ response: HTTPURLResponse,
+        requestedStart: Int64,
+        requestedEnd: Int64,
+        expectedTotal: Int64,
+        actualBytes: Int64
+    ) throws {
+        guard let value = response.value(forHTTPHeaderField: "Content-Range"),
+              let range = ParsedContentRange(value),
+              range.start == requestedStart,
+              range.end == requestedEnd,
+              range.total == expectedTotal,
+              actualBytes == requestedEnd - requestedStart + 1
+        else {
+            throw DownloadError.invalidResponse(
+                "The model server returned an invalid resume range. Please retry.")
+        }
+    }
+
+    private nonisolated static func appendFile(at source: URL, to destination: URL) throws {
+        let input = try FileHandle(forReadingFrom: source)
+        defer { try? input.close() }
+        let output = try FileHandle(forWritingTo: destination)
+        defer { try? output.close() }
+        try output.seekToEnd()
+        while true {
+            let data = try input.read(upToCount: 1024 * 1024) ?? Data()
+            if data.isEmpty { break }
+            try output.write(contentsOf: data)
+        }
+        try output.synchronize()
+    }
+
+    private nonisolated static func adoptDownloadedFile(_ source: URL, at destination: URL) throws {
+        if FileManager.default.fileExists(atPath: destination.path) {
+            _ = try FileManager.default.replaceItemAt(destination, withItemAt: source)
+        } else {
+            try FileManager.default.moveItem(at: source, to: destination)
+        }
+    }
+
+    private nonisolated static func fileSize(_ url: URL) throws -> Int64 {
+        let values = try url.resourceValues(forKeys: [.fileSizeKey])
+        return Int64(values.fileSize ?? 0)
     }
 
     /// Streaming SHA-256 of a file, 8 MiB at a time, off the main actor.
@@ -285,6 +473,68 @@ final class ModelStore {
     private static func formatEta(seconds: Double) -> String {
         let total = Int(seconds.rounded())
         let minutes = total / 60
-        return minutes > 0 ? "~\(minutes)m \(total % 60)s left" : "~\(total)s left"
+        return minutes > 0 ? "About \(minutes)m \(total % 60)s left" : "About \(total)s left"
+    }
+
+    private static func storageString(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+}
+
+private extension ModelFile {
+    var displayName: String {
+        switch asset {
+        case "qwen3-tts-12hz-0.6b-base.fttsq": "Voice engine"
+        case "speech_tokenizer_model.safetensors": "Speech decoder"
+        case "vocab.json": "Language vocabulary"
+        case "merges.txt": "Tokenizer rules"
+        case "tokenizer_config.json": "Tokenizer settings"
+        case "fastenhancer-s-48k-denoise.safetensors": "Voice cleanup"
+        default: "Model component"
+        }
+    }
+}
+
+private struct ParsedContentRange {
+    let start: Int64
+    let end: Int64
+    let total: Int64
+
+    init?(_ value: String) {
+        // RFC 9110 form: "bytes 0-8388607/1312015713".
+        let components = value.split(separator: " ", maxSplits: 1)
+        guard components.count == 2, components[0].lowercased() == "bytes" else { return nil }
+        let rangeAndTotal = components[1].split(separator: "/", maxSplits: 1)
+        guard rangeAndTotal.count == 2, let total = Int64(rangeAndTotal[1]) else { return nil }
+        let bounds = rangeAndTotal[0].split(separator: "-", maxSplits: 1)
+        guard bounds.count == 2,
+              let start = Int64(bounds[0]),
+              let end = Int64(bounds[1]),
+              start >= 0,
+              end >= start
+        else { return nil }
+        self.start = start
+        self.end = end
+        self.total = total
+    }
+}
+
+private enum DownloadError: LocalizedError {
+    case network(String)
+    case httpStatus(Int)
+    case invalidResponse(String)
+    case insufficientStorage(needed: String, available: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .network(let detail):
+            "The download was interrupted (\(detail)). Your progress is saved; tap Resume to continue."
+        case .httpStatus(let status):
+            "The model server returned HTTP \(status). Your progress is saved; wait a moment and tap Resume."
+        case .invalidResponse(let message):
+            message
+        case .insufficientStorage(let needed, let available):
+            "Not enough free space. FrankenTTS needs \(needed) available to finish safely; this device currently has \(available)."
+        }
     }
 }
