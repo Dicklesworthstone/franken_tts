@@ -13,12 +13,12 @@ autobins = false
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = { version = "3.5.2", features = ["termination"] }
-ftts-artifacts = { path = "../ftts-artifacts", version = "0.1.8" }
-ftts-core = { path = "../ftts-core", version = "0.1.8" }
-ftts-kernels = { path = "../ftts-kernels", version = "0.1.8" }
-ftts-model-qwen = { path = "../ftts-model-qwen", version = "0.1.8" }
-ftts-video = { path = "../ftts-video", version = "0.1.8" }
-ftts-voicecard = { path = "../ftts-voicecard", version = "0.1.8" }
+ftts-artifacts = { path = "../ftts-artifacts", version = "0.1.10" }
+ftts-core = { path = "../ftts-core", version = "0.1.10" }
+ftts-kernels = { path = "../ftts-kernels", version = "0.1.10" }
+ftts-model-qwen = { path = "../ftts-model-qwen", version = "0.1.10" }
+ftts-video = { path = "../ftts-video", version = "0.1.10" }
+ftts-voicecard = { path = "../ftts-voicecard", version = "0.1.10" }
 fmd-font = { version = "0.1.0", features = ["bundled-faces"] }
 png = "0.18"
 zune-jpeg = "0.5"

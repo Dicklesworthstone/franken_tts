@@ -15,7 +15,8 @@ individual commits are intentionally not cited.
 
 | Version | Date | Status | Summary |
 |---------|------|--------|---------|
-| 0.1.9 | 2026-08-25 | current | the voice compiler: ICL QUALITY packs end to end; enrollment diagnostics; Ctrl-C contract everywhere; micro-q8 artifacts |
+| 0.1.10 | 2026-08-29 | current | 18 built-in voices across all platforms; Accelerate SGEMM kernels; AWQ/GPTQ microdecoder int4; iOS benchmark suite & LabView callouts |
+| 0.1.9 | 2026-08-25 | superseded | the voice compiler: ICL QUALITY packs end to end; enrollment diagnostics; Ctrl-C contract everywhere; micro-q8 artifacts |
 | 0.1.8 | 2026-08-12 | superseded | model downloads survive GitHub throttling: Hugging Face is the primary mirror everywhere |
 | 0.1.7 | 2026-08-12 | superseded | browser memory diet (no double-resident model), native↔browser parity harness, w8a16 multicore |
 | 0.1.6 | 2026-08-10 | superseded | voice cards (a picture that IS the voice), phone↔CLI interop; iOS video export unstuck; output denoising |
@@ -25,6 +26,19 @@ individual commits are intentionally not cited.
 | 0.1.2 | 2026-08-08 | superseded | `ftts convert` works on the real checkpoint; `ftts pull` ships the quantized `.fttsq` |
 | 0.1.1 | 2026-08-08 | superseded | zero-config UX: `ftts pull`, default model cache, m4a/mp3 enrollment |
 | 0.1.0 | 2026-08-08 | first release | f32 reference engine, CLI, conformance ladder, artifact groundwork |
+
+## [0.1.10] - 2026-08-29
+
+Expanded voice roster, Apple Accelerate kernel optimizations, microdecoder int4 quantization pipeline, and iOS profiling & workbench tooling.
+
+### Added
+
+- **11 new built-in preset voice profiles**: Added `liam`, `anthony`, `russell`, `steve`, `daniel`, `meryl`, `laurence`, `jack`, `michael`, `jodie`, and `denzel` to the preset voice roster (expanding built-in voices from 7 to 18) embedded across the CLI binary, C FFI library, WebAssembly module, and web playground UI.
+- **FastEnhancer SGEMM acceleration**: Accelerated FastEnhancer GRU gates and 1D convolutions using Apple Accelerate CBLAS in kernels.
+- **iOS profiling & workbench**: Structured JSONL benchmark runner in LabModel and LabView, signature `VoiceEnrollmentCallout`, adaptive synthesis ETA prediction, Dynamic Type scaling, and waveform scrubbing.
+- **AWQ + GPTQ quantization pipeline**: Activation-aware weight quantization scale search and GPTQ rounding core for microdecoder int4 (`frankentts-ukk6`).
+- **Artifact load progress events**: Emits fine-grained verification progress events across talker, microdecoder, and text embedding stages.
+- **Digest & diagnostic resilience**: Handled non-finite and digital silence pause floors (`-inf`) seamlessly in `.ftvoice` metadata parsing and serialization.
 
 ## [0.1.9] - 2026-08-25
 
