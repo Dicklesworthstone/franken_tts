@@ -10,7 +10,7 @@ struct Preset: Identifiable, Decodable {
     var id: String { name }
 }
 
-struct SynthesisProfile: Decodable {
+struct SynthesisProfile: Decodable, Sendable {
     let totalMs: Double
     let generationMs: Double
     let prefillMs: Double
@@ -52,9 +52,13 @@ struct SynthesisProfile: Decodable {
     }
 }
 
-struct SynthesisOutput {
+struct SynthesisOutput: Sendable {
     let pcm: [Float]
     let profile: SynthesisProfile?
+}
+
+struct MultiVoiceSynthesisInput: Sendable {
+    let speaker: [Float]
 }
 
 struct EngineProgress: Sendable, Equatable {
@@ -121,7 +125,11 @@ struct EngineProgress: Sendable, Equatable {
     }
 }
 
-private final class ProgressCallbackBox: @unchecked Sendable {
+private protocol EngineCancellationTarget: AnyObject {
+    func requestCancellation()
+}
+
+private final class ProgressCallbackBox: EngineCancellationTarget, @unchecked Sendable {
     private let stateLock = NSLock()
     private let publicationLock = NSLock()
     private var cancellationRequested = false
@@ -157,15 +165,15 @@ private final class ProgressCallbackBox: @unchecked Sendable {
 
 private final class EngineCancellationController: @unchecked Sendable {
     private let lock = NSLock()
-    private weak var active: ProgressCallbackBox?
+    private weak var active: (any EngineCancellationTarget)?
 
-    func begin(_ box: ProgressCallbackBox) {
+    func begin(_ box: any EngineCancellationTarget) {
         lock.lock()
         active = box
         lock.unlock()
     }
 
-    func end(_ box: ProgressCallbackBox) {
+    func end(_ box: any EngineCancellationTarget) {
         lock.lock()
         if active === box { active = nil }
         lock.unlock()
@@ -179,6 +187,48 @@ private final class EngineCancellationController: @unchecked Sendable {
     }
 }
 
+private final class MultiVoiceCallbackBox: EngineCancellationTarget, @unchecked Sendable {
+    private let stateLock = NSLock()
+    private let publicationLock = NSLock()
+    private var cancellationRequested = false
+    let publishProgress: @Sendable (Int, EngineProgress) -> Void
+    let publishVoice: @Sendable (Int, SynthesisOutput) -> Void
+
+    init(
+        publishProgress: @escaping @Sendable (Int, EngineProgress) -> Void,
+        publishVoice: @escaping @Sendable (Int, SynthesisOutput) -> Void
+    ) {
+        self.publishProgress = publishProgress
+        self.publishVoice = publishVoice
+    }
+
+    func requestCancellation() {
+        stateLock.lock()
+        cancellationRequested = true
+        stateLock.unlock()
+    }
+
+    func callbackVerdict() -> Int32 {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return cancellationRequested ? 1 : 0
+    }
+
+    func publishAndReturnVerdict(index: Int, progress: EngineProgress) -> Int32 {
+        publicationLock.lock()
+        publishProgress(index, progress)
+        publicationLock.unlock()
+        return callbackVerdict()
+    }
+
+    func publishAndReturnVerdict(index: Int, output: SynthesisOutput) -> Int32 {
+        publicationLock.lock()
+        publishVoice(index, output)
+        publicationLock.unlock()
+        return callbackVerdict()
+    }
+}
+
 private let nativeProgressCallback: @convention(c) (
     UnsafeMutableRawPointer?, UnsafePointer<FttsProgressEvent>?
 ) -> Int32 = { context, eventPointer in
@@ -188,6 +238,35 @@ private let nativeProgressCallback: @convention(c) (
         return box.publishAndReturnVerdict(progress)
     }
     return box.callbackVerdict()
+}
+
+private let nativeMultiVoiceProgressCallback: @convention(c) (
+    UnsafeMutableRawPointer?, Int, UnsafePointer<FttsProgressEvent>?
+) -> Int32 = { context, voiceIndex, eventPointer in
+    guard let context, let eventPointer else { return 0 }
+    let box = Unmanaged<MultiVoiceCallbackBox>.fromOpaque(context).takeUnretainedValue()
+    if let progress = EngineProgress(eventPointer.pointee) {
+        return box.publishAndReturnVerdict(index: voiceIndex, progress: progress)
+    }
+    return box.callbackVerdict()
+}
+
+private let nativeMultiVoiceResultCallback: @convention(c) (
+    UnsafeMutableRawPointer?, Int, UnsafePointer<Float>?, Int, UnsafePointer<CChar>?
+) -> Int32 = { context, voiceIndex, pcmPointer, length, profilePointer in
+    guard let context, let pcmPointer, length > 0 else { return 1 }
+    let box = Unmanaged<MultiVoiceCallbackBox>.fromOpaque(context).takeUnretainedValue()
+    let profile = profilePointer.flatMap { pointer in
+        try? JSONDecoder().decode(
+            SynthesisProfile.self,
+            from: Data(String(cString: pointer).utf8)
+        )
+    }
+    let output = SynthesisOutput(
+        pcm: Array(UnsafeBufferPointer(start: pcmPointer, count: length)),
+        profile: profile
+    )
+    return box.publishAndReturnVerdict(index: voiceIndex, output: output)
 }
 
 enum EngineError: LocalizedError {
@@ -233,6 +312,7 @@ actor Engine {
         modelDirectory: URL,
         onProgress: @escaping @Sendable (EngineProgress) -> Void = { _ in }
     ) throws {
+        guard !Task.isCancelled else { throw EngineError.cancelled }
         guard handle == nil else { return }
         let callback = ProgressCallbackBox(publish: onProgress)
         cancellationController.begin(callback)
@@ -263,6 +343,7 @@ actor Engine {
         seed: UInt64,
         onProgress: @escaping @Sendable (EngineProgress) -> Void = { _ in }
     ) throws -> SynthesisOutput {
+        guard !Task.isCancelled else { throw EngineError.cancelled }
         guard !text.utf8.contains(0) else {
             throw EngineError.native("utterance contains an unsupported NUL character")
         }
@@ -301,6 +382,55 @@ actor Engine {
             pcm: Array(UnsafeBufferPointer(start: pcm, count: length)),
             profile: profile
         )
+    }
+
+    /// Synthesizes one utterance across every supplied voice through one native batch.
+    /// Rust prepares/tokenizes the text and gathers its cold embedding rows exactly once;
+    /// each result still runs a genuine speaker-conditioned autoregressive decode.
+    func synthesizeMany(
+        text: String,
+        voices: [MultiVoiceSynthesisInput],
+        seed: UInt64,
+        onProgress: @escaping @Sendable (Int, EngineProgress) -> Void = { _, _ in },
+        onVoice: @escaping @Sendable (Int, SynthesisOutput) -> Void
+    ) throws {
+        guard !Task.isCancelled else { throw EngineError.cancelled }
+        guard !text.utf8.contains(0) else {
+            throw EngineError.native("utterance contains an unsupported NUL character")
+        }
+        guard let handle else { throw EngineError.native("engine not loaded") }
+        guard !voices.isEmpty else {
+            throw EngineError.native("choose at least one voice to compare")
+        }
+        guard voices.allSatisfy({ input in
+            input.speaker.count == Self.speakerWidth && input.speaker.allSatisfy(\.isFinite)
+        }) else {
+            throw EngineError.native("a comparison voice has a damaged speaker vector")
+        }
+
+        let flatSpeakers = voices.flatMap(\.speaker)
+        let callback = MultiVoiceCallbackBox(
+            publishProgress: onProgress,
+            publishVoice: onVoice
+        )
+        cancellationController.begin(callback)
+        defer { cancellationController.end(callback) }
+        let context = Unmanaged.passUnretained(callback).toOpaque()
+        let code = flatSpeakers.withUnsafeBufferPointer { speakers in
+            ftts_synthesize_many_with_progress(
+                handle,
+                text,
+                speakers.baseAddress,
+                speakers.count,
+                voices.count,
+                seed,
+                nativeMultiVoiceProgressCallback,
+                nativeMultiVoiceResultCallback,
+                context
+            )
+        }
+        if code == FTTS_SYNTH_CANCELLED { throw EngineError.cancelled }
+        guard code == 0 else { throw EngineError.lastFromNative() }
     }
 
     /// Thread-safe and nonisolated so a main-actor Cancel button can signal a native

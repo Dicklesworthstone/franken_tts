@@ -245,6 +245,8 @@ final class LabModel {
     var seed: UInt64 = 0
 
     var isSynthesizing = false
+    /// True while Voice Lab owns the engine for an all-voice comparison run.
+    var isComparingVoices = false
     var isLoadingModel = false
     var isEngineWarm = false
     var synthesisSeconds = 0.0
@@ -284,9 +286,19 @@ final class LabModel {
 
     var canSynthesizeFromCommand: Bool {
         !isSynthesizing
+            && !isComparingVoices
             && !isLoadingModel
             && store.phase == .ready
             && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var canCompareVoices: Bool {
+        !isSynthesizing
+            && !isComparingVoices
+            && !isLoadingModel
+            && store.phase == .ready
+            && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !presets.isEmpty
     }
 
     func speakerVector() throws -> [Float] {
@@ -796,7 +808,7 @@ final class LabModel {
 
     /// Frees the ~2.3 GB engine heap; the next synthesis reloads it.
     func unloadEngineForMemoryPressure() {
-        guard !isSynthesizing else { return }
+        guard !isSynthesizing, !isComparingVoices else { return }
         // A callback already queued onto the main actor can outlive cancellation of
         // the warm task. Fence it before changing the visible warm/loading state.
         progressGeneration &+= 1
@@ -815,7 +827,8 @@ final class LabModel {
         guard store.phase == .ready,
               !isEngineWarm,
               engineWarmTask == nil,
-              !isSynthesizing
+              !isSynthesizing,
+              !isComparingVoices
         else { return }
 
         isLoadingModel = true
@@ -972,6 +985,8 @@ struct LabView: View {
     @State private var showGalaxy = false
     @State private var showSpecimen = false
     @State private var showVoiceLab = ProcessInfo.processInfo.environment["FTTS_OPEN_VOICE_LIBRARY"] == "1"
+    @State private var showVoiceComparison =
+        ProcessInfo.processInfo.environment["FTTS_OPEN_VOICE_COMPARISON"] == "1"
     #if DEBUG
         @State private var showSynthesisInstrument =
             ProcessInfo.processInfo.environment["FTTS_DEBUG_SYNTHESIS_UI"] == "1"
@@ -1129,6 +1144,14 @@ struct LabView: View {
                             Button("Done") { showVoiceLab = false }
                         }
                     }
+            }
+            .preferredColorScheme(.dark)
+        }
+        .fullScreenCover(isPresented: $showVoiceComparison) {
+            NavigationStack {
+                VoiceComparisonView(model: model) {
+                    showVoiceComparison = false
+                }
             }
             .preferredColorScheme(.dark)
         }
@@ -2035,25 +2058,39 @@ struct LabView: View {
                     .buttonStyle(GhostButtonStyle())
                     .accessibilityLabel("Randomize seed")
                 }
-                Button {
-                    focusedField = nil
-                    model.synthesize()
-                } label: {
-                    HStack(spacing: 8) {
-                        if model.isSynthesizing {
-                            ProgressView().tint(.white).controlSize(.small)
+                HStack(spacing: 10) {
+                    Button {
+                        focusedField = nil
+                        model.synthesize()
+                    } label: {
+                        HStack(spacing: 8) {
+                            if model.isSynthesizing {
+                                ProgressView().tint(.white).controlSize(.small)
+                            }
+                            Text(
+                                model.isSynthesizing
+                                    ? "Synthesizing"
+                                    : (model.isLoadingModel ? "Warming model…" : "⚡ Synthesize")
+                            )
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.72)
                         }
-                        Text(
-                            model.isSynthesizing
-                                ? "Synthesizing"
-                                : (model.isLoadingModel ? "Warming model…" : "⚡ Synthesize")
-                        )
                     }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .disabled(!model.canSynthesizeFromCommand)
+
+                    Button {
+                        focusedField = nil
+                        showVoiceComparison = true
+                    } label: {
+                        Label("Voice Lab", systemImage: "person.3.sequence.fill")
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.72)
+                    }
+                    .buttonStyle(GhostButtonStyle(tint: Lab.cyan))
+                    .disabled(!model.canCompareVoices)
+                    .accessibilityHint("Speaks the same excerpt with every available voice")
                 }
-                .buttonStyle(PrimaryButtonStyle())
-                .disabled(
-                    !model.canSynthesizeFromCommand
-                )
                 if model.isSynthesizing {
                     GalvanicVoiceForge(
                         telemetry: model.forge,
