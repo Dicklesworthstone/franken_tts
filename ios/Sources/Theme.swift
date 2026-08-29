@@ -28,6 +28,40 @@ enum Lab {
     }
 }
 
+/// A shared FrankenSuite wordmark: full-size product initials with the
+/// connective uppercase letters set as small caps. This preserves the playful
+/// laboratory voice without flattening the app name into one visual block.
+struct FrankenWordmark: View {
+    let productInitial: String
+    let productRemainder: String
+    let fullName: String
+    var size: CGFloat = 22
+    var accent: Color = Lab.emerald
+
+    var body: some View {
+        (
+            Text("F")
+                .font(.system(size: Lab.typeSize(size), weight: .black, design: .monospaced))
+                .foregroundColor(accent)
+            + Text("RANKEN")
+                .font(.system(size: Lab.typeSize(size * 0.66), weight: .black, design: .monospaced))
+                .foregroundColor(Lab.textPrimary.opacity(0.88))
+            + Text(productInitial)
+                .font(.system(size: Lab.typeSize(size), weight: .black, design: .monospaced))
+                .foregroundColor(accent)
+            + Text(productRemainder)
+                .font(.system(size: Lab.typeSize(size * 0.66), weight: .black, design: .monospaced))
+                .foregroundColor(Lab.textPrimary.opacity(0.88))
+        )
+        .kerning(0.8)
+        .lineLimit(1)
+        .minimumScaleFactor(0.72)
+        .allowsTightening(true)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(fullName)
+    }
+}
+
 private struct CatalystReadableType: ViewModifier {
     func body(content: Content) -> some View {
 #if targetEnvironment(macCatalyst)

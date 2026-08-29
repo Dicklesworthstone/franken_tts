@@ -1047,9 +1047,11 @@ struct LabView: View {
             MonsterStatusMark(mood: monsterMood, instrument: .voice)
                 .frame(width: 52, height: 52)
             VStack(alignment: .leading, spacing: 2) {
-                Text("FrankenTTS")
-                    .font(.system(size: Lab.typeSize(22), weight: .black))
-                    .foregroundStyle(Lab.textPrimary)
+                FrankenWordmark(
+                    productInitial: "TTS",
+                    productRemainder: "",
+                    fullName: "FrankenTTS"
+                )
                 Text("VOICE_ALIVE")
                     .font(.system(size: Lab.typeSize(8), weight: .black, design: .monospaced))
                     .kerning(2)
