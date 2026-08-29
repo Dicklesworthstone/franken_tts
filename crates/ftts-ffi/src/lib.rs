@@ -1519,6 +1519,31 @@ mod tests {
         assert_eq!(events, vec![event]);
         assert_eq!(events[0].abi_version, FTTS_PROGRESS_ABI_VERSION);
     }
+    #[test]
+    fn null_callbacks_are_silent_no_ops() {
+        // The plain (non-`_with_progress`) ABI surface is built on exactly this
+        // emitter configuration: a NULL callback must neither panic nor request
+        // cancellation, and synthesis must proceed.
+        let emitter = ProgressEmitter {
+            callback: None,
+            ctx: std::ptr::null_mut(),
+            cancellation: Some(CancellationToken::new()),
+        };
+        assert!(emitter.emit(FttsProgressEvent::new(
+            FTTS_PROGRESS_KIND_UNIT,
+            FTTS_PROGRESS_STAGE_FRAMES,
+        )));
+        let batch_emitter = VoiceProgressEmitter {
+            callback: None,
+            ctx: std::ptr::null_mut(),
+            voice_index: 0,
+            cancellation: CancellationToken::new(),
+        };
+        batch_emitter.emit(FttsProgressEvent::new(
+            FTTS_PROGRESS_KIND_STAGE_FINISHED,
+            FTTS_PROGRESS_STAGE_SYNTHESIS,
+        ));
+    }
 
     #[test]
     fn every_preset_is_exactly_one_speaker_vector() {
@@ -1707,6 +1732,68 @@ mod tests {
             }),
             "missing codec packet progress: {observed:?}"
         );
+        // pbrj.2: the single-voice stream is ordered and terminates exactly once.
+        // The codec worker drains concurrently, so packets MAY follow the terminal
+        // event, but nothing else may; generation events all precede it.
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| {
+                    event.kind == FTTS_PROGRESS_KIND_STAGE_FINISHED
+                        && event.stage == FTTS_PROGRESS_STAGE_SYNTHESIS
+                })
+                .count(),
+            1,
+            "exactly one terminal event expected: {observed:?}"
+        );
+        let terminal_pos = observed
+            .iter()
+            .position(|event| {
+                event.kind == FTTS_PROGRESS_KIND_STAGE_FINISHED
+                    && event.stage == FTTS_PROGRESS_STAGE_SYNTHESIS
+            })
+            .expect("terminal asserted above");
+        assert!(
+            observed[..terminal_pos]
+                .iter()
+                .any(|event| event.kind == FTTS_PROGRESS_KIND_ADMISSION),
+            "admission must precede the terminal: {observed:?}"
+        );
+        let started_pos = observed
+            .iter()
+            .position(|event| {
+                event.kind == FTTS_PROGRESS_KIND_STAGE_STARTED
+                    && event.stage == FTTS_PROGRESS_STAGE_SYNTHESIS
+            })
+            .expect("synthesis stage must start: {observed:?}");
+        let first_frame_pos = observed
+            .iter()
+            .position(|event| event.stage == FTTS_PROGRESS_STAGE_FRAMES)
+            .expect("frame progress asserted above");
+        assert!(
+            started_pos < first_frame_pos && first_frame_pos < terminal_pos,
+            "stage start < frame work < terminal required: {observed:?}"
+        );
+        assert!(
+            observed[terminal_pos + 1..]
+                .iter()
+                .all(|event| event.stage == FTTS_PROGRESS_STAGE_CODEC),
+            "only codec drain may follow the terminal: {:?}",
+            &observed[terminal_pos + 1..]
+        );
+        let ascending = |stage: u32, label: &str| {
+            let currents: Vec<u64> = observed
+                .iter()
+                .filter(|event| event.kind == FTTS_PROGRESS_KIND_UNIT && event.stage == stage)
+                .map(|event| event.current)
+                .collect();
+            assert!(
+                currents.windows(2).all(|pair| pair[0] < pair[1]),
+                "{label} currents must strictly ascend: {currents:?}"
+            );
+        };
+        ascending(FTTS_PROGRESS_STAGE_FRAMES, "frame");
+        ascending(FTTS_PROGRESS_STAGE_CODEC, "codec");
         drop(observed);
         // SAFETY: `pcm`/`len` are exactly the buffer this crate allocated in the call above, freed
         // once; `engine` is the handle from the matching open, closed once.
@@ -1762,8 +1849,16 @@ mod tests {
             }));
         }
         drop(progress);
+        // pbrj.2 callback lifetime: callbacks are synchronous inside ABI calls, so
+        // after close returns, no further event may ever be recorded.
+        let events_before_close = events.lock().unwrap().len();
         // SAFETY: as above — one close for one successful open.
         unsafe { ftts_engine_close(engine) };
+        assert_eq!(
+            events.lock().unwrap().len(),
+            events_before_close,
+            "no callback may fire after the engine is closed"
+        );
     }
 
     #[test]
@@ -1786,7 +1881,7 @@ mod tests {
             0
         );
         assert!(rgb.iter().any(|&b| b != 0), "frame should not be black");
-        // SAFETY: as above; a past-the-end index is a value error the callee rejects before it
+        // SAFETY: a past-the-end index is a value error the callee rejects before it
         // touches `out`, so the buffer contract is unchanged.
         assert_eq!(
             unsafe { ftts_video_render_frame(renderer, frames, rgb.as_mut_ptr()) },
