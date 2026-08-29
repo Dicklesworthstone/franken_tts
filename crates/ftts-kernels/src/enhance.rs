@@ -229,6 +229,33 @@ fn enhancer_conv_accelerate_available() -> bool {
     false
 }
 
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
+fn enhancer_concat_accelerate_available() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        enhancer_accelerate_enabled()
+            && !matches!(
+                std::env::var("FTTS_ENHANCE_CONCAT_ACCELERATE")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "0" | "off" | "false" | "no"
+            )
+    })
+}
+
+#[cfg(not(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+)))]
+fn enhancer_concat_accelerate_available() -> bool {
+    false
+}
+
 /// Batch the 48 independent frequency-token GRU input and recurrent
 /// projections into two SGEMMs. This changes only the floating-point reduction
 /// order; the scalar gate activation/update remains the oracle below.
@@ -988,6 +1015,56 @@ fn conv_k_same_scalar(conv: &Conv1d, x: &[f32], width: usize, act: bool) -> Vec<
 
 /// 1x1 conv over the channel concat `[x ; skip]`, then SiLU.
 fn concat_mix(conv: &Conv1d, x: &[f32], skip: &[f32], width: usize) -> Vec<f32> {
+    if let Some(out) = accelerated_concat_mix(conv, x, skip, width) {
+        return out;
+    }
+    concat_mix_scalar(conv, x, skip, width)
+}
+
+fn accelerated_concat_mix(
+    conv: &Conv1d,
+    x: &[f32],
+    skip: &[f32],
+    width: usize,
+) -> Option<Vec<f32>> {
+    if !enhancer_concat_accelerate_available() {
+        return None;
+    }
+    let half = conv.in_ch / 2;
+    let mut packed_in = vec![0.0f32; width * conv.in_ch];
+    for position in 0..width {
+        let row = &mut packed_in[position * conv.in_ch..(position + 1) * conv.in_ch];
+        for channel in 0..half {
+            row[channel] = x[channel * width + position];
+            row[half + channel] = skip[channel * width + position];
+        }
+    }
+    let mut packed_out = vec![0.0f32; width * conv.out_ch];
+    for row in packed_out.chunks_exact_mut(conv.out_ch) {
+        row.copy_from_slice(&conv.bias);
+    }
+    if !super::f32ref::accelerate_sgemm(
+        &packed_in,
+        &conv.weight,
+        width,
+        conv.in_ch,
+        conv.out_ch,
+        1.0,
+        false,
+        &mut packed_out,
+    ) {
+        return None;
+    }
+    let mut out = vec![0.0f32; conv.out_ch * width];
+    for position in 0..width {
+        for channel in 0..conv.out_ch {
+            out[channel * width + position] = silu(packed_out[position * conv.out_ch + channel]);
+        }
+    }
+    Some(out)
+}
+
+fn concat_mix_scalar(conv: &Conv1d, x: &[f32], skip: &[f32], width: usize) -> Vec<f32> {
     let half = conv.in_ch / 2;
     let mut out = vec![0.0f32; conv.out_ch * width];
     for o in 0..conv.out_ch {
@@ -1309,6 +1386,36 @@ mod tests {
         let input: Vec<f32> = (0..CH * F_ENC).map(|i| value(i, 103, 0.0015)).collect();
         let expected = conv_k_same_scalar(&conv, &input, F_ENC, true);
         let got = accelerated_conv_k_same(&conv, &input, F_ENC, true)
+            .expect("the Apple test build enables Accelerate SGEMM");
+        let max_abs = expected
+            .iter()
+            .zip(got.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs < 3.0e-6, "SGEMM vs scalar max abs error {max_abs}");
+    }
+
+    #[cfg(all(
+        feature = "accelerate-sgemm",
+        any(target_os = "macos", target_os = "ios")
+    ))]
+    #[test]
+    fn accelerated_concat_mix_tracks_the_scalar_oracle() {
+        let value = |index: usize, modulus: usize, scale: f32| {
+            ((index.wrapping_mul(43).wrapping_add(17) % modulus) as f32 - (modulus / 2) as f32)
+                * scale
+        };
+        let conv = Conv1d {
+            weight: (0..CH * 2 * CH).map(|i| value(i, 113, 0.0007)).collect(),
+            bias: (0..CH).map(|i| value(i, 41, 0.001)).collect(),
+            out_ch: CH,
+            in_ch: 2 * CH,
+            k: 1,
+        };
+        let input: Vec<f32> = (0..CH * F_ENC).map(|i| value(i, 107, 0.0014)).collect();
+        let skip: Vec<f32> = (0..CH * F_ENC).map(|i| value(i, 101, 0.0012)).collect();
+        let expected = concat_mix_scalar(&conv, &input, &skip, F_ENC);
+        let got = accelerated_concat_mix(&conv, &input, &skip, F_ENC)
             .expect("the Apple test build enables Accelerate SGEMM");
         let max_abs = expected
             .iter()

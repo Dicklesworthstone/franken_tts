@@ -1137,6 +1137,13 @@ struct LabView: View {
                     .buttonStyle(.plain)
             }
 
+            VoiceEnrollmentCallout(
+                isReady: model.store.phase == .ready,
+                compact: true
+            ) {
+                openEnrollment(target: nil)
+            }
+
             if vertical {
                 Button { showVoiceLab = true } label: {
                     HStack(spacing: 12) {
@@ -1178,16 +1185,6 @@ struct LabView: View {
                                 isPersonal: true
                             ) { model.selectedVoice = "voice:\(voice.id.uuidString)" }
                         }
-                        Button { openEnrollment(target: nil) } label: {
-                            Label("Clone", systemImage: "waveform.badge.plus")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(Lab.emerald)
-                                .padding(.horizontal, 13)
-                                .frame(height: 42)
-                                .background(Lab.emerald.opacity(0.08), in: Capsule())
-                                .overlay(Capsule().strokeBorder(Lab.emerald.opacity(0.25), lineWidth: 1))
-                        }
-                        .buttonStyle(.plain)
                     }
                     .padding(.vertical, 2)
                 }
@@ -1359,6 +1356,12 @@ struct LabView: View {
         LabPanel {
             VStack(alignment: .leading, spacing: 12) {
                 LabLabel(text: "02 · The Voice")
+                VoiceEnrollmentCallout(
+                    isReady: model.store.phase == .ready,
+                    compact: false
+                ) {
+                    openEnrollment(target: nil)
+                }
                 LazyVGrid(
                     columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10
                 ) {
@@ -1384,16 +1387,6 @@ struct LabView: View {
                                     model.selectedVoice = "matt"
                                 }
                             })
-                    }
-                    VoiceTile(
-                        name: "+ new voice",
-                        character: "read a few sentences to clone one",
-                        selected: false,
-                        accent: true
-                    ) {
-                        if model.store.phase == .ready {
-                            openEnrollment(target: nil)
-                        }
                     }
                 }
                 .animation(.snappy, value: model.library.voices)
@@ -1838,6 +1831,138 @@ private struct ModelPromise: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
         .background(Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+/// Enrollment is the app's signature capability, so it gets a real call to
+/// action instead of masquerading as one more preset in the voice grid.
+private struct VoiceEnrollmentCallout: View {
+    let isReady: Bool
+    let compact: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ViewThatFits(in: .horizontal) {
+                calloutLabel(showActionTitle: true)
+                calloutLabel(showActionTitle: false)
+            }
+            .padding(.horizontal, compact ? 13 : 16)
+            .padding(.vertical, compact ? 11 : 14)
+            .frame(maxWidth: .infinity, minHeight: compact ? 72 : 84, alignment: .leading)
+            .background {
+                ZStack(alignment: .topTrailing) {
+                    LinearGradient(
+                        colors: [
+                            Lab.emeraldDeep.opacity(0.92),
+                            Lab.emerald.opacity(0.18),
+                            Lab.cyan.opacity(0.07),
+                            Color.black.opacity(0.76)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    Circle()
+                        .fill(Lab.emerald.opacity(0.16))
+                        .frame(width: 112, height: 112)
+                        .blur(radius: 28)
+                        .offset(x: 36, y: -46)
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [Lab.emerald.opacity(0.9), Lab.cyan.opacity(0.34), Lab.emerald.opacity(0.18)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1.25
+                    )
+            }
+            .shadow(color: Lab.emerald.opacity(0.18), radius: 16, y: 7)
+            .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        }
+        .buttonStyle(VoiceEnrollmentCalloutStyle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Create your own voice")
+        .accessibilityValue(
+            isReady
+                ? "Ready. Record about thirty seconds. Processing stays on this device."
+                : "Voice model setup required first."
+        )
+        .accessibilityHint(isReady ? "Opens the private voice recorder" : "Opens model setup")
+    }
+
+    private func calloutLabel(showActionTitle: Bool) -> some View {
+        HStack(spacing: compact ? 11 : 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.black.opacity(0.34))
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.13), lineWidth: 1)
+                Image(systemName: "waveform.badge.plus")
+                    .font(.system(size: Lab.typeSize(compact ? 19 : 22), weight: .bold))
+                    .foregroundStyle(.white)
+                    .symbolRenderingMode(.hierarchical)
+            }
+            .frame(width: compact ? 46 : 52, height: compact ? 46 : 52)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("SIGNATURE FEATURE")
+                    .font(.system(size: Lab.typeSize(compact ? 8 : 9), weight: .black, design: .monospaced))
+                    .kerning(1.35)
+                    .foregroundStyle(Lab.emerald)
+                    .lineLimit(1)
+                Text("Create your own voice")
+                    .font(.system(size: Lab.typeSize(compact ? 15 : 17), weight: .black))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
+                Text(
+                    isReady
+                        ? "Read for about 30 seconds · private and on-device"
+                        : "Finish model setup, then record privately on-device"
+                )
+                .font(.system(size: Lab.typeSize(compact ? 10 : 11), weight: .medium))
+                .foregroundStyle(Lab.textPrimary.opacity(0.78))
+                // The dashboard sidebar is narrower than an iPhone. Keep the
+                // headline intact and let this supporting promise wrap instead.
+                .lineLimit(2)
+                .minimumScaleFactor(0.78)
+            }
+
+            Spacer(minLength: 4)
+
+            if showActionTitle {
+                HStack(spacing: 5) {
+                    Text(isReady ? "Start" : "Set up")
+                    Image(systemName: "arrow.right")
+                }
+                .font(.system(size: Lab.typeSize(10), weight: .black, design: .monospaced))
+                .textCase(.uppercase)
+                .foregroundStyle(Color.black.opacity(0.82))
+                .padding(.horizontal, 11)
+                .frame(minHeight: 34)
+                .background(Lab.emerald, in: Capsule())
+            } else {
+                Image(systemName: "arrow.right.circle.fill")
+                    .font(.system(size: Lab.typeSize(24), weight: .bold))
+                    .foregroundStyle(Lab.emerald)
+            }
+        }
+    }
+}
+
+private struct VoiceEnrollmentCalloutStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.988 : 1)
+            .brightness(configuration.isPressed ? -0.04 : 0)
+            .animation(.easeOut(duration: 0.14), value: configuration.isPressed)
+            .hoverEffect(.lift)
     }
 }
 
