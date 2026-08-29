@@ -51,6 +51,7 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
     @Binding var isFocused: Bool
     let maximumLength: Int
     let focusRequest: Int
+    let selectAllRequest: Int
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -104,15 +105,25 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
                 textView.becomeFirstResponder()
             }
         }
+
+        if context.coordinator.lastSelectAllRequest != selectAllRequest {
+            context.coordinator.lastSelectAllRequest = selectAllRequest
+            DispatchQueue.main.async {
+                textView.becomeFirstResponder()
+                textView.selectAll(nil)
+            }
+        }
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
         var parent: NativeUtteranceEditor
         var lastFocusRequest: Int
+        var lastSelectAllRequest: Int
 
         init(parent: NativeUtteranceEditor) {
             self.parent = parent
             lastFocusRequest = parent.focusRequest
+            lastSelectAllRequest = parent.selectAllRequest
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
@@ -1133,7 +1144,6 @@ final class LabModel {
 
 struct LabView: View {
     private enum EditorFocus: Hashable {
-        case utterance
         case seed
     }
 
@@ -1160,6 +1170,8 @@ struct LabView: View {
     @State private var voiceSearchText = ""
     @State private var voiceLibraryFilter: VoiceLibraryFilter = .all
     @State private var utteranceFocusRequest = 0
+    @State private var utteranceSelectAllRequest = 0
+    @State private var isUtteranceFocused = false
     @State private var phoneWorkspaceHeight: CGFloat = 0
     /// Bumped to refresh the play/pause icon, which tracks external playback state.
     @State private var playbackTick = 0
@@ -1225,14 +1237,14 @@ struct LabView: View {
                         // Scrolling switches on only for genuinely taller content or
                         // while editing, without replacing the UIKit editor hierarchy.
                         .scrollDisabled(
-                            focusedField == nil
+                            !isUtteranceFocused && focusedField == nil
                                 && phoneWorkspaceHeight <= geometry.size.height + 1
                         )
                         .onPreferenceChange(PhoneWorkspaceHeightKey.self) { height in
                             phoneWorkspaceHeight = height
                         }
-                        .onChange(of: focusedField) { _, field in
-                            guard field == .utterance else { return }
+                        .onChange(of: isUtteranceFocused) { _, focused in
+                            guard focused else { return }
                             Task { @MainActor in
                                 // Wait for the keyboard's safe-area animation, then
                                 // keep the complete composer (not merely its cursor)
@@ -1310,6 +1322,12 @@ struct LabView: View {
                     }
             }
             .preferredColorScheme(.dark)
+            // The share button lives inside this full-screen cover, so this cover
+            // must own the card sheet. Asking the obscured root view to present a
+            // second modal could be delayed or silently dropped by UIKit.
+            .sheet(item: $cardVoice) { voice in
+                VoiceCardSheet(voice: voice)
+            }
         }
         .fullScreenCover(isPresented: $showVoiceComparison) {
             NavigationStack {
@@ -1328,9 +1346,6 @@ struct LabView: View {
         #endif
         .sheet(isPresented: $showGalaxy) {
             VoiceGalaxyView(presets: model.presets, enrolled: model.library.voices)
-        }
-        .sheet(item: $cardVoice) { voice in
-            VoiceCardSheet(voice: voice)
         }
     }
 
@@ -1500,7 +1515,7 @@ struct LabView: View {
             VoiceForgeCommandActions(
                 importFile: { showDesktopImporter = true },
                 synthesize: {
-                    focusedField = nil
+                    dismissKeyboard()
                     model.synthesize()
                 },
                 stop: { model.cancelSynthesis() },
@@ -1510,7 +1525,8 @@ struct LabView: View {
                 },
                 canSynthesize: model.canSynthesizeFromCommand,
                 canStop: model.isSynthesizing,
-                canTogglePlayback: model.player != nil && focusedField == nil
+                canTogglePlayback:
+                    model.player != nil && focusedField == nil && !isUtteranceFocused
             )
         )
     }
@@ -1518,7 +1534,7 @@ struct LabView: View {
     private func consumeStagedText() {
         guard let staged = FrankenTTSSharedStore.consumeStagedText(), !staged.isEmpty else { return }
         model.text = String(staged.prefix(JokeLibrary.maximumUtteranceLength))
-        focusedField = .utterance
+        focusUtteranceAfterCurrentTap()
     }
 
     private func handleDeepLink(_ url: URL) {
@@ -2105,7 +2121,26 @@ struct LabView: View {
                 HStack(spacing: 8) {
                     LabLabel(text: "03 · The Utterance")
                     Spacer()
-                    if focusedField == .utterance {
+                    if isUtteranceFocused {
+                        Button {
+                            selectAllUtterance()
+                        } label: {
+                            Image(systemName: "text.badge.checkmark")
+                        }
+                        .buttonStyle(GhostButtonStyle())
+                        .disabled(model.text.isEmpty)
+                        .accessibilityLabel("Select all")
+                        .accessibilityHint("Selects the entire utterance so typing replaces it")
+                        Button {
+                            model.text = ""
+                            focusUtteranceAfterCurrentTap()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                        .disabled(model.text.isEmpty)
+                        .accessibilityLabel("Clear")
+                        .accessibilityHint("Removes the current utterance")
                         Button {
                             dismissKeyboard()
                         } label: {
@@ -2113,20 +2148,21 @@ struct LabView: View {
                         }
                         .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
                         .accessibilityHint("Finishes editing and hides the keyboard")
-                    }
-                    Button("Select all") { selectAllUtterance() }
-                        .buttonStyle(GhostButtonStyle())
+                    } else {
+                        Button("Select all") { selectAllUtterance() }
+                            .buttonStyle(GhostButtonStyle())
+                            .disabled(model.text.isEmpty)
+                            .accessibilityHint("Selects the entire utterance so typing replaces it")
+                        Button {
+                            model.text = ""
+                            focusUtteranceAfterCurrentTap()
+                        } label: {
+                            Label("Clear", systemImage: "xmark.circle.fill")
+                        }
+                        .buttonStyle(GhostButtonStyle(tint: Lab.danger))
                         .disabled(model.text.isEmpty)
-                        .accessibilityHint("Selects the entire utterance so typing replaces it")
-                    Button {
-                        model.text = ""
-                        focusUtteranceAfterCurrentTap()
-                    } label: {
-                        Label("Clear", systemImage: "xmark.circle.fill")
+                        .accessibilityHint("Removes the current utterance")
                     }
-                    .buttonStyle(GhostButtonStyle(tint: Lab.danger))
-                    .disabled(model.text.isEmpty)
-                    .accessibilityHint("Removes the current utterance")
                 }
 
                 ZStack(alignment: .topLeading) {
@@ -2140,30 +2176,22 @@ struct LabView: View {
                     }
                     NativeUtteranceEditor(
                         text: $model.text,
-                        isFocused: Binding(
-                            get: { focusedField == .utterance },
-                            set: { focused in
-                                if focused {
-                                    focusedField = .utterance
-                                } else if focusedField == .utterance {
-                                    focusedField = nil
-                                }
-                            }
-                        ),
+                        isFocused: $isUtteranceFocused,
                         maximumLength: JokeLibrary.maximumUtteranceLength,
-                        focusRequest: utteranceFocusRequest
+                        focusRequest: utteranceFocusRequest,
+                        selectAllRequest: utteranceSelectAllRequest
                     )
                 }
                 // More vertical room makes drag handles and the magnifier
                 // practical on a phone instead of fighting a three-line box.
                 // Never let keyboard-driven relayout stretch the empty editor into
                 // a large black void. Long utterances scroll inside this native field.
-                .frame(height: focusedField == .utterance ? 108 : (compact ? 104 : 138))
+                .frame(height: isUtteranceFocused ? 108 : (compact ? 104 : 138))
                 .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10)
                         .strokeBorder(
-                            focusedField == .utterance
+                            isUtteranceFocused
                                 ? Lab.emerald.opacity(0.62) : Color.clear,
                             lineWidth: 1
                         )
@@ -2174,7 +2202,7 @@ struct LabView: View {
                         .foregroundStyle(Lab.textSecondary)
                     Button {
                         model.text = JokeLibrary.random(excluding: model.text)
-                        focusedField = nil
+                        dismissKeyboard()
                     } label: {
                         Image(systemName: "dice.fill")
                     }
@@ -2233,7 +2261,7 @@ struct LabView: View {
                 }
                 HStack(spacing: 10) {
                     Button {
-                        focusedField = nil
+                        dismissKeyboard()
                         model.synthesize()
                     } label: {
                         HStack(spacing: 8) {
@@ -2253,7 +2281,7 @@ struct LabView: View {
                     .disabled(!model.canSynthesizeFromCommand)
 
                     Button {
-                        focusedField = nil
+                        dismissKeyboard()
                         showVoiceComparison = true
                     } label: {
                         Label("Voice Lab", systemImage: "person.3.sequence.fill")
@@ -2411,30 +2439,22 @@ struct LabView: View {
     }
 
     private func selectAllUtterance() {
-        // The parent tap gesture dismisses the keyboard for taps outside an editor.
-        // Restore focus after that gesture finishes, then wait one more run-loop turn
-        // for UIKit to install the text view as first responder before selecting.
-        focusUtteranceAfterCurrentTap {
-            UIApplication.shared.sendAction(
-                #selector(UIResponder.selectAll(_:)),
-                to: nil,
-                from: nil,
-                for: nil
-            )
+        DispatchQueue.main.async {
+            isUtteranceFocused = true
+            utteranceFocusRequest &+= 1
+            utteranceSelectAllRequest &+= 1
         }
     }
 
-    private func focusUtteranceAfterCurrentTap(action: (() -> Void)? = nil) {
+    private func focusUtteranceAfterCurrentTap() {
         DispatchQueue.main.async {
-            focusedField = .utterance
+            isUtteranceFocused = true
             utteranceFocusRequest &+= 1
-            DispatchQueue.main.async {
-                action?()
-            }
         }
     }
 
     private func dismissKeyboard() {
+        isUtteranceFocused = false
         focusedField = nil
         UIApplication.shared.sendAction(
             #selector(UIResponder.resignFirstResponder),
@@ -2501,13 +2521,20 @@ struct LabView: View {
                 state ^= state << 17
                 return Float(Double(state >> 40) / Double(1 << 24) - 0.5) * 3
             }
-            cardVoice = EnrolledVoice(id: UUID(), name: "Jeff", vector: vector)
+            let debugVoice = EnrolledVoice(id: UUID(), name: "Jeff", vector: vector)
+            showVoiceLab = true
+            Task { @MainActor in
+                // The library cover must finish presenting before it can own the
+                // nested card sheet.
+                try? await Task.sleep(for: .milliseconds(250))
+                cardVoice = debugVoice
+            }
             // Round-trip the REAL composed PNG through both import paths: the raw
             // bytes exercise the lossless chunk; a re-encode via UIImage strips the
             // private chunk, forcing the pixel decoder against the exact pixels
             // ImageRenderer produced (which the off-device harness only approximates).
             Task {
-                guard let png = try? VoicePrintCard.pngData(name: "Jeff", vector: vector)
+                guard let png = try? await VoicePrintCard.pngData(name: "Jeff", vector: vector)
                 else {
                     NSLog("FTTS_DEBUG_CARD render FAILED")
                     return
