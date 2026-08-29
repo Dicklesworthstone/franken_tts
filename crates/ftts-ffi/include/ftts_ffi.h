@@ -100,6 +100,26 @@ int32_t ftts_synthesize_with_progress(FttsEngine *engine, const char *text,
                                       uint64_t seed, FttsProgressFn on_progress,
                                       void *ctx, float **out_pcm, size_t *out_len);
 
+/* Multi-voice comparison: tokenization and sparse cold text-row preparation happen
+ * once, then every x-vector runs through its own real speaker-conditioned prefill,
+ * autoregressive generation, and codec decode. Voices are serial to bound phone memory.
+ *
+ * `speakers` is a flat voice_count * FTTS_SPEAKER_WIDTH matrix. Progress identifies
+ * the zero-based voice index. `on_voice` receives borrowed mono 24 kHz f32 PCM and
+ * profile JSON valid only during that callback; copy anything retained. Returning
+ * nonzero from either callback cooperatively cancels the batch before another voice.
+ * Callbacks may run on engine threads, must return promptly, must not unwind, and must
+ * not call back into the same engine. `on_voice` is required; progress may be NULL. */
+typedef int32_t (*FttsVoiceProgressFn)(void *ctx, size_t voice_index,
+                                       const FttsProgressEvent *event);
+typedef int32_t (*FttsVoiceResultFn)(void *ctx, size_t voice_index,
+                                     const float *pcm, size_t len,
+                                     const char *profile_json);
+int32_t ftts_synthesize_many_with_progress(
+    FttsEngine *engine, const char *text, const float *speakers,
+    size_t speaker_len, size_t voice_count, uint64_t seed,
+    FttsVoiceProgressFn on_progress, FttsVoiceResultFn on_voice, void *ctx);
+
 /* JSON attribution for the most recent successful synthesis. The pointer remains valid
  * until the next successful synthesis or engine close. Durations are milliseconds;
  * codec_active_ms overlaps generation_ms because codec decode runs concurrently. */

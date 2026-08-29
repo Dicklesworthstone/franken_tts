@@ -31,6 +31,7 @@ use ftts_core::{
 };
 use ftts_model_qwen::checkpoint::{
     CODEC_LANGUAGE_ENGLISH_ID, CheckpointError, CodecCheckpoint, TALKER_HIDDEN, TalkerCheckpoint,
+    TextEmbeddingTable,
 };
 use ftts_model_qwen::generate::{
     Int8Route, QwenGenerator, QwenGeneratorConfig, ReferencePrompt, prepare_int8_route,
@@ -1814,6 +1815,111 @@ pub fn synthesize(
     text_feed: Option<&ftts_core::BoundedReceiver<ftts_core::TextControl>>,
     pcm_sink: Option<&mut dyn PcmPacketSink>,
 ) -> Result<SynthesizedAudio, FttsError> {
+    synthesize_inner(
+        model,
+        engine,
+        request,
+        voice,
+        None,
+        seed,
+        cancellation,
+        observer,
+        packet_frames,
+        text_feed,
+        pcm_sink,
+    )
+}
+
+/// Voice-independent work shared by a fair multi-voice comparison.
+///
+/// The tokenizer, assistant wrapper, and sparse cold-text row gather depend on the
+/// utterance and normalization policy, not the speaker x-vector. Preparing them once
+/// prevents an `N`-voice comparison from re-reading the same cold rows `N` times. The
+/// speaker still enters the prompt prefill, so every autoregressive generation remains
+/// separate; sharing anything after that point would silently stop comparing real voices.
+pub struct PreparedXVectorSynthesis {
+    request: SynthesisRequest,
+    prepared: PreparedText,
+    table: TextEmbeddingTable,
+}
+
+/// Prepares the voice-independent half of an x-vector synthesis request.
+///
+/// # Errors
+///
+/// Returns the same named tokenizer or checkpoint-row failures as [`synthesize`].
+pub fn prepare_xvector_synthesis(
+    model: &LoadedModel,
+    request: &SynthesisRequest,
+) -> Result<PreparedXVectorSynthesis, FttsError> {
+    let prepared_raw = model
+        .tokenizer
+        .prepare(&request.text, &request.normalization_options)
+        .map_err(|error| FttsError::Input(format!("text preparation failed: {error}")))?;
+    let wrapped = TalkerCheckpoint::wrap_target_ids(&prepared_raw.token_ids);
+    let ids = TalkerCheckpoint::utterance_text_ids(&wrapped);
+    let table = model
+        .talker
+        .gather_text_rows(&ids)
+        .map_err(checkpoint_error)?;
+    Ok(PreparedXVectorSynthesis {
+        request: request.clone(),
+        prepared: PreparedText::new(wrapped, prepared_raw.normalization_trace),
+        table,
+    })
+}
+
+/// Synthesizes one real voice from a shared x-vector text plan.
+///
+/// This is the multi-voice comparison seam: callers prepare once, then invoke this
+/// function serially for every speaker. Serial execution is intentional on phones—the
+/// loaded weights and text plan are shared while only one KV cache and codec workspace
+/// exists at a time.
+///
+/// # Errors
+///
+/// The same engine, speaker-width, cancellation, and output failures as [`synthesize`].
+#[allow(clippy::too_many_arguments)]
+pub fn synthesize_prepared_xvector(
+    model: &LoadedModel,
+    engine: &TtsEngine,
+    plan: &PreparedXVectorSynthesis,
+    speaker: &[f32],
+    seed: u64,
+    cancellation: &CancellationToken,
+    observer: &dyn SynthesisObserver,
+    packet_frames: usize,
+    pcm_sink: Option<&mut dyn PcmPacketSink>,
+) -> Result<SynthesizedAudio, FttsError> {
+    synthesize_inner(
+        model,
+        engine,
+        &plan.request,
+        &VoiceConditioning::XVector(speaker.to_vec()),
+        Some(plan),
+        seed,
+        cancellation,
+        observer,
+        packet_frames,
+        None,
+        pcm_sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn synthesize_inner(
+    model: &LoadedModel,
+    engine: &TtsEngine,
+    request: &SynthesisRequest,
+    voice: &VoiceConditioning,
+    prepared_xvector: Option<&PreparedXVectorSynthesis>,
+    seed: u64,
+    cancellation: &CancellationToken,
+    observer: &dyn SynthesisObserver,
+    packet_frames: usize,
+    text_feed: Option<&ftts_core::BoundedReceiver<ftts_core::TextControl>>,
+    pcm_sink: Option<&mut dyn PcmPacketSink>,
+) -> Result<SynthesizedAudio, FttsError> {
     LAST_SYNTHESIS_PROFILE.with(|slot| slot.set(SynthesisProfile::EMPTY));
     let call_started = Instant::now();
     if packet_frames == 0 {
@@ -1821,41 +1927,55 @@ pub fn synthesize(
             "packet_frames must be at least 1 (one 80 ms codec frame)".to_owned(),
         ));
     }
-    // 1. Text, once — see the module docs on ordering.
-    let prepared_raw = model
-        .tokenizer
-        .prepare(&request.text, &request.normalization_options)
-        .map_err(|error| FttsError::Input(format!("text preparation failed: {error}")))?;
-    let wrapped = TalkerCheckpoint::wrap_target_ids(&prepared_raw.token_ids);
-    let prepared = PreparedText::new(wrapped.clone(), prepared_raw.normalization_trace);
-
-    // 2. The cold-embedding rows this utterance can reach, and nothing else.
-    let reference_inner_ids: Vec<u32> = match voice {
-        VoiceConditioning::Icl {
-            transcript,
-            codec_codes: _,
-            embedding: _,
-        } => {
-            // The same wrap the prompt build will apply; slicing mirrors
-            // `extract_prompt_text_ids`'s `ref_ids[:, 3:-2]` contract.
-            let wrapped_reference = ftts_model_qwen::prompt::wrap_reference_transcript(transcript);
-            let wrapped_ids = model
-                .tokenizer
-                .encode(&wrapped_reference)
-                .map_err(|error| {
-                    FttsError::Input(format!(
-                        "cannot tokenize pack transcript for ICL conditioning: {error}"
-                    ))
-                })?;
-            wrapped_ids[3..wrapped_ids.len().saturating_sub(2)].to_vec()
+    // 1–2. Text and its sparse cold rows. A batch-owned x-vector plan lends both;
+    // ordinary and ICL calls construct the same values locally.
+    let owned_table: TextEmbeddingTable;
+    let prepared: PreparedText;
+    let table = if let Some(plan) = prepared_xvector {
+        if !matches!(voice, VoiceConditioning::XVector(_)) {
+            return Err(FttsError::Usage(
+                "a prepared x-vector text plan cannot be used with ICL conditioning".to_owned(),
+            ));
         }
-        VoiceConditioning::XVector(_) => Vec::new(),
+        prepared = plan.prepared.clone();
+        &plan.table
+    } else {
+        let prepared_raw = model
+            .tokenizer
+            .prepare(&request.text, &request.normalization_options)
+            .map_err(|error| FttsError::Input(format!("text preparation failed: {error}")))?;
+        let wrapped = TalkerCheckpoint::wrap_target_ids(&prepared_raw.token_ids);
+        let reference_inner_ids: Vec<u32> = match voice {
+            VoiceConditioning::Icl {
+                transcript,
+                codec_codes: _,
+                embedding: _,
+            } => {
+                // The same wrap the prompt build will apply; slicing mirrors
+                // `extract_prompt_text_ids`'s `ref_ids[:, 3:-2]` contract.
+                let wrapped_reference =
+                    ftts_model_qwen::prompt::wrap_reference_transcript(transcript);
+                let wrapped_ids = model
+                    .tokenizer
+                    .encode(&wrapped_reference)
+                    .map_err(|error| {
+                        FttsError::Input(format!(
+                            "cannot tokenize pack transcript for ICL conditioning: {error}"
+                        ))
+                    })?;
+                wrapped_ids[3..wrapped_ids.len().saturating_sub(2)].to_vec()
+            }
+            VoiceConditioning::XVector(_) => Vec::new(),
+        };
+        let ids =
+            TalkerCheckpoint::utterance_text_ids_with_reference(&wrapped, &reference_inner_ids);
+        owned_table = model
+            .talker
+            .gather_text_rows(&ids)
+            .map_err(checkpoint_error)?;
+        prepared = PreparedText::new(wrapped, prepared_raw.normalization_trace);
+        &owned_table
     };
-    let ids = TalkerCheckpoint::utterance_text_ids_with_reference(&wrapped, &reference_inner_ids);
-    let table = model
-        .talker
-        .gather_text_rows(&ids)
-        .map_err(checkpoint_error)?;
 
     // 3. The prompt header and reference block, per the resolved conditioning. ICL swaps the
     // speaker slot for a reference continuation (OQ-10 §1: S=0 in ICL headers) and enters
@@ -1866,7 +1986,7 @@ pub fn synthesize(
         VoiceConditioning::XVector(speaker) => (
             model
                 .talker
-                .xvector_header(&table, speaker, CODEC_LANGUAGE_ENGLISH_ID)
+                .xvector_header(table, speaker, CODEC_LANGUAGE_ENGLISH_ID)
                 .map_err(checkpoint_error)?,
             PromptMode {
                 clone_mode: CloneMode::XVector,
@@ -1899,7 +2019,7 @@ pub fn synthesize(
             (
                 model
                     .talker
-                    .icl_header(&table, CODEC_LANGUAGE_ENGLISH_ID)
+                    .icl_header(table, CODEC_LANGUAGE_ENGLISH_ID)
                     .map_err(checkpoint_error)?,
                 PromptMode {
                     clone_mode: CloneMode::Icl,
@@ -1909,7 +2029,7 @@ pub fn synthesize(
             )
         }
     };
-    let tts_eos = model.talker.tts_eos(&table);
+    let tts_eos = model.talker.tts_eos(table);
     // 4. Borrowed weights for the generator.
     let talker_layers = model.talker.talker_layer_weights();
     let micro_layers = model.talker.microdecoder_layer_weights();
@@ -1925,7 +2045,7 @@ pub fn synthesize(
     let generator_config = QwenGeneratorConfig {
         talker_config: TalkerConfig::default(),
         talker_weights: model.talker.talker_weights(&talker_layers),
-        text: model.talker.text_weights(&table),
+        text: model.talker.text_weights(table),
         cold_rows: Some(&model.talker),
         feedback: model.talker.feedback_tables(),
         microdecoder_config: MicrodecoderConfig::default(),

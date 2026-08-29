@@ -252,6 +252,11 @@ pub fn cli_main() -> ExitCode {
         };
     }
 
+    use std::io::IsTerminal as _;
+    let capabilities = IoCapabilities {
+        human_output: io::stdout().is_terminal(),
+        can_confirm: io::stdin().is_terminal() && io::stdout().is_terminal(),
+    };
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
@@ -260,10 +265,16 @@ pub fn cli_main() -> ExitCode {
     // plain-text duplicate below would be a non-JSON line in that same stream, so for `say`
     // it only appears when a human (a terminal) is reading stderr.
     let already_on_contract = matches!(cli.command, Command::Say(_));
-    match dispatch(cli, environment(), &mut stdin, &mut stdout, &mut stderr) {
+    match dispatch(
+        cli,
+        environment(),
+        &mut stdin,
+        &mut stdout,
+        &mut stderr,
+        capabilities,
+    ) {
         Ok(()) => FttsExitCode::Success.as_exit_code(),
         Err(error) => {
-            use std::io::IsTerminal as _;
             if !already_on_contract || io::stderr().is_terminal() {
                 let _ = writeln!(stderr, "error: {error}");
             }
@@ -940,17 +951,31 @@ where
     }
 }
 
+/// Capabilities of the concrete I/O handles owned by the process entry point.
+///
+/// Sink-agnostic command functions cannot infer these from `&mut dyn Write`. Keeping them
+/// explicit prevents a library call that writes to a buffer from inheriting the parent process's
+/// TTY state and accidentally emitting prose, blocking for input, or corrupting NDJSON.
+#[derive(Clone, Copy, Debug, Default)]
+struct IoCapabilities {
+    human_output: bool,
+    can_confirm: bool,
+}
+
 fn dispatch(
     cli: Cli,
     environment: &Environment,
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
+    capabilities: IoCapabilities,
 ) -> Result<(), FttsError> {
     match &cli.command {
-        Command::Say(args) => run_say(&cli, args, environment, stdin, stdout, stderr),
-        Command::MakeVideo(args) => run_make_video(&cli, args, environment, stdin, stdout, stderr),
-        Command::Enroll(args) => run_enroll(args, environment, stdout),
+        Command::Say(args) => run_say(&cli, args, environment, stdin, stdout, stderr, capabilities),
+        Command::MakeVideo(args) => {
+            run_make_video(&cli, args, environment, stdin, stdout, stderr, capabilities)
+        }
+        Command::Enroll(args) => run_enroll(args, environment, stdin, stdout, capabilities),
         Command::Voice(VoiceArgs {
             command: VoiceCommand::Inspect { path },
         }) => run_voice_inspect(path, stdout),
@@ -1611,6 +1636,7 @@ fn run_say(
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
+    capabilities: IoCapabilities,
 ) -> Result<(), FttsError> {
     let run = robot::RunContext::generate();
     // `--stream raw` puts PCM on stdout, so events move to stderr. One contract, chosen once here
@@ -1618,10 +1644,19 @@ fn run_say(
     // two branches also settle the borrows: in raw mode audio owns `stdout` and events own
     // `stderr`; otherwise events own `stdout` and the raw sink is a discard that never runs.
     let outcome = if args.stream == Some(StreamMode::Raw) {
-        run_say_events(cli, args, environment, stdin, &run, stdout, &mut |event| {
-            write_json_line(stderr, event)
-        })
-    } else if args.robot || !style::is_interactive() {
+        run_say_events(
+            cli,
+            args,
+            environment,
+            stdin,
+            &run,
+            SayEventOutput {
+                raw_audio: stdout,
+                human_progress: false,
+            },
+            &mut |event| write_json_line(stderr, event),
+        )
+    } else if args.robot || !capabilities.human_output {
         let mut discard = io::sink();
         run_say_events(
             cli,
@@ -1629,7 +1664,10 @@ fn run_say(
             environment,
             stdin,
             &run,
-            &mut discard,
+            SayEventOutput {
+                raw_audio: &mut discard,
+                human_progress: false,
+            },
             &mut |event| write_json_line(stdout, event),
         )
     } else {
@@ -1649,7 +1687,10 @@ fn run_say(
             environment,
             stdin,
             &run,
-            &mut discard,
+            SayEventOutput {
+                raw_audio: &mut discard,
+                human_progress: true,
+            },
             &mut |event| {
                 presenter
                     .event(event, stdout)
@@ -1686,6 +1727,7 @@ fn run_make_video(
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
+    capabilities: IoCapabilities,
 ) -> Result<(), FttsError> {
     let output = args
         .output
@@ -1788,7 +1830,15 @@ fn run_make_video(
             robot: false,
             no_resident: args.no_resident,
         };
-        run_say(cli, &say_args, environment, stdin, stdout, stderr)?;
+        run_say(
+            cli,
+            &say_args,
+            environment,
+            stdin,
+            stdout,
+            stderr,
+            capabilities,
+        )?;
     }
     let audio_path = args
         .audio
@@ -1801,7 +1851,7 @@ fn run_make_video(
     // around rendering and a `run_complete` carrying the video frame count. A terminal
     // gets the human progress line instead; agents were previously left with silence
     // between the say run ending and the process exiting.
-    let interactive = style::is_interactive();
+    let interactive = capabilities.human_output;
     let settings = EffectiveSettings::resolve(cli, environment)?;
     let run = robot::RunContext::generate();
     let mut seq = 0_u64;
@@ -1932,13 +1982,18 @@ fn emit_stage(
 ///
 /// Split out so the caller owns stream selection and the single `run_error` emission point: a
 /// pipeline that emitted its own errors would have to know which stream it was on at every `?`.
+struct SayEventOutput<'a> {
+    raw_audio: &'a mut dyn Write,
+    human_progress: bool,
+}
+
 fn run_say_events(
     cli: &Cli,
     args: &SayArgs,
     environment: &Environment,
     stdin: &mut dyn Read,
     run: &robot::RunContext,
-    raw_audio: &mut dyn Write,
+    output: SayEventOutput<'_>,
     emit: &mut dyn FnMut(&Value) -> Result<(), FttsError>,
 ) -> Result<(), FttsError> {
     let settings = EffectiveSettings::resolve(cli, environment)?;
@@ -2096,7 +2151,7 @@ fn run_say_events(
     let use_resident =
         resident::enabled(args.no_resident) && !raw_stream && voice_conditioning.is_xvector();
     let load_inline = || {
-        if style::is_interactive() && !args.robot && !raw_stream {
+        if output.human_progress && !args.robot && !raw_stream {
             synth::LoadedModel::load_with_human_progress(&bundle)
         } else {
             synth::LoadedModel::load(&bundle)
@@ -2269,7 +2324,7 @@ fn run_say_events(
                             }
                             let event = audio.write_packet(
                                 &pcm,
-                                raw_audio,
+                                output.raw_audio,
                                 run.run_id(),
                                 u8::try_from(frames).unwrap_or(u8::MAX),
                             )?;
@@ -2277,7 +2332,7 @@ fn run_say_events(
                             if raw_stream {
                                 // Latency depends on flush discipline, not on the writer's
                                 // incidental buffering: one packet, one flush.
-                                raw_audio.flush().map_err(|error| {
+                                output.raw_audio.flush().map_err(|error| {
                                     FttsError::Generic(format!("cannot flush raw PCM: {error}"))
                                 })?;
                             }
@@ -2357,7 +2412,8 @@ fn run_say_events(
         let packet_frame_count = settings.packet_frames.frames_per_packet();
         emit_stage(run, emit, "output", "begin", &mut seq)?;
         for packet in audio_result.pcm.chunks(packet_samples) {
-            let event = audio.write_packet(packet, raw_audio, run.run_id(), packet_frame_count)?;
+            let event =
+                audio.write_packet(packet, output.raw_audio, run.run_id(), packet_frame_count)?;
             emit(&event)?;
         }
     }
@@ -2917,7 +2973,9 @@ fn resolve_requested_voice(
 fn run_enroll(
     args: &EnrollArgs,
     environment: &Environment,
+    stdin: &mut dyn Read,
     stdout: &mut dyn Write,
+    capabilities: IoCapabilities,
 ) -> Result<(), FttsError> {
     let started = std::time::Instant::now();
     let model = resolve_model(args.model.as_deref(), environment)?;
@@ -3041,8 +3099,10 @@ fn run_enroll(
     };
     let consent_attested = args.consent_attest
         || style::confirm(
+            stdin,
             stdout,
             "Do you have the right to clone this voice? (recorded in the pack)",
+            capabilities.can_confirm,
         )
         .map_err(|error| FttsError::Generic(format!("cannot read a reply: {error}")))?
         .unwrap_or_default();
@@ -3140,7 +3200,7 @@ fn run_enroll(
             .map_err(|error| {
                 FttsError::Generic(format!("cannot write overwrite notice: {error}"))
             })?;
-            match style::confirm(stdout, "Replace it?")
+            match style::confirm(stdin, stdout, "Replace it?", capabilities.can_confirm)
                 .map_err(|error| FttsError::Generic(format!("cannot read a reply: {error}")))?
             {
                 Some(reply) => reply,
@@ -4945,6 +5005,7 @@ mod tests {
             &mut stdin,
             &mut stdout,
             &mut stderr,
+            IoCapabilities::default(),
         )
         .expect("check path");
 
@@ -5490,8 +5551,15 @@ mod tests {
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
         let mut stdin: &[u8] = &[];
-        dispatch(cli, environment(), &mut stdin, &mut stdout, &mut stderr)
-            .expect("inspect succeeds");
+        dispatch(
+            cli,
+            environment(),
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+            IoCapabilities::default(),
+        )
+        .expect("inspect succeeds");
         let text = String::from_utf8(stdout).expect("utf-8 output");
         let event_line = text.lines().last().expect("at least one output line");
         let event: serde_json::Value = serde_json::from_str(event_line).expect("json event");
@@ -5534,8 +5602,15 @@ mod tests {
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
         let mut stdin: &[u8] = &[];
-        dispatch(cli, environment(), &mut stdin, &mut stdout, &mut stderr)
-            .expect("inspect of a legacy vector still succeeds");
+        dispatch(
+            cli,
+            environment(),
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+            IoCapabilities::default(),
+        )
+        .expect("inspect of a legacy vector still succeeds");
         let text = String::from_utf8(stdout).expect("utf-8 output");
         let event: serde_json::Value =
             serde_json::from_str(text.lines().last().expect("line")).expect("json");

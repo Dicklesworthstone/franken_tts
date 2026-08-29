@@ -17,7 +17,7 @@
 //! have to strip escape sequences. Prompts follow the same rule and refuse to block when there is
 //! no human attached.
 
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 
 /// Whether human-facing decoration should be emitted at all.
 ///
@@ -80,16 +80,21 @@ pub fn emphasis(text: &str) -> String {
 
 /// Asks a yes/no question, defaulting to no.
 ///
-/// Returns `None` when there is no human to ask — stdin or stdout is not a terminal — so callers
-/// can keep their non-interactive behavior (a clear error) instead of blocking a script or an
-/// agent forever on a prompt nothing will answer. That distinction is the whole reason this
-/// returns an `Option` rather than a `bool`.
+/// Returns `None` when the process entry point says there is no human to ask, so callers can keep
+/// their non-interactive behavior (a clear error) instead of blocking a script or an agent forever
+/// on a prompt nothing will answer. The input source is injected alongside the output sink; this
+/// function never consults or locks process-global stdin on behalf of a library caller.
 ///
 /// # Errors
 ///
 /// When the prompt cannot be written or stdin cannot be read.
-pub fn confirm(out: &mut dyn Write, question: &str) -> std::io::Result<Option<bool>> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+pub fn confirm(
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+    question: &str,
+    interactive: bool,
+) -> std::io::Result<Option<bool>> {
+    if !interactive {
         return Ok(None);
     }
     write!(
@@ -99,21 +104,23 @@ pub fn confirm(out: &mut dyn Write, question: &str) -> std::io::Result<Option<bo
         detail("[y/N]")
     )?;
     out.flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
+    // Read only this answer. Wrapping the injected reader in a temporary `BufReader` could read
+    // ahead into a later prompt and then discard those bytes when the wrapper is dropped.
+    let mut answer = Vec::with_capacity(8);
+    let mut byte = [0_u8; 1];
+    while answer.len() < 64 {
+        match input.read(&mut byte)? {
+            0 => break,
+            1 if byte[0] == b'\n' => break,
+            1 => answer.push(byte[0]),
+            _ => unreachable!("a one-byte buffer cannot report a longer read"),
+        }
+    }
+    let answer = String::from_utf8_lossy(&answer);
     let answer = answer.trim();
     Ok(Some(
         answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"),
     ))
-}
-
-/// Whether a human is reading stdout, as opposed to a pipe, a file, an agent, or CI.
-///
-/// Deliberately distinct from [`decorate`]: `NO_COLOR` means "no color", not "give me JSON", so a
-/// user who sets it still gets human output, just uncolored.
-#[must_use]
-pub fn is_interactive() -> bool {
-    std::io::stdout().is_terminal()
 }
 
 /// Renders the `say` lifecycle as something a person wants to read.
@@ -274,7 +281,8 @@ mod tests {
     #[test]
     fn confirm_declines_to_block_without_a_terminal() {
         let mut buffer: Vec<u8> = Vec::new();
-        let answer = confirm(&mut buffer, "Overwrite?").expect("confirm");
+        let mut input: &[u8] = b"yes\n";
+        let answer = confirm(&mut input, &mut buffer, "Overwrite?", false).expect("confirm");
         assert_eq!(
             answer, None,
             "a non-interactive run must fall through to the caller's own policy"
@@ -282,6 +290,19 @@ mod tests {
         assert!(
             buffer.is_empty(),
             "nothing should be printed with no reader"
+        );
+    }
+
+    #[test]
+    fn confirm_reads_only_one_answer_from_the_injected_input() {
+        let mut input: &[u8] = b"yes\nsecond answer\n";
+        let mut buffer = Vec::new();
+        let answer = confirm(&mut input, &mut buffer, "Overwrite?", true).expect("confirm");
+        assert_eq!(answer, Some(true));
+        assert_eq!(input, b"second answer\n");
+        assert!(
+            !buffer.is_empty(),
+            "an interactive prompt should be visible"
         );
     }
 }

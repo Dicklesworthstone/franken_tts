@@ -34,7 +34,8 @@ use std::sync::{Arc, OnceLock};
 
 use ftts_cli::synth::{
     DENOISE_ARTIFACT_RELPATH, LoadedModel, ModelBundle, ReferenceCleanup, VoiceConditioning,
-    denoise_pcm_24k, last_synthesis_profile, speaker_from_reference_pcm, synthesize,
+    denoise_pcm_24k, last_synthesis_profile, prepare_xvector_synthesis, speaker_from_reference_pcm,
+    synthesize, synthesize_prepared_xvector,
 };
 use ftts_core::{CancellationToken, SynthesisRequest, TtsEngine};
 
@@ -95,6 +96,25 @@ impl FttsProgressEvent {
 pub type FttsProgressFn =
     unsafe extern "C" fn(ctx: *mut c_void, event: *const FttsProgressEvent) -> i32;
 
+/// Per-voice progress callback for one shared multi-voice run. A nonzero verdict
+/// cooperatively cancels the active voice and prevents later voices from starting.
+pub type FttsVoiceProgressFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    voice_index: usize,
+    event: *const FttsProgressEvent,
+) -> i32;
+
+/// Receives one completed voice's borrowed PCM and profile JSON. Both pointers are
+/// valid only for the synchronous callback; hosts copy what they retain. A nonzero
+/// verdict ends the batch before another voice starts.
+pub type FttsVoiceResultFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    voice_index: usize,
+    pcm: *const f32,
+    len: usize,
+    profile_json: *const c_char,
+) -> i32;
+
 #[derive(Clone)]
 struct ProgressEmitter {
     callback: Option<FttsProgressFn>,
@@ -128,6 +148,127 @@ impl ProgressEmitter {
         } else {
             true
         }
+    }
+}
+
+#[derive(Clone)]
+struct VoiceProgressEmitter {
+    callback: Option<FttsVoiceProgressFn>,
+    ctx: *mut c_void,
+    voice_index: usize,
+    cancellation: CancellationToken,
+}
+
+// SAFETY: identical to ProgressEmitter, with an immutable scalar index added.
+// The C header requires the callback/context pair to be callable from engine threads.
+#[allow(unsafe_code)]
+unsafe impl Send for VoiceProgressEmitter {}
+// SAFETY: same callback contract as Send; Rust never dereferences the context.
+#[allow(unsafe_code)]
+unsafe impl Sync for VoiceProgressEmitter {}
+
+impl VoiceProgressEmitter {
+    fn emit(&self, event: FttsProgressEvent) {
+        let Some(callback) = self.callback else {
+            return;
+        };
+        // SAFETY: the callback/context pair follows the header contract and `event`
+        // remains alive and immutable for the complete synchronous call.
+        #[allow(unsafe_code)]
+        let verdict = unsafe { callback(self.ctx, self.voice_index, &event) };
+        if verdict != 0 {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+fn translate_synthesis_event(
+    event: ftts_core::SynthesisEvent,
+    predicted_max_frames: &AtomicU64,
+    decoded_frames: &AtomicU64,
+) -> Option<FttsProgressEvent> {
+    use ftts_core::SynthesisEvent;
+
+    match event {
+        SynthesisEvent::Admission { accepted } => {
+            let mut event =
+                FttsProgressEvent::new(FTTS_PROGRESS_KIND_ADMISSION, FTTS_PROGRESS_STAGE_SYNTHESIS);
+            event.current = u64::from(accepted);
+            event.total = 1;
+            Some(event)
+        }
+        SynthesisEvent::ResourceAdmission {
+            admitted,
+            predicted_max_frames: predicted,
+            predicted_peak_bytes,
+            budget_bytes,
+        } => {
+            predicted_max_frames.store(predicted, Ordering::Release);
+            let mut event = FttsProgressEvent::new(
+                FTTS_PROGRESS_KIND_ADMISSION,
+                FTTS_PROGRESS_STAGE_RESOURCE_ADMISSION,
+            );
+            event.current = predicted_peak_bytes;
+            event.total = budget_bytes;
+            event.detail = predicted;
+            if !admitted {
+                event.flags |= FTTS_PROGRESS_FLAG_INVALIDATES_OUTPUT;
+            }
+            Some(event)
+        }
+        SynthesisEvent::StageStarted { .. } => Some(FttsProgressEvent::new(
+            FTTS_PROGRESS_KIND_STAGE_STARTED,
+            FTTS_PROGRESS_STAGE_SYNTHESIS,
+        )),
+        SynthesisEvent::StageFinished { elapsed, .. } => {
+            let mut event = FttsProgressEvent::new(
+                FTTS_PROGRESS_KIND_STAGE_FINISHED,
+                FTTS_PROGRESS_STAGE_SYNTHESIS,
+            );
+            event.elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
+            Some(event)
+        }
+        SynthesisEvent::FrameProgress { frame } => {
+            let mut event =
+                FttsProgressEvent::new(FTTS_PROGRESS_KIND_UNIT, FTTS_PROGRESS_STAGE_FRAMES);
+            event.current = frame.saturating_add(1);
+            event.total = predicted_max_frames.load(Ordering::Acquire);
+            event.flags |= FTTS_PROGRESS_FLAG_TOTAL_IS_UPPER_BOUND;
+            Some(event)
+        }
+        SynthesisEvent::TextPrepared { token_count, .. } => {
+            let mut event =
+                FttsProgressEvent::new(FTTS_PROGRESS_KIND_UNIT, FTTS_PROGRESS_STAGE_TEXT);
+            event.current = token_count as u64;
+            Some(event)
+        }
+        SynthesisEvent::PacketEmitted {
+            frame_count,
+            sample_count,
+        } => {
+            let frame_count = u64::try_from(frame_count).unwrap_or(u64::MAX);
+            let current = decoded_frames
+                .fetch_add(frame_count, Ordering::AcqRel)
+                .saturating_add(frame_count);
+            let mut event =
+                FttsProgressEvent::new(FTTS_PROGRESS_KIND_UNIT, FTTS_PROGRESS_STAGE_CODEC);
+            event.current = current;
+            event.total = predicted_max_frames.load(Ordering::Acquire);
+            event.detail = sample_count as u64;
+            event.flags |= FTTS_PROGRESS_FLAG_TOTAL_IS_UPPER_BOUND;
+            Some(event)
+        }
+        SynthesisEvent::Health { event: health } => {
+            let mut event =
+                FttsProgressEvent::new(FTTS_PROGRESS_KIND_HEALTH, FTTS_PROGRESS_STAGE_HEALTH);
+            if health.invalidates_output() {
+                event.flags |= FTTS_PROGRESS_FLAG_INVALIDATES_OUTPUT;
+            }
+            Some(event)
+        }
+        SynthesisEvent::TextUnderrun { .. }
+        | SynthesisEvent::TextStallEnded { .. }
+        | SynthesisEvent::TextAppendRejected { .. } => None,
     }
 }
 
@@ -557,6 +698,16 @@ pub unsafe extern "C" fn ftts_synthesize_with_progress(
             set_error("text is not UTF-8");
             return 1;
         };
+        if let Some((index, _)) = speaker
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            set_error(format!(
+                "speaker vector contains a non-finite value at index {index}"
+            ));
+            return 1;
+        }
         let request = SynthesisRequest::new(text.to_owned());
         let cancellation = CancellationToken::new();
         let progress = ProgressEmitter {
@@ -570,93 +721,8 @@ pub unsafe extern "C" fn ftts_synthesize_with_progress(
         let observer_predicted = Arc::clone(&predicted_max_frames);
         let observer_decoded = Arc::clone(&decoded_frames);
         let observer = move |event: ftts_core::SynthesisEvent| {
-            use ftts_core::SynthesisEvent;
-
-            let translated = match event {
-                SynthesisEvent::Admission { accepted } => {
-                    let mut event = FttsProgressEvent::new(
-                        FTTS_PROGRESS_KIND_ADMISSION,
-                        FTTS_PROGRESS_STAGE_SYNTHESIS,
-                    );
-                    event.current = if accepted { 1 } else { 0 };
-                    event.total = 1;
-                    Some(event)
-                }
-                SynthesisEvent::ResourceAdmission {
-                    admitted,
-                    predicted_max_frames,
-                    predicted_peak_bytes,
-                    budget_bytes,
-                } => {
-                    observer_predicted.store(predicted_max_frames, Ordering::Release);
-                    let mut event = FttsProgressEvent::new(
-                        FTTS_PROGRESS_KIND_ADMISSION,
-                        FTTS_PROGRESS_STAGE_RESOURCE_ADMISSION,
-                    );
-                    event.current = predicted_peak_bytes;
-                    event.total = budget_bytes;
-                    event.detail = predicted_max_frames;
-                    if !admitted {
-                        event.flags |= FTTS_PROGRESS_FLAG_INVALIDATES_OUTPUT;
-                    }
-                    Some(event)
-                }
-                SynthesisEvent::StageStarted { .. } => Some(FttsProgressEvent::new(
-                    FTTS_PROGRESS_KIND_STAGE_STARTED,
-                    FTTS_PROGRESS_STAGE_SYNTHESIS,
-                )),
-                SynthesisEvent::StageFinished { elapsed, .. } => {
-                    let mut event = FttsProgressEvent::new(
-                        FTTS_PROGRESS_KIND_STAGE_FINISHED,
-                        FTTS_PROGRESS_STAGE_SYNTHESIS,
-                    );
-                    event.elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
-                    Some(event)
-                }
-                SynthesisEvent::FrameProgress { frame } => {
-                    let mut event =
-                        FttsProgressEvent::new(FTTS_PROGRESS_KIND_UNIT, FTTS_PROGRESS_STAGE_FRAMES);
-                    event.current = frame.saturating_add(1);
-                    event.total = observer_predicted.load(Ordering::Acquire);
-                    event.flags |= FTTS_PROGRESS_FLAG_TOTAL_IS_UPPER_BOUND;
-                    Some(event)
-                }
-                SynthesisEvent::TextPrepared { token_count, .. } => {
-                    let mut event =
-                        FttsProgressEvent::new(FTTS_PROGRESS_KIND_UNIT, FTTS_PROGRESS_STAGE_TEXT);
-                    event.current = token_count as u64;
-                    Some(event)
-                }
-                SynthesisEvent::PacketEmitted {
-                    frame_count,
-                    sample_count,
-                } => {
-                    let frame_count = u64::try_from(frame_count).unwrap_or(u64::MAX);
-                    let current = observer_decoded
-                        .fetch_add(frame_count, Ordering::AcqRel)
-                        .saturating_add(frame_count);
-                    let mut event =
-                        FttsProgressEvent::new(FTTS_PROGRESS_KIND_UNIT, FTTS_PROGRESS_STAGE_CODEC);
-                    event.current = current;
-                    event.total = observer_predicted.load(Ordering::Acquire);
-                    event.detail = sample_count as u64;
-                    event.flags |= FTTS_PROGRESS_FLAG_TOTAL_IS_UPPER_BOUND;
-                    Some(event)
-                }
-                SynthesisEvent::Health { event: health } => {
-                    let mut event = FttsProgressEvent::new(
-                        FTTS_PROGRESS_KIND_HEALTH,
-                        FTTS_PROGRESS_STAGE_HEALTH,
-                    );
-                    if health.invalidates_output() {
-                        event.flags |= FTTS_PROGRESS_FLAG_INVALIDATES_OUTPUT;
-                    }
-                    Some(event)
-                }
-                SynthesisEvent::TextUnderrun { .. }
-                | SynthesisEvent::TextStallEnded { .. }
-                | SynthesisEvent::TextAppendRejected { .. } => None,
-            };
+            let translated =
+                translate_synthesis_event(event, &observer_predicted, &observer_decoded);
             if let Some(event) = translated {
                 observer_progress.emit(event);
             }
@@ -700,6 +766,165 @@ pub unsafe extern "C" fn ftts_synthesize_with_progress(
                 1
             }
         }
+    })
+}
+
+/// Synthesizes one text with every supplied x-vector while sharing its tokenizer and
+/// sparse cold-row preparation. Voices run serially through one warm engine; each
+/// completed PCM buffer is borrowed by `on_voice` only for that callback.
+#[allow(unsafe_code)] // audited export, part of the C ABI surface
+#[unsafe(no_mangle)]
+/// # Safety
+/// `engine` and `text` follow [`ftts_synthesize`]. `speakers` must address exactly
+/// `speaker_len` floats, where `speaker_len == voice_count * SPEAKER_WIDTH`.
+/// Callback/context pairs follow the header contract and must not unwind or re-enter
+/// this engine. `on_voice` is required and must copy any PCM/profile bytes it retains.
+pub unsafe extern "C" fn ftts_synthesize_many_with_progress(
+    engine: *mut FttsEngine,
+    text: *const c_char,
+    speakers: *const f32,
+    speaker_len: usize,
+    voice_count: usize,
+    seed: u64,
+    on_progress: Option<FttsVoiceProgressFn>,
+    on_voice: Option<FttsVoiceResultFn>,
+    ctx: *mut c_void,
+) -> i32 {
+    guarded(1, || {
+        if engine.is_null() || text.is_null() || speakers.is_null() {
+            set_error("null pointer to ftts_synthesize_many_with_progress");
+            return 1;
+        }
+        let Some(on_voice) = on_voice else {
+            set_error("null result callback to ftts_synthesize_many_with_progress");
+            return 1;
+        };
+        if voice_count == 0 {
+            set_error("multi-voice synthesis requires at least one voice");
+            return 1;
+        }
+        let Some(expected_len) = voice_count.checked_mul(SPEAKER_WIDTH) else {
+            set_error("multi-voice speaker matrix length overflows usize");
+            return 1;
+        };
+        if speaker_len != expected_len {
+            set_error(format!(
+                "speaker matrix must contain {voice_count} × {SPEAKER_WIDTH} = {expected_len} \
+                 floats, got {speaker_len}"
+            ));
+            return 1;
+        }
+
+        // SAFETY: all pointers are non-null and the header requires a NUL-terminated
+        // text plus exactly `speaker_len` readable floats. The caller serializes this
+        // engine handle for the full synchronous batch.
+        #[allow(unsafe_code)]
+        let (engine, text, speakers) = unsafe {
+            (
+                &mut *engine,
+                CStr::from_ptr(text),
+                std::slice::from_raw_parts(speakers, speaker_len),
+            )
+        };
+        let Ok(text) = text.to_str() else {
+            set_error("text is not UTF-8");
+            return 1;
+        };
+        if let Some((index, _)) = speakers
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            set_error(format!(
+                "speaker matrix contains a non-finite value at flat index {index}"
+            ));
+            return 1;
+        }
+
+        let request = SynthesisRequest::new(text.to_owned());
+        let plan = match prepare_xvector_synthesis(&engine.loaded, &request) {
+            Ok(plan) => plan,
+            Err(error) => {
+                set_error(error.to_string());
+                return 1;
+            }
+        };
+        let cancellation = CancellationToken::new();
+
+        let (speaker_rows, remainder) = speakers.as_chunks::<SPEAKER_WIDTH>();
+        debug_assert!(remainder.is_empty(), "exact matrix length checked above");
+        for (voice_index, speaker) in speaker_rows.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return FTTS_SYNTH_CANCELLED;
+            }
+            let predicted_max_frames = Arc::new(AtomicU64::new(0));
+            let decoded_frames = Arc::new(AtomicU64::new(0));
+            let progress = VoiceProgressEmitter {
+                callback: on_progress,
+                ctx,
+                voice_index,
+                cancellation: cancellation.clone(),
+            };
+            let observer_progress = progress.clone();
+            let observer_predicted = Arc::clone(&predicted_max_frames);
+            let observer_decoded = Arc::clone(&decoded_frames);
+            let observer = move |event: ftts_core::SynthesisEvent| {
+                if let Some(event) =
+                    translate_synthesis_event(event, &observer_predicted, &observer_decoded)
+                {
+                    observer_progress.emit(event);
+                }
+            };
+
+            let audio = match synthesize_prepared_xvector(
+                &engine.loaded,
+                &engine.engine,
+                &plan,
+                speaker,
+                seed,
+                &cancellation,
+                &observer,
+                4,
+                None,
+            ) {
+                Ok(audio) => {
+                    if cancellation.is_cancelled() {
+                        return FTTS_SYNTH_CANCELLED;
+                    }
+                    audio
+                }
+                Err(error) => {
+                    if cancellation.is_cancelled() {
+                        return FTTS_SYNTH_CANCELLED;
+                    }
+                    set_error(format!(
+                        "voice {} of {voice_count} failed: {error}",
+                        voice_index + 1
+                    ));
+                    return 1;
+                }
+            };
+
+            engine.last_profile_json = synthesis_profile_json();
+            // SAFETY: the required function/context pair follows the header contract.
+            // PCM and JSON storage both outlive this synchronous callback and are never
+            // mutated during it.
+            #[allow(unsafe_code)]
+            let verdict = unsafe {
+                on_voice(
+                    ctx,
+                    voice_index,
+                    audio.pcm.as_ptr(),
+                    audio.pcm.len(),
+                    engine.last_profile_json.as_ptr(),
+                )
+            };
+            if verdict != 0 {
+                cancellation.cancel();
+                return FTTS_SYNTH_CANCELLED;
+            }
+        }
+        0
     })
 }
 
@@ -809,6 +1034,16 @@ pub unsafe extern "C" fn ftts_synthesize_streaming(
             set_error("text is not UTF-8");
             return 1;
         };
+        if let Some((index, _)) = speaker
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            set_error(format!(
+                "speaker vector contains a non-finite value at index {index}"
+            ));
+            return 1;
+        }
         let request = SynthesisRequest::new(text.to_owned());
         let cancellation = CancellationToken::new();
         let observer = |_event: ftts_core::SynthesisEvent| {};
@@ -1190,6 +1425,12 @@ pub unsafe extern "C" fn ftts_video_close(renderer: *mut FttsVideoRenderer) {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct BatchReceipt {
+        progress: std::sync::Mutex<Vec<(usize, FttsProgressEvent)>>,
+        outputs: std::sync::Mutex<Vec<(usize, Vec<f32>, String)>>,
+    }
+
     unsafe extern "C" fn record_and_cancel_progress(
         ctx: *mut c_void,
         event: *const FttsProgressEvent,
@@ -1214,6 +1455,44 @@ mod tests {
             )
         };
         events.lock().unwrap().push(event);
+        0
+    }
+
+    unsafe extern "C" fn record_voice_progress(
+        ctx: *mut c_void,
+        voice_index: usize,
+        event: *const FttsProgressEvent,
+    ) -> i32 {
+        // SAFETY: the synchronous batch call keeps `BatchReceipt` and the event alive;
+        // callbacks may arrive on two engine threads, so storage is mutex-protected.
+        #[allow(unsafe_code)]
+        let (receipt, event) = unsafe { (&*ctx.cast::<BatchReceipt>(), *event) };
+        receipt.progress.lock().unwrap().push((voice_index, event));
+        0
+    }
+
+    unsafe extern "C" fn record_voice_result(
+        ctx: *mut c_void,
+        voice_index: usize,
+        pcm: *const f32,
+        len: usize,
+        profile_json: *const c_char,
+    ) -> i32 {
+        // SAFETY: the batch ABI keeps all borrowed pointers live for this callback;
+        // the test copies both payloads before returning.
+        #[allow(unsafe_code)]
+        let (receipt, pcm, profile) = unsafe {
+            (
+                &*ctx.cast::<BatchReceipt>(),
+                std::slice::from_raw_parts(pcm, len).to_vec(),
+                CStr::from_ptr(profile_json).to_string_lossy().into_owned(),
+            )
+        };
+        receipt
+            .outputs
+            .lock()
+            .unwrap()
+            .push((voice_index, pcm, profile));
         0
     }
 
@@ -1400,6 +1679,11 @@ mod tests {
         };
         assert_eq!(code, 0, "synthesize failed: {}", last_error());
         assert!(len > 0 && !pcm.is_null());
+        // SAFETY: `pcm` is the successful owned result and remains live until the
+        // matching free below. Retain a reference copy to prove the shared-plan batch
+        // is not merely self-consistent but bit-identical to the ordinary ABI path.
+        #[allow(unsafe_code)]
+        let single_pcm = unsafe { std::slice::from_raw_parts(pcm, len).to_vec() };
         let observed = events.lock().unwrap();
         assert!(
             observed.iter().any(|event| {
@@ -1422,6 +1706,57 @@ mod tests {
         // SAFETY: `pcm`/`len` are exactly the buffer this crate allocated in the call above, freed
         // once; `engine` is the handle from the matching open, closed once.
         unsafe { ftts_pcm_free(pcm, len) };
+
+        let receipt = BatchReceipt::default();
+        let mut speakers = speaker.clone();
+        speakers.extend_from_slice(&speaker);
+        let batch_context = (&raw const receipt).cast_mut().cast();
+        // SAFETY: the engine and text remain live; the flat matrix has exactly two
+        // complete speaker rows; both callbacks copy borrowed data synchronously.
+        let batch_code = unsafe {
+            ftts_synthesize_many_with_progress(
+                engine,
+                text.as_ptr(),
+                speakers.as_ptr(),
+                speakers.len(),
+                2,
+                0,
+                Some(record_voice_progress),
+                Some(record_voice_result),
+                batch_context,
+            )
+        };
+        assert_eq!(
+            batch_code,
+            0,
+            "multi-voice synthesis failed: {}",
+            last_error()
+        );
+        let mut outputs = receipt.outputs.lock().unwrap();
+        outputs.sort_by_key(|(index, _, _)| *index);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].0, 0);
+        assert_eq!(outputs[1].0, 1);
+        assert_eq!(
+            outputs[0].1, single_pcm,
+            "prepared and ordinary paths differ"
+        );
+        assert_eq!(outputs[0].1, outputs[1].1, "same voice and seed must match");
+        for (_, pcm, profile) in outputs.iter() {
+            assert!(!pcm.is_empty());
+            assert!(serde_json::from_str::<serde_json::Value>(profile).is_ok());
+        }
+        drop(outputs);
+        let progress = receipt.progress.lock().unwrap();
+        for voice_index in 0..2 {
+            assert!(progress.iter().any(|(index, event)| {
+                *index == voice_index
+                    && event.kind == FTTS_PROGRESS_KIND_UNIT
+                    && event.stage == FTTS_PROGRESS_STAGE_FRAMES
+                    && event.current > 0
+            }));
+        }
+        drop(progress);
         // SAFETY: as above — one close for one successful open.
         unsafe { ftts_engine_close(engine) };
     }
