@@ -804,6 +804,7 @@ private struct VoiceComparisonCard: View {
                             player: session.playbackPlayer(for: candidate),
                             analysisID: result.url.lastPathComponent,
                             refreshToken: session.playbackRevision,
+                            durationOverride: result.duration,
                             preparedAnalysis: result.signalAnalysis,
                             resumesPlaybackAfterSeek: true,
                             onSeekFinished: { session.finishScrubbing(candidate) }

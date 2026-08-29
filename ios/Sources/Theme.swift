@@ -251,6 +251,7 @@ struct PlaybackSignalView: View {
     let player: AVAudioPlayer?
     let analysisID: String
     let refreshToken: Int
+    let durationOverride: TimeInterval?
     /// Voice Lab computes this once while it writes each WAV, then discards the
     /// full PCM. The main forge leaves it nil and analysis is derived from `samples`.
     let preparedAnalysis: SignalAnalysis?
@@ -270,6 +271,7 @@ struct PlaybackSignalView: View {
         player: AVAudioPlayer?,
         analysisID: String,
         refreshToken: Int,
+        durationOverride: TimeInterval? = nil,
         preparedAnalysis: SignalAnalysis? = nil,
         resumesPlaybackAfterSeek: Bool = false,
         onSeekFinished: (() -> Void)? = nil,
@@ -279,6 +281,7 @@ struct PlaybackSignalView: View {
         self.player = player
         self.analysisID = analysisID
         self.refreshToken = refreshToken
+        self.durationOverride = durationOverride
         self.preparedAnalysis = preparedAnalysis
         self.resumesPlaybackAfterSeek = resumesPlaybackAfterSeek
         self.onSeekFinished = onSeekFinished
@@ -314,7 +317,7 @@ struct PlaybackSignalView: View {
                             .kerning(1.3)
                             .foregroundStyle(Lab.emerald.opacity(0.9))
                         Spacer()
-                        Text("\(Self.clock((player?.duration ?? 0) * progress)) / \(Self.clock(player?.duration ?? 0))")
+                        Text("\(Self.clock(displayDuration * progress)) / \(Self.clock(displayDuration))")
                             .font(.system(size: Lab.typeSize(9), weight: .semibold, design: .monospaced))
                             .foregroundStyle(Lab.textSecondary)
                             .monospacedDigit()
@@ -367,6 +370,13 @@ struct PlaybackSignalView: View {
     private var playbackProgress: Double {
         guard let player, player.duration > 0 else { return 0 }
         return min(1, max(0, player.currentTime / player.duration))
+    }
+
+    private var displayDuration: TimeInterval {
+        if let player, player.duration.isFinite, player.duration > 0 {
+            return player.duration
+        }
+        return max(0, durationOverride ?? 0)
     }
 
     private func accessibleSeek(to progress: Double) {
