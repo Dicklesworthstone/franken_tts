@@ -188,7 +188,7 @@ struct GalvanicVoiceForge: View {
                     Text("Forging your voice")
                         .font(.headline.weight(.semibold))
                         .foregroundStyle(Lab.textPrimary)
-                    Text("Text becomes speech here — nothing leaves this device")
+                    Text("Entirely on-device · text to finished audio")
                         .font(.subheadline)
                         .foregroundStyle(Lab.textSecondary)
                         .lineLimit(1)
@@ -512,3 +512,72 @@ private struct ForgeMetric: View {
         .accessibilityElement(children: .combine)
     }
 }
+
+#if DEBUG
+    /// Simulator-only visual harness. It deliberately publishes native-like progress
+    /// bursts so screenshot/video passes exercise the same high-frequency invalidation
+    /// pattern as a physical-device synthesis without requiring the 2 GB model.
+    struct SynthesisInstrumentHarness: View {
+        let dismiss: () -> Void
+
+        @State private var telemetry = VoiceForgeTelemetry(phase: .readingBundle)
+        @State private var elapsed: TimeInterval = 0
+
+        var body: some View {
+            NavigationStack {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 22) {
+                        Text("Synthesis instrument")
+                            .font(.largeTitle.bold())
+                            .foregroundStyle(Lab.textPrimary)
+                        Text("A visual stress run using native-shaped progress events")
+                            .foregroundStyle(Lab.textSecondary)
+                        GalvanicVoiceForge(
+                            telemetry: telemetry,
+                            elapsed: elapsed,
+                            estimatedRemainingSeconds: max(1, 18 - Int(elapsed)),
+                            compact: false
+                        )
+                    }
+                    .frame(maxWidth: 760, alignment: .leading)
+                    .padding(22)
+                }
+                .background(LaboratoryBackground())
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done", action: dismiss)
+                    }
+                }
+            }
+            .preferredColorScheme(.dark)
+            .task { await run() }
+        }
+
+        private func run() async {
+            telemetry.phase = .readingBundle
+            try? await Task.sleep(for: .seconds(1.2))
+            telemetry.phase = .checkingMemory
+            telemetry.predictedMaximumFrames = 96
+            try? await Task.sleep(for: .seconds(1.2))
+            telemetry.phase = .bindingText
+            telemetry.preparedTokens = 18
+            try? await Task.sleep(for: .seconds(1.2))
+            telemetry.phase = .forgingFrames
+            for frame in 1...72 {
+                guard !Task.isCancelled else { return }
+                telemetry.generatedFrames = UInt64(frame)
+                elapsed += 0.06
+                try? await Task.sleep(for: .milliseconds(60))
+            }
+            telemetry.phase = .decodingAudio
+            for frame in 1...72 {
+                guard !Task.isCancelled else { return }
+                telemetry.decodedFrames = UInt64(frame)
+                telemetry.decodedSamples += 2_048
+                elapsed += 0.025
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+            telemetry.phase = .denoising
+        }
+    }
+#endif

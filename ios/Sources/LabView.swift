@@ -756,6 +756,10 @@ struct LabView: View {
     @State private var showGalaxy = false
     @State private var showSpecimen = false
     @State private var showVoiceLab = ProcessInfo.processInfo.environment["FTTS_OPEN_VOICE_LIBRARY"] == "1"
+    #if DEBUG
+        @State private var showSynthesisInstrument =
+            ProcessInfo.processInfo.environment["FTTS_DEBUG_SYNTHESIS_UI"] == "1"
+    #endif
     @State private var renameTarget: EnrolledVoice?
     @State private var renameText = ""
     @State private var cardVoice: EnrolledVoice?
@@ -892,6 +896,13 @@ struct LabView: View {
             }
             .preferredColorScheme(.dark)
         }
+        #if DEBUG
+            .fullScreenCover(isPresented: $showSynthesisInstrument) {
+                SynthesisInstrumentHarness {
+                    showSynthesisInstrument = false
+                }
+            }
+        #endif
         .sheet(isPresented: $showGalaxy) {
             VoiceGalaxyView(presets: model.presets, enrolled: model.library.voices)
         }
