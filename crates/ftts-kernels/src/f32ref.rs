@@ -418,7 +418,7 @@ static APPLE_ACCELERATE_SGEMM_ENABLED: std::sync::LazyLock<bool> = std::sync::La
     any(target_os = "macos", target_os = "ios")
 ))]
 #[allow(clippy::too_many_arguments)]
-fn accelerate_sgemm(
+pub(crate) fn accelerate_sgemm(
     x: &[f32],
     weight: &[f32],
     m: usize,
@@ -490,7 +490,7 @@ fn accelerate_sgemm(
     feature = "accelerate-sgemm",
     any(target_os = "macos", target_os = "ios")
 )))]
-fn accelerate_sgemm(
+pub(crate) fn accelerate_sgemm(
     _x: &[f32],
     _weight: &[f32],
     _m: usize,

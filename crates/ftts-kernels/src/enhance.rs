@@ -17,6 +17,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
+use std::sync::OnceLock;
 
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 
@@ -147,6 +152,155 @@ fn silu(x: f32) -> f32 {
 
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+/// Apple SGEMM gate for the frame-local dense GRU projections. The scalar
+/// implementation stays in the same binary as the audio oracle and can be
+/// restored before first use with `FTTS_ENHANCE_ACCELERATE=0`.
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
+fn enhancer_accelerate_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("FTTS_ENHANCE_ACCELERATE")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "off" | "false" | "no"
+        )
+    })
+}
+
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
+fn enhancer_gru_accelerate_available() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        enhancer_accelerate_enabled()
+            && !matches!(
+                std::env::var("FTTS_ENHANCE_GRU_ACCELERATE")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "0" | "off" | "false" | "no"
+            )
+    })
+}
+
+#[cfg(not(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+)))]
+fn enhancer_gru_accelerate_available() -> bool {
+    false
+}
+
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
+fn enhancer_conv_accelerate_available() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        enhancer_accelerate_enabled()
+            && !matches!(
+                std::env::var("FTTS_ENHANCE_CONV_ACCELERATE")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "0" | "off" | "false" | "no"
+            )
+    })
+}
+
+#[cfg(not(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+)))]
+fn enhancer_conv_accelerate_available() -> bool {
+    false
+}
+
+/// Batch the 48 independent frequency-token GRU input and recurrent
+/// projections into two SGEMMs. This changes only the floating-point reduction
+/// order; the scalar gate activation/update remains the oracle below.
+fn accelerated_gru_gates(
+    block: &RnnFormerBlock,
+    tokens: &[f32],
+    hidden: &[f32],
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    // Do not even allocate the batched scratch on targets where the Accelerate
+    // backend is unavailable; the scalar oracle below is also the portable
+    // implementation.
+    if !enhancer_gru_accelerate_available() {
+        return None;
+    }
+    let gates = 3 * RF_CH;
+    let mut gi = vec![0.0f32; RF_FREQ * gates];
+    let mut gh = vec![0.0f32; RF_FREQ * gates];
+    for row in gi.chunks_exact_mut(gates) {
+        row.copy_from_slice(&block.rnn.bias_ih);
+    }
+    for row in gh.chunks_exact_mut(gates) {
+        row.copy_from_slice(&block.rnn.bias_hh);
+    }
+    if !super::f32ref::accelerate_sgemm(
+        tokens,
+        &block.rnn.weight_ih,
+        RF_FREQ,
+        RF_CH,
+        gates,
+        1.0,
+        false,
+        &mut gi,
+    ) || !super::f32ref::accelerate_sgemm(
+        hidden,
+        &block.rnn.weight_hh,
+        RF_FREQ,
+        RF_CH,
+        gates,
+        1.0,
+        false,
+        &mut gh,
+    ) {
+        return None;
+    }
+    Some((gi, gh))
+}
+
+fn finish_gru_frequency(
+    block: &RnnFormerBlock,
+    token: &mut [f32],
+    hidden: &mut [f32],
+    gi: &[f32],
+    gh: &[f32],
+) {
+    let mut rnn_out = [0.0f32; RF_CH];
+    for c in 0..RF_CH {
+        let r = sigmoid(gi[c] + gh[c]);
+        let z = sigmoid(gi[RF_CH + c] + gh[RF_CH + c]);
+        let candidate = (gi[2 * RF_CH + c] + r * gh[2 * RF_CH + c]).tanh();
+        let next = (1.0 - z) * candidate + z * hidden[c];
+        hidden[c] = next;
+        rnn_out[c] = next;
+    }
+    // rnn_fc (post-norm folded into weight+bias) + residual.
+    for (c, slot) in token.iter_mut().enumerate().take(RF_CH) {
+        let w = &block.rnn_fc.weight[c * RF_CH..(c + 1) * RF_CH];
+        let mut acc = block.rnn_fc.bias[c];
+        for i in 0..RF_CH {
+            acc += w[i] * rnn_out[i];
+        }
+        *slot += acc;
+    }
 }
 
 impl Enhancer {
@@ -515,40 +669,35 @@ impl Enhancer {
         // ---- RNNFormer blocks -----------------------------------------------------------
         for (block, h) in self.blocks.iter().zip(state.iter_mut()) {
             // GRU over time, one independent state per frequency token.
-            for fr in 0..RF_FREQ {
-                let tok = &mut tokens[fr * RF_CH..(fr + 1) * RF_CH];
-                let hcur = &mut h[fr * RF_CH..(fr + 1) * RF_CH];
-                let mut gi = [0.0f32; 3 * RF_CH];
-                let mut gh = [0.0f32; 3 * RF_CH];
-                for g in 0..3 * RF_CH {
-                    let wi = &block.rnn.weight_ih[g * RF_CH..(g + 1) * RF_CH];
-                    let wh = &block.rnn.weight_hh[g * RF_CH..(g + 1) * RF_CH];
-                    let mut ai = block.rnn.bias_ih[g];
-                    let mut ah = block.rnn.bias_hh[g];
-                    for c in 0..RF_CH {
-                        ai += wi[c] * tok[c];
-                        ah += wh[c] * hcur[c];
-                    }
-                    gi[g] = ai;
-                    gh[g] = ah;
+            if let Some((gi, gh)) = accelerated_gru_gates(block, &tokens, h) {
+                for fr in 0..RF_FREQ {
+                    finish_gru_frequency(
+                        block,
+                        &mut tokens[fr * RF_CH..(fr + 1) * RF_CH],
+                        &mut h[fr * RF_CH..(fr + 1) * RF_CH],
+                        &gi[fr * 3 * RF_CH..(fr + 1) * 3 * RF_CH],
+                        &gh[fr * 3 * RF_CH..(fr + 1) * 3 * RF_CH],
+                    );
                 }
-                let mut rnn_out = [0.0f32; RF_CH];
-                for c in 0..RF_CH {
-                    let r = sigmoid(gi[c] + gh[c]);
-                    let z = sigmoid(gi[RF_CH + c] + gh[RF_CH + c]);
-                    let ncand = (gi[2 * RF_CH + c] + r * gh[2 * RF_CH + c]).tanh();
-                    let hnew = (1.0 - z) * ncand + z * hcur[c];
-                    hcur[c] = hnew;
-                    rnn_out[c] = hnew;
-                }
-                // rnn_fc (post-norm folded into weight+bias) + residual.
-                for (c, slot) in tok.iter_mut().enumerate().take(RF_CH) {
-                    let w = &block.rnn_fc.weight[c * RF_CH..(c + 1) * RF_CH];
-                    let mut acc = block.rnn_fc.bias[c];
-                    for i in 0..RF_CH {
-                        acc += w[i] * rnn_out[i];
+            } else {
+                for fr in 0..RF_FREQ {
+                    let tok = &mut tokens[fr * RF_CH..(fr + 1) * RF_CH];
+                    let hcur = &mut h[fr * RF_CH..(fr + 1) * RF_CH];
+                    let mut gi = [0.0f32; 3 * RF_CH];
+                    let mut gh = [0.0f32; 3 * RF_CH];
+                    for g in 0..3 * RF_CH {
+                        let wi = &block.rnn.weight_ih[g * RF_CH..(g + 1) * RF_CH];
+                        let wh = &block.rnn.weight_hh[g * RF_CH..(g + 1) * RF_CH];
+                        let mut ai = block.rnn.bias_ih[g];
+                        let mut ah = block.rnn.bias_hh[g];
+                        for c in 0..RF_CH {
+                            ai += wi[c] * tok[c];
+                            ah += wh[c] * hcur[c];
+                        }
+                        gi[g] = ai;
+                        gh[g] = ah;
                     }
-                    *slot += acc;
+                    finish_gru_frequency(block, tok, hcur, &gi, &gh);
                 }
             }
 
@@ -749,6 +898,62 @@ fn lanczos6_tap(distance: f64, cutoff: f64) -> f64 {
 
 /// Same-padding k-wide conv over `width` positions, optional SiLU.
 fn conv_k_same(conv: &Conv1d, x: &[f32], width: usize, act: bool) -> Vec<f32> {
+    if let Some(out) = accelerated_conv_k_same(conv, x, width, act) {
+        return out;
+    }
+    conv_k_same_scalar(conv, x, width, act)
+}
+
+/// Pack the channel-major input into the im2col rows consumed by one SGEMM.
+/// The model's convolution weights are already `[out][in][k]`, exactly the
+/// row-major matrix layout expected by `accelerate_sgemm`.
+fn accelerated_conv_k_same(conv: &Conv1d, x: &[f32], width: usize, act: bool) -> Option<Vec<f32>> {
+    if !enhancer_conv_accelerate_available() {
+        return None;
+    }
+    let reduction = conv.in_ch * conv.k;
+    let pad = (conv.k - 1) / 2;
+    let mut im2col = vec![0.0f32; width * reduction];
+    for position in 0..width {
+        let row = &mut im2col[position * reduction..(position + 1) * reduction];
+        for channel in 0..conv.in_ch {
+            for tap in 0..conv.k {
+                let source = position as isize + tap as isize - pad as isize;
+                if source >= 0 && source < width as isize {
+                    row[channel * conv.k + tap] = x[channel * width + source as usize];
+                }
+            }
+        }
+    }
+    let mut packed_out = vec![0.0f32; width * conv.out_ch];
+    for row in packed_out.chunks_exact_mut(conv.out_ch) {
+        row.copy_from_slice(&conv.bias);
+    }
+    if !super::f32ref::accelerate_sgemm(
+        &im2col,
+        &conv.weight,
+        width,
+        reduction,
+        conv.out_ch,
+        1.0,
+        false,
+        &mut packed_out,
+    ) {
+        return None;
+    }
+
+    // Restore the channel-major layout used by every surrounding layer.
+    let mut out = vec![0.0f32; conv.out_ch * width];
+    for position in 0..width {
+        for channel in 0..conv.out_ch {
+            let value = packed_out[position * conv.out_ch + channel];
+            out[channel * width + position] = if act { silu(value) } else { value };
+        }
+    }
+    Some(out)
+}
+
+fn conv_k_same_scalar(conv: &Conv1d, x: &[f32], width: usize, act: bool) -> Vec<f32> {
     let mut out = vec![0.0f32; conv.out_ch * width];
     let pad = (conv.k - 1) / 2;
     for o in 0..conv.out_ch {
@@ -1021,5 +1226,95 @@ mod tests {
             assert!((spec[2 * k] as f64 - re).abs() < 1.0e-3, "bin {k} re");
             assert!((spec[2 * k + 1] as f64 - im).abs() < 1.0e-3, "bin {k} im");
         }
+    }
+
+    #[cfg(all(
+        feature = "accelerate-sgemm",
+        any(target_os = "macos", target_os = "ios")
+    ))]
+    #[test]
+    fn accelerated_gru_gates_track_the_scalar_oracle() {
+        let value = |index: usize, modulus: usize, scale: f32| {
+            ((index.wrapping_mul(37).wrapping_add(11) % modulus) as f32 - (modulus / 2) as f32)
+                * scale
+        };
+        let block = RnnFormerBlock {
+            rnn: GruWeights {
+                weight_ih: (0..3 * RF_CH * RF_CH)
+                    .map(|i| value(i, 101, 0.0007))
+                    .collect(),
+                weight_hh: (0..3 * RF_CH * RF_CH)
+                    .map(|i| value(i, 97, 0.0006))
+                    .collect(),
+                bias_ih: (0..3 * RF_CH).map(|i| value(i, 31, 0.001)).collect(),
+                bias_hh: (0..3 * RF_CH).map(|i| value(i, 29, 0.001)).collect(),
+            },
+            rnn_fc: Conv1d {
+                weight: vec![0.0; RF_CH * RF_CH],
+                bias: vec![0.0; RF_CH],
+                out_ch: RF_CH,
+                in_ch: RF_CH,
+                k: 1,
+            },
+            qkv: Linear { weight: Vec::new() },
+            attn_fc: Conv1d {
+                weight: Vec::new(),
+                bias: Vec::new(),
+                out_ch: RF_CH,
+                in_ch: RF_CH,
+                k: 1,
+            },
+            pe: None,
+        };
+        let tokens: Vec<f32> = (0..RF_FREQ * RF_CH).map(|i| value(i, 89, 0.002)).collect();
+        let hidden: Vec<f32> = (0..RF_FREQ * RF_CH).map(|i| value(i, 83, 0.0015)).collect();
+        let (got_i, got_h) = accelerated_gru_gates(&block, &tokens, &hidden)
+            .expect("the Apple test build enables Accelerate SGEMM");
+
+        let mut max_abs = 0.0f32;
+        for fr in 0..RF_FREQ {
+            for gate in 0..3 * RF_CH {
+                let mut expected_i = block.rnn.bias_ih[gate];
+                let mut expected_h = block.rnn.bias_hh[gate];
+                for c in 0..RF_CH {
+                    expected_i += block.rnn.weight_ih[gate * RF_CH + c] * tokens[fr * RF_CH + c];
+                    expected_h += block.rnn.weight_hh[gate * RF_CH + c] * hidden[fr * RF_CH + c];
+                }
+                max_abs = max_abs.max((got_i[fr * 3 * RF_CH + gate] - expected_i).abs());
+                max_abs = max_abs.max((got_h[fr * 3 * RF_CH + gate] - expected_h).abs());
+            }
+        }
+        assert!(max_abs < 2.0e-6, "SGEMM vs scalar max abs error {max_abs}");
+    }
+
+    #[cfg(all(
+        feature = "accelerate-sgemm",
+        any(target_os = "macos", target_os = "ios")
+    ))]
+    #[test]
+    fn accelerated_same_conv_tracks_the_scalar_oracle() {
+        let value = |index: usize, modulus: usize, scale: f32| {
+            ((index.wrapping_mul(41).wrapping_add(13) % modulus) as f32 - (modulus / 2) as f32)
+                * scale
+        };
+        let conv = Conv1d {
+            weight: (0..CH * CH * ENC_K)
+                .map(|i| value(i, 109, 0.0008))
+                .collect(),
+            bias: (0..CH).map(|i| value(i, 37, 0.001)).collect(),
+            out_ch: CH,
+            in_ch: CH,
+            k: ENC_K,
+        };
+        let input: Vec<f32> = (0..CH * F_ENC).map(|i| value(i, 103, 0.0015)).collect();
+        let expected = conv_k_same_scalar(&conv, &input, F_ENC, true);
+        let got = accelerated_conv_k_same(&conv, &input, F_ENC, true)
+            .expect("the Apple test build enables Accelerate SGEMM");
+        let max_abs = expected
+            .iter()
+            .zip(got.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs < 3.0e-6, "SGEMM vs scalar max abs error {max_abs}");
     }
 }
