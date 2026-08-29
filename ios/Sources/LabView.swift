@@ -2016,11 +2016,16 @@ struct LabView: View {
                         .kerning(1.2)
                         .foregroundStyle(Lab.emerald)
                     Text(model.currentVoiceLabel.capitalized)
-                        .font(.system(size: Lab.typeSize(28), weight: .black, design: .rounded))
+                        .font(.system(
+                            size: Lab.typeSize(voiceArchiveNamePointSize),
+                            weight: .black,
+                            design: .rounded
+                        ))
                         .foregroundStyle(.white)
                         .lineLimit(1)
-                        .minimumScaleFactor(0.62)
+                        .minimumScaleFactor(0.72)
                         .allowsTightening(true)
+                        .layoutPriority(1)
                     Text(selectedVoiceCharacter)
                         .font(.system(size: Lab.typeSize(12), weight: .medium))
                         .foregroundStyle(Lab.textPrimary.opacity(0.78))
@@ -2035,6 +2040,14 @@ struct LabView: View {
         }
         .frame(minHeight: 170)
         .shadow(color: Lab.emerald.opacity(0.15), radius: 24, y: 10)
+    }
+
+    /// Keep the hero name complete without letting an intrinsically wide Text
+    /// enlarge the containing ScrollView. The coefficient is tuned to the space
+    /// remaining beside the 74-point orb on a 390-point compact screen.
+    private var voiceArchiveNamePointSize: CGFloat {
+        let glyphCount = max(1, model.currentVoiceLabel.count)
+        return min(28, max(12, 420 / CGFloat(glyphCount)))
     }
 
     private var voiceSearchField: some View {
@@ -2060,29 +2073,38 @@ struct LabView: View {
     }
 
     private var voiceFilterBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(VoiceLibraryFilter.allCases) { filter in
-                    Button {
-                        withAnimation(.snappy) { voiceLibraryFilter = filter }
-                    } label: {
-                        Label(filter.rawValue, systemImage: filter.symbol)
-                            .font(.system(size: Lab.typeSize(11), weight: .bold))
-                            .foregroundStyle(voiceLibraryFilter == filter ? Color.black : Lab.textPrimary)
-                            .padding(.horizontal, 13)
-                            .frame(height: 38)
-                            .background(
-                                voiceLibraryFilter == filter ? Lab.emerald : Color.black.opacity(0.38),
-                                in: Capsule()
-                            )
-                            .overlay(Capsule().stroke(voiceLibraryFilter == filter ? .clear : Lab.stroke))
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(VoiceLibraryFilter.allCases) { filter in
+                        Button {
+                            withAnimation(.snappy) { voiceLibraryFilter = filter }
+                        } label: {
+                            Label(filter.rawValue, systemImage: filter.symbol)
+                                .font(.system(size: Lab.typeSize(11), weight: .bold))
+                                .foregroundStyle(voiceLibraryFilter == filter ? Color.black : Lab.textPrimary)
+                                .padding(.horizontal, 13)
+                                .frame(height: 38)
+                                .background(
+                                    voiceLibraryFilter == filter ? Lab.emerald : Color.black.opacity(0.38),
+                                    in: Capsule()
+                                )
+                                .overlay(Capsule().stroke(voiceLibraryFilter == filter ? .clear : Lab.stroke))
+                        }
+                        .buttonStyle(.plain)
+                        .id(filter)
                     }
-                    .buttonStyle(.plain)
                 }
+                .padding(.vertical, 2)
             }
-            .padding(.vertical, 2)
+            .scrollClipDisabled()
+            .onAppear {
+                proxy.scrollTo(voiceLibraryFilter, anchor: .trailing)
+            }
+            .onChange(of: voiceLibraryFilter) { _, filter in
+                withAnimation(.snappy) { proxy.scrollTo(filter, anchor: .center) }
+            }
         }
-        .scrollClipDisabled()
     }
 
     private func voiceSectionHeader(_ title: String, detail: String) -> some View {
