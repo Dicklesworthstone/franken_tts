@@ -772,6 +772,10 @@ private struct VoiceComparisonCard: View {
                         Text(candidate.name)
                             .font(.headline)
                             .foregroundStyle(Lab.textPrimary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.68)
+                            .allowsTightening(true)
+                            .layoutPriority(1)
                         if candidate.personal {
                             Text("YOURS")
                                 .font(.caption2.bold().monospaced())
@@ -824,19 +828,20 @@ private struct VoiceComparisonCard: View {
                             }
                             .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
                             Button { session.useVoice(candidate) } label: {
-                                Label("Use voice", systemImage: "checkmark.circle")
+                                ViewThatFits(in: .horizontal) {
+                                    Label("Use voice", systemImage: "checkmark.circle")
+                                    Label("Use", systemImage: "checkmark.circle")
+                                }
                             }
                             .buttonStyle(GhostButtonStyle(
                                 tint: session.model.selectedVoice == candidate.selectionID
                                     ? Lab.emerald : Lab.textSecondary))
+                            .accessibilityLabel("Use \(candidate.name) voice")
                             ShareLink(item: result.url) {
                                 Image(systemName: "square.and.arrow.up")
                             }
                             .buttonStyle(GhostButtonStyle())
-                            Spacer()
-                            Text(String(format: "%.1fs", result.duration))
-                                .font(.caption.monospaced())
-                                .foregroundStyle(Lab.textSecondary)
+                            .accessibilityLabel("Share \(candidate.name) audio")
                         }
                     }
                 } else {

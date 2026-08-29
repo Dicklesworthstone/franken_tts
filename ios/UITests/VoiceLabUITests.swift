@@ -63,3 +63,27 @@ final class VoiceLabUITests: XCTestCase {
         add(attachment)
     }
 }
+
+final class VoiceBrowserUITests: XCTestCase {
+    func testLongPersonalVoiceNameStaysOnOneLineOnCompactPhone() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["FTTS_DEBUG_LONG_VOICE_NAME"] = "1"
+        app.launch()
+
+        XCTAssertTrue(app.navigationBars["Voice Library"].waitForExistence(timeout: 8))
+        let name = app.staticTexts[
+            "voice-library-name-A11CE000-0000-4000-8000-000000000001"
+        ]
+        XCTAssertTrue(name.waitForExistence(timeout: 3))
+        XCTAssertLessThan(
+            name.frame.height,
+            32,
+            "Long voice names must scale within a stable single-line tile instead of wrapping"
+        )
+
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "voice-browser-long-name"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+}

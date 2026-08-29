@@ -26,6 +26,17 @@ final class VoiceLibrary {
         reload()
     }
 
+    #if DEBUG
+        /// Non-persistent layout fixture for UI tests. Long names are especially
+        /// important here because a wrapped label changes the height of an entire
+        /// adaptive grid row on compact phones.
+        func installDebugVoices(_ fixtures: [EnrolledVoice]) {
+            voices = fixtures.sorted {
+                $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+        }
+    #endif
+
     func reload() {
         let contents =
             (try? FileManager.default.contentsOfDirectory(

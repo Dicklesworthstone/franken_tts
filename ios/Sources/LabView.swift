@@ -1474,6 +1474,7 @@ struct LabView: View {
         .sensoryFeedback(.success, trigger: model.enrollmentSaved) { _, saved in saved }
         .sensoryFeedback(.success, trigger: importCount) { _, count in count > 0 }
         .onAppear(perform: debugCardHook)
+        .onAppear(perform: debugLongVoiceNameHook)
         .onAppear(perform: debugVideoHook)
         .task {
             if profilingRequested {
@@ -1655,6 +1656,9 @@ struct LabView: View {
                             Text(model.currentVoiceLabel)
                                 .font(.headline)
                                 .foregroundStyle(Lab.textPrimary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.68)
+                                .allowsTightening(true)
                             Text("Selected voice")
                                 .font(.caption)
                                 .foregroundStyle(Lab.textSecondary)
@@ -2014,6 +2018,9 @@ struct LabView: View {
                     Text(model.currentVoiceLabel.capitalized)
                         .font(.system(size: Lab.typeSize(28), weight: .black, design: .rounded))
                         .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.62)
+                        .allowsTightening(true)
                     Text(selectedVoiceCharacter)
                         .font(.system(size: Lab.typeSize(12), weight: .medium))
                         .foregroundStyle(Lab.textPrimary.opacity(0.78))
@@ -2549,6 +2556,24 @@ struct LabView: View {
         #endif
     }
 
+    /// Layout harness for the narrowest supported phone. It does not touch the
+    /// persisted voice archive, so repeatedly running the screenshot test cannot
+    /// leave synthetic voices behind in the simulator or a developer build.
+    private func debugLongVoiceNameHook() {
+        #if DEBUG
+            guard ProcessInfo.processInfo.environment["FTTS_DEBUG_LONG_VOICE_NAME"] == "1"
+            else { return }
+            let voice = EnrolledVoice(
+                id: UUID(uuidString: "A11CE000-0000-4000-8000-000000000001")!,
+                name: "Alexandria-Cassandra Nightingale",
+                vector: Array(repeating: 0, count: Engine.speakerWidth)
+            )
+            model.library.installDebugVoices([voice])
+            model.selectedVoice = "voice:\(voice.id.uuidString)"
+            showVoiceLab = true
+        #endif
+    }
+
     /// Reproduction harness: FTTS_DEBUG_VIDEO=1 runs a full video export over 20 s of
     /// synthetic tone on launch, logging progress and per-frame timing. Debug only.
     private func debugVideoHook() {
@@ -2829,6 +2854,10 @@ struct VoiceTile: View {
                         Text(name.capitalized)
                             .font(.system(size: Lab.typeSize(16), weight: .black))
                             .foregroundStyle(Lab.textPrimary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.62)
+                            .allowsTightening(true)
+                            .layoutPriority(1)
                         Text(character.localizedCaseInsensitiveContains("feminine") ? "FEMININE" : "MASCULINE")
                             .font(.system(size: Lab.typeSize(7), weight: .black, design: .monospaced))
                             .kerning(1)
@@ -2901,6 +2930,10 @@ struct EnrolledVoiceTile: View {
                             .font(.system(size: Lab.typeSize(15), weight: .black))
                             .foregroundStyle(Lab.textPrimary)
                             .lineLimit(1)
+                            .minimumScaleFactor(0.62)
+                            .allowsTightening(true)
+                            .layoutPriority(1)
+                            .accessibilityIdentifier("voice-library-name-\(voice.id.uuidString)")
                         Text("PRIVATE VOICEPRINT")
                             .font(.system(size: Lab.typeSize(7), weight: .black, design: .monospaced))
                             .foregroundStyle(Lab.emerald)
