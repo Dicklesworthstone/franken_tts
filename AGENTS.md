@@ -186,14 +186,16 @@ cargo fmt --check
 cargo check --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-ubs --diff
+ubs --diff  # advisory heuristic review; inspect findings, but false positives do not make the gate red
 ```
 
 If any check fails, fix root causes before handing off.
 
-### The `cargo test --locked` gate (green-bar requirement)
+### Fast gate versus ultra certification
 
-`cargo test --locked` is a **hard gate**: it MUST exit `0` before any change is handed off or a bead is closed. `scripts/check.sh` is the one-command gate: it runs the repository validators before `cargo fmt --check`, locked check/clippy/test, and bounded `ubs --diff`, stopping on the first failure. CI invokes this same script as its single test step, so the script is the source of truth rather than a duplicated workflow command list.
+`cargo test --locked` remains a **hard gate**: it MUST exit `0` before any change is handed off or a bead is closed. It is intentionally bounded: multi-minute real-model integration binaries are compiled only with their package's `ultra-tests` feature. `scripts/check.sh` is the default one-command edit-loop gate; it runs repository validators, format, locked check/clippy/test, and bounded `ubs --diff`, stopping on deterministic failures. UBS is a heuristic advisory: review its output, but do not turn known test/FFI false positives into a counterfeit compile or test failure.
+
+`./scripts/check.sh --ultra` is the explicit certification lane. It additionally runs the real Chromium synthesis, all five release-target checks, and every real-model cancellation/resident/streaming/oracle/conformance battery. Run it before releases, after broad engine changes, or when the relevant targeted real-model test is not sufficient—not after every Swift or documentation edit. Never describe a fast-gate result as ultra certification.
 
 Full stage list, the eight structural rules in `scripts/validate_repo.py`, the skip-honest banner (`GREEN WITH SKIPS` is **not** a green bar), the advisory 5-target cross-check matrix, and the sibling-repo pinning policy are documented in [`docs/CI_AND_GATES.md`](docs/CI_AND_GATES.md).
 

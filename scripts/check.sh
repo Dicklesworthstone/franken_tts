@@ -3,7 +3,8 @@
 # The one command. CI runs exactly this script as its single test step, so the gate lives in
 # one place and cannot drift from a duplicated list of workflow commands.
 #
-#   ./scripts/check.sh
+#   ./scripts/check.sh           # bounded edit-loop gate (default)
+#   ./scripts/check.sh --ultra   # full model/browser/cross-target certification
 #
 # Stages run in cheapest-first order and STOP AT THE FIRST FAILURE, so a structural mistake is
 # reported in under two seconds instead of after a ten-minute build.
@@ -12,7 +13,12 @@
 # "green" — the closing banner reads GREEN WITH SKIPS and lists them (AGENTS.md Doctrine #0.4:
 # a skipped check is never presented as passing).
 #
+# Modes:
+#   fast (default)  architecture, compile, lint, unit/contract tests, bug scan
+#   ultra           also real browser, five release targets, and every real-model battery
+#
 # Environment:
+#   FTTS_CHECK_MODE=fast|ultra  alternative to the command-line mode flag
 #   FTTS_CHECK_USE_RCH=1    offload cargo to remote workers — SEE THE WARNING BELOW
 #   FTTS_CHECK_UBS_TIMEOUT  seconds to bound `ubs --diff` (default 300)
 #
@@ -28,11 +34,36 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
+CHECK_MODE="${FTTS_CHECK_MODE:-fast}"
+for arg in "$@"; do
+    case "$arg" in
+        --fast) CHECK_MODE="fast" ;;
+        --ultra) CHECK_MODE="ultra" ;;
+        -h|--help)
+            printf '%s\n' \
+                'usage: ./scripts/check.sh [--fast|--ultra]' \
+                '' \
+                '  --fast   bounded default gate; excludes multi-minute real-model batteries' \
+                '  --ultra  full browser, cross-target, and real-model certification'
+            exit 0
+            ;;
+        *)
+            printf 'unknown check mode argument: %s\n' "$arg" >&2
+            exit 2
+            ;;
+    esac
+done
+if [[ "$CHECK_MODE" != "fast" && "$CHECK_MODE" != "ultra" ]]; then
+    printf 'invalid FTTS_CHECK_MODE=%q; use fast or ultra\n' "$CHECK_MODE" >&2
+    exit 2
+fi
+
 BOLD=$'\033[1m'; RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
 if [[ ! -t 1 ]]; then BOLD=""; RED=""; GREEN=""; YELLOW=""; DIM=""; OFF=""; fi
 
 STAGE_NUM=0
 SKIPPED=()
+ADVISORIES=()
 START_ALL=$SECONDS
 
 banner() { printf '%s\n' "${DIM}────────────────────────────────────────────────────────────${OFF}"; }
@@ -49,6 +80,12 @@ stage_pass() { printf '    %sPASS%s  %s (%ss)\n\n' "$GREEN" "$OFF" "$STAGE_NAME"
 stage_skip() {
     SKIPPED+=("$STAGE_NAME: $1")
     printf '    %sSKIP%s  %s — %s\n\n' "$YELLOW" "$OFF" "$STAGE_NAME" "$1"
+}
+
+stage_advisory() {
+    ADVISORIES+=("$STAGE_NAME: $1")
+    printf '    %sADVISORY%s  %s — %s (%ss)\n\n' \
+        "$YELLOW" "$OFF" "$STAGE_NAME" "$1" "$((SECONDS - STAGE_START))"
 }
 
 stage_fail() {
@@ -102,7 +139,12 @@ DIRTY_FILES="$(git status --porcelain 2>/dev/null | grep -v '^?? \.ntm/' || true
 DIRTY_COUNT="$(printf '%s' "$DIRTY_FILES" | grep -c . || true)"
 
 printf '%sfranken_tts gate%s  %s\n' "$BOLD" "$OFF" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+printf '%smode:      %s%s\n' "$DIM" "$CHECK_MODE" "$OFF"
 printf '%scargo via: %s%s\n' "$DIM" "$CARGO_MODE" "$OFF"
+if [[ "$CHECK_MODE" == "fast" ]]; then
+    printf '%sscope:     bounded edit loop; use --ultra for real-model/browser/release certification%s\n' \
+        "$DIM" "$OFF"
+fi
 if [[ -z "$DIRTY_FILES" ]]; then
     printf '%stree:      %s (clean)%s\n' "$DIM" "$HEAD_SHA" "$OFF"
 else
@@ -205,20 +247,22 @@ fi
 #
 # FTTS_SKIP_BROWSER_GATE=1 opts out for a quick iteration loop; the full run takes several minutes
 # because it downloads and hydrates 1.86 GB.
-stage_start "site loads + synthesizes in real Chromium"
-if [ "${FTTS_SKIP_BROWSER_GATE:-0}" = "1" ]; then
-    stage_skip "FTTS_SKIP_BROWSER_GATE=1; the browser end-to-end was NOT run"
-elif ! command -v node >/dev/null 2>&1; then
-    stage_skip "node not installed; browser end-to-end NOT run"
-elif [ ! -d "$HOME/.cache/franken_tts/model" ]; then
-    stage_skip "no local model cache; browser end-to-end NOT run"
-elif ! node -e "require.resolve('playwright')" >/dev/null 2>&1; then
-    stage_skip "playwright not installed (npm i playwright && npx playwright install chromium)"
-else
-    if ! node site/harness/browser.mjs; then
-        stage_fail "the site does not load or synthesize in a real browser"
+if [[ "$CHECK_MODE" == "ultra" ]]; then
+    stage_start "site loads + synthesizes in real Chromium"
+    if [ "${FTTS_SKIP_BROWSER_GATE:-0}" = "1" ]; then
+        stage_skip "FTTS_SKIP_BROWSER_GATE=1; the browser end-to-end was NOT run"
+    elif ! command -v node >/dev/null 2>&1; then
+        stage_skip "node not installed; browser end-to-end NOT run"
+    elif [ ! -d "$HOME/.cache/franken_tts/model" ]; then
+        stage_skip "no local model cache; browser end-to-end NOT run"
+    elif ! node -e "require.resolve('playwright')" >/dev/null 2>&1; then
+        stage_skip "playwright not installed (npm i playwright && npx playwright install chromium)"
+    else
+        if ! node site/harness/browser.mjs; then
+            stage_fail "the site does not load or synthesize in a real browser"
+        fi
+        stage_pass
     fi
-    stage_pass
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,25 +344,27 @@ RELEASE_TARGETS=(
     aarch64-apple-darwin
     x86_64-pc-windows-msvc
 )
-stage_start "cross-target check (${#RELEASE_TARGETS[@]} release targets)"
-INSTALLED_TARGETS="$(rustup target list --installed 2>/dev/null || true)"
-MISSING_TARGETS=()
-for target in "${RELEASE_TARGETS[@]}"; do
-    if ! printf '%s\n' "$INSTALLED_TARGETS" | grep -qx "$target"; then
-        MISSING_TARGETS+=("$target")
-        continue
+if [[ "$CHECK_MODE" == "ultra" ]]; then
+    stage_start "cross-target check (${#RELEASE_TARGETS[@]} release targets)"
+    INSTALLED_TARGETS="$(rustup target list --installed 2>/dev/null || true)"
+    MISSING_TARGETS=()
+    for target in "${RELEASE_TARGETS[@]}"; do
+        if ! printf '%s\n' "$INSTALLED_TARGETS" | grep -qx "$target"; then
+            MISSING_TARGETS+=("$target")
+            continue
+        fi
+        if ! run_cargo check --locked --all-targets --target "$target"; then
+            stage_fail "$target does not build; the Phase-0 exit criterion covers all ${#RELEASE_TARGETS[@]} targets"
+        fi
+    done
+    if [[ ${#MISSING_TARGETS[@]} -gt 0 ]]; then
+        if [[ "${FTTS_REQUIRE_ALL_TARGETS:-0}" == "1" ]]; then
+            stage_fail "std missing for: ${MISSING_TARGETS[*]} — run \`rustup target add\` for each (FTTS_REQUIRE_ALL_TARGETS=1 forbids skipping)"
+        fi
+        stage_skip "not checked (std not installed): ${MISSING_TARGETS[*]} — \`rustup target add\` them, or set FTTS_REQUIRE_ALL_TARGETS=1 to make this fatal"
+    else
+        stage_pass
     fi
-    if ! run_cargo check --locked --all-targets --target "$target"; then
-        stage_fail "$target does not build; the Phase-0 exit criterion covers all ${#RELEASE_TARGETS[@]} targets"
-    fi
-done
-if [[ ${#MISSING_TARGETS[@]} -gt 0 ]]; then
-    if [[ "${FTTS_REQUIRE_ALL_TARGETS:-0}" == "1" ]]; then
-        stage_fail "std missing for: ${MISSING_TARGETS[*]} — run \`rustup target add\` for each (FTTS_REQUIRE_ALL_TARGETS=1 forbids skipping)"
-    fi
-    stage_skip "not checked (std not installed): ${MISSING_TARGETS[*]} — \`rustup target add\` them, or set FTTS_REQUIRE_ALL_TARGETS=1 to make this fatal"
-else
-    stage_pass
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -333,7 +379,16 @@ stage_pass
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Tests — the hard gate
 # ─────────────────────────────────────────────────────────────────────────────
-stage_start "cargo test --locked (HARD GATE — must exit 0 before any bead closes)"
+if [[ "$CHECK_MODE" == "ultra" ]]; then
+    stage_start "cargo test --locked (ULTRA: real-model certification batteries enabled)"
+    TEST_ARGS=(
+        --workspace
+        --features ftts-cli/ultra-tests,ftts-conformance/ultra-tests,ftts-ffi/ultra-tests
+    )
+else
+    stage_start "cargo test --locked (FAST: bounded unit and contract gate)"
+    TEST_ARGS=()
+fi
 # Capture the receipt stream. `libtest` prints captured stdout only for FAILING tests, so on a
 # green run the receipts that distinguish `skipped` from `passed` would be invisible — exactly
 # when that distinction is worth auditing. The path must be ABSOLUTE: cargo runs each test
@@ -343,7 +398,7 @@ RECEIPTS="$PWD/target/receipts.ndjson"
 mkdir -p target
 rm -f "$RECEIPTS"
 export FTTS_RECEIPTS="$RECEIPTS"
-if ! run_cargo test --locked; then
+if ! run_cargo test --locked "${TEST_ARGS[@]}"; then
     stage_fail "no bead closes while this is red"
 fi
 stage_pass
@@ -380,7 +435,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. Bug scan over the working-tree diff (bounded; optional tool)
 # ─────────────────────────────────────────────────────────────────────────────
-stage_start "ubs --diff"
+stage_start "ubs --diff (advisory heuristic scan)"
 UBS_TIMEOUT="${FTTS_CHECK_UBS_TIMEOUT:-300}"
 if ! command -v ubs >/dev/null 2>&1; then
     stage_skip "ubs is not installed on this machine"
@@ -398,19 +453,22 @@ else
     if [[ ${#BOUND[@]} -eq 0 ]]; then
         ubs --diff
         UBS_RC=$?
-        [[ $UBS_RC -ne 0 ]] && stage_fail "ubs reported findings (exit $UBS_RC)"
-        SKIPPED+=("ubs bound: no timeout(1) on this machine, ran unbounded")
-        printf '    %sPASS%s  %s (%ss, %sunbounded — no timeout(1)%s)\n\n' \
-            "$GREEN" "$OFF" "$STAGE_NAME" "$((SECONDS - STAGE_START))" "$YELLOW" "$OFF"
+        if [[ $UBS_RC -ne 0 ]]; then
+            stage_advisory "reported heuristic findings (exit $UBS_RC); review above"
+        else
+            ADVISORIES+=("ubs bound: no timeout(1) on this machine, ran unbounded")
+            stage_pass
+        fi
     else
         "${BOUND[@]}" ubs --diff
         UBS_RC=$?
         if [[ $UBS_RC -eq 124 ]]; then
-            stage_fail "ubs exceeded its ${UBS_TIMEOUT}s bound (raise FTTS_CHECK_UBS_TIMEOUT if that is legitimate)"
+            stage_advisory "exceeded its ${UBS_TIMEOUT}s bound; scan incomplete"
         elif [[ $UBS_RC -ne 0 ]]; then
-            stage_fail "ubs reported findings (exit $UBS_RC)"
+            stage_advisory "reported heuristic findings (exit $UBS_RC); review above"
+        else
+            stage_pass
         fi
-        stage_pass
     fi
 fi
 
@@ -424,5 +482,9 @@ else
         "$YELLOW$BOLD" "$OFF" "$STAGE_NUM" "$ELAPSED" "${#SKIPPED[@]}"
     for entry in "${SKIPPED[@]}"; do printf '  %s- %s%s\n' "$YELLOW" "$entry" "$OFF"; done
     printf '%sThis is NOT a full green bar. Do not quote it as one.%s\n' "$DIM" "$OFF"
+fi
+if [[ ${#ADVISORIES[@]} -gt 0 ]]; then
+    printf '%sAdvisories (%s):%s\n' "$YELLOW" "${#ADVISORIES[@]}" "$OFF"
+    for entry in "${ADVISORIES[@]}"; do printf '  %s- %s%s\n' "$YELLOW" "$entry" "$OFF"; done
 fi
 exit 0

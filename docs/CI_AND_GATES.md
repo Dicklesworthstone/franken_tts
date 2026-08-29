@@ -6,6 +6,13 @@ One command gates this repo:
 ./scripts/check.sh
 ```
 
+That command is deliberately bounded for the normal edit loop. Full real-model and release
+certification is explicit:
+
+```bash
+./scripts/check.sh --ultra
+```
+
 CI runs exactly that script as its single test step. There is no second list of commands in a
 workflow file to drift out of sync — if you want to change what CI enforces, change the script.
 
@@ -26,9 +33,15 @@ under two seconds instead of after a ten-minute build.
 | 4 | `cargo fmt --check` | formatting |
 | 5 | `cargo check --locked --all-targets` | type errors, **and the multiple-build-targets warning** |
 | 6 | `cargo clippy --locked --all-targets -- -D warnings` | lints |
-| 7 | `cargo test --locked` | **the hard gate** — no bead closes while this is red |
+| 7 | `cargo test --locked` | **the bounded hard gate** — unit and contract tests; no bead closes while this is red |
 | 8 | `summarize_receipts.py` | a model-gated test that skipped being counted as a pass |
-| 9 | `ubs --diff` (bounded) | bug scan over working-tree changes |
+| 9 | `ubs --diff` (bounded, advisory) | heuristic review over working-tree changes; findings are printed but do not counterfeit a deterministic gate failure |
+
+Ultra mode inserts the real Chromium synthesis and five release-target checks, and enables the
+`ultra-tests` features on `ftts-cli`, `ftts-conformance`, and `ftts-ffi`. Those features contain
+the full-model cancellation, resident-daemon, streaming, warm-engine, ABI, and numerical-oracle
+batteries. On a machine with the model and truth pack they can take well over an hour; that cost is
+appropriate for release certification, not every edit.
 
 Stages 2, 3, and the selftest inside stage 8 exist because a validator nobody has seen fail is a
 validator nobody knows works. Each runs in about two seconds and guards a gate that would
@@ -40,8 +53,9 @@ Every stage prints `PASS`, `FAIL`, or `SKIP <reason>`. A skip is never folded in
 closing banner reads **`GREEN WITH SKIPS`** and lists them, per AGENTS.md Doctrine #0.4. Quote
 that banner as it appears; "the gate passed" is not an accurate summary of a run with skips.
 
-`ubs` is the only stage that may skip (it is not installed on hosted runners). Everything else is
-required: a missing tool is a failure, not a skip.
+Within the selected mode, every listed stage is required unless its own prerequisite is explicitly
+reported as a skip. Fast mode does not report ultra-only stages as skipped: they are outside the
+fast contract, and the header says so. Never quote a fast result as an ultra result.
 
 #### The second skip layer: model-gated tests
 

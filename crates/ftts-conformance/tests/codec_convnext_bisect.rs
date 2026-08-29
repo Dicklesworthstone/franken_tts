@@ -56,9 +56,8 @@
 //! cut. Testing that needs a `baddbmm`-shaped call, which `linear_with_accumulation` cannot
 //! currently issue.
 
-#![feature(float_erf)]
-
 #![cfg(feature = "ultra-tests")]
+#![feature(float_erf)]
 
 use ftts_artifacts::safetensors::SafetensorsFile;
 use ftts_conformance::npy::NpyArray;

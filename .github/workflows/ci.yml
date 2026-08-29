@@ -1,8 +1,8 @@
 name: CI
 
-# The `gate` job runs scripts/check.sh and nothing else. The gate lives in the script, so this
-# workflow can never drift from what a developer runs locally — if you want to change what CI
-# enforces, change scripts/check.sh.
+# The `gate` job runs the bounded scripts/check.sh lane on pushes and PRs. Nightly (or an explicit
+# ultra dispatch) selects the same script's certification lane. The stage definitions therefore
+# remain in one place instead of drifting into workflow YAML.
 #
 # The `cross` job is ADVISORY (continue-on-error): it type-checks all five release targets from
 # day 0 so target rot surfaces early, without blocking a merge on a platform we do not yet ship.
@@ -19,6 +19,15 @@ on:
       - '.beads/**'
   pull_request:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Check tier
+        required: true
+        default: fast
+        type: choice
+        options:
+          - fast
+          - ultra
   # Carries the advisory 5-target cross-check, which no longer runs on main pushes (see the
   # `cross` job). Nightly keeps target rot surfacing early without competing with the gate.
   schedule:
@@ -127,10 +136,11 @@ jobs:
           set -euo pipefail
           rustup show active-toolchain
           rustup component add rustfmt clippy
-          # The Phase-0 exit criterion is "builds green on all 5 targets". check.sh enforces it
-          # in-job (see its stage 5b); these are the stds it needs. Installing them here rather
-          # than requesting five extra concurrent runner slots keeps the blocking gate off the
-          # free-plan queue that starves it (frankentts-nlb, frankentts-j5j).
+      - name: Install ultra certification target stds
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'ultra')
+        working-directory: frankentts
+        run: |
+          set -euo pipefail
           rustup target add \
             x86_64-unknown-linux-gnu \
             aarch64-unknown-linux-gnu \
@@ -153,11 +163,10 @@ jobs:
       # a hosted runner anyway).
       - name: Run the gate
         working-directory: frankentts
-        # FTTS_REQUIRE_ALL_TARGETS turns check.sh's cross-target SKIP into a hard FAIL. Locally a
-        # missing std is reported honestly and skipped; in CI every target is installed above, so
-        # a skip there would mean the install silently regressed and must fail the run.
         env:
-          FTTS_REQUIRE_ALL_TARGETS: "1"
+          FTTS_CHECK_MODE: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'ultra')) && 'ultra' || 'fast' }}
+          # Ultra CI installs every release std above, so a missing one is a setup failure.
+          FTTS_REQUIRE_ALL_TARGETS: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'ultra')) && '1' || '0' }}
         run: ./scripts/check.sh
 
   cross:

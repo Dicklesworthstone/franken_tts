@@ -1425,6 +1425,7 @@ pub unsafe extern "C" fn ftts_video_close(renderer: *mut FttsVideoRenderer) {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "ultra-tests")]
     #[derive(Default)]
     struct BatchReceipt {
         progress: std::sync::Mutex<Vec<(usize, FttsProgressEvent)>>,
@@ -1443,6 +1444,7 @@ mod tests {
         1
     }
 
+    #[cfg(feature = "ultra-tests")]
     unsafe extern "C" fn record_progress(ctx: *mut c_void, event: *const FttsProgressEvent) -> i32 {
         // SAFETY: the test passes a live Mutex for the complete synchronous ABI call,
         // and the event pointer is valid for this callback invocation. The mutex is
@@ -1458,6 +1460,7 @@ mod tests {
         0
     }
 
+    #[cfg(feature = "ultra-tests")]
     unsafe extern "C" fn record_voice_progress(
         ctx: *mut c_void,
         voice_index: usize,
@@ -1471,6 +1474,7 @@ mod tests {
         0
     }
 
+    #[cfg(feature = "ultra-tests")]
     unsafe extern "C" fn record_voice_result(
         ctx: *mut c_void,
         voice_index: usize,
