@@ -19,7 +19,10 @@ struct VoiceComparisonCandidate: Identifiable, Sendable {
 struct VoiceComparisonResult: Sendable {
     let url: URL
     let duration: TimeInterval
-    let waveform: [Float]
+    /// Compact, sample-derived time/frequency analysis used by the same interactive
+    /// playback instrument as the main forge. Keeping this instead of every voice's
+    /// full PCM avoids retaining hundreds of megabytes beside the resident model.
+    let signalAnalysis: SignalAnalysis
     let profile: SynthesisProfile?
 }
 
@@ -88,6 +91,7 @@ final class VoiceComparisonSession {
     var errorMessage: String?
     var playingID: String?
     var playbackFraction = 0.0
+    var playbackRevision = 0
 
     private var runTask: Task<Void, Never>?
     private var tickerTask: Task<Void, Never>?
@@ -127,6 +131,12 @@ final class VoiceComparisonSession {
         favorites = Set(
             UserDefaults.standard.stringArray(forKey: Self.favoritesKey) ?? [])
         status = Dictionary(uniqueKeysWithValues: built.map { ($0.id, .waiting) })
+
+        #if DEBUG
+            if ProcessInfo.processInfo.environment["FTTS_VOICE_LAB_FIXTURE"] == "1" {
+                installVisualTestFixture()
+            }
+        #endif
     }
 
     var canStart: Bool {
@@ -305,8 +315,13 @@ final class VoiceComparisonSession {
             if player.isPlaying {
                 player.pause()
             } else {
+                if player.duration > 0, player.currentTime >= player.duration - 0.05 {
+                    player.currentTime = 0
+                    playbackFraction = 0
+                }
                 player.play()
             }
+            playbackRevision &+= 1
             return
         }
         do {
@@ -315,9 +330,45 @@ final class VoiceComparisonSession {
             playingID = candidate.id
             playbackFraction = 0
             player?.play()
+            playbackRevision &+= 1
         } catch {
             errorMessage = "Could not play \(candidate.name): \(error.localizedDescription)"
         }
+    }
+
+    func playbackPlayer(for candidate: VoiceComparisonCandidate) -> AVAudioPlayer? {
+        playingID == candidate.id ? player : nil
+    }
+
+    /// Seek one card without starting audio under the user's finger. The shared signal
+    /// view calls `finishScrubbing` on release, which resumes an existing preview or
+    /// starts the newly selected one from the exact touched position.
+    func seekPlayback(_ candidate: VoiceComparisonCandidate, to progress: Double) {
+        guard let result = results[candidate.id] else { return }
+        do {
+            if playingID != candidate.id || player == nil {
+                try AVAudioSession.sharedInstance().setCategory(.playback)
+                player = try AVAudioPlayer(contentsOf: result.url)
+                playingID = candidate.id
+            }
+            guard let player, player.duration > 0 else { return }
+            let fraction = min(1, max(0, progress))
+            player.currentTime = player.duration * fraction
+            playbackFraction = fraction
+            playbackRevision &+= 1
+        } catch {
+            errorMessage = "Could not seek \(candidate.name): \(error.localizedDescription)"
+        }
+    }
+
+    func finishScrubbing(_ candidate: VoiceComparisonCandidate) {
+        guard playingID == candidate.id, let player else { return }
+        if player.duration > 0, player.currentTime >= player.duration - 0.05 {
+            player.currentTime = 0
+            playbackFraction = 0
+        }
+        player.play()
+        playbackRevision &+= 1
     }
 
     func refreshPlayback() {
@@ -326,8 +377,7 @@ final class VoiceComparisonSession {
             ? min(1, max(0, player.currentTime / player.duration))
             : 0
         if !player.isPlaying, player.currentTime >= player.duration - 0.05 {
-            playingID = nil
-            playbackFraction = 0
+            playbackFraction = 1
         }
     }
 
@@ -340,6 +390,7 @@ final class VoiceComparisonSession {
         player = nil
         playingID = nil
         playbackFraction = 0
+        playbackRevision &+= 1
     }
 
     private func removeTemporaryResults() {
@@ -393,7 +444,7 @@ final class VoiceComparisonSession {
                 return VoiceComparisonResult(
                     url: url,
                     duration: Double(mastered.count) / Double(WavWriter.sampleRate),
-                    waveform: Self.waveform(mastered),
+                    signalAnalysis: SignalAnalysis(samples: mastered),
                     profile: output.profile
                 )
             }.result
@@ -420,31 +471,53 @@ final class VoiceComparisonSession {
         }
     }
 
-    nonisolated private static func waveform(_ samples: [Float], bins: Int = 160) -> [Float] {
-        guard !samples.isEmpty else { return [] }
-        // Partition by proportional boundaries so every source sample—including the
-        // tail—is represented even when the duration is not divisible by `bins`.
-        return (0..<bins).map { bin in
-            let start = min(samples.count, bin * samples.count / bins)
-            let end = min(samples.count, (bin + 1) * samples.count / bins)
-            guard start < end else { return 0 }
-            var peak: Float = 0
-            var energy: Double = 0
-            for sample in samples[start..<end] {
-                peak = max(peak, abs(sample))
-                energy += Double(sample * sample)
-            }
-            let rms = Float(sqrt(energy / Double(end - start)))
-            return peak * 0.72 + rms * 0.28
-        }
-    }
-
     nonisolated private static func safeFileComponent(_ name: String) -> String {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
         let scalars = name.unicodeScalars.map { allowed.contains($0) ? Character(String($0)) : "-" }
         let cleaned = String(scalars).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         return cleaned.isEmpty ? "Voice" : String(cleaned.prefix(48))
     }
+
+    #if DEBUG
+        /// Gives UI tests all important card states without pretending the simulator
+        /// can run a damaged multi-gigabyte model installation. This path is compiled
+        /// out of release builds and requires an explicit test environment variable.
+        private func installVisualTestFixture() {
+            guard !candidates.isEmpty else { return }
+            isRunning = true
+            activeIndex = 0
+            activeStage = "Growing semantic voice frames"
+            activeFraction = 0.42
+            elapsed = 7
+            estimatedRemaining = 19
+            status[candidates[0].id] = .forging
+
+            if candidates.indices.contains(1) {
+                let samples = (0..<(WavWriter.sampleRate * 5)).map { index -> Float in
+                    let time = Float(index) / Float(WavWriter.sampleRate)
+                    let carrier = sin(2 * .pi * 165 * time) * 0.16
+                    let overtone = sin(2 * .pi * 330 * time) * 0.07
+                    let envelope = 0.38 + 0.62 * abs(sin(2 * .pi * 1.7 * time))
+                    return (carrier + overtone) * envelope
+                }
+                let placeholder = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("FrankenTTS-Voice-Lab-visual-fixture.wav")
+                try? WavWriter.data(from: samples).write(to: placeholder, options: .atomic)
+                results[candidates[1].id] = VoiceComparisonResult(
+                    url: placeholder,
+                    duration: Double(samples.count) / Double(WavWriter.sampleRate),
+                    signalAnalysis: SignalAnalysis(samples: samples),
+                    profile: nil
+                )
+                status[candidates[1].id] = .ready
+                completedCount = 1
+                settledCount = 1
+            }
+            if candidates.indices.contains(2) {
+                status[candidates[2].id] = .mastering
+            }
+        }
+    #endif
 }
 
 struct VoiceComparisonView: View {
@@ -477,6 +550,7 @@ struct VoiceComparisonView: View {
             .frame(maxWidth: 1_080)
             .frame(maxWidth: .infinity)
         }
+        .scrollIndicators(.hidden)
         .background(LaboratoryBackground())
         .navigationTitle("Voice Lab")
         .navigationBarTitleDisplayMode(.inline)
@@ -725,14 +799,20 @@ private struct VoiceComparisonCard: View {
             Group {
                 if let result = session.results[candidate.id] {
                     VStack(spacing: 8) {
-                        MiniVoiceWaveform(
-                            samples: result.waveform,
-                            progress: session.playingID == candidate.id
-                                ? session.playbackFraction : 0,
-                            active: session.isPlaying(candidate)
-                        )
+                        PlaybackSignalView(
+                            samples: [],
+                            player: session.playbackPlayer(for: candidate),
+                            analysisID: result.url.lastPathComponent,
+                            refreshToken: session.playbackRevision,
+                            preparedAnalysis: result.signalAnalysis,
+                            resumesPlaybackAfterSeek: true,
+                            onSeekFinished: { session.finishScrubbing(candidate) }
+                        ) { progress in
+                            session.seekPlayback(candidate, to: progress)
+                        }
+                        .accessibilityIdentifier("voice-lab-signal-\(candidate.id)")
                         .frame(maxWidth: .infinity)
-                        .frame(height: 52)
+                        .frame(height: 96)
                         HStack(spacing: 8) {
                             Button { session.togglePlayback(candidate) } label: {
                                 Label(
@@ -785,9 +865,9 @@ private struct VoiceComparisonCard: View {
             }
             // Every card reserves the result controls from the start. As earlier
             // voices finish, later cards no longer jump dramatically up and down.
-            .frame(height: 106, alignment: .top)
+            .frame(height: 150, alignment: .top)
         }
-        .frame(minHeight: 174, alignment: .top)
+        .frame(minHeight: 218, alignment: .top)
         .padding(15)
         .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
@@ -837,6 +917,9 @@ private struct VoiceComparisonOrb: View {
         .shadow(
             color: active ? (candidate.personal ? Lab.violet : Lab.emerald).opacity(0.5) : .clear,
             radius: 10)
+        .accessibilityElement(children: .ignore)
+        .accessibilityIdentifier(active ? "voice-lab-active-orb" : "voice-lab-orb-\(candidate.id)")
+        .accessibilityLabel(active ? "Generating \(candidate.name)" : candidate.name)
         // The active treatment is painted inside this fixed frame. Never animate
         // scale or position: that made the currently generating voice appear to jump.
     }
@@ -867,50 +950,6 @@ private struct VoiceLabPulse: View {
                 context.draw(bolt, at: center)
             }
         }
-        .accessibilityHidden(true)
-    }
-}
-
-private struct MiniVoiceWaveform: View {
-    let samples: [Float]
-    let progress: Double
-    let active: Bool
-
-    var body: some View {
-        Canvas { context, size in
-            guard !samples.isEmpty else { return }
-            let center = size.height / 2
-            let step = size.width / CGFloat(samples.count)
-            let peak = max(samples.max() ?? 1, 0.000_1)
-            var path = Path()
-            for (index, sample) in samples.enumerated() {
-                let height = max(1.5, CGFloat(sample / peak) * size.height * 0.44)
-                let x = (CGFloat(index) + 0.5) * step
-                path.move(to: CGPoint(x: x, y: center - height))
-                path.addLine(to: CGPoint(x: x, y: center + height))
-            }
-            context.stroke(
-                path,
-                with: .color(Lab.textSecondary.opacity(0.58)),
-                style: StrokeStyle(lineWidth: max(1, step * 0.58), lineCap: .round))
-            var played = context
-            played.clip(to: Path(CGRect(
-                origin: .zero,
-                size: CGSize(width: size.width * progress, height: size.height)
-            )))
-            played.stroke(
-                path,
-                with: .linearGradient(
-                    Gradient(colors: [Lab.emerald, Lab.cyan]),
-                    startPoint: .zero,
-                    endPoint: CGPoint(x: size.width, y: 0)),
-                style: StrokeStyle(lineWidth: max(1, step * 0.58), lineCap: .round))
-        }
-        .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Lab.stroke.opacity(0.8)))
-        .clipped()
-        .opacity(active ? 1 : 0.72)
-        .shadow(color: active ? Lab.cyan.opacity(0.5) : .clear, radius: 6)
         .accessibilityHidden(true)
     }
 }

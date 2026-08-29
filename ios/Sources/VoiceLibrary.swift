@@ -6,7 +6,7 @@
 
 import Foundation
 
-struct EnrolledVoice: Identifiable, Codable, Equatable {
+struct EnrolledVoice: Identifiable, Codable, Equatable, Sendable {
     let id: UUID
     var name: String
     var vector: [Float]

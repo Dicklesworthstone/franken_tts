@@ -88,11 +88,25 @@ enum VoiceCode {
 
     // ------------------------------------------------------------------ encode
 
+    /// The wire format gives a voice label 64 UTF-8 bytes. Truncate only at an
+    /// extended-grapheme boundary so an emoji or accented name never imports with
+    /// a replacement character after a byte-level prefix split.
+    static func cardNameBytes(_ name: String) -> [UInt8] {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(min(64, name.utf8.count))
+        for character in name {
+            let encoded = Array(String(character).utf8)
+            guard bytes.count + encoded.count <= 64 else { break }
+            bytes.append(contentsOf: encoded)
+        }
+        return bytes
+    }
+
     /// Encode name + vector into an RGB24 mosaic image (cardSize × cardSize).
     static func renderMosaicPixels(name: String, vector: [Float]) -> [UInt8] {
         precondition(vector.count == 1024, "the mosaic carries exactly 1,024 floats")
         var plaintext = magic
-        let nameBytes = Array(name.utf8.prefix(64))
+        let nameBytes = cardNameBytes(name)
         plaintext += [UInt8(nameBytes.count >> 8), UInt8(nameBytes.count & 0xFF)]
         plaintext += nameBytes
         for value in vector {

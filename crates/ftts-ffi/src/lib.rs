@@ -769,9 +769,10 @@ pub unsafe extern "C" fn ftts_synthesize_with_progress(
     })
 }
 
-/// Synthesizes one text with every supplied x-vector while sharing its tokenizer and
-/// sparse cold-row preparation. Voices run serially through one warm engine; each
-/// completed PCM buffer is borrowed by `on_voice` only for that callback.
+/// Synthesizes one text with every supplied x-vector while sharing its tokenizer,
+/// sparse cold-row preparation, projected text rows, constant prompt rows, and the
+/// causal talker prefix before the speaker slot. Voices run serially through one warm
+/// engine; each completed PCM buffer is borrowed by `on_voice` only for that callback.
 #[allow(unsafe_code)] // audited export, part of the C ABI surface
 #[unsafe(no_mangle)]
 /// # Safety
@@ -1803,6 +1804,7 @@ mod tests {
         let mut speakers = speaker.clone();
         speakers.extend_from_slice(&speaker);
         let batch_context = (&raw const receipt).cast_mut().cast();
+        let batch_started = std::time::Instant::now();
         // SAFETY: the engine and text remain live; the flat matrix has exactly two
         // complete speaker rows; both callbacks copy borrowed data synchronously.
         let batch_code = unsafe {
@@ -1818,6 +1820,7 @@ mod tests {
                 batch_context,
             )
         };
+        let batch_elapsed = batch_started.elapsed();
         assert_eq!(
             batch_code,
             0,
@@ -1838,6 +1841,18 @@ mod tests {
             assert!(!pcm.is_empty());
             assert!(serde_json::from_str::<serde_json::Value>(profile).is_ok());
         }
+        eprintln!(
+            "VOICE-LAB-RECEIPT shared_prefix_env={:?} voices=2 elapsed_ms={:.3} profiles={}",
+            std::env::var("FTTS_VOICE_LAB_SHARED_PREFIX").ok(),
+            batch_elapsed.as_secs_f64() * 1_000.0,
+            serde_json::to_string(
+                &outputs
+                    .iter()
+                    .map(|(index, _, profile)| (index, profile))
+                    .collect::<Vec<_>>()
+            )
+            .expect("receipt JSON")
+        );
         drop(outputs);
         let progress = receipt.progress.lock().unwrap();
         for voice_index in 0..2 {

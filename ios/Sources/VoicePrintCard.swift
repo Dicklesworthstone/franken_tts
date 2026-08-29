@@ -11,6 +11,8 @@
 
 import SwiftUI
 import UIKit
+import ImageIO
+import UniformTypeIdentifiers
 
 enum VoicePrintCard {
     static let cardWidth = VoiceCode.cardSize // 1024
@@ -23,22 +25,47 @@ enum VoicePrintCard {
     // ---- encode -----------------------------------------------------------------
 
     /// Render the card and embed the lossless copy into its PNG bytes.
-    @MainActor
-    static func pngData(name: String, vector: [Float]) throws -> Data {
-        let mosaic = mosaicImage(name: name, vector: vector)
-        let renderer = ImageRenderer(content: CardView(name: name, mosaic: mosaic))
-        renderer.scale = 1
-        renderer.proposedSize = .init(
-            width: CGFloat(cardWidth), height: CGFloat(cardHeight))
-        guard let image = renderer.uiImage, let png = image.pngData() else {
-            throw EngineError.native("cannot render the voice card")
+    static func pngData(name: String, vector: [Float]) async throws -> Data {
+        guard vector.count == Engine.speakerWidth, vector.allSatisfy(\.isFinite) else {
+            throw EngineError.native("voice fingerprint is damaged or has the wrong size")
         }
-        return try embed(name: name, vector: vector, into: png)
+        let cardName = String(decoding: VoiceCode.cardNameBytes(name), as: UTF8.self)
+        guard !cardName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw EngineError.native("voice name must contain visible text")
+        }
+        // Mosaic coding and PNG compression are the expensive parts of this path.
+        // Neither belongs on the main actor: doing both there froze the presented
+        // sheet so completely that its progress indicator could not animate.
+        let pixels = await Task.detached(priority: .userInitiated) {
+            VoiceCode.renderMosaicPixels(name: cardName, vector: vector)
+        }.value
+        try Task.checkCancellation()
+
+        let composed: CGImage = try await MainActor.run {
+            let mosaic = try mosaicImage(pixels: pixels)
+            let renderer = ImageRenderer(content: CardView(name: cardName, mosaic: mosaic))
+            renderer.scale = 1
+            renderer.proposedSize = .init(
+                width: CGFloat(cardWidth), height: CGFloat(cardHeight))
+            guard let image = renderer.cgImage else {
+                throw EngineError.native("cannot render the voice card")
+            }
+            return image
+        }
+        try Task.checkCancellation()
+
+        let png = try await Task.detached(priority: .userInitiated) {
+            try pngData(from: composed)
+        }.value
+        return try embed(name: cardName, vector: vector, into: png)
     }
 
-    private static func mosaicImage(name: String, vector: [Float]) -> UIImage {
-        let pixels = VoiceCode.renderMosaicPixels(name: name, vector: vector)
+    @MainActor
+    private static func mosaicImage(pixels: [UInt8]) throws -> UIImage {
         let size = VoiceCode.cardSize
+        guard pixels.count == size * size * 3 else {
+            throw EngineError.native("voice-card mosaic has the wrong pixel count")
+        }
         let data = Data(pixels)
         guard let provider = CGDataProvider(data: data as CFData),
             let cgImage = CGImage(
@@ -48,15 +75,35 @@ enum VoicePrintCard {
                 provider: provider, decode: nil, shouldInterpolate: false,
                 intent: .defaultIntent)
         else {
-            return UIImage()
+            throw EngineError.native("cannot create the voice-card mosaic image")
         }
         return UIImage(cgImage: cgImage)
     }
 
+    nonisolated private static func pngData(from image: CGImage) throws -> Data {
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw EngineError.native("cannot create the voice-card PNG encoder")
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw EngineError.native("cannot encode the voice card as PNG")
+        }
+        return output as Data
+    }
+
     static func embed(name: String, vector: [Float], into png: Data) throws -> Data {
         guard png.count >= 12 else { throw EngineError.native("truncated PNG") }
+        guard vector.count == Engine.speakerWidth, vector.allSatisfy(\.isFinite) else {
+            throw EngineError.native("voice fingerprint is damaged or has the wrong size")
+        }
         var payload = magic
-        let nameBytes = Array(name.utf8.prefix(64))
+        let nameBytes = VoiceCode.cardNameBytes(name)
         payload += [UInt8(nameBytes.count >> 8), UInt8(nameBytes.count & 0xFF)]
         payload += nameBytes
         for value in vector {

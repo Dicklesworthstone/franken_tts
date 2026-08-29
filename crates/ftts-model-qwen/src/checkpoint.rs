@@ -64,6 +64,14 @@ pub const CODE_GROUP_COUNT: usize = 16;
 /// Width of the talker hidden state.
 pub const TALKER_HIDDEN: usize = 1_024;
 
+/// The x-vector's position inside [`PromptHeader::codec_prefill`].
+///
+/// The four preceding codec rows (`think`, `think_bos`, language, `think_eos`) and the
+/// three text-role rows are causally independent of the selected speaker. Voice Lab can
+/// therefore compute their talker KV once and clone that small prefix for every voice;
+/// the speaker row itself and everything after it must remain per-voice.
+const XVECTOR_SPEAKER_CODEC_INDEX: usize = 4;
+
 /// Width of one cold text-embedding row, before the text projection narrows it to the hidden size.
 pub const TEXT_EMBED_WIDTH: usize = 2_048;
 
@@ -1001,6 +1009,48 @@ impl TextEmbeddingTable {
     }
 }
 
+/// Speaker-independent x-vector prompt rows prepared once for a comparison batch.
+///
+/// The template deliberately keeps the speaker slot private. Callers can only obtain a
+/// complete [`PromptHeader`] by supplying a correctly sized speaker vector, which prevents a
+/// zero-filled template from accidentally reaching synthesis as a fabricated voice.
+#[derive(Clone, Debug)]
+pub struct XVectorPromptTemplate {
+    header: PromptHeader,
+}
+
+impl XVectorPromptTemplate {
+    /// Materializes one prompt header by replacing the template's private speaker slot.
+    ///
+    /// # Errors
+    ///
+    /// If `speaker` is not [`TALKER_HIDDEN`] floats wide.
+    pub fn with_speaker(&self, speaker: &[f32]) -> Result<PromptHeader, CheckpointError> {
+        if speaker.len() != TALKER_HIDDEN {
+            return Err(CheckpointError::SpeakerWidth {
+                expected: TALKER_HIDDEN,
+                actual: speaker.len(),
+            });
+        }
+        let mut header = self.header.clone();
+        debug_assert!(
+            header.codec_prefill.len() > XVECTOR_SPEAKER_CODEC_INDEX,
+            "x-vector template must retain its speaker slot"
+        );
+        header.codec_prefill[XVECTOR_SPEAKER_CODEC_INDEX].copy_from_slice(speaker);
+        Ok(header)
+    }
+
+    /// Number of leading assembled prompt positions that are causally speaker-independent.
+    ///
+    /// This ends immediately before the speaker x-vector. The speaker position itself must
+    /// never enter a cross-voice cache even though it is independent of the target text.
+    #[must_use]
+    pub const fn speaker_independent_prefix_len(&self) -> usize {
+        ROLE_PREFIX_IDS.len() + XVECTOR_SPEAKER_CODEC_INDEX
+    }
+}
+
 /// The talker, microdecoder, feedback tables, and text projection from `model.safetensors`.
 pub struct TalkerCheckpoint {
     path: PathBuf,
@@ -1749,8 +1799,32 @@ impl TalkerCheckpoint {
     /// one way rather than growing a second implementation that can drift.
     #[must_use]
     pub fn project_text_ids(&self, table: &TextEmbeddingTable, ids: &[u32]) -> Vec<HiddenState> {
-        ids.iter()
-            .map(|id| self.project_text_id(table, *id))
+        let mut embedded = Vec::with_capacity(ids.len() * TEXT_EMBED_WIDTH);
+        for id in ids {
+            embedded.extend_from_slice(
+                table
+                    .row(*id)
+                    .expect("projected ids must be in the gathered text table"),
+            );
+        }
+        let mut projected = vec![0.0; ids.len() * TALKER_HIDDEN];
+        if !ids.is_empty() {
+            crate::talker::project_text_rows(
+                &embedded,
+                ids.len(),
+                TEXT_EMBED_WIDTH,
+                self.fc1_bias.len(),
+                TALKER_HIDDEN,
+                &self.fc1_weight,
+                &self.fc1_bias,
+                &self.fc2_weight,
+                &self.fc2_bias,
+                &mut projected,
+            );
+        }
+        projected
+            .chunks(TALKER_HIDDEN)
+            .map(<[f32]>::to_vec)
             .collect()
     }
 
@@ -1805,29 +1879,41 @@ impl TalkerCheckpoint {
         speaker: &[f32],
         language_id: usize,
     ) -> Result<PromptHeader, CheckpointError> {
-        if speaker.len() != TALKER_HIDDEN {
-            return Err(CheckpointError::SpeakerWidth {
-                expected: TALKER_HIDDEN,
-                actual: speaker.len(),
-            });
+        self.xvector_header_template(table, language_id)
+            .with_speaker(speaker)
+    }
+
+    /// Builds every x-vector header row that is common to all speakers in a comparison.
+    ///
+    /// The returned template cannot be synthesized directly: its placeholder speaker slot is
+    /// private and [`XVectorPromptTemplate::with_speaker`] validates and fills it. Preparing this
+    /// once avoids repeatedly projecting the role/BOS/PAD text rows and copying the same codec
+    /// rows for every Voice Lab entry.
+    #[must_use]
+    pub fn xvector_header_template(
+        &self,
+        table: &TextEmbeddingTable,
+        language_id: usize,
+    ) -> XVectorPromptTemplate {
+        XVectorPromptTemplate {
+            header: PromptHeader {
+                role: ROLE_PREFIX_IDS
+                    .iter()
+                    .map(|id| self.project_text_id(table, *id))
+                    .collect(),
+                codec_prefill: vec![
+                    self.codec_row(CODEC_THINK_ID),
+                    self.codec_row(CODEC_THINK_BOS_ID),
+                    self.codec_row(language_id),
+                    self.codec_row(CODEC_THINK_EOS_ID),
+                    vec![0.0; TALKER_HIDDEN],
+                    self.codec_row(CODEC_PAD_ID),
+                    self.codec_row(CODEC_BOS_ID),
+                ],
+                tts_bos: self.project_text_id(table, TTS_BOS_TOKEN_ID),
+                tts_pad: self.project_text_id(table, TTS_PAD_TOKEN_ID),
+            },
         }
-        Ok(PromptHeader {
-            role: ROLE_PREFIX_IDS
-                .iter()
-                .map(|id| self.project_text_id(table, *id))
-                .collect(),
-            codec_prefill: vec![
-                self.codec_row(CODEC_THINK_ID),
-                self.codec_row(CODEC_THINK_BOS_ID),
-                self.codec_row(language_id),
-                self.codec_row(CODEC_THINK_EOS_ID),
-                speaker.to_vec(),
-                self.codec_row(CODEC_PAD_ID),
-                self.codec_row(CODEC_BOS_ID),
-            ],
-            tts_bos: self.project_text_id(table, TTS_BOS_TOKEN_ID),
-            tts_pad: self.project_text_id(table, TTS_PAD_TOKEN_ID),
-        })
     }
 
     /// Build the ICL-mode prompt header: the same `H` composition the x-vector header builds

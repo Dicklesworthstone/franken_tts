@@ -251,12 +251,39 @@ struct PlaybackSignalView: View {
     let player: AVAudioPlayer?
     let analysisID: String
     let refreshToken: Int
+    /// Voice Lab computes this once while it writes each WAV, then discards the
+    /// full PCM. The main forge leaves it nil and analysis is derived from `samples`.
+    let preparedAnalysis: SignalAnalysis?
+    /// A Voice Lab tap selects and starts that preview on release. The main forge
+    /// retains its existing pause/seek/resume semantics by leaving this false.
+    let resumesPlaybackAfterSeek: Bool
+    let onSeekFinished: (() -> Void)?
     let onSeek: (Double) -> Void
 
     @State private var analysis = SignalAnalysis.empty
     @State private var draggedProgress: Double?
     @State private var isScrubbing = false
     @State private var resumesAfterScrub = false
+
+    init(
+        samples: [Float],
+        player: AVAudioPlayer?,
+        analysisID: String,
+        refreshToken: Int,
+        preparedAnalysis: SignalAnalysis? = nil,
+        resumesPlaybackAfterSeek: Bool = false,
+        onSeekFinished: (() -> Void)? = nil,
+        onSeek: @escaping (Double) -> Void
+    ) {
+        self.samples = samples
+        self.player = player
+        self.analysisID = analysisID
+        self.refreshToken = refreshToken
+        self.preparedAnalysis = preparedAnalysis
+        self.resumesPlaybackAfterSeek = resumesPlaybackAfterSeek
+        self.onSeekFinished = onSeekFinished
+        self.onSeek = onSeek
+    }
 
     var body: some View {
         let _ = refreshToken
@@ -312,6 +339,10 @@ struct PlaybackSignalView: View {
         )
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .task(id: analysisID) {
+            if let preparedAnalysis {
+                analysis = preparedAnalysis
+                return
+            }
             let captured = samples
             analysis = await Task.detached(priority: .userInitiated) {
                 SignalAnalysis(samples: captured)
@@ -341,6 +372,9 @@ struct PlaybackSignalView: View {
     private func accessibleSeek(to progress: Double) {
         draggedProgress = progress
         onSeek(progress)
+        if resumesPlaybackAfterSeek {
+            onSeekFinished?()
+        }
         Task { @MainActor in
             await Task.yield()
             draggedProgress = nil
@@ -352,8 +386,9 @@ struct PlaybackSignalView: View {
             .onChanged { value in
                 if !isScrubbing {
                     isScrubbing = true
-                    resumesAfterScrub = player?.isPlaying == true
-                    if resumesAfterScrub { player?.pause() }
+                    let wasPlaying = player?.isPlaying == true
+                    resumesAfterScrub = wasPlaying || resumesPlaybackAfterSeek
+                    if wasPlaying { player?.pause() }
                 }
                 let progress = min(1, max(0, value.location.x / max(1, width)))
                 draggedProgress = progress
@@ -362,7 +397,13 @@ struct PlaybackSignalView: View {
             .onEnded { _ in
                 draggedProgress = nil
                 isScrubbing = false
-                if resumesAfterScrub { player?.play() }
+                if resumesAfterScrub {
+                    if let onSeekFinished {
+                        onSeekFinished()
+                    } else {
+                        player?.play()
+                    }
+                }
                 resumesAfterScrub = false
             }
     }
@@ -453,7 +494,7 @@ struct PlaybackSignalView: View {
     }
 }
 
-private struct SignalAnalysis: Sendable {
+struct SignalAnalysis: Sendable {
     static let empty = SignalAnalysis(
         timeBins: 0,
         bandCount: 0,
@@ -525,14 +566,13 @@ private struct SignalAnalysis: Sendable {
             }
         }
 
-        let waveColumns = 180
+        let waveColumns = min(180, samples.count)
         var lows = Array(repeating: Float.zero, count: waveColumns)
         var highs = Array(repeating: Float.zero, count: waveColumns)
-        let samplesPerColumn = max(1, samples.count / waveColumns)
         for column in 0..<waveColumns {
-            let start = column * samplesPerColumn
-            guard start < samples.count else { break }
-            for index in start..<min(samples.count, start + samplesPerColumn) {
+            let start = column * samples.count / waveColumns
+            let end = (column + 1) * samples.count / waveColumns
+            for index in start..<end {
                 lows[column] = min(lows[column], samples[index])
                 highs[column] = max(highs[column], samples[index])
             }

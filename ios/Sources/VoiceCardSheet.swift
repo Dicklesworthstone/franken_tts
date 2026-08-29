@@ -4,6 +4,52 @@
 
 import Photos
 import SwiftUI
+import CryptoKit
+
+private struct VoiceCardArtifact: Sendable {
+    let data: Data
+    let url: URL
+}
+
+private actor VoiceCardArtifactStore {
+    static let shared = VoiceCardArtifactStore()
+
+    private var artifacts: [String: VoiceCardArtifact] = [:]
+
+    func artifact(for voice: EnrolledVoice) async throws -> VoiceCardArtifact {
+        let key = cacheKey(for: voice)
+        if let artifact = artifacts[key] { return artifact }
+
+        let png = try await VoicePrintCard.pngData(name: voice.name, vector: voice.vector)
+        try Task.checkCancellation()
+        let safeName = voice.name
+            .map { $0.isLetter || $0.isNumber ? $0 : "-" }
+            .prefix(48)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("franken_tts-voice-cards", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let url = directory.appendingPathComponent(
+            "\(safeName.isEmpty ? "Voice" : String(safeName))-\(key.prefix(12))-voice-card.png"
+        )
+        try png.write(to: url, options: .atomic)
+        let artifact = VoiceCardArtifact(data: png, url: url)
+        artifacts[key] = artifact
+        return artifact
+    }
+
+    private func cacheKey(for voice: EnrolledVoice) -> String {
+        var hash = SHA256()
+        hash.update(data: Data(voice.name.utf8))
+        for value in voice.vector {
+            var bits = value.bitPattern.littleEndian
+            withUnsafeBytes(of: &bits) { hash.update(bufferPointer: $0) }
+        }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
 
 struct VoiceCardSheet: View {
     let voice: EnrolledVoice
@@ -39,6 +85,7 @@ struct VoiceCardSheet: View {
                         )
                         .frame(maxWidth: .infinity)
                         .accessibilityLabel("Voice card for \(voice.name)")
+                        .accessibilityIdentifier("voice-card-preview")
                 } else if failed {
                     Text("Something went wrong making the card. Close this and try again.")
                         .font(.system(size: 14))
@@ -46,6 +93,7 @@ struct VoiceCardSheet: View {
                 } else {
                     ProgressView()
                         .frame(maxWidth: .infinity, minHeight: 200)
+                        .accessibilityIdentifier("voice-card-progress")
                 }
                 Text(
                     "The green mosaic is \(voice.name), written as thousands of tiny tiles. Send this picture to a friend; in their FrankenTTS app they tap \"Add a voice from a picture\", pick it, and the voice appears in their library. It survives screenshots and messaging apps, and it holds only the small voiceprint, never a recording of you."
@@ -90,22 +138,16 @@ struct VoiceCardSheet: View {
         .presentationDetents([.large])
         .task {
             do {
-                let png = try VoicePrintCard.pngData(name: voice.name, vector: voice.vector)
-                let safeName = voice.name.map { $0.isLetter || $0.isNumber ? $0 : "-" }
-                let directory = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(
-                        "franken_tts-card-\(ProcessInfo.processInfo.globallyUniqueString)",
-                        isDirectory: true)
-                try FileManager.default.createDirectory(
-                    at: directory, withIntermediateDirectories: true)
-                let url = directory.appendingPathComponent(
-                    "\(String(safeName))-voice-card.png")
-                try png.write(to: url)
-                preview = UIImage(data: png)
-                cardData = png
-                cardUrl = url
+                let artifact = try await VoiceCardArtifactStore.shared.artifact(for: voice)
+                try Task.checkCancellation()
+                guard let decodedPreview = UIImage(data: artifact.data) else {
+                    throw EngineError.native("cannot decode the rendered voice-card preview")
+                }
+                preview = decodedPreview
+                cardData = artifact.data
+                cardUrl = artifact.url
             } catch {
-                failed = true
+                if !Task.isCancelled { failed = true }
             }
         }
     }

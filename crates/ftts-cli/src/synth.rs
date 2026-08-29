@@ -31,13 +31,14 @@ use ftts_core::{
 };
 use ftts_model_qwen::checkpoint::{
     CODEC_LANGUAGE_ENGLISH_ID, CheckpointError, CodecCheckpoint, TALKER_HIDDEN, TalkerCheckpoint,
-    TextEmbeddingTable,
+    TextEmbeddingTable, XVectorPromptTemplate,
 };
 use ftts_model_qwen::generate::{
-    Int8Route, QwenGenerator, QwenGeneratorConfig, ReferencePrompt, prepare_int8_route,
+    Int8Route, QwenGenerator, QwenGeneratorConfig, ReferencePrompt, TalkerPromptPrefix,
+    prepare_int8_route,
 };
 use ftts_model_qwen::microdecoder::MicrodecoderConfig;
-use ftts_model_qwen::prompt::{CloneMode, PromptMode};
+use ftts_model_qwen::prompt::{CloneMode, HiddenState, PromptMode};
 use ftts_model_qwen::sampler::SamplingMode;
 use ftts_model_qwen::speaker::{
     Encoder as SpeakerEncoder, SPEAKER_SAMPLE_RATE_HZ, log_mel_from_24khz_pcm,
@@ -48,6 +49,7 @@ use std::cell::Cell;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -149,6 +151,10 @@ impl ModelBundle {
 
 /// Every weight and table one `say` needs, hydrated once.
 pub struct LoadedModel {
+    /// Process-local identity for plans that borrow precomputed values derived from this exact
+    /// hydration. A monotonic token remains stable if `LoadedModel` itself moves, unlike its
+    /// address, and prevents a public prepared plan from being mixed with another model load.
+    identity: u64,
     talker: TalkerCheckpoint,
     codec: CodecCheckpoint,
     tokenizer: QwenTokenizer,
@@ -168,6 +174,8 @@ pub struct LoadedModel {
     /// inside [`QwenGenerator::new_with_artifact`] — same inputs, same bytes, same total work.
     int8_route: std::sync::OnceLock<Option<std::sync::Arc<Int8Route>>>,
 }
+
+static NEXT_LOADED_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 
 static DIGEST_PROGRESS_USERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -276,6 +284,7 @@ impl LoadedModel {
         // digests (~1.3 GB of hashing) for a mapping the checkpoint already carries.
         let artifact = talker.artifact().cloned();
         Ok(Self {
+            identity: NEXT_LOADED_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             talker,
             codec: codec.map_err(checkpoint_error)?,
             tokenizer,
@@ -1682,6 +1691,57 @@ impl TextPreparer for PreparedPassThrough {
     }
 }
 
+/// Routes Voice Lab's engine begin call through the request-local projected text and causal KV.
+///
+/// Every later frame remains the ordinary [`QwenGenerator`] path. Only fresh-prompt setup is
+/// specialized, and the generator itself validates the prefix's prompt/model/route identity.
+struct VoiceBatchGenerator<'model, 'plan> {
+    inner: QwenGenerator<'model>,
+    plan: Option<&'plan SharedXVectorSetup>,
+}
+
+impl VoiceBatchGenerator<'_, '_> {
+    fn timings(&self) -> ftts_model_qwen::generate::GenerationTimings {
+        self.inner.timings()
+    }
+}
+
+impl FrameGenerator for VoiceBatchGenerator<'_, '_> {
+    fn begin_utterance(
+        &mut self,
+        prepared: &PreparedText,
+        mode: UtteranceStart,
+    ) -> Result<(), GenerationError> {
+        let Some(plan) = self.plan else {
+            return self.inner.begin_utterance(prepared, mode);
+        };
+        let newly_prepared = self.inner.begin_xvector_with_shared_prefix(
+            &plan.projected_target,
+            mode,
+            plan.header_template.speaker_independent_prefix_len(),
+            plan.shared_prefix.get(),
+        )?;
+        if let Some(prefix) = newly_prepared {
+            // A comparison is serial today, but accepting a benign racing initializer keeps
+            // this seam correct if a future throughput scheduler prepares two voices at once.
+            let _ = plan.shared_prefix.set(prefix);
+        }
+        Ok(())
+    }
+
+    fn append_text(&mut self, prepared: &PreparedText) -> Result<(), GenerationError> {
+        self.inner.append_text(prepared)
+    }
+
+    fn finish_text(&mut self) -> Result<(), GenerationError> {
+        self.inner.finish_text()
+    }
+
+    fn next_frame(&mut self) -> Result<ftts_core::FrameStep, GenerationError> {
+        self.inner.next_frame()
+    }
+}
+
 impl LoadedModel {
     /// The tokenizer, for callers that prepare continuation chunks outside `synthesize`
     /// (the talk session) with byte-for-byte the same preparation this module uses.
@@ -1832,15 +1892,25 @@ pub fn synthesize(
 
 /// Voice-independent work shared by a fair multi-voice comparison.
 ///
-/// The tokenizer, assistant wrapper, and sparse cold-text row gather depend on the
-/// utterance and normalization policy, not the speaker x-vector. Preparing them once
-/// prevents an `N`-voice comparison from re-reading the same cold rows `N` times. The
-/// speaker still enters the prompt prefill, so every autoregressive generation remains
-/// separate; sharing anything after that point would silently stop comparing real voices.
+/// The tokenizer, assistant wrapper, sparse cold-text row gather, projected target rows,
+/// constant header rows, and causal talker KV before the speaker position depend on the
+/// utterance and normalization policy, not the speaker x-vector. Preparing them once prevents
+/// an `N`-voice comparison from repeating that setup `N` times. The speaker still enters the
+/// prompt prefill, so every autoregressive generation remains separate; sharing anything after
+/// that point would silently stop comparing real voices.
 pub struct PreparedXVectorSynthesis {
+    model_identity: u64,
     request: SynthesisRequest,
     prepared: PreparedText,
     table: TextEmbeddingTable,
+    shared: Option<SharedXVectorSetup>,
+}
+
+struct SharedXVectorSetup {
+    projected_target: Vec<HiddenState>,
+    header_template: XVectorPromptTemplate,
+    tts_eos: HiddenState,
+    shared_prefix: std::sync::OnceLock<TalkerPromptPrefix>,
 }
 
 /// Prepares the voice-independent half of an x-vector synthesis request.
@@ -1862,10 +1932,26 @@ pub fn prepare_xvector_synthesis(
         .talker
         .gather_text_rows(&ids)
         .map_err(checkpoint_error)?;
+    let shared = if ftts_kernels::route::optimized_default("FTTS_VOICE_LAB_SHARED_PREFIX") {
+        let prompt_ids = ftts_model_qwen::prompt::extract_prompt_text_ids(&wrapped, None)
+            .map_err(|error| FttsError::Input(format!("prompt text extraction failed: {error}")))?;
+        Some(SharedXVectorSetup {
+            projected_target: model.talker.project_text_ids(&table, &prompt_ids.target),
+            header_template: model
+                .talker
+                .xvector_header_template(&table, CODEC_LANGUAGE_ENGLISH_ID),
+            tts_eos: model.talker.tts_eos(&table),
+            shared_prefix: std::sync::OnceLock::new(),
+        })
+    } else {
+        None
+    };
     Ok(PreparedXVectorSynthesis {
+        model_identity: model.identity,
         request: request.clone(),
         prepared: PreparedText::new(wrapped, prepared_raw.normalization_trace),
         table,
+        shared,
     })
 }
 
@@ -1891,6 +1977,7 @@ pub fn synthesize_prepared_xvector(
     packet_frames: usize,
     pcm_sink: Option<&mut dyn PcmPacketSink>,
 ) -> Result<SynthesizedAudio, FttsError> {
+    ensure_prepared_model_identity(plan.model_identity, model.identity)?;
     synthesize_inner(
         model,
         engine,
@@ -1904,6 +1991,16 @@ pub fn synthesize_prepared_xvector(
         None,
         pcm_sink,
     )
+}
+
+fn ensure_prepared_model_identity(plan_identity: u64, model_identity: u64) -> Result<(), FttsError> {
+    if plan_identity == model_identity {
+        Ok(())
+    } else {
+        Err(FttsError::Usage(
+            "prepared x-vector plan belongs to a different loaded model".to_owned(),
+        ))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1983,17 +2080,26 @@ fn synthesize_inner(
     // added-token delimited, so encoding the WRAPPED transcript and using it whole is the
     // official path; `extract_prompt_text_ids` slices `[3..-2]` itself.
     let (header, prompt_mode, reference) = match voice {
-        VoiceConditioning::XVector(speaker) => (
-            model
-                .talker
-                .xvector_header(table, speaker, CODEC_LANGUAGE_ENGLISH_ID)
-                .map_err(checkpoint_error)?,
-            PromptMode {
-                clone_mode: CloneMode::XVector,
-                non_streaming_mode: false,
-            },
-            None,
-        ),
+        VoiceConditioning::XVector(speaker) => {
+            let header = match prepared_xvector.and_then(|plan| plan.shared.as_ref()) {
+                Some(shared) => shared
+                    .header_template
+                    .with_speaker(speaker)
+                    .map_err(checkpoint_error)?,
+                None => model
+                    .talker
+                    .xvector_header(table, speaker, CODEC_LANGUAGE_ENGLISH_ID)
+                    .map_err(checkpoint_error)?,
+            };
+            (
+                header,
+                PromptMode {
+                    clone_mode: CloneMode::XVector,
+                    non_streaming_mode: false,
+                },
+                None,
+            )
+        }
         VoiceConditioning::Icl { codec_codes, .. } => {
             let wrapped_ids = {
                 // The FULL wrapped encoding: ReferencePrompt carries it whole and the
@@ -2029,7 +2135,12 @@ fn synthesize_inner(
             )
         }
     };
-    let tts_eos = model.talker.tts_eos(table);
+    let tts_eos = prepared_xvector
+        .and_then(|plan| plan.shared.as_ref())
+        .map_or_else(
+            || model.talker.tts_eos(table),
+            |shared| shared.tts_eos.clone(),
+        );
     // 4. Borrowed weights for the generator.
     let talker_layers = model.talker.talker_layer_weights();
     let micro_layers = model.talker.microdecoder_layer_weights();
@@ -2083,7 +2194,11 @@ fn synthesize_inner(
             .flatten()
             .map(std::sync::Arc::new)
     });
-    let mut generator = QwenGenerator::new_with_prepared_int8(generator_config, int8.clone());
+    let generator = QwenGenerator::new_with_prepared_int8(generator_config, int8.clone());
+    let mut generator = VoiceBatchGenerator {
+        inner: generator,
+        plan: prepared_xvector.and_then(|plan| plan.shared.as_ref()),
+    };
     // 5. The engine owns admission, the budget, cancellation, and the frame loop — and the
     // codec decodes IN PARALLEL with it: a tee on the generator feeds every produced frame
     // through a bounded channel to a scoped codec worker driving the streaming decoder.
@@ -2390,6 +2505,14 @@ pub fn generation_error(message: &str) -> GenerationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_voice_plan_is_bound_to_its_loaded_model() {
+        assert!(ensure_prepared_model_identity(17, 17).is_ok());
+        let error = ensure_prepared_model_identity(17, 18)
+            .expect_err("cross-model prepared embeddings and KV must be refused");
+        assert!(error.to_string().contains("different loaded model"), "{error}");
+    }
 
     /// Audio already at the pinned rate must come back untouched — the resample path is additive
     /// and may not perturb any enrollment that worked before it existed.

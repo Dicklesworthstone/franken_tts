@@ -399,6 +399,38 @@ struct UtteranceState {
     text_finished: bool,
 }
 
+/// Request-local talker KV for the causal prompt positions before an x-vector speaker slot.
+///
+/// Voice Lab compares many speakers against one exact text. The text-role rows plus the
+/// `think`/language rows before the speaker are byte-identical for every entry, and causality
+/// guarantees that their KV cannot depend on the later speaker row. This snapshot lets the
+/// comparison compute those positions once. It carries both an input hash and a generator
+/// identity so a cache from another prompt, model hydration, or int8 route fails closed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TalkerPromptPrefix {
+    kv: TalkerKvCache,
+    positions: usize,
+    input_hash: u64,
+    identity: TalkerPromptPrefixIdentity,
+}
+
+impl TalkerPromptPrefix {
+    /// Number of cached causal positions.
+    #[must_use]
+    pub const fn positions(&self) -> usize {
+        self.positions
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TalkerPromptPrefixIdentity {
+    first_q_weight: usize,
+    final_norm_weight: usize,
+    int8_route: usize,
+    hidden_size: usize,
+    head_dim: usize,
+}
+
 /// The armed W8A8 int8 route: quantized projection tables for both stacks plus the dot tier.
 ///
 /// Built once at construction when the `FTTS_INT8=1` kill-switch is armed (staged levers 2a+2b);
@@ -747,6 +779,25 @@ impl<'a> QwenGenerator<'a> {
         self.kv.len()
     }
 
+    fn prompt_prefix_identity(&self) -> TalkerPromptPrefixIdentity {
+        let first_q_weight = self
+            .talker_weights
+            .layers
+            .first()
+            .map_or(0, |layer| layer.q_proj.as_ptr() as usize);
+        let int8_route = self
+            .int8
+            .as_ref()
+            .map_or(0, |route| std::sync::Arc::as_ptr(route) as usize);
+        TalkerPromptPrefixIdentity {
+            first_q_weight,
+            final_norm_weight: self.talker_weights.final_norm.as_ptr() as usize,
+            int8_route,
+            hidden_size: self.talker_config.hidden_size,
+            head_dim: self.talker_config.head_dim,
+        }
+    }
+
     /// Embeds token ids through the cold table and projects them to talker width.
     /// Makes every id in `ids` resolvable by [`Self::project_text_ids`], batch-gathering
     /// the misses through the cold-row source into the overlay.
@@ -885,14 +936,19 @@ impl<'a> QwenGenerator<'a> {
         Ok(())
     }
 
-    /// Runs the talker over an assembled prefill and parks the newest position's state.
-    fn run_prefill(&mut self, mut hidden: Vec<f32>, seq: usize, trailing: Vec<HiddenState>) {
-        self.utterance = None;
-        self.kv.clear();
+    /// Runs one contiguous prefill segment after the positions already present in `self.kv`.
+    ///
+    /// Splitting a causal prefill at any row is exact: every query in this segment sees all
+    /// cached prefix keys plus only preceding keys in this segment. The model's existing
+    /// cached-vs-batched bit-exact gate proves that this execution shape preserves the bytes.
+    fn run_prefill_segment(&mut self, mut hidden: Vec<f32>, seq: usize) -> (Vec<f32>, Vec<f32>) {
+        debug_assert!(seq > 0, "a prefill segment cannot be empty");
         let hidden_size = self.talker_config.hidden_size;
-        let positions: Vec<i64> = (0..seq as i64).collect();
+        debug_assert_eq!(hidden.len(), seq * hidden_size, "prefill segment shape");
+        let past = self.kv.len();
+        let positions: Vec<i64> = (past as i64..(past + seq) as i64).collect();
         let (cos, sin) = talker::mrope_rows(&positions, self.talker_config.head_dim, MROPE_THETA);
-        let mask = causal_mask(seq);
+        let mask = causal_mask_with_prefix(past, seq);
         // A [3072] buffer selects the last-row-only head: prefill consumes only the newest
         // position's logits, and the projected row is byte-identical to the full-head form.
         let mut logits = vec![0.0_f32; PRIMARY_CODE_VOCAB_SIZE];
@@ -924,11 +980,22 @@ impl<'a> QwenGenerator<'a> {
                 &mut logits,
             ),
         }
+        (hidden, logits)
+    }
+
+    fn park_prefill(
+        &mut self,
+        hidden: &[f32],
+        logits: Vec<f32>,
+        trailing: Vec<HiddenState>,
+        next_position: usize,
+    ) {
+        let hidden_size = self.talker_config.hidden_size;
         self.utterance = Some(UtteranceState {
-            pending_hidden: hidden[(seq - 1) * hidden_size..].to_vec(),
+            pending_hidden: hidden[hidden.len() - hidden_size..].to_vec(),
             pending_logits: logits,
             trailing_text_hidden: trailing,
-            next_position: seq,
+            next_position,
             frames_emitted: 0,
             group_zero_history: Vec::new(),
             finished: false,
@@ -945,18 +1012,134 @@ impl<'a> QwenGenerator<'a> {
             ));
         }
     }
+
+    /// Runs the talker over an assembled prefill and parks the newest position's state.
+    fn run_prefill(&mut self, hidden: Vec<f32>, seq: usize, trailing: Vec<HiddenState>) {
+        self.utterance = None;
+        self.kv.clear();
+        let (hidden, logits) = self.run_prefill_segment(hidden, seq);
+        self.park_prefill(&hidden, logits, trailing, seq);
+    }
+
+    /// Begins one fresh x-vector utterance from text rows projected once for a voice batch.
+    ///
+    /// When `shared_prefix` is absent, this call computes and returns the causal KV immediately
+    /// before the speaker slot while also using it for the current voice. Later voices pass that
+    /// snapshot back and skip those positions. The snapshot is rejected unless its prompt bytes,
+    /// model hydration, execution route, and geometry all match this generator.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-x-vector/continuation modes, malformed projected rows, an invalid prefix
+    /// boundary, or a snapshot from another prompt/model/route.
+    pub fn begin_xvector_with_shared_prefix(
+        &mut self,
+        target_text: &[HiddenState],
+        mode: UtteranceStart,
+        speaker_independent_prefix_len: usize,
+        shared_prefix: Option<&TalkerPromptPrefix>,
+    ) -> Result<Option<TalkerPromptPrefix>, GenerationError> {
+        self.timings = GenerationTimings::default();
+        let prefill_started = Instant::now();
+        if self.prompt_mode.clone_mode != CloneMode::XVector {
+            return Err(GenerationError::new(
+                "shared cross-voice prefixes require x-vector prompt assembly",
+            ));
+        }
+        if !matches!(mode, UtteranceStart::Fresh) {
+            return Err(GenerationError::new(
+                "shared cross-voice prefixes are only valid for fresh utterances",
+            ));
+        }
+        self.utterance = None;
+
+        let assembly = prompt::assemble_prompt(PromptAssemblyInput {
+            mode: self.prompt_mode,
+            header: self.header.clone(),
+            target_text: target_text.to_vec(),
+            reference_text: None,
+            reference_codec: None,
+            tts_eos: self.tts_eos.clone(),
+            hold_tts_eos: false,
+        })
+        .map_err(generation_error)?;
+        let hidden_size = self.talker_config.hidden_size;
+        let seq = assembly.prefill.len();
+        if speaker_independent_prefix_len == 0
+            || speaker_independent_prefix_len >= seq
+            || speaker_independent_prefix_len > assembly.target_independent_prefix_len
+        {
+            return Err(GenerationError::new(format!(
+                "speaker-independent prefix length {speaker_independent_prefix_len} is invalid \
+                 for a {seq}-position prompt with target-independent boundary {}",
+                assembly.target_independent_prefix_len
+            )));
+        }
+
+        let mut hidden = Vec::with_capacity(seq * hidden_size);
+        for state in &assembly.prefill {
+            if state.len() != hidden_size {
+                return Err(generation_error(PromptError::WidthMismatch {
+                    expected: hidden_size,
+                    actual: state.len(),
+                }));
+            }
+            hidden.extend_from_slice(state);
+        }
+        if taps_active() {
+            tap_emit(&format!("ftts-tapP h={:016x}", tap_hash_f32(&hidden)));
+        }
+
+        let prefix_values = speaker_independent_prefix_len * hidden_size;
+        let input_hash = tap_hash_f32(&hidden[..prefix_values]);
+        let identity = self.prompt_prefix_identity();
+        let newly_prepared = if let Some(prefix) = shared_prefix {
+            if prefix.positions != speaker_independent_prefix_len
+                || prefix.kv.len() != speaker_independent_prefix_len
+                || prefix.input_hash != input_hash
+                || prefix.identity != identity
+            {
+                return Err(GenerationError::new(
+                    "shared cross-voice prefix does not match this prompt, model, or route",
+                ));
+            }
+            self.kv = prefix.kv.clone();
+            None
+        } else {
+            self.kv.clear();
+            let _ = self.run_prefill_segment(
+                hidden[..prefix_values].to_vec(),
+                speaker_independent_prefix_len,
+            );
+            let prefix = TalkerPromptPrefix {
+                kv: self.kv.clone(),
+                positions: speaker_independent_prefix_len,
+                input_hash,
+                identity,
+            };
+            Some(prefix)
+        };
+
+        let suffix_seq = seq - speaker_independent_prefix_len;
+        let (suffix_hidden, logits) =
+            self.run_prefill_segment(hidden[prefix_values..].to_vec(), suffix_seq);
+        self.park_prefill(&suffix_hidden, logits, assembly.trailing_text_hidden, seq);
+        self.timings.prefill = prefill_started.elapsed();
+        Ok(newly_prepared)
+    }
 }
 
 fn generation_error(error: impl std::fmt::Display) -> GenerationError {
     GenerationError::new(error.to_string())
 }
 
-/// The additive causal mask for a `seq`-position prefill over an empty cache.
-fn causal_mask(seq: usize) -> Vec<f32> {
-    let mut mask = vec![0.0_f32; seq * seq];
+/// Additive causal mask for `seq` new positions following an already cached prefix.
+fn causal_mask_with_prefix(past: usize, seq: usize) -> Vec<f32> {
+    let total = past + seq;
+    let mut mask = vec![0.0_f32; seq * total];
     for query in 0..seq {
-        for key in query + 1..seq {
-            mask[query * seq + key] = f32::NEG_INFINITY;
+        for key in past + query + 1..total {
+            mask[query * total + key] = f32::NEG_INFINITY;
         }
     }
     mask
@@ -1814,6 +1997,101 @@ mod tests {
         let right = drive(&weights, 42, SamplingMode::Production, 6);
         assert!(!left.is_empty());
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn speaker_independent_prefix_reuse_is_bit_exact_across_voice_rows() {
+        // Keep attention context-sensitive so a wrong split/cache cannot pass through an
+        // identity transformer. In this tiny header the second non-BOS codec row stands in for
+        // the speaker, so role(3) + the one preceding codec row gives a four-position prefix.
+        let mut weights = TinyWeights::new(1.0);
+        weights.talker_q.fill(0.05);
+        weights.talker_kv.fill(0.08);
+        weights.talker_o.fill(0.025);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+
+        let mut cache_builder = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback.clone(),
+            42,
+            SamplingMode::Production,
+        );
+        let projected = cache_builder
+            .project_text_ids(&[1, 2])
+            .expect("tiny target rows are gathered");
+        let snapshot = cache_builder
+            .begin_xvector_with_shared_prefix(&projected, UtteranceStart::Fresh, 4, None)
+            .expect("first voice prepares the shared prefix")
+            .expect("first voice returns a new snapshot");
+        assert_eq!(snapshot.positions(), 4);
+
+        let mut full_voice = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback.clone(),
+            42,
+            SamplingMode::Production,
+        );
+        let mut cached_voice = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback,
+            42,
+            SamplingMode::Production,
+        );
+        // The product generators clone one process-owned int8 Arc. Mirror that identity here;
+        // QwenGenerator::new would otherwise build separate synthetic routes for this test.
+        full_voice.int8 = cache_builder.int8.clone();
+        cached_voice.int8 = cache_builder.int8.clone();
+        full_voice.header.codec_prefill[1].fill(0.875);
+        cached_voice.header.codec_prefill[1].fill(0.875);
+
+        full_voice
+            .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
+            .expect("ordinary second voice prefill");
+        assert!(
+            cached_voice
+                .begin_xvector_with_shared_prefix(
+                    &projected,
+                    UtteranceStart::Fresh,
+                    4,
+                    Some(&snapshot),
+                )
+                .expect("cached second voice prefill")
+                .is_none(),
+            "an existing snapshot must be reused rather than rebuilt"
+        );
+
+        assert_eq!(cached_voice.kv, full_voice.kv, "all cached K/V bytes");
+        assert_eq!(
+            cached_voice.utterance, full_voice.utterance,
+            "parked hidden/logits and trailing text"
+        );
+        for frame_index in 0..4 {
+            assert_eq!(
+                cached_voice.next_frame().expect("cached frame"),
+                full_voice.next_frame().expect("full frame"),
+                "frame {frame_index} diverged after shared-prefix prefill"
+            );
+        }
     }
 
     #[test]
