@@ -1,6 +1,7 @@
 // The laboratory: one scrolling screen mirroring the site's playground.
 
 import AVFoundation
+import CryptoKit
 import PhotosUI
 import SwiftUI
 import UIKit
@@ -347,6 +348,142 @@ final class LabModel {
         }
     }
 
+    /// Physical-device profiling lane. This is environment-triggered and absent
+    /// from the product UI: it measures the app's exact FFI route repeatedly in
+    /// an optimized app build without adding benchmark controls to the interface.
+    func runProfilingBenchmarkIfRequested() async {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["FTTS_IOS_PROFILE"] == "1" else { return }
+
+        let requestedRuns = Int(environment["FTTS_IOS_PROFILE_RUNS"] ?? "20") ?? 20
+        let runs = max(1, min(100, requestedRuns))
+        let benchmarkText = environment["FTTS_IOS_PROFILE_TEXT"]
+            ?? "Frankenstein listened carefully while the rain tapped softly against the laboratory window."
+        let voice = environment["FTTS_IOS_PROFILE_VOICE"] ?? "matt"
+        let benchmarkSeed = UInt64(environment["FTTS_IOS_PROFILE_SEED"] ?? "0") ?? 0
+
+        let documents = FileManager.default.urls(
+            for: .documentDirectory, in: .userDomainMask
+        )[0]
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let receiptURL = documents.appendingPathComponent(
+            "ftts-ios-profile-\(stamp).jsonl")
+        var receiptLines: [String] = []
+
+        UIApplication.shared.isIdleTimerDisabled = true
+        defer { UIApplication.shared.isIdleTimerDisabled = false }
+
+        func appendReceipt(_ object: [String: Any]) throws {
+            let data = try JSONSerialization.data(
+                withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+            guard let line = String(data: data, encoding: .utf8) else {
+                throw EngineError.native("profiling receipt was not UTF-8")
+            }
+            receiptLines.append(line)
+            try Data((receiptLines.joined(separator: "\n") + "\n").utf8)
+                .write(to: receiptURL, options: .atomic)
+            print("FTTS_IOS_PROFILE \(line)")
+        }
+
+        do {
+            guard store.isComplete else {
+                throw EngineError.native("profiling requires the complete downloaded model")
+            }
+            let speaker = try Engine.presetVector(named: voice)
+            try appendReceipt([
+                "event": "run_start",
+                "schema_version": 1,
+                "runs": runs,
+                "text": benchmarkText,
+                "voice": voice,
+                "seed": benchmarkSeed,
+                "device_model": UIDevice.current.model,
+                "system_name": UIDevice.current.systemName,
+                "system_version": UIDevice.current.systemVersion,
+                "active_processors": ProcessInfo.processInfo.activeProcessorCount,
+                "physical_memory_bytes": ProcessInfo.processInfo.physicalMemory,
+                "team_threads": environment["FTTS_INT8_THREADS"] ?? "unset",
+                "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+                "receipt_path": receiptURL.path,
+                "model_manifest": ModelManifest.files.map { file in
+                    [
+                        "asset": file.asset,
+                        "relative_path": file.relativePath,
+                        "bytes": file.bytes,
+                        "sha256": file.sha256,
+                    ] as [String: Any]
+                },
+            ])
+
+            let loadStarted = Date()
+            try await engine.load(modelDirectory: store.modelDirectory)
+            try appendReceipt([
+                "event": "engine_loaded",
+                "load_ms": Date().timeIntervalSince(loadStarted) * 1_000,
+                "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+            ])
+
+            var firstDigest: String?
+            var validRuns = 0
+            var allAudioIdentical = true
+            for index in 0..<runs {
+                let started = Date()
+                let output = try await engine.synthesize(
+                    text: benchmarkText,
+                    speaker: speaker,
+                    seed: benchmarkSeed
+                )
+                let wallMs = Date().timeIntervalSince(started) * 1_000
+                let audioSeconds = Double(output.pcm.count) / Double(WavWriter.sampleRate)
+                let realtimeSpeed = audioSeconds / max(wallMs / 1_000, 0.000_001)
+                let wav = WavWriter.data(from: output.pcm)
+                let digest = SHA256.hash(data: wav)
+                    .map { String(format: "%02x", $0) }.joined()
+                if firstDigest == nil { firstDigest = digest }
+                guard let profile = output.profile else {
+                    throw EngineError.native("native synthesis profile was unavailable")
+                }
+                let matchesFirstAudio = digest == firstDigest
+                allAudioIdentical = allAudioIdentical && matchesFirstAudio
+                try appendReceipt([
+                    "event": "sample",
+                    "index": index,
+                    "wall_ms": wallMs,
+                    "audio_seconds": audioSeconds,
+                    "realtime_speed": realtimeSpeed,
+                    "wav_sha256": digest,
+                    "matches_first_audio": matchesFirstAudio,
+                    "total_ms": profile.totalMs,
+                    "generation_ms": profile.generationMs,
+                    "prefill_ms": profile.prefillMs,
+                    "talker_ms": profile.talkerMs,
+                    "microdecoder_ms": profile.microdecoderMs,
+                    "feedback_ms": profile.feedbackMs,
+                    "codec_active_ms": profile.codecActiveMs,
+                    "other_generation_ms": profile.otherGenerationMs,
+                    "frames": profile.frames,
+                    "team_partitions": profile.teamPartitions,
+                    "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+                ])
+                validRuns += 1
+            }
+
+            try appendReceipt([
+                "event": "run_complete",
+                "completed_runs": validRuns,
+                "all_audio_identical": validRuns == runs && allAudioIdentical,
+                "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+            ])
+        } catch {
+            try? appendReceipt([
+                "event": "run_error",
+                "message": error.localizedDescription,
+                "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+            ])
+        }
+    }
+
     func cancelSynthesis() {
         guard isSynthesizing else { return }
         forge.phase = .cancelling
@@ -606,6 +743,13 @@ struct LabView: View {
     @Environment(\.scenePhase) private var scenePhase
     @FocusState private var focusedField: EditorFocus?
 
+    /// The profiling lane owns engine hydration while it is active. Suppressing
+    /// the ordinary foreground/store-ready warm hooks avoids racing two opens of
+    /// the same multi-gigabyte engine and invalidating a physical-device sample.
+    private var profilingRequested: Bool {
+        ProcessInfo.processInfo.environment["FTTS_IOS_PROFILE"] == "1"
+    }
+
     var body: some View {
         systemIntegrationView
     }
@@ -816,12 +960,14 @@ struct LabView: View {
             if phase == .background {
                 model.unloadEngineForMemoryPressure()
             } else if phase == .active {
-                model.warmEngineIfPossible()
+                if !profilingRequested { model.warmEngineIfPossible() }
                 consumeStagedText()
             }
         }
         .onChange(of: model.store.phase) { _, phase in
-            if phase == .ready { model.warmEngineIfPossible() }
+            if phase == .ready, !profilingRequested {
+                model.warmEngineIfPossible()
+            }
         }
         .sensoryFeedback(.selection, trigger: model.selectedVoice)
         .sensoryFeedback(.success, trigger: model.lastAudio?.count)
@@ -829,7 +975,13 @@ struct LabView: View {
         .sensoryFeedback(.success, trigger: importCount) { _, count in count > 0 }
         .onAppear(perform: debugCardHook)
         .onAppear(perform: debugVideoHook)
-        .task { model.warmEngineIfPossible() }
+        .task {
+            if profilingRequested {
+                await model.runProfilingBenchmarkIfRequested()
+            } else {
+                model.warmEngineIfPossible()
+            }
+        }
         .task { consumeStagedText() }
     }
 
