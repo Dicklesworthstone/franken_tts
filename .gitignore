@@ -10,6 +10,9 @@ Cargo.lock.orig
 *.fttsdraft
 /models
 /snapshots
+/ios/build/
+/ios/FttsCore.xcframework.mixed-*/
+/ios/FttsCore.xcframework.previous-*/
 *.wav
 *.npz
 *.npy

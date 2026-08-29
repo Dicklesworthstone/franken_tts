@@ -159,6 +159,8 @@ struct GalvanicVoiceForge: View {
     let telemetry: VoiceForgeTelemetry
     let elapsed: TimeInterval
     var estimatedRemainingSeconds: Int?
+    var chunkIndex = 1
+    var chunkCount = 1
     var compact = false
     var cancel: (() -> Void)?
 
@@ -197,6 +199,10 @@ struct GalvanicVoiceForge: View {
                 Spacer(minLength: 8)
                 if telemetry.phase.isActive {
                     VStack(alignment: .trailing, spacing: 3) {
+                        if chunkCount > 1 {
+                            Text("PASSAGE \(chunkIndex)/\(chunkCount)")
+                                .foregroundStyle(phaseColor)
+                        }
                         Text(Self.elapsed(elapsed))
                             .foregroundStyle(Lab.textSecondary)
                         if let estimatedRemainingSeconds {
@@ -508,6 +514,9 @@ private struct ForgeMetric: View {
                 .font(.system(size: Lab.typeSize(13), weight: .semibold, design: .monospaced))
                 .foregroundStyle(Lab.textPrimary)
                 .monospacedDigit()
+                // Native counters cross digit boundaries frequently. Reserving the
+                // four-digit frame width keeps neighboring metrics and Stop stationary.
+                .frame(minWidth: 46, alignment: .leading)
         }
         .accessibilityElement(children: .combine)
     }

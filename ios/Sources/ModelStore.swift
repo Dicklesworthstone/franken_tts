@@ -64,6 +64,9 @@ enum ModelManifest {
     /// connection. `URLSession.download(for:)` keeps even an unexpectedly large CDN
     /// response out of the process heap.
     static let chunkBytes: Int64 = 8 * 1024 * 1024
+    /// Hashing these files at launch costs only a few milliseconds and closes the
+    /// exact-size corruption hole that a byte-count-only readiness check leaves open.
+    static let launchDigestLimit: Int64 = 5_000_000
 }
 
 enum DownloadPhase: Equatable {
@@ -84,6 +87,7 @@ final class ModelStore {
     var currentFileCount = ModelManifest.files.count
 
     private var task: Task<Void, Never>?
+    private var launchValidationTask: Task<Void, Never>?
     private var activeTaskID: UUID?
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.default
@@ -94,27 +98,25 @@ final class ModelStore {
         return URLSession(configuration: configuration)
     }()
 
-    let modelDirectory: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return base.appendingPathComponent("franken_tts/model", isDirectory: true)
-    }()
+    let modelDirectory: URL
 
-    init() {
+    init(modelDirectory: URL? = nil) {
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0]
+        self.modelDirectory = modelDirectory
+            ?? applicationSupport.appendingPathComponent("franken_tts/model", isDirectory: true)
         refreshCachedBytes()
-        // Size-only trust at launch, the same tradeoff the website makes with its memo
-        // file: every byte was digest-verified when it was downloaded, and the .fttsq
-        // artifact re-verifies its own digests at engine load. A full re-hash of 2 GB on
-        // every app start would cost tens of seconds for corruption this storage does
-        // not produce in practice.
-        if isComplete {
-            phase = .ready
-        } else if missingFiles().allSatisfy({ $0.bytes < 5_000_000 }), cachedBytes > 0 {
-            // An install from before a small file (the denoiser) joined the manifest:
-            // everything big is here, so completing the sub-megabyte remainder needs
-            // no fresh consent — the user consented to this model. The phone stays
-            // usable meanwhile; enrollment checks the engine directly before running.
-            phase = .ready
-            fetchSmallMissingFiles()
+        if largeArtifactsHaveExpectedSizes {
+            // A full 2 GB digest on every launch would be hostile to battery and startup.
+            // Instead, hash every small tokenizer/config artifact and parse the large
+            // containers' bounded headers before advertising readiness. The Rust loader
+            // performs the deeper section checks when the engine warms.
+            phase = .verifying(asset: "installed model")
+            launchValidationTask = Task { [weak self] in
+                await self?.validateInstalledModelAtLaunch()
+            }
         }
     }
 
@@ -126,28 +128,96 @@ final class ModelStore {
         }
     }
 
-    private func fetchSmallMissingFiles() {
-        Task { [weak self] in
-            guard let self else { return }
-            for file in self.missingFiles() {
-                do {
-                    let data = try await URLSession.shared.data(
-                        from: URL(string: ModelManifest.releaseBase + file.asset)!).0
-                    let digest = SHA256.hash(data: data)
-                        .map { String(format: "%02x", $0) }.joined()
-                    guard digest == file.sha256 else { continue }
-                    let destination = self.modelDirectory
-                        .appendingPathComponent(file.relativePath)
-                    try FileManager.default.createDirectory(
-                        at: destination.deletingLastPathComponent(),
-                        withIntermediateDirectories: true)
-                    try data.write(to: destination, options: .atomic)
-                    self.refreshCachedBytes()
-                } catch {
-                    // Transient network failure; the next launch retries.
+    private var largeArtifactsHaveExpectedSizes: Bool {
+        ModelManifest.files
+            .filter { $0.bytes >= ModelManifest.launchDigestLimit }
+            .allSatisfy { installedSize(of: $0) == $0.bytes }
+    }
+
+    private func installedSize(of file: ModelFile) -> Int64? {
+        let path = modelDirectory.appendingPathComponent(file.relativePath).path
+        return (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? nil
+    }
+
+    private func validateInstalledModelAtLaunch() async {
+        defer { launchValidationTask = nil }
+        do {
+            let largeFiles = ModelManifest.files.filter {
+                $0.bytes >= ModelManifest.launchDigestLimit
+            }
+            for file in largeFiles {
+                try Task.checkCancellation()
+                let url = modelDirectory.appendingPathComponent(file.relativePath)
+                guard installedSize(of: file) == file.bytes,
+                      try await Self.hasValidContainerHeader(file: file, at: url)
+                else {
+                    phase = .failed(
+                        "A saved model component is damaged. Tap Repair model to verify and replace only the affected file."
+                    )
+                    return
                 }
             }
+
+            let smallFiles = ModelManifest.files.filter {
+                $0.bytes < ModelManifest.launchDigestLimit
+            }
+            var filesToRepair: [ModelFile] = []
+            for file in smallFiles {
+                try Task.checkCancellation()
+                let url = modelDirectory.appendingPathComponent(file.relativePath)
+                guard installedSize(of: file) == file.bytes,
+                      try await digest(of: url) == file.sha256
+                else {
+                    filesToRepair.append(file)
+                    continue
+                }
+            }
+
+            for file in filesToRepair {
+                try Task.checkCancellation()
+                phase = .verifying(asset: file.displayName)
+                try await repairSmallFile(file)
+                refreshCachedBytes()
+            }
+
+            guard isComplete else {
+                phase = .idle
+                return
+            }
+            phase = .ready
+        } catch is CancellationError {
+            // An explicit download, pause, or clear owns the next phase.
+        } catch {
+            phase = .failed(
+                "The model's support files could not be repaired: \(error.localizedDescription)"
+            )
         }
+    }
+
+    private func repairSmallFile(_ file: ModelFile) async throws {
+        guard file.bytes < ModelManifest.launchDigestLimit,
+              let source = URL(string: ModelManifest.releaseBase + file.asset)
+        else {
+            throw DownloadError.invalidResponse("The requested repair was not a small model file.")
+        }
+        let (temporary, response) = try await session.download(for: URLRequest(url: source))
+        try Task.checkCancellation()
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw DownloadError.invalidResponse("The model server refused the repair download.")
+        }
+        guard try Self.fileSize(temporary) == file.bytes,
+              try await digest(of: temporary) == file.sha256
+        else {
+            throw DownloadError.invalidResponse(
+                "\(file.displayName) did not pass its security check."
+            )
+        }
+        let destination = modelDirectory.appendingPathComponent(file.relativePath)
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Self.adoptDownloadedFile(temporary, at: destination)
     }
 
     var isComplete: Bool {
@@ -169,6 +239,8 @@ final class ModelStore {
     }
 
     func startDownload() {
+        launchValidationTask?.cancel()
+        launchValidationTask = nil
         guard task == nil else { return }
         refreshCachedBytes()
         downloadRateBytesPerSecond = 0
@@ -190,6 +262,8 @@ final class ModelStore {
     }
 
     func pauseDownload() {
+        launchValidationTask?.cancel()
+        launchValidationTask = nil
         task?.cancel()
         task = nil
         activeTaskID = nil
@@ -199,6 +273,8 @@ final class ModelStore {
     }
 
     func clear() {
+        launchValidationTask?.cancel()
+        launchValidationTask = nil
         task?.cancel()
         task = nil
         activeTaskID = nil
@@ -267,6 +343,8 @@ final class ModelStore {
             if try await digest(of: destination) == file.sha256 { return }
             try requireActive(taskID)
             try FileManager.default.removeItem(at: destination)
+            // Do not publish a stale near-100% count while the replacement begins.
+            refreshCachedBytes()
         }
 
         var offset: Int64 = 0
@@ -453,6 +531,40 @@ final class ModelStore {
     private nonisolated static func fileSize(_ url: URL) throws -> Int64 {
         let values = try url.resourceValues(forKeys: [.fileSizeKey])
         return Int64(values.fileSize ?? 0)
+    }
+
+    /// Cheap startup validation for the two large artifact formats. This catches
+    /// zero-filled, truncated, or mislabeled files without reading their multi-GB payloads.
+    nonisolated static func hasValidContainerHeader(
+        file: ModelFile,
+        at url: URL
+    ) async throws -> Bool {
+        try await Task.detached(priority: .utility) {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+
+            if file.asset.hasSuffix(".fttsq") {
+                return try handle.read(upToCount: 8) == Data("FTTSQ\0\0\0".utf8)
+            }
+            if file.asset.hasSuffix(".safetensors") {
+                guard let prefix = try handle.read(upToCount: 8), prefix.count == 8 else {
+                    return false
+                }
+                let headerLength = prefix.withUnsafeBytes { raw -> UInt64 in
+                    raw.loadUnaligned(as: UInt64.self).littleEndian
+                }
+                guard headerLength > 1,
+                      headerLength <= 64 * 1024 * 1024,
+                      headerLength <= UInt64(max(0, file.bytes - 8))
+                else { return false }
+                guard let header = try handle.read(upToCount: Int(headerLength)),
+                      header.count == Int(headerLength),
+                      let object = try JSONSerialization.jsonObject(with: header) as? [String: Any]
+                else { return false }
+                return object.keys.contains { $0 != "__metadata__" }
+            }
+            return false
+        }.value
     }
 
     /// Streaming SHA-256 of a file, 8 MiB at a time, off the main actor.

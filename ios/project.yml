@@ -16,6 +16,15 @@ settings:
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: AU8V2Z6NKY
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+schemes:
+  FrankenTTS:
+    build:
+      targets:
+        FrankenTTS: all
+        FrankenTTSTests: [test]
+    test:
+      targets:
+        - FrankenTTSTests
 targets:
   FrankenTTS:
     type: application
@@ -139,3 +148,13 @@ targets:
           NSExtensionAttributes:
             NSExtensionActivationRule:
               NSExtensionActivationSupportsText: true
+  FrankenTTSTests:
+    type: bundle.unit-test
+    platform: iOS
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+    sources:
+      - Tests
+    dependencies:
+      - target: FrankenTTS

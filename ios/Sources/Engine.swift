@@ -36,6 +36,20 @@ struct SynthesisProfile: Decodable {
     var otherGenerationMs: Double {
         max(0, generationMs - prefillMs - microdecoderMs - feedbackMs - talkerMs)
     }
+
+    func adding(_ other: SynthesisProfile) -> SynthesisProfile {
+        SynthesisProfile(
+            totalMs: totalMs + other.totalMs,
+            generationMs: generationMs + other.generationMs,
+            prefillMs: prefillMs + other.prefillMs,
+            microdecoderMs: microdecoderMs + other.microdecoderMs,
+            feedbackMs: feedbackMs + other.feedbackMs,
+            talkerMs: talkerMs + other.talkerMs,
+            codecActiveMs: codecActiveMs + other.codecActiveMs,
+            frames: frames + other.frames,
+            teamPartitions: max(teamPartitions, other.teamPartitions)
+        )
+    }
 }
 
 struct SynthesisOutput {
@@ -346,5 +360,145 @@ enum WavWriter {
             u16(UInt16(bitPattern: Int16((clamped * 32767.0).rounded())))
         }
         return data
+    }
+}
+
+/// Conservative, deterministic speech mastering for synthesized 24 kHz mono
+/// audio. It corrects recording-dependent tonal extremes, normalizes active
+/// speech rather than leading/trailing silence, and catches peaks without
+/// changing the timing or sample count used by playback and exports.
+enum SpeechMastering {
+    private static let targetActiveRMS: Float = 0.112 // approximately -19 dBFS
+    private static let limiterKnee: Float = 0.82
+    private static let limiterCeiling: Float = 0.95
+
+    static func process(
+        _ input: [Float],
+        sampleRate: Float = 24_000,
+        maximumGain: Float = 24.0
+    ) -> [Float] {
+        guard input.count > 1, sampleRate > 0 else { return input }
+
+        var peak: Float = 0
+        for sample in input where sample.isFinite {
+            peak = max(peak, abs(sample))
+        }
+        guard peak > 0.001 else { return input.map { $0.isFinite ? $0 : 0 } }
+
+        // DC/rumble removal. The one-pole high-pass is intentionally below the
+        // useful speech fundamental, so it removes recording bias without
+        // thinning ordinary voices.
+        let highPassPole = exp(-2 * Float.pi * 70 / sampleRate)
+        var cleaned = [Float](repeating: 0, count: input.count)
+        var previousInput: Float = 0
+        var previousOutput: Float = 0
+        for index in input.indices {
+            let sample = input[index].isFinite ? input[index] : 0
+            let output = sample - previousInput + highPassPole * previousOutput
+            cleaned[index] = output
+            previousInput = sample
+            previousOutput = output
+        }
+
+        // Split into reconstructing low/mid/high bands. Analysis determines a
+        // gentle, bounded correction; no band moves more than 2.5 dB, so this
+        // reduces microphone coloration without replacing the voice's timbre.
+        let lowCoefficient = onePoleCoefficient(cutoff: 220, sampleRate: sampleRate)
+        let presenceCoefficient = onePoleCoefficient(cutoff: 3_400, sampleRate: sampleRate)
+        var lowState: Float = 0
+        var presenceState: Float = 0
+        var lowEnergy: Double = 0
+        var midEnergy: Double = 0
+        var highEnergy: Double = 0
+        let analysisGate = max(0.003, peak * 0.012)
+
+        for index in cleaned.indices {
+            let sample = cleaned[index]
+            lowState += lowCoefficient * (sample - lowState)
+            presenceState += presenceCoefficient * (sample - presenceState)
+            let low = lowState
+            let high = sample - presenceState
+            let mid = presenceState - low
+            if abs(sample) >= analysisGate {
+                lowEnergy += Double(low * low)
+                midEnergy += Double(mid * mid)
+                highEnergy += Double(high * high)
+            }
+        }
+
+        let totalEnergy = lowEnergy + midEnergy + highEnergy
+        let lowShare = totalEnergy > 0 ? Float(lowEnergy / totalEnergy) : 0.22
+        let highShare = totalEnergy > 0 ? Float(highEnergy / totalEnergy) : 0.12
+        let lowGain = decibelsToGain(clamp((0.22 - lowShare) * 10, -2.5, 2.0))
+        let highGain = decibelsToGain(clamp((0.12 - highShare) * 12, -2.5, 2.0))
+
+        var equalized = [Float](repeating: 0, count: cleaned.count)
+        lowState = 0
+        presenceState = 0
+        for index in equalized.indices {
+            let sample = cleaned[index]
+            lowState += lowCoefficient * (sample - lowState)
+            presenceState += presenceCoefficient * (sample - presenceState)
+            let low = lowState
+            let high = sample - presenceState
+            let mid = presenceState - low
+            equalized[index] = low * lowGain + mid + high * highGain
+        }
+
+        let activeRMS = gatedRMS(equalized, sampleRate: sampleRate)
+        guard activeRMS > 0.000_1 else { return equalized }
+        let loudnessGain = clamp(targetActiveRMS / activeRMS, 0.25, max(0.25, maximumGain))
+
+        for index in equalized.indices {
+            equalized[index] = softLimit(equalized[index] * loudnessGain)
+        }
+        let fadeSamples = min(equalized.count / 2, max(1, Int(sampleRate * 0.004)))
+        if fadeSamples > 1 {
+            for index in 0..<fadeSamples {
+                let gain = Float(index) / Float(fadeSamples - 1)
+                equalized[index] *= gain
+                equalized[equalized.count - 1 - index] *= gain
+            }
+        }
+        return equalized
+    }
+
+    private static func gatedRMS(_ samples: [Float], sampleRate: Float) -> Float {
+        let window = max(1, Int(sampleRate * 0.020))
+        var windowPowers: [Double] = []
+        windowPowers.reserveCapacity((samples.count + window - 1) / window)
+        var index = 0
+        while index < samples.count {
+            let end = min(samples.count, index + window)
+            var power: Double = 0
+            for sample in samples[index..<end] { power += Double(sample * sample) }
+            windowPowers.append(power / Double(end - index))
+            index = end
+        }
+        guard let maximum = windowPowers.max(), maximum > 0 else { return 0 }
+        let gate = max(0.000_01, maximum * 0.01) // -50 dBFS or 20 dB below this clip's peak window
+        let active = windowPowers.filter { $0 >= gate }
+        guard !active.isEmpty else { return 0 }
+        return Float(sqrt(active.reduce(0, +) / Double(active.count)))
+    }
+
+    private static func onePoleCoefficient(cutoff: Float, sampleRate: Float) -> Float {
+        1 - exp(-2 * Float.pi * cutoff / sampleRate)
+    }
+
+    private static func decibelsToGain(_ decibels: Float) -> Float {
+        pow(10, decibels / 20)
+    }
+
+    private static func softLimit(_ sample: Float) -> Float {
+        let magnitude = abs(sample)
+        guard magnitude > limiterKnee else { return sample }
+        let span = limiterCeiling - limiterKnee
+        let limited = limiterKnee + span * (1 - exp(-(magnitude - limiterKnee) / span))
+        return sample.sign == .minus ? -limited : limited
+    }
+
+    private static func clamp(_ value: Float, _ lower: Float, _ upper: Float) -> Float {
+        min(upper, max(lower, value))
     }
 }

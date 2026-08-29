@@ -133,6 +133,30 @@ private struct TTSAdaptiveETA {
         }
     }
 
+    mutating func markMeasuredWork(elapsed: TimeInterval) {
+        guard elapsed >= 0 else { return }
+        hasMeasuredWork = true
+        if predictedFinishElapsed == nil {
+            predictedFinishElapsed = max(
+                elapsed + 0.75,
+                learnedSecondsPerWord * Double(words)
+            )
+        }
+    }
+
+    mutating func observeCompletedFraction(_ fraction: Double, elapsed: TimeInterval) {
+        guard fraction > 0, fraction < 1, elapsed > 0 else { return }
+        hasMeasuredWork = true
+        let observedTotal = elapsed / fraction
+        let priorTotal = learnedSecondsPerWord * Double(words)
+        let candidate = max(elapsed + 0.75, priorTotal * 0.30 + observedTotal * 0.70)
+        if let old = predictedFinishElapsed {
+            predictedFinishElapsed = min(old * 0.62 + candidate * 0.38, old + 5)
+        } else {
+            predictedFinishElapsed = candidate
+        }
+    }
+
     mutating func beginDenoise(elapsed: TimeInterval) {
         denoiseStartedAt = elapsed
         let learned = UserDefaults.standard.double(forKey: Self.denoiseSecondsKey)
@@ -217,8 +241,7 @@ final class LabModel {
     /// Set when an enrollment just saved, so the sheet knows to dismiss.
     var enrollmentSaved = false
 
-    var text =
-        "The rainbow is a division of white light into many beautiful colors. Now, spoken entirely on this device."
+    var text = JokeLibrary.random()
     var seed: UInt64 = 0
 
     var isSynthesizing = false
@@ -227,9 +250,13 @@ final class LabModel {
     var synthesisSeconds = 0.0
     var estimatedRemainingSeconds: Int?
     var lastError: String?
+    var textImportNotice: String?
+    var isImportingText = false
     var lastAudio: [Float]?
     var lastRealTimeFactor: Double?
     var lastProfile: SynthesisProfile?
+    var synthesisChunkIndex = 1
+    var synthesisChunkCount = 1
     var forge = VoiceForgeTelemetry()
     var nativeProgressEvents: [EngineProgress] = []
     var player: AVAudioPlayer?
@@ -241,6 +268,10 @@ final class LabModel {
     var videoProgress = 0.0
     /// Bumped per synthesis so a slow export cannot stamp its output onto a newer clip.
     private var synthesisGeneration = 0
+    private var importGeneration = 0
+    private var importTask: Task<Void, Never>?
+    private var cancellationRequested = false
+    private var completedSynthesisFrames: UInt64 = 0
     private var engineWarmTask: Task<Void, Never>?
     private let activity = VoiceForgeActivityController.shared
     private var eta = TTSAdaptiveETA()
@@ -277,7 +308,15 @@ final class LabModel {
     // the right refinement if background work ever grows.
     func synthesize() {
         guard canSynthesizeFromCommand else { return }
+        let text = self.text
+        let chunks = UtteranceChunker.split(text)
+        guard !chunks.isEmpty else { return }
+        player?.pause()
         isSynthesizing = true
+        cancellationRequested = false
+        completedSynthesisFrames = 0
+        synthesisChunkIndex = 1
+        synthesisChunkCount = chunks.count
         lastError = nil
         lastProfile = nil
         synthesisSeconds = 0
@@ -287,7 +326,6 @@ final class LabModel {
         forge.reset(for: beganWarm ? .checkingMemory : .readingBundle)
         eta.reset(text: text, warm: beganWarm)
         activity.begin()
-        let text = self.text
         let seed = self.seed
         let runStartedAt = Date()
         let ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -316,32 +354,87 @@ final class LabModel {
                 }
                 isEngineWarm = true
                 isLoadingModel = false
-                let started = Date()
-                let output = try await engine.synthesize(
-                    text: text,
-                    speaker: speaker,
-                    seed: seed
-                ) { [weak self] event in
-                    Task { @MainActor in self?.receive(event) }
+                let denoiseAvailable = await engine.denoiseAvailable
+                var pcm: [Float] = []
+                var aggregateProfile: SynthesisProfile?
+                var everyProfileAvailable = true
+                var synthesisElapsed = 0.0
+                var generatedSampleCount = 0
+                var completedCharacters = 0
+
+                for (index, chunk) in chunks.enumerated() {
+                    guard !cancellationRequested else { throw EngineError.cancelled }
+                    synthesisChunkIndex = index + 1
+                    let frameOffset = completedSynthesisFrames
+                    let started = Date()
+                    let output = try await engine.synthesize(
+                        text: chunk.text,
+                        speaker: speaker,
+                        seed: seed &+ UInt64(index)
+                    ) { [weak self] event in
+                        Task { @MainActor in
+                            self?.receive(
+                                event,
+                                chunkOrdinal: index + 1,
+                                frameOffset: frameOffset
+                            )
+                        }
+                    }
+                    synthesisElapsed += Date().timeIntervalSince(started)
+                    guard !cancellationRequested else { throw EngineError.cancelled }
+
+                    if let profile = output.profile {
+                        aggregateProfile = aggregateProfile?.adding(profile) ?? profile
+                        completedSynthesisFrames += profile.frames
+                    } else {
+                        everyProfileAvailable = false
+                        completedSynthesisFrames += UInt64(
+                            output.pcm.count / 1_920
+                        )
+                    }
+                    generatedSampleCount += output.pcm.count
+
+                    var chunkPCM = output.pcm
+                    if denoiseAvailable {
+                        forge.phase = .denoising
+                        if index == chunks.count - 1 {
+                            eta.beginDenoise(elapsed: Date().timeIntervalSince(runStartedAt))
+                        }
+                        chunkPCM = (try? await engine.denoise(pcm: chunkPCM)) ?? chunkPCM
+                    }
+                    guard !cancellationRequested else { throw EngineError.cancelled }
+
+                    chunkPCM = await Task.detached(priority: .userInitiated) {
+                        SpeechMastering.process(chunkPCM)
+                    }.value
+                    pcm.append(contentsOf: chunkPCM)
+                    if index < chunks.count - 1 {
+                        let pauseSamples = Int(
+                            chunk.trailingPauseSeconds * Double(WavWriter.sampleRate)
+                        )
+                        pcm.append(contentsOf: repeatElement(Float.zero, count: pauseSamples))
+                    }
+
+                    completedCharacters += chunk.text.count
+                    eta.observeCompletedFraction(
+                        Double(completedCharacters) / Double(max(1, text.count)),
+                        elapsed: Date().timeIntervalSince(runStartedAt)
+                    )
                 }
-                var pcm = output.pcm
-                lastProfile = output.profile
-                let elapsed = Date().timeIntervalSince(started)
-                let factor = (Double(pcm.count) / Double(WavWriter.sampleRate)) / elapsed
+
+                guard !cancellationRequested else { throw EngineError.cancelled }
+                lastProfile = everyProfileAvailable ? aggregateProfile : nil
+                forge.generatedFrames = completedSynthesisFrames
+                forge.decodedFrames = max(forge.decodedFrames, completedSynthesisFrames)
+                forge.decodedSamples = UInt64(generatedSampleCount)
+                let factor = (Double(generatedSampleCount) / Double(WavWriter.sampleRate))
+                    / max(0.000_001, synthesisElapsed)
                 lastRealTimeFactor = factor
                 UserDefaults.standard.set(factor, forKey: "measuredRealTimeFactor")
-                // The same neural denoiser enrollment uses, run over the OUTPUT: it
-                // strips residual hiss (especially audible with cloned voices) and a
-                // failure just keeps the original audio.
-                if await engine.denoiseAvailable {
-                    forge.phase = .denoising
-                    eta.beginDenoise(elapsed: Date().timeIntervalSince(runStartedAt))
-                    pcm = (try? await engine.denoise(pcm: pcm)) ?? pcm
-                }
                 synthesisSeconds = Date().timeIntervalSince(runStartedAt)
                 eta.finish(
                     elapsed: synthesisSeconds,
-                    frames: output.profile?.frames ?? forge.generatedFrames
+                    frames: completedSynthesisFrames
                 )
                 estimatedRemainingSeconds = nil
                 lastAudio = pcm
@@ -513,13 +606,30 @@ final class LabModel {
 
     func cancelSynthesis() {
         guard isSynthesizing else { return }
+        cancellationRequested = true
         forge.phase = .cancelling
         engine.cancelCurrentWork()
     }
 
-    private func receive(_ event: EngineProgress) {
+    private func receive(
+        _ event: EngineProgress,
+        chunkOrdinal: Int? = nil,
+        frameOffset: UInt64 = 0
+    ) {
+        if let chunkOrdinal, chunkOrdinal != synthesisChunkIndex { return }
         forge.apply(event)
-        eta.observe(event, elapsed: synthesisSeconds)
+        if synthesisChunkCount > 1, chunkOrdinal != nil {
+            if event.kind == .unit, event.stage == .frames {
+                forge.generatedFrames = frameOffset + event.current
+                forge.predictedMaximumFrames = 0
+                if event.current > 0 { eta.markMeasuredWork(elapsed: synthesisSeconds) }
+            } else if event.kind == .unit, event.stage == .codec {
+                forge.decodedFrames = frameOffset + event.current
+                forge.predictedMaximumFrames = 0
+            }
+        } else {
+            eta.observe(event, elapsed: synthesisSeconds)
+        }
         estimatedRemainingSeconds = eta.remainingSeconds(at: synthesisSeconds)
         activity.update(from: forge, elapsed: synthesisSeconds)
         nativeProgressEvents.append(event)
@@ -553,7 +663,19 @@ final class LabModel {
 
     func togglePlayback() {
         guard let player else { return }
-        if player.isPlaying { player.pause() } else { player.play() }
+        if player.isPlaying {
+            player.pause()
+        } else {
+            if player.duration > 0, player.currentTime >= player.duration - 0.05 {
+                player.currentTime = 0
+            }
+            player.play()
+        }
+    }
+
+    func seekPlayback(to progress: Double) {
+        guard let player, player.duration > 0 else { return }
+        player.currentTime = player.duration * min(1, max(0, progress))
     }
 
     /// The label stamped on the video's voice pill.
@@ -599,7 +721,9 @@ final class LabModel {
         Task {
             defer { isEnrolling = false }
             do {
-                let pcm = try Self.conditioned(raw)
+                let pcm = try await Task.detached(priority: .userInitiated) {
+                    try Self.conditioned(raw)
+                }.value
                 guard pcm.count >= 3 * Int(AudioRecorder.targetRate) else {
                     throw EngineError.native(
                         "recording too short; a few sentences of the script is all it takes")
@@ -632,13 +756,13 @@ final class LabModel {
         }
     }
 
-    /// Trim edge silence and peak-normalize before enrollment. The encoder embeds
-    /// whatever it is given: a quiet recording embeds "a quiet voice" and everything
-    /// synthesized from it inherits that, which on a real device meant inaudible output.
-    /// Refusing outright silence beats enrolling it.
-    private static func conditioned(_ pcm: [Float]) throws -> [Float] {
+    /// Trim edge silence, remove rumble, gently correct microphone coloration, and
+    /// normalize active speech before enrollment. The encoder embeds whatever it is
+    /// given; conditioning the reference keeps room and microphone differences from
+    /// dominating the resulting voiceprint. Refusing outright silence beats enrolling it.
+    nonisolated private static func conditioned(_ pcm: [Float]) throws -> [Float] {
         var peak: Float = 0
-        for value in pcm { peak = max(peak, abs(value)) }
+        for value in pcm where value.isFinite { peak = max(peak, abs(value)) }
         guard peak > 0.01 else {
             throw EngineError.native(
                 "we couldn't hear you (peak level \(String(format: "%.3f", peak))); check the microphone and try again")
@@ -649,8 +773,11 @@ final class LabModel {
         let pad = Int(AudioRecorder.targetRate * 0.2)
         let low = max(0, first - pad)
         let high = min(pcm.count, last + 1 + pad)
-        let scale = 0.85 / peak
-        return pcm[low..<high].map { $0 * scale }
+        return SpeechMastering.process(
+            Array(pcm[low..<high]),
+            sampleRate: Float(AudioRecorder.targetRate),
+            maximumGain: 32
+        )
     }
 
     /// Frees the ~2.3 GB engine heap; the next synthesis reloads it.
@@ -713,25 +840,48 @@ final class LabModel {
     func importDesktopFile(_ url: URL) {
         let supportedText = ["txt", "md", "markdown"]
         let ext = url.pathExtension.lowercased()
+        let isTextFile = supportedText.contains(ext)
+            || UTType(filenameExtension: ext)?.conforms(to: .text) == true
         let scoped = url.startAccessingSecurityScopedResource()
-        Task {
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        importTask?.cancel()
+        importGeneration += 1
+        let generation = importGeneration
+        isImportingText = true
+        importTask = Task {
+            defer {
+                if scoped { url.stopAccessingSecurityScopedResource() }
+                if generation == importGeneration {
+                    isImportingText = false
+                    importTask = nil
+                }
+            }
             do {
+                try Task.checkCancellation()
+                if isTextFile {
+                    let imported = try await Task.detached(priority: .userInitiated) {
+                        try TextImportLoader.readTextFile(from: url)
+                    }.value
+                    guard generation == importGeneration else { return }
+                    replaceUtterance(with: imported.text, wasTruncated: imported.wasTruncated)
+                    return
+                }
+                if ext == "pdf" {
+                    let imported = try await Task.detached(priority: .userInitiated) {
+                        try TextImportLoader.extractPDF(from: url)
+                    }.value
+                    guard generation == importGeneration else { return }
+                    replaceUtterance(with: imported.text, wasTruncated: imported.wasTruncated)
+                    return
+                }
                 let data = try await Task.detached(priority: .userInitiated) {
                     try Data(contentsOf: url, options: .mappedIfSafe)
                 }.value
-                if supportedText.contains(ext) {
-                    guard let imported = String(data: data, encoding: .utf8) else {
-                        throw EngineError.native("that text file is not UTF-8")
-                    }
-                    text = String(imported.prefix(600))
-                    return
-                }
                 guard let (name, vector) = await Task.detached(priority: .userInitiated, operation: {
                     VoicePrintCard.decode(data)
                 }).value else {
                     throw EngineError.native("that image does not contain a FrankenTTS voice card")
                 }
+                guard generation == importGeneration else { return }
                 if let existing = library.voices.first(where: { $0.vector == vector }) {
                     selectedVoice = "voice:\(existing.id.uuidString)"
                 } else {
@@ -739,8 +889,49 @@ final class LabModel {
                     selectedVoice = "voice:\(voice.id.uuidString)"
                 }
             } catch {
-                lastError = error.localizedDescription
+                guard generation == importGeneration, !Task.isCancelled else { return }
+                if isTextFile || ext == "pdf" {
+                    textImportNotice = error.localizedDescription
+                } else {
+                    lastError = error.localizedDescription
+                }
             }
+        }
+    }
+
+    func importRemoteText(_ rawURL: String) {
+        let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed) else {
+            textImportNotice = "Enter a complete HTTPS URL for a web page, text file, or PDF."
+            return
+        }
+        importTask?.cancel()
+        importGeneration += 1
+        let generation = importGeneration
+        isImportingText = true
+        importTask = Task {
+            defer {
+                if generation == importGeneration {
+                    isImportingText = false
+                    importTask = nil
+                }
+            }
+            do {
+                let imported = try await TextImportLoader.download(from: url)
+                guard generation == importGeneration else { return }
+                replaceUtterance(with: imported.text, wasTruncated: imported.wasTruncated)
+            } catch {
+                if generation == importGeneration, !Task.isCancelled {
+                    textImportNotice = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func replaceUtterance(with imported: String, wasTruncated: Bool = false) {
+        text = String(imported.prefix(JokeLibrary.maximumUtteranceLength))
+        if wasTruncated || imported.count > JokeLibrary.maximumUtteranceLength {
+            textImportNotice = "Imported the first 50,000 characters. The source was longer than the utterance limit."
         }
     }
 }
@@ -767,6 +958,8 @@ struct LabView: View {
     @State private var importFailed = false
     @State private var importCount = 0
     @State private var showDesktopImporter = false
+    @State private var showURLImporter = false
+    @State private var importURLText = ""
     @State private var voiceSearchText = ""
     @State private var voiceLibraryFilter: VoiceLibraryFilter = .all
     @State private var textEntryFrames: [VoiceForgeTextEntry: CGRect] = [:]
@@ -813,23 +1006,41 @@ struct LabView: View {
                     .padding(.horizontal, 24)
                     .padding(.vertical, 14)
                 } else {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 18) {
-                            header
-                            modelEntryView
-                            compactVoiceSelector(vertical: false)
-                            utteranceCard(compact: false)
-                            footer
+                    ViewThatFits(in: .vertical) {
+                        // The normal ready-state phone experience is a single,
+                        // stable instrument panel. Do not make the whole app feel
+                        // like a web page when its controls fit on the display.
+                        phoneWorkspace(compact: true)
+
+                        // Download details, generated audio, the live forge, very
+                        // small displays, and large accessibility type can exceed
+                        // the viewport. Preserve access to every control without
+                        // exposing a bright system scroll indicator over the dark
+                        // laboratory chrome.
+                        ScrollView {
+                            phoneWorkspace(compact: false)
                         }
-                        .frame(maxWidth: 760)
+                        .scrollIndicators(.hidden)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, 14)
-                    .padding(.vertical, 16)
+                    .padding(.vertical, 8)
                 }
             }
             .catalystReadableType()
         }
+    }
+
+    private func phoneWorkspace(compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: compact ? 10 : 16) {
+            header
+            modelEntryView
+            compactVoiceSelector(vertical: false)
+            utteranceCard(compact: compact)
+            footer
+        }
+        .frame(maxWidth: 760)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var usesDashboardLayout: Bool {
@@ -915,7 +1126,7 @@ struct LabView: View {
         sheetView
         .fileImporter(
             isPresented: $showDesktopImporter,
-            allowedContentTypes: [.plainText, .image],
+            allowedContentTypes: [.plainText, .pdf, .image],
             allowsMultipleSelection: false
         ) { result in
             switch result {
@@ -924,6 +1135,29 @@ struct LabView: View {
             case .failure(let error):
                 model.lastError = error.localizedDescription
             }
+        }
+        .alert("Import text from URL", isPresented: $showURLImporter) {
+            TextField("https://example.com/script.txt", text: $importURLText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Import") {
+                model.importRemoteText(importURLText)
+                importURLText = ""
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("FrankenTTS extracts the main reading text from a web page, text file, or PDF. The resulting utterance stays on this device.")
+        }
+        .alert(
+            "Text import",
+            isPresented: Binding(
+                get: { model.textImportNotice != nil },
+                set: { if !$0 { model.textImportNotice = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) { model.textImportNotice = nil }
+        } message: {
+            Text(model.textImportNotice ?? "")
         }
         .alert(
             "No voice in that picture", isPresented: $importFailed
@@ -1071,7 +1305,7 @@ struct LabView: View {
 
     private func consumeStagedText() {
         guard let staged = FrankenTTSSharedStore.consumeStagedText(), !staged.isEmpty else { return }
-        model.text = String(staged.prefix(600))
+        model.text = String(staged.prefix(JokeLibrary.maximumUtteranceLength))
         focusedField = .utterance
     }
 
@@ -1199,11 +1433,13 @@ struct LabView: View {
                         }
                         Spacer()
                         HStack(spacing: 5) {
-                            Text("BROWSE & MANAGE")
+                            Text("MANAGE VOICES")
                             Image(systemName: "chevron.right")
                         }
                         .font(.system(size: Lab.typeSize(9), weight: .black, design: .monospaced))
                         .foregroundStyle(Color.black.opacity(0.84))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.72)
                         .padding(.horizontal, 11)
                         .frame(minHeight: 36)
                         .background(Lab.emerald, in: Capsule())
@@ -1370,7 +1606,7 @@ struct LabView: View {
                     Text(message)
                         .font(.system(size: Lab.typeSize(13)))
                         .foregroundStyle(Lab.textSecondary)
-                    Button(model.store.cachedBytes > 0 ? "Resume setup" : "Try again") {
+                    Button(model.store.cachedBytes > 0 ? "Repair model" : "Try again") {
                         model.store.startDownload()
                     }
                         .buttonStyle(PrimaryButtonStyle())
@@ -1683,7 +1919,7 @@ struct LabView: View {
                     }
                     TextEditor(text: Binding(
                         get: { model.text },
-                        set: { model.text = String($0.prefix(600)) }
+                        set: { model.text = String($0.prefix(JokeLibrary.maximumUtteranceLength)) }
                     ))
                     .scrollContentBackground(.hidden)
                     .padding(8)
@@ -1711,9 +1947,40 @@ struct LabView: View {
                         )
                 )
                 HStack {
-                    Text("\(model.text.count) / 600")
+                    Text("\(model.text.count) / 50k")
                         .font(.system(size: Lab.typeSize(11), design: .monospaced))
                         .foregroundStyle(Lab.textSecondary)
+                    Button {
+                        model.text = JokeLibrary.random(excluding: model.text)
+                        focusedField = nil
+                    } label: {
+                        Image(systemName: "dice.fill")
+                    }
+                    .buttonStyle(GhostButtonStyle(tint: Lab.cyan))
+                    .accessibilityLabel("Choose another random joke")
+                    .accessibilityHint("Replaces the utterance with a different bundled joke")
+                    Menu {
+                        Button {
+                            showDesktopImporter = true
+                        } label: {
+                            Label("Text, PDF, or voice card from Files", systemImage: "folder")
+                        }
+                        Button {
+                            showURLImporter = true
+                        } label: {
+                            Label("Web page, text, or PDF URL", systemImage: "link")
+                        }
+                    } label: {
+                        if model.isImportingText {
+                            ProgressView().controlSize(.small).tint(Lab.emerald)
+                        } else {
+                            Image(systemName: "square.and.arrow.down")
+                        }
+                    }
+                    .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+                    .disabled(model.isImportingText)
+                    .accessibilityLabel("Import utterance")
+                    .accessibilityHint("Imports text from Files or an HTTPS URL")
                     Spacer()
                     Text("seed")
                         .font(.system(size: Lab.typeSize(11), design: .monospaced))
@@ -1767,24 +2034,26 @@ struct LabView: View {
                         telemetry: model.forge,
                         elapsed: model.synthesisSeconds,
                         estimatedRemainingSeconds: model.estimatedRemainingSeconds,
+                        chunkIndex: model.synthesisChunkIndex,
+                        chunkCount: model.synthesisChunkCount,
                         compact: compact,
                         cancel: model.isSynthesizing ? { model.cancelSynthesis() } : nil
                     )
                     .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
                 }
                 if let audio = model.lastAudio {
-                    PlaybackSignalView(samples: audio, player: model.player)
+                    PlaybackSignalView(
+                        samples: audio,
+                        player: model.player,
+                        analysisID: model.wavUrl?.lastPathComponent ?? "\(audio.count)",
+                        refreshToken: playbackTick
+                    ) { progress in
+                        model.seekPlayback(to: progress)
+                    }
                         .frame(height: compact ? 112 : 148)
                     HStack(spacing: 10) {
                         Button {
-                            if model.player?.isPlaying == true {
-                                model.player?.pause()
-                            } else {
-                                if model.player?.currentTime == model.player?.duration {
-                                    model.player?.currentTime = 0
-                                }
-                                model.player?.play()
-                            }
+                            model.togglePlayback()
                             playbackTick += 1
                         } label: {
                             Image(
@@ -1794,7 +2063,6 @@ struct LabView: View {
                         .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
                         .accessibilityLabel(
                             model.player?.isPlaying == true ? "Pause" : "Play")
-                        .id(playbackTick)
                         .onReceive(
                             Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
                         ) { _ in
@@ -2084,25 +2352,23 @@ private struct VoiceEnrollmentCallout: View {
             .padding(.vertical, compact ? 11 : 14)
             .frame(maxWidth: .infinity, minHeight: compact ? 72 : 84, alignment: .leading)
             .background {
-                ZStack(alignment: .topTrailing) {
-                    LinearGradient(
-                        colors: [
-                            Lab.emeraldDeep.opacity(0.92),
-                            Lab.emerald.opacity(0.18),
-                            Lab.cyan.opacity(0.07),
-                            Color.black.opacity(0.76)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    Circle()
-                        .fill(Lab.emerald.opacity(0.16))
-                        .frame(width: 112, height: 112)
-                        .blur(radius: 28)
-                        .offset(x: 36, y: -46)
-                }
+                LinearGradient(
+                    colors: [
+                        Lab.emeraldDeep.opacity(0.90),
+                        Lab.emerald.opacity(0.13),
+                        Lab.cyan.opacity(0.055),
+                        Color.black.opacity(0.80)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             }
+            // Force the complete composited button through one final mask. A
+            // blurred sublayer here previously escaped the rounded outline on
+            // physical iPhones even though the background itself was clipped.
+            .compositingGroup()
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .strokeBorder(
@@ -2151,7 +2417,7 @@ private struct VoiceEnrollmentCallout: View {
                 Text("Create your own voice")
                     .font(.system(size: Lab.typeSize(compact ? 15 : 17), weight: .black))
                     .foregroundStyle(.white)
-                    .lineLimit(1)
+                    .lineLimit(compact ? 2 : 1)
                     .minimumScaleFactor(0.78)
                 Text(
                     isReady

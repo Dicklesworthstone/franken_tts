@@ -249,11 +249,17 @@ struct StatusCapsule: View {
 struct PlaybackSignalView: View {
     let samples: [Float]
     let player: AVAudioPlayer?
+    let analysisID: String
+    let refreshToken: Int
+    let onSeek: (Double) -> Void
 
     @State private var analysis = SignalAnalysis.empty
     @State private var draggedProgress: Double?
+    @State private var isScrubbing = false
+    @State private var resumesAfterScrub = false
 
     var body: some View {
+        let _ = refreshToken
         GeometryReader { geometry in
             TimelineView(
                 .animation(
@@ -263,7 +269,10 @@ struct PlaybackSignalView: View {
             ) { _ in
                 let progress = draggedProgress ?? playbackProgress
                 ZStack(alignment: .topLeading) {
-                    Canvas(opaque: false, colorMode: .linear, rendersAsynchronously: true) {
+                    // Playback advances continuously; synchronous presentation prevents
+                    // an older off-thread frame from arriving after a newer playhead and
+                    // producing the flash seen on physical ProMotion displays.
+                    Canvas(opaque: false, colorMode: .linear, rendersAsynchronously: false) {
                         context, size in
                         drawSpectrum(context: &context, size: size, progress: progress)
                         drawWaveform(context: &context, size: size, progress: progress)
@@ -302,7 +311,7 @@ struct PlaybackSignalView: View {
                 )
         )
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .task(id: samples.count) {
+        .task(id: analysisID) {
             let captured = samples
             analysis = await Task.detached(priority: .userInitiated) {
                 SignalAnalysis(samples: captured)
@@ -315,8 +324,10 @@ struct PlaybackSignalView: View {
             guard let player, player.duration > 0 else { return }
             let delta = max(1, player.duration * 0.05)
             switch direction {
-            case .increment: player.currentTime = min(player.duration, player.currentTime + delta)
-            case .decrement: player.currentTime = max(0, player.currentTime - delta)
+            case .increment:
+                accessibleSeek(to: min(1, (player.currentTime + delta) / player.duration))
+            case .decrement:
+                accessibleSeek(to: max(0, (player.currentTime - delta) / player.duration))
             @unknown default: break
             }
         }
@@ -327,16 +338,33 @@ struct PlaybackSignalView: View {
         return min(1, max(0, player.currentTime / player.duration))
     }
 
+    private func accessibleSeek(to progress: Double) {
+        draggedProgress = progress
+        onSeek(progress)
+        Task { @MainActor in
+            await Task.yield()
+            draggedProgress = nil
+        }
+    }
+
     private func scrubGesture(width: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
+                if !isScrubbing {
+                    isScrubbing = true
+                    resumesAfterScrub = player?.isPlaying == true
+                    if resumesAfterScrub { player?.pause() }
+                }
                 let progress = min(1, max(0, value.location.x / max(1, width)))
                 draggedProgress = progress
-                if let player, player.duration > 0 {
-                    player.currentTime = player.duration * progress
-                }
+                onSeek(progress)
             }
-            .onEnded { _ in draggedProgress = nil }
+            .onEnded { _ in
+                draggedProgress = nil
+                isScrubbing = false
+                if resumesAfterScrub { player?.play() }
+                resumesAfterScrub = false
+            }
     }
 
     private func drawSpectrum(
