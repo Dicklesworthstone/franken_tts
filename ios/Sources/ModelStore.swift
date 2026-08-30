@@ -89,6 +89,7 @@ final class ModelStore {
 
     private var task: Task<Void, Never>?
     private var launchValidationTask: Task<Void, Never>?
+    private var launchValidationID: UUID?
     private var activeTaskID: UUID?
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.default
@@ -115,8 +116,10 @@ final class ModelStore {
             // containers' bounded headers before advertising readiness. The Rust loader
             // performs the deeper section checks when the engine warms.
             phase = .verifying(asset: "installed model")
+            let validationID = UUID()
+            launchValidationID = validationID
             launchValidationTask = Task { [weak self] in
-                await self?.validateInstalledModelAtLaunch()
+                await self?.validateInstalledModelAtLaunch(validationID: validationID)
             }
         }
     }
@@ -140,18 +143,27 @@ final class ModelStore {
         return (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? nil
     }
 
-    private func validateInstalledModelAtLaunch() async {
-        defer { launchValidationTask = nil }
+    private func validateInstalledModelAtLaunch(validationID: UUID) async {
+        defer {
+            if launchValidationID == validationID {
+                launchValidationID = nil
+                launchValidationTask = nil
+            }
+        }
         do {
             let largeFiles = ModelManifest.files.filter {
                 $0.bytes >= ModelManifest.launchDigestLimit
             }
             for file in largeFiles {
-                try Task.checkCancellation()
+                try requireLaunchValidation(validationID)
                 let url = modelDirectory.appendingPathComponent(file.relativePath)
-                guard installedSize(of: file) == file.bytes,
-                      try await Self.hasValidContainerHeader(file: file, at: url)
-                else {
+                let hasExpectedSize = installedSize(of: file) == file.bytes
+                let hasValidHeader = hasExpectedSize
+                    ? try await Self.hasValidContainerHeader(file: file, at: url)
+                    : false
+                let valid = hasExpectedSize && hasValidHeader
+                try requireLaunchValidation(validationID)
+                guard valid else {
                     phase = .failed(
                         "A saved model component is damaged. Tap Repair model to verify and replace only the affected file."
                     )
@@ -164,23 +176,29 @@ final class ModelStore {
             }
             var filesToRepair: [ModelFile] = []
             for file in smallFiles {
-                try Task.checkCancellation()
+                try requireLaunchValidation(validationID)
                 let url = modelDirectory.appendingPathComponent(file.relativePath)
-                guard installedSize(of: file) == file.bytes,
-                      try await digest(of: url) == file.sha256
-                else {
+                let hasExpectedSize = installedSize(of: file) == file.bytes
+                let hasValidDigest = hasExpectedSize
+                    ? try await digest(of: url) == file.sha256
+                    : false
+                let valid = hasExpectedSize && hasValidDigest
+                try requireLaunchValidation(validationID)
+                guard valid else {
                     filesToRepair.append(file)
                     continue
                 }
             }
 
             for file in filesToRepair {
-                try Task.checkCancellation()
+                try requireLaunchValidation(validationID)
                 phase = .verifying(asset: file.displayName)
                 try await repairSmallFile(file)
+                try requireLaunchValidation(validationID)
                 refreshCachedBytes()
             }
 
+            try requireLaunchValidation(validationID)
             guard isComplete else {
                 phase = .idle
                 return
@@ -189,6 +207,7 @@ final class ModelStore {
         } catch is CancellationError {
             // An explicit download, pause, or clear owns the next phase.
         } catch {
+            guard launchValidationID == validationID else { return }
             phase = .failed(
                 "The model's support files could not be repaired: \(error.localizedDescription)"
             )
@@ -213,6 +232,7 @@ final class ModelStore {
                 "\(file.displayName) did not pass its security check."
             )
         }
+        try Task.checkCancellation()
         let destination = modelDirectory.appendingPathComponent(file.relativePath)
         try FileManager.default.createDirectory(
             at: destination.deletingLastPathComponent(),
@@ -249,6 +269,7 @@ final class ModelStore {
 
     func startDownload() {
         launchValidationTask?.cancel()
+        launchValidationID = nil
         launchValidationTask = nil
         guard task == nil else { return }
         refreshCachedBytes()
@@ -272,6 +293,7 @@ final class ModelStore {
 
     func pauseDownload() {
         launchValidationTask?.cancel()
+        launchValidationID = nil
         launchValidationTask = nil
         task?.cancel()
         task = nil
@@ -283,6 +305,7 @@ final class ModelStore {
 
     func clear() {
         launchValidationTask?.cancel()
+        launchValidationID = nil
         launchValidationTask = nil
         task?.cancel()
         task = nil
@@ -449,6 +472,11 @@ final class ModelStore {
     private func requireActive(_ taskID: UUID) throws {
         try Task.checkCancellation()
         guard activeTaskID == taskID else { throw CancellationError() }
+    }
+
+    private func requireLaunchValidation(_ validationID: UUID) throws {
+        try Task.checkCancellation()
+        guard launchValidationID == validationID else { throw CancellationError() }
     }
 
     private func updateProgress(asset: String, started: TimeInterval, startingBytes: Int64) {

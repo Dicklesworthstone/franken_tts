@@ -3,6 +3,15 @@ import XCTest
 @testable import FrankenTTS
 
 final class ModelStoreTests: XCTestCase {
+    func testEngineLifecycleFenceRejectsDelayedOlderUnload() {
+        var fence = EngineLifecycleFence()
+
+        XCTAssertTrue(fence.accept(1))
+        XCTAssertTrue(fence.accept(2))
+        XCTAssertFalse(fence.accept(1))
+        XCTAssertEqual(fence.latestToken, 2)
+    }
+
     @MainActor
     func testModelClearIsBlockedWhileVoiceWorkOwnsTheEngine() {
         let model = LabModel()

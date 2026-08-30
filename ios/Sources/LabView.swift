@@ -429,10 +429,18 @@ final class LabModel {
     private var cancellationRequested = false
     private var completedSynthesisFrames: UInt64 = 0
     private var engineWarmTask: Task<Void, Never>?
+    /// Allocated before lifecycle tasks are spawned so actor mailbox reordering cannot
+    /// let an old memory-pressure unload close a newly claimed engine.
+    private var engineLifecycleToken: UInt64 = 0
     /// Fences native callbacks from completed/cancelled warm and synthesis runs.
     private var progressGeneration = 0
     private let activity = VoiceForgeActivityController.shared
     private var eta = TTSAdaptiveETA()
+
+    func nextEngineLifecycleToken() -> UInt64 {
+        engineLifecycleToken &+= 1
+        return engineLifecycleToken
+    }
 
     var lowMemoryDevice: Bool {
         ProcessInfo.processInfo.physicalMemory < 6 * 1024 * 1024 * 1024
@@ -518,6 +526,7 @@ final class LabModel {
         eta.reset(text: text, warm: beganWarm)
         activity.begin()
         let seed = self.seed
+        let lifecycleToken = nextEngineLifecycleToken()
         let runStartedAt = ProcessInfo.processInfo.systemUptime
         let ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -537,12 +546,13 @@ final class LabModel {
                 UIApplication.shared.isIdleTimerDisabled = false
             }
             do {
-                if await !engine.isLoaded {
-                    isLoadingModel = true
-                    try await engine.load(modelDirectory: store.modelDirectory) { [weak self] event in
-                        DispatchQueue.main.async {
-                            self?.receive(event, generation: progressRun)
-                        }
+                isLoadingModel = await !engine.isLoaded
+                try await engine.load(
+                    modelDirectory: store.modelDirectory,
+                    lifecycleToken: lifecycleToken
+                ) { [weak self] event in
+                    DispatchQueue.main.async {
+                        self?.receive(event, generation: progressRun)
                     }
                 }
                 isEngineWarm = true
@@ -687,6 +697,7 @@ final class LabModel {
         guard !isProfilingBenchmark else { return }
         isProfilingBenchmark = true
         defer { isProfilingBenchmark = false }
+        let lifecycleToken = nextEngineLifecycleToken()
 
         let requestedRuns = Int(environment["FTTS_IOS_PROFILE_RUNS"] ?? "20") ?? 20
         let runs = max(1, min(100, requestedRuns))
@@ -776,7 +787,10 @@ final class LabModel {
             ])
 
             let loadStartedUptime = ProcessInfo.processInfo.systemUptime
-            try await engine.load(modelDirectory: store.modelDirectory)
+            try await engine.load(
+                modelDirectory: store.modelDirectory,
+                lifecycleToken: lifecycleToken
+            )
             try appendReceipt([
                 "event": "engine_loaded",
                 "load_ms": (ProcessInfo.processInfo.systemUptime - loadStartedUptime) * 1_000,
@@ -1049,6 +1063,7 @@ final class LabModel {
         }
         isEnrolling = true
         enrollmentSaved = false
+        let lifecycleToken = nextEngineLifecycleToken()
         Task {
             defer { isEnrolling = false }
             do {
@@ -1059,9 +1074,10 @@ final class LabModel {
                     throw EngineError.native(
                         "recording too short; a few sentences of the script is all it takes")
                 }
-                if await !engine.isLoaded {
-                    try await engine.load(modelDirectory: store.modelDirectory)
-                }
+                try await engine.load(
+                    modelDirectory: store.modelDirectory,
+                    lifecycleToken: lifecycleToken
+                )
                 // The denoiser is not optional: a profile built from un-denoised audio
                 // carries the recording's noise into every synthesis. Its absence
                 // means the model download is incomplete — refuse and say so.
@@ -1127,7 +1143,8 @@ final class LabModel {
         engineWarmTask = nil
         isEngineWarm = false
         isLoadingModel = false
-        Task { await engine.unload() }
+        let lifecycleToken = nextEngineLifecycleToken()
+        Task { await engine.unload(lifecycleToken: lifecycleToken) }
     }
 
     /// Hydrate as soon as verified model files are present. Users should wait
@@ -1147,6 +1164,7 @@ final class LabModel {
         isLoadingModel = true
         progressGeneration &+= 1
         let progressRun = progressGeneration
+        let lifecycleToken = nextEngineLifecycleToken()
         engineWarmTask = Task { [weak self] in
             guard let self else { return }
             defer {
@@ -1156,10 +1174,13 @@ final class LabModel {
             do {
                 if await !self.engine.isLoaded {
                     self.forge.reset(for: .readingBundle)
-                    try await self.engine.load(modelDirectory: self.store.modelDirectory) { [weak self] event in
-                        DispatchQueue.main.async {
-                            self?.receive(event, generation: progressRun)
-                        }
+                }
+                try await self.engine.load(
+                    modelDirectory: self.store.modelDirectory,
+                    lifecycleToken: lifecycleToken
+                ) { [weak self] event in
+                    DispatchQueue.main.async {
+                        self?.receive(event, generation: progressRun)
                     }
                 }
                 try Task.checkCancellation()
@@ -1196,8 +1217,9 @@ final class LabModel {
         engineWarmTask = nil
         isEngineWarm = false
         isLoadingModel = false
+        let lifecycleToken = nextEngineLifecycleToken()
         Task {
-            await engine.unload()
+            await engine.unload(lifecycleToken: lifecycleToken)
             store.clear()
             isClearingModel = false
         }
@@ -1368,6 +1390,7 @@ struct LabView: View {
     @State private var importItem: PhotosPickerItem?
     @State private var importFailed = false
     @State private var importCount = 0
+    @State private var voiceCardImportGeneration = 0
     @State private var showDesktopImporter = false
     @State private var showURLImporter = false
     @State private var importURLText = ""
@@ -1388,6 +1411,16 @@ struct LabView: View {
     /// the same multi-gigabyte engine and invalidating a physical-device sample.
     private var profilingRequested: Bool {
         ProcessInfo.processInfo.environment["FTTS_IOS_PROFILE"] == "1"
+    }
+
+    /// Unit-test host launches should exercise the requested Swift test, not
+    /// silently hydrate a 2.3 GB native engine in the background. Besides
+    /// making the default suite needlessly slow, those deliberate app-lifetime
+    /// worker threads are reported as leaks by Thread Sanitizer when XCTest
+    /// terminates its host process.
+    private var automaticWarmSuppressed: Bool {
+        profilingRequested
+            || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     }
 
     var body: some View {
@@ -1602,11 +1635,18 @@ struct LabView: View {
         .onChange(of: importItem) { _, item in
             guard let item else { return }
             importItem = nil
+            voiceCardImportGeneration &+= 1
+            let generation = voiceCardImportGeneration
             Task {
                 let data = try? await item.loadTransferable(type: Data.self)
+                guard generation == voiceCardImportGeneration, !Task.isCancelled else { return }
                 let decoded = await Task.detached(priority: .userInitiated) {
                     data.flatMap { VoicePrintCard.decode($0) }
                 }.value
+                // Photo-provider reads and million-pixel card decoding can
+                // complete out of order. Only the latest selection may add a
+                // voice or surface an error for the user.
+                guard generation == voiceCardImportGeneration, !Task.isCancelled else { return }
                 if let (name, vector) = decoded {
                     // Importing the same card twice selects the existing voice
                     // instead of duplicating it.
@@ -1664,12 +1704,12 @@ struct LabView: View {
             if phase == .background {
                 model.prepareForBackground()
             } else if phase == .active {
-                if !profilingRequested { model.warmEngineIfPossible() }
+                if !automaticWarmSuppressed { model.warmEngineIfPossible() }
                 consumeStagedText()
             }
         }
         .onChange(of: model.store.phase) { _, phase in
-            if phase == .ready, !profilingRequested {
+            if phase == .ready, !automaticWarmSuppressed {
                 model.warmEngineIfPossible()
             }
         }
@@ -1683,7 +1723,7 @@ struct LabView: View {
         .task {
             if profilingRequested {
                 await model.runProfilingBenchmarkIfRequested()
-            } else {
+            } else if !automaticWarmSuppressed {
                 model.warmEngineIfPossible()
             }
         }

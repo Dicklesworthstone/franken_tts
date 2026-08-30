@@ -2371,6 +2371,15 @@ pub struct CodecCheckpoint {
     final_conv: OwnedConv,
 }
 
+impl Drop for CodecCheckpoint {
+    fn drop(&mut self) {
+        // `codec` memoizes quantized weights by allocation address for speed. Retiring the owner
+        // is the one point where that address may become eligible for allocator reuse, so fence
+        // the cache before any of this checkpoint's weight vectors are released.
+        crate::codec::clear_codec_int8_memo();
+    }
+}
+
 impl CodecCheckpoint {
     /// Hydrate from a parsed safetensors file, as native hosts do.
     ///

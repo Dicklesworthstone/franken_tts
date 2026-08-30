@@ -201,6 +201,7 @@ final class VoiceComparisonSession {
         let text = excerpt
         let inputs = candidates.map { MultiVoiceSynthesisInput(speaker: $0.speaker) }
         let seed = model.seed
+        let lifecycleToken = model.nextEngineLifecycleToken()
         let progressRelay = progressRelay
         UIApplication.shared.isIdleTimerDisabled = true
         runTask = Task { [weak self] in
@@ -224,17 +225,16 @@ final class VoiceComparisonSession {
             }
             do {
                 try Task.checkCancellation()
-                if await !self.model.engine.isLoaded {
-                    self.model.isLoadingModel = true
-                    do {
-                        try await self.model.engine.load(
-                            modelDirectory: self.model.store.modelDirectory)
-                        self.model.isEngineWarm = true
-                        self.model.isLoadingModel = false
-                    } catch {
-                        self.model.isLoadingModel = false
-                        throw error
-                    }
+                self.model.isLoadingModel = await !self.model.engine.isLoaded
+                do {
+                    try await self.model.engine.load(
+                        modelDirectory: self.model.store.modelDirectory,
+                        lifecycleToken: lifecycleToken)
+                    self.model.isEngineWarm = true
+                    self.model.isLoadingModel = false
+                } catch {
+                    self.model.isLoadingModel = false
+                    throw error
                 }
                 try Task.checkCancellation()
                 try await self.model.engine.synthesizeMany(

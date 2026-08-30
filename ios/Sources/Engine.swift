@@ -396,11 +396,27 @@ enum EngineError: LocalizedError {
     }
 }
 
+/// Rejects lifecycle commands that arrive at the engine actor after a newer command.
+///
+/// Callers create tokens on the main actor before spawning unstructured tasks. Actor
+/// mailbox order between those tasks is intentionally unspecified, so task creation order
+/// alone cannot keep a delayed memory-pressure unload from closing a newly warmed engine.
+struct EngineLifecycleFence {
+    private(set) var latestToken: UInt64 = 0
+
+    mutating func accept(_ token: UInt64) -> Bool {
+        guard token >= latestToken else { return false }
+        latestToken = token
+        return true
+    }
+}
+
 /// All engine access lives here. The Rust handle is not thread-safe; an actor's
 /// serialization is the whole safety argument, so no engine call may leave this type.
 actor Engine {
     static let speakerWidth = Int(FTTS_SPEAKER_WIDTH)
     private var handle: OpaquePointer?
+    private var lifecycleFence = EngineLifecycleFence()
     nonisolated private let cancellationController = EngineCancellationController()
 
     static func presets() -> [Preset] {
@@ -422,9 +438,11 @@ actor Engine {
     /// Hydrates the model. Multi-second; callers show progress copy of their own.
     func load(
         modelDirectory: URL,
+        lifecycleToken: UInt64,
         onProgress: @escaping @Sendable (EngineProgress) -> Void = { _ in }
     ) throws {
         guard !Task.isCancelled else { throw EngineError.cancelled }
+        guard lifecycleFence.accept(lifecycleToken) else { throw EngineError.cancelled }
         guard handle == nil else { return }
         let callback = ProgressCallbackBox(publish: onProgress)
         cancellationController.begin(callback)
@@ -442,7 +460,11 @@ actor Engine {
     }
 
     /// Drops the model, freeing its ~2.3 GB of heap. Safe to call at any idle moment.
-    func unload() {
+    func unload(lifecycleToken: UInt64) {
+        // An older unstructured unload may reach this actor after a newer load. The
+        // lifecycle fence makes that delayed command a no-op instead of tearing down
+        // the engine underneath its new owner.
+        guard lifecycleFence.accept(lifecycleToken) else { return }
         if let handle {
             ftts_engine_close(handle)
         }

@@ -756,6 +756,26 @@ fn codec_int8_route() -> Option<&'static CodecInt8Route> {
         .as_ref()
 }
 
+/// Forget memoized quantizations when an owning codec checkpoint is retired.
+///
+/// The cache key deliberately uses a borrowed weight's allocation address so the hot path does
+/// not hash multi-megabyte tensors on every projection. That is valid only for the lifetime of
+/// the checkpoint which owns the allocation: an allocator may later reuse the same address for a
+/// different tensor whose shape and endpoint fingerprint happen to match. Clearing at the owner
+/// boundary prevents that ABA reuse. Concurrent decodes are safe because they clone the cached
+/// `Arc` before releasing the mutex; clearing only removes future lookup entries.
+pub(crate) fn clear_codec_int8_memo() {
+    if let Some(route) = codec_int8_route() {
+        clear_codec_int8_memo_entries(&route.memo);
+    }
+}
+
+fn clear_codec_int8_memo_entries(
+    memo: &Mutex<HashMap<(usize, usize, usize, usize), QuantMemoEntry>>,
+) {
+    memo.lock().expect("codec int8 memo poisoned").clear();
+}
+
 /// The `FTTS_INT8_CODEC` arming decision, as a pure function so its full matrix is testable.
 ///
 /// A pinned reference route (every conformance entry point pins before synthesizing — see
@@ -2899,5 +2919,27 @@ mod tests {
             codec_int8_route_decision(false, Some("convnext")),
             Some((false, true))
         );
+    }
+
+    #[test]
+    fn retiring_codec_owner_clears_address_keyed_quantizations() {
+        let memo = Mutex::new(HashMap::new());
+        memo.lock().expect("test memo").insert(
+            (0x1234, 2, 1, 2),
+            Arc::new((
+                1.0_f32.to_bits(),
+                2.0_f32.to_bits(),
+                QuantizedMatrix {
+                    data: vec![64, 127],
+                    scales: vec![2.0 / 127.0],
+                    n: 1,
+                    k: 2,
+                },
+            )),
+        );
+
+        clear_codec_int8_memo_entries(&memo);
+
+        assert!(memo.lock().expect("test memo").is_empty());
     }
 }
