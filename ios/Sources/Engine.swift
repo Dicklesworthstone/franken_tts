@@ -660,7 +660,12 @@ enum WavWriter {
         chunk("data")
         u32(UInt32(samples.count * 2))
         for sample in samples {
-            let clamped = max(-1.0, min(1.0, sample))
+            // Swift's min/max map NaN to the other operand, which would turn a
+            // damaged non-finite sample into a full-scale click. Silence invalid
+            // values at this final serialization boundary; infinities are invalid
+            // audio too, not legitimate peaks to clamp.
+            let finiteSample = sample.isFinite ? sample : 0
+            let clamped = max(-1.0, min(1.0, finiteSample))
             u16(UInt16(bitPattern: Int16((clamped * 32767.0).rounded())))
         }
         return data

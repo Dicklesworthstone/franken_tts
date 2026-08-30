@@ -28,6 +28,13 @@ final class SpeechMasteringTests: XCTestCase {
         XCTAssertEqual(mastered, [0, 0, 0, 0, 0])
     }
 
+    func testWavWriterSerializesNonFiniteSamplesAsSilence() {
+        let wav = WavWriter.data(from: [.nan, .infinity, -.infinity, 0])
+
+        XCTAssertEqual(wav.count, 44 + 8)
+        XCTAssertEqual(Array(wav.suffix(8)), Array(repeating: UInt8(0), count: 8))
+    }
+
     private func fixture(amplitude: Float) -> [Float] {
         let sampleRate = 24_000
         let activeCount = sampleRate

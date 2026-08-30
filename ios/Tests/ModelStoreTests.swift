@@ -3,6 +3,27 @@ import XCTest
 @testable import FrankenTTS
 
 final class ModelStoreTests: XCTestCase {
+    @MainActor
+    func testModelClearIsBlockedWhileVoiceWorkOwnsTheEngine() {
+        let model = LabModel()
+        XCTAssertTrue(model.canClearModel)
+
+        model.isSynthesizing = true
+        XCTAssertFalse(model.canClearModel)
+        model.isSynthesizing = false
+
+        model.isComparingVoices = true
+        XCTAssertFalse(model.canClearModel)
+        model.isComparingVoices = false
+
+        model.isEnrolling = true
+        XCTAssertFalse(model.canClearModel)
+        model.isEnrolling = false
+
+        model.isClearingModel = true
+        XCTAssertFalse(model.canClearModel)
+    }
+
     func testFttsqHeaderRejectsAnExactSizeZeroFilledFile() async throws {
         let file = ModelFile(
             asset: "fixture.fttsq",
