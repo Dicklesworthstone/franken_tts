@@ -396,6 +396,9 @@ fn synthesis_profile_json() -> CString {
         "feedback_ms": millis(profile.feedback),
         "talker_ms": millis(profile.talker),
         "codec_active_ms": millis(profile.codec_active),
+        "codec_backpressure_ms": millis(profile.codec_backpressure),
+        "codec_tail_ms": millis(profile.codec_tail),
+        "codec_user_initiated_qos": profile.codec_user_initiated_qos,
         "frames": profile.frames,
         "team_partitions": profile.team_partitions,
     });
@@ -980,8 +983,13 @@ impl ftts_cli::synth::PcmPacketSink for CallbackSink {
         if verdict != 0 {
             self.cancelled_by_callback = true;
             self.cancellation.cancel();
-            // Not an error: the engine notices the token at the next frame boundary and
-            // winds down as a cancellation; erroring here would misreport the outcome.
+            // Stop this worker immediately so a bounded generator queue cannot produce
+            // another callback after the caller has revoked delivery. The shared token
+            // and `cancelled_by_callback` flag ensure the outer ABI still reports the
+            // documented cancellation status, never this internal unwind signal.
+            return Err(ftts_cli::FttsError::Cancelled(
+                "packet callback requested cancellation".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -995,7 +1003,8 @@ impl ftts_cli::synth::PcmPacketSink for CallbackSink {
 /// # Safety
 /// As [`ftts_synthesize`], plus: `on_packet` must be a valid function pointer following
 /// the header's contract (prompt return, no unwinding, samples copied out), and `ctx`
-/// must be whatever that callback expects.
+/// must be whatever that callback expects. `None` is accepted at the raw ABI boundary
+/// only so a null C function pointer can be rejected as an ordinary error.
 pub unsafe extern "C" fn ftts_synthesize_streaming(
     engine: *mut FttsEngine,
     text: *const c_char,
@@ -1003,10 +1012,14 @@ pub unsafe extern "C" fn ftts_synthesize_streaming(
     speaker_len: usize,
     seed: u64,
     packet_frames: usize,
-    on_packet: FttsPacketFn,
+    on_packet: Option<FttsPacketFn>,
     ctx: *mut std::ffi::c_void,
 ) -> i32 {
     guarded(1, || {
+        let Some(on_packet) = on_packet else {
+            set_error("null packet callback to ftts_synthesize_streaming");
+            return 1;
+        };
         if engine.is_null() || text.is_null() || speaker.is_null() {
             set_error("null pointer to ftts_synthesize_streaming");
             return 1;
@@ -1544,6 +1557,63 @@ mod tests {
             FTTS_PROGRESS_KIND_STAGE_FINISHED,
             FTTS_PROGRESS_STAGE_SYNTHESIS,
         ));
+    }
+
+    #[test]
+    fn streaming_refuses_a_null_packet_callback_before_touching_inputs() {
+        // SAFETY: this deliberately supplies nulls to exercise the ABI's checked
+        // refusal path; the function rejects the optional callback before reading any
+        // of the other pointers.
+        let status = unsafe {
+            ftts_synthesize_streaming(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                1,
+                None,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, 1);
+        assert!(last_error().contains("null packet callback"));
+    }
+
+    #[test]
+    fn packet_callback_cancellation_stops_the_sink_immediately() {
+        unsafe extern "C" fn cancel(
+            ctx: *mut std::ffi::c_void,
+            _samples: *const f32,
+            _len: usize,
+            frame_index: u64,
+        ) -> i32 {
+            // SAFETY: the test passes a live, uniquely borrowed `u64` for this
+            // synchronous invocation.
+            #[allow(unsafe_code)]
+            unsafe {
+                *ctx.cast::<u64>() = frame_index;
+            }
+            1
+        }
+
+        let cancellation = CancellationToken::new();
+        let mut observed_frame = u64::MAX;
+        let mut sink = CallbackSink {
+            on_packet: cancel,
+            ctx: std::ptr::from_mut(&mut observed_frame).cast(),
+            cancellation: cancellation.clone(),
+            frames_delivered: 7,
+            cancelled_by_callback: false,
+        };
+
+        let error = ftts_cli::synth::PcmPacketSink::deliver(&mut sink, &[0.0; 16], 2)
+            .expect_err("a callback cancellation must end delivery");
+        assert!(matches!(error, ftts_cli::FttsError::Cancelled(_)));
+        assert_eq!(observed_frame, 7);
+        assert_eq!(sink.frames_delivered, 9);
+        assert!(sink.cancelled_by_callback);
+        assert!(cancellation.is_cancelled());
     }
 
     #[test]

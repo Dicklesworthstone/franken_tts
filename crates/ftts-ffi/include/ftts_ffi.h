@@ -137,6 +137,7 @@ void ftts_pcm_free(float *pcm, size_t len);
  * audio latency, 4 = the whole-buffer call's historical cadence). Returning nonzero
  * from `on_packet` requests cancellation: delivery stops within one packet and the
  * call returns FTTS_SYNTH_CANCELLED. The callback must not throw/unwind (C contract).
+ * `on_packet` is required; a NULL callback is rejected without reading other inputs.
  * Returns 0 on success, FTTS_SYNTH_CANCELLED (6) when the callback cancelled,
  * any other nonzero on failure (see ftts_last_error_message). The engine handle
  * stays externally serialized, exactly as for ftts_synthesize. */

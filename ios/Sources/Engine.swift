@@ -18,6 +18,9 @@ struct SynthesisProfile: Decodable, Sendable {
     let feedbackMs: Double
     let talkerMs: Double
     let codecActiveMs: Double
+    let codecBackpressureMs: Double
+    let codecTailMs: Double
+    let codecUserInitiatedQos: Bool
     let frames: UInt64
     let teamPartitions: Int
 
@@ -29,12 +32,71 @@ struct SynthesisProfile: Decodable, Sendable {
         case feedbackMs = "feedback_ms"
         case talkerMs = "talker_ms"
         case codecActiveMs = "codec_active_ms"
+        case codecBackpressureMs = "codec_backpressure_ms"
+        case codecTailMs = "codec_tail_ms"
+        case codecUserInitiatedQos = "codec_user_initiated_qos"
         case frames
         case teamPartitions = "team_partitions"
     }
 
+    /// Keep profile decoding compatible with older xcframework slices.
+    ///
+    /// The app's device, simulator, and Mac Catalyst slices can be rebuilt at different times
+    /// during development. The original timing fields remain required because their absence means
+    /// the payload is not a synthesis profile; newly added diagnostic fields fail closed to their
+    /// neutral values so one older native slice cannot discard the entire otherwise-valid profile.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        totalMs = try values.decode(Double.self, forKey: .totalMs)
+        generationMs = try values.decode(Double.self, forKey: .generationMs)
+        prefillMs = try values.decode(Double.self, forKey: .prefillMs)
+        microdecoderMs = try values.decode(Double.self, forKey: .microdecoderMs)
+        feedbackMs = try values.decode(Double.self, forKey: .feedbackMs)
+        talkerMs = try values.decode(Double.self, forKey: .talkerMs)
+        codecActiveMs = try values.decode(Double.self, forKey: .codecActiveMs)
+        codecBackpressureMs = try values.decodeIfPresent(
+            Double.self, forKey: .codecBackpressureMs) ?? 0
+        codecTailMs = try values.decodeIfPresent(Double.self, forKey: .codecTailMs) ?? 0
+        codecUserInitiatedQos = try values.decodeIfPresent(
+            Bool.self, forKey: .codecUserInitiatedQos) ?? false
+        frames = try values.decode(UInt64.self, forKey: .frames)
+        teamPartitions = try values.decode(Int.self, forKey: .teamPartitions)
+    }
+
+    init(
+        totalMs: Double,
+        generationMs: Double,
+        prefillMs: Double,
+        microdecoderMs: Double,
+        feedbackMs: Double,
+        talkerMs: Double,
+        codecActiveMs: Double,
+        codecBackpressureMs: Double,
+        codecTailMs: Double,
+        codecUserInitiatedQos: Bool,
+        frames: UInt64,
+        teamPartitions: Int
+    ) {
+        self.totalMs = totalMs
+        self.generationMs = generationMs
+        self.prefillMs = prefillMs
+        self.microdecoderMs = microdecoderMs
+        self.feedbackMs = feedbackMs
+        self.talkerMs = talkerMs
+        self.codecActiveMs = codecActiveMs
+        self.codecBackpressureMs = codecBackpressureMs
+        self.codecTailMs = codecTailMs
+        self.codecUserInitiatedQos = codecUserInitiatedQos
+        self.frames = frames
+        self.teamPartitions = teamPartitions
+    }
+
     var otherGenerationMs: Double {
         max(0, generationMs - prefillMs - microdecoderMs - feedbackMs - talkerMs)
+    }
+
+    var generatorGlueMs: Double {
+        max(0, otherGenerationMs - codecBackpressureMs)
     }
 
     func adding(_ other: SynthesisProfile) -> SynthesisProfile {
@@ -46,6 +108,9 @@ struct SynthesisProfile: Decodable, Sendable {
             feedbackMs: feedbackMs + other.feedbackMs,
             talkerMs: talkerMs + other.talkerMs,
             codecActiveMs: codecActiveMs + other.codecActiveMs,
+            codecBackpressureMs: codecBackpressureMs + other.codecBackpressureMs,
+            codecTailMs: codecTailMs + other.codecTailMs,
+            codecUserInitiatedQos: codecUserInitiatedQos && other.codecUserInitiatedQos,
             frames: frames + other.frames,
             teamPartitions: max(teamPartitions, other.teamPartitions)
         )

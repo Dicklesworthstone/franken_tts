@@ -46,12 +46,11 @@ pub enum F32LinearAccumulation {
     AccelerateBiasSeeded,
     /// [`Self::AccelerateBiasSeeded`], with M = 1 calls pinned onto the M >= 2 GEMM kernel.
     ///
-    /// Accelerate routes M = 1 to a GEMV kernel whose reduction order differs from its (measured
-    /// row-invariant) M >= 2 GEMM kernel. Seams whose streaming variant must equal whole-sequence
-    /// decode bit-for-bit — the codec convolutions — need every M on the same kernel path, and
-    /// accept drifting a single-frame call away from the oracle's own GEMV bits to get it. Seams
-    /// the ORACLE itself computes at M = 1 (the speaker-encoder embedding head) must NOT use
-    /// this: the GEMV path is the oracle-matching one there.
+    /// Accelerate routes M = 1 to a GEMV kernel whose reduction order differs from its M >= 2
+    /// GEMM kernel. Seams whose streaming variant must equal whole-sequence decode bit-for-bit —
+    /// the codec convolutions — need M = 1 on the GEMM path. Seams the ORACLE itself computes at
+    /// M = 1 (the speaker-encoder embedding head) must NOT use this: the GEMV path is the
+    /// oracle-matching one there. A profiling override can force every M through fixed row blocks.
     AccelerateBiasSeededRowInvariant,
     /// One f64 accumulator, narrowed to f32 only at the store.
     ///
@@ -435,14 +434,64 @@ pub(crate) fn accelerate_sgemm(
         return false;
     }
 
-    // Accelerate routes M = 1 to a GEMV kernel whose reduction order differs from its M >= 2
-    // GEMM kernel in the last ulps, while M >= 2 is row-invariant (measured: M of 2, 3, 4 and 14
-    // produce bit-identical rows). A streaming decode presents the same convolution at M = packet
-    // while offline presents M = utterance, so without this pinning the streaming == offline gate
-    // fails on every 1-frame packet. Under `row_invariant`, present M = 1 as a duplicated-row
-    // M = 2 call and keep row 0, so every M reduces on the same kernel path. Seams the ORACLE
-    // itself computes at M = 1 (the speaker-encoder embedding head) must NOT request this:
-    // the GEMV bits ARE the oracle's bits there.
+    // A streaming decode presents the same convolution at M = packet while whole-buffer decode
+    // presents M = four for the product cadence. Accelerate's exact reduction order is not a
+    // public contract: iOS Simulator 26.1, for example, produces different last ulps for M = 1,
+    // M = 2, and M = 4 even though older macOS Accelerate builds happened to agree for M >= 2.
+    // A physical-device profiling override can evaluate every row in one fixed BLAS shape. It is
+    // process-sticky and accepts only a tiny audited set. A final partial block duplicates its
+    // last real input/output row only as padding; those padded outputs are discarded. The default
+    // remains the measured production path below: only M = 1 is duplicated into an M = 2 call.
+    if row_invariant && m != 0 {
+        static ROW_BLOCK: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let row_block = *ROW_BLOCK.get_or_init(|| {
+            std::env::var("FTTS_ACCELERATE_ROW_BLOCK")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| matches!(value, 4 | 8 | 16 | 32 | 64))
+        });
+        if let Some(block_rows) = row_block {
+            let mut block_x = vec![0.0_f32; block_rows * k];
+            let mut block_out = vec![0.0_f32; block_rows * n];
+            for row_start in (0..m).step_by(block_rows) {
+                let rows = (m - row_start).min(block_rows);
+                for row in 0..rows {
+                    let source = &x[(row_start + row) * k..(row_start + row + 1) * k];
+                    block_x[row * k..(row + 1) * k].copy_from_slice(source);
+                    let source = &out[(row_start + row) * n..(row_start + row + 1) * n];
+                    block_out[row * n..(row + 1) * n].copy_from_slice(source);
+                }
+                if rows < block_rows {
+                    for row in rows..block_rows {
+                        block_x.copy_within((rows - 1) * k..rows * k, row * k);
+                        block_out.copy_within((rows - 1) * n..rows * n, row * n);
+                    }
+                }
+                if !accelerate_sgemm(
+                    &block_x,
+                    weight,
+                    block_rows,
+                    k,
+                    n,
+                    beta,
+                    false,
+                    &mut block_out,
+                ) {
+                    return false;
+                }
+                for row in 0..rows {
+                    let source = &block_out[row * n..(row + 1) * n];
+                    out[(row_start + row) * n..(row_start + row + 1) * n].copy_from_slice(source);
+                }
+            }
+            return true;
+        }
+    }
+
+    // Production path: Accelerate routes M = 1 to GEMV, whose reduction differs from GEMM in the
+    // last ulps. Present it as a duplicated-row M = 2 call and keep row 0. M >= 2 is exact on the
+    // physical Apple devices this path supports; the fixed-block override above remains available
+    // for investigating a future Accelerate implementation without silently slowing the product.
     if row_invariant && m == 1 {
         let mut doubled_x = Vec::with_capacity(2 * k);
         doubled_x.extend_from_slice(x);
@@ -483,6 +532,78 @@ pub(crate) fn accelerate_sgemm(
     true
 }
 
+/// Attempts a row-major `C = A * B + beta * C` SGEMM where `A` may have a
+/// wider physical row stride than its logical reduction width.
+///
+/// FastEnhancer's decoder stores one `[out][2 * channels]` 1x1-convolution
+/// matrix.  Its two channel halves can therefore be multiplied directly from
+/// that storage by passing `lda = 2 * channels`, avoiding a frame-local weight
+/// or activation transpose.  This deliberately remains a narrow internal
+/// primitive rather than broadening [`accelerate_sgemm`]'s already audited
+/// `X * W^T` contract.
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accelerate_sgemm_nn_strided(
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    beta: f32,
+    out: &mut [f32],
+) -> bool {
+    if !*APPLE_ACCELERATE_SGEMM_ENABLED {
+        return false;
+    }
+    assert!(lda >= k, "SGEMM A row stride must cover its logical row");
+    let a_len = m
+        .saturating_sub(1)
+        .checked_mul(lda)
+        .and_then(|prefix| prefix.checked_add(k))
+        .expect("SGEMM A dimensions fit usize");
+    assert!(a.len() >= a_len, "SGEMM A storage is too short");
+    assert_eq!(
+        b.len(),
+        k.checked_mul(n).expect("SGEMM B dimensions fit usize")
+    );
+    assert_eq!(
+        out.len(),
+        m.checked_mul(n).expect("SGEMM output dimensions fit usize")
+    );
+
+    let m = i32::try_from(m).expect("SGEMM rows fit CBLAS i32 dimensions");
+    let n = i32::try_from(n).expect("SGEMM columns fit CBLAS i32 dimensions");
+    let k = i32::try_from(k).expect("SGEMM reduction fits CBLAS i32 dimensions");
+    let lda = i32::try_from(lda).expect("SGEMM A stride fits CBLAS i32 dimensions");
+    // SAFETY: the checked slice bounds above prove that CBLAS can read every
+    // logical A and B element using the supplied row strides and write every C
+    // element. The three live slices are disjoint at this internal call site,
+    // and CBLAS completes synchronously before any borrow ends.
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANSPOSE,
+            CBLAS_NO_TRANSPOSE,
+            m,
+            n,
+            k,
+            1.0,
+            a.as_ptr(),
+            lda,
+            b.as_ptr(),
+            n,
+            beta,
+            out.as_mut_ptr(),
+            n,
+        );
+    }
+    true
+}
+
 // The stub must mirror the real Accelerate entry's eight parameters exactly so both cfg
 // arms are call-site identical; the arity is the contract, not a design smell.
 #[allow(clippy::too_many_arguments)]
@@ -498,6 +619,24 @@ pub(crate) fn accelerate_sgemm(
     _n: usize,
     _beta: f32,
     _row_invariant: bool,
+    _out: &mut [f32],
+) -> bool {
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+)))]
+pub(crate) fn accelerate_sgemm_nn_strided(
+    _a: &[f32],
+    _b: &[f32],
+    _m: usize,
+    _n: usize,
+    _k: usize,
+    _lda: usize,
+    _beta: f32,
     _out: &mut [f32],
 ) -> bool {
     false

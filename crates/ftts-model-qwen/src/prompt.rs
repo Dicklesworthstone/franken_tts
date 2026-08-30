@@ -144,9 +144,8 @@ impl fmt::Display for PromptError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidWrapper { kind } => write!(formatter, "invalid {kind} assistant wrapper"),
-            Self::InvalidHeader => {
-                formatter.write_str("prompt header requires three role states and codec pad/BOS")
-            }
+            Self::InvalidHeader => formatter
+                .write_str("prompt header requires three role states and non-empty codec pad/BOS"),
             Self::MissingIclReferenceText => {
                 formatter.write_str("ICL prompt lacks reference transcript states")
             }
@@ -355,6 +354,9 @@ fn validate_input(input: &PromptAssemblyInput) -> Result<(), PromptError> {
         return Err(PromptError::InvalidHeader);
     }
     let width = input.header.tts_pad.len();
+    if width == 0 {
+        return Err(PromptError::InvalidHeader);
+    }
     for state in input
         .header
         .role
@@ -538,6 +540,23 @@ mod tests {
             extract_prompt_text_ids(&[151_644, 77_091, 198], None),
             Err(PromptError::InvalidWrapper { kind: "target" })
         ));
+    }
+
+    #[test]
+    fn zero_width_prompt_states_are_an_invalid_header() {
+        let mode = PromptMode {
+            clone_mode: CloneMode::XVector,
+            non_streaming_mode: false,
+        };
+        let mut fixture = input(mode);
+        fixture.header.role.iter_mut().for_each(Vec::clear);
+        fixture.header.codec_prefill.iter_mut().for_each(Vec::clear);
+        fixture.header.tts_bos.clear();
+        fixture.header.tts_pad.clear();
+        fixture.target_text.iter_mut().for_each(Vec::clear);
+        fixture.tts_eos.clear();
+
+        assert_eq!(assemble_prompt(fixture), Err(PromptError::InvalidHeader));
     }
 }
 

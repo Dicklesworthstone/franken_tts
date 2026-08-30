@@ -36,6 +36,27 @@
 use crate::int8::{Int8Tier, QuantizedMatrix, dot_i32, dot_w8a16};
 use std::sync::{Condvar, Mutex, OnceLock};
 
+/// Ask Apple to schedule the current worker at the user-initiated QoS class.
+///
+/// Kernel-team workers and the concurrent codec worker both serve a foreground synthesis
+/// request. Keeping the platform call here preserves one audited unsafe boundary instead of
+/// duplicating it in higher-level crates. Other platforms deliberately report `false` and leave
+/// scheduling unchanged.
+#[cfg(target_vendor = "apple")]
+pub fn request_user_initiated_qos_for_current_thread() -> bool {
+    // SAFETY: this changes only the calling thread's scheduling class. It does not dereference
+    // pointers, transfer ownership, or alter any memory-safety contract.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) == 0
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+pub fn request_user_initiated_qos_for_current_thread() -> bool {
+    false
+}
+
 /// One dispatched operation, shared read-only with every worker.
 #[derive(Clone, Copy)]
 enum Job {
@@ -349,15 +370,7 @@ fn armed_native() -> Option<&'static Team> {
                     // game for the efficiency cores. The team barrier waits for its
                     // slowest member, so one demoted worker sets the pace of every
                     // dispatch; ask for the same class the caller's UI work runs at.
-                    #[cfg(target_vendor = "apple")]
-                    // SAFETY: setting this thread's own QoS class; no memory contract.
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        libc::pthread_set_qos_class_self_np(
-                            libc::qos_class_t::QOS_CLASS_USER_INITIATED,
-                            0,
-                        );
-                    }
+                    let _ = request_user_initiated_qos_for_current_thread();
                     worker_loop(shared, worker)
                 })
                 .expect("spawn int8 worker");

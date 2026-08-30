@@ -6,6 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-17.0}"
 # Apple cross targets require the local Xcode SDK and linker. Resolve Cargo
 # through rustup so an RCH shim cannot reject the build for lack of a Darwin worker.
 APPLE_RUST_TOOLCHAIN="${APPLE_RUST_TOOLCHAIN:-nightly-2026-08-25-aarch64-apple-darwin}"
@@ -21,7 +22,14 @@ do
   # and Catalyst triples, and a substring match can falsely skip installation.
   rustup target list --toolchain "$APPLE_RUST_TOOLCHAIN" --installed | grep -qx "$target" || \
     rustup target add --toolchain "$APPLE_RUST_TOOLCHAIN" "$target"
-  RUSTUP_TOOLCHAIN="$APPLE_RUST_TOOLCHAIN" RCH_CARGO_WRAPPER_BYPASS=1 "$APPLE_CARGO" build \
+  # cc-rs otherwise derives the minimum from the installed SDK. That made its
+  # hand-written assembly objects advertise iOS/macCatalyst 26.1 even though
+  # rustc's objects and the app support iOS 17, producing a Catalyst linker
+  # warning and silently narrowing Intel-Mac compatibility.
+  IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+    RUSTUP_TOOLCHAIN="$APPLE_RUST_TOOLCHAIN" \
+    RCH_CARGO_WRAPPER_BYPASS=1 \
+    "$APPLE_CARGO" build \
     --release --locked -p ftts-ffi --target "$target"
 done
 

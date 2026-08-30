@@ -248,6 +248,36 @@ fn enhancer_concat_accelerate_available() -> bool {
     })
 }
 
+/// Experimental no-pack decoder concat route.  It remains opt-in until the
+/// physical-device ABBA gate proves both transcript parity and a retained wall
+/// win; `FTTS_ENHANCE_CONCAT_ACCELERATE=0` still disables every concat SGEMM.
+#[cfg(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+))]
+fn enhancer_split_concat_accelerate_available() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        enhancer_concat_accelerate_available()
+            && matches!(
+                std::env::var("FTTS_ENHANCE_SPLIT_CONCAT_ACCELERATE")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "1" | "on" | "true" | "yes"
+            )
+    })
+}
+
+#[cfg(not(all(
+    feature = "accelerate-sgemm",
+    any(target_os = "macos", target_os = "ios")
+)))]
+fn enhancer_split_concat_accelerate_available() -> bool {
+    false
+}
+
 #[cfg(not(all(
     feature = "accelerate-sgemm",
     any(target_os = "macos", target_os = "ios")
@@ -1030,6 +1060,18 @@ fn accelerated_concat_mix(
     if !enhancer_concat_accelerate_available() {
         return None;
     }
+    if enhancer_split_concat_accelerate_available() {
+        return accelerated_split_concat_mix(conv, x, skip, width);
+    }
+    accelerated_concat_mix_packed(conv, x, skip, width)
+}
+
+fn accelerated_concat_mix_packed(
+    conv: &Conv1d,
+    x: &[f32],
+    skip: &[f32],
+    width: usize,
+) -> Option<Vec<f32>> {
     let half = conv.in_ch / 2;
     let mut packed_in = vec![0.0f32; width * conv.in_ch];
     for position in 0..width {
@@ -1060,6 +1102,50 @@ fn accelerated_concat_mix(
         for channel in 0..conv.out_ch {
             out[channel * width + position] = silu(packed_out[position * conv.out_ch + channel]);
         }
+    }
+    Some(out)
+}
+
+/// Computes the same 1x1 convolution as two directly-strided SGEMMs:
+/// `W_x * x + W_skip * skip`. Inputs and output stay in the enhancer's native
+/// channel-major layout, eliminating the old per-frame pack and transpose.
+fn accelerated_split_concat_mix(
+    conv: &Conv1d,
+    x: &[f32],
+    skip: &[f32],
+    width: usize,
+) -> Option<Vec<f32>> {
+    let half = conv.in_ch / 2;
+    let mut out = vec![0.0f32; conv.out_ch * width];
+    for (output_channel, row) in out.chunks_exact_mut(width).enumerate() {
+        row.fill(conv.bias[output_channel]);
+    }
+    if !super::f32ref::accelerate_sgemm_nn_strided(
+        &conv.weight,
+        x,
+        conv.out_ch,
+        width,
+        half,
+        conv.in_ch,
+        1.0,
+        &mut out,
+    ) {
+        return None;
+    }
+    if !super::f32ref::accelerate_sgemm_nn_strided(
+        &conv.weight[half..],
+        skip,
+        conv.out_ch,
+        width,
+        half,
+        conv.in_ch,
+        1.0,
+        &mut out,
+    ) {
+        return None;
+    }
+    for value in &mut out {
+        *value = silu(*value);
     }
     Some(out)
 }
@@ -1423,5 +1509,120 @@ mod tests {
             .map(|(left, right)| (left - right).abs())
             .fold(0.0f32, f32::max);
         assert!(max_abs < 3.0e-6, "SGEMM vs scalar max abs error {max_abs}");
+    }
+
+    #[cfg(all(
+        feature = "accelerate-sgemm",
+        any(target_os = "macos", target_os = "ios")
+    ))]
+    #[test]
+    fn accelerated_split_concat_mix_tracks_the_scalar_oracle() {
+        let value = |index: usize, modulus: usize, scale: f32| {
+            ((index.wrapping_mul(47).wrapping_add(19) % modulus) as f32 - (modulus / 2) as f32)
+                * scale
+        };
+        let conv = Conv1d {
+            weight: (0..CH * 2 * CH).map(|i| value(i, 127, 0.0006)).collect(),
+            bias: (0..CH).map(|i| value(i, 43, 0.001)).collect(),
+            out_ch: CH,
+            in_ch: 2 * CH,
+            k: 1,
+        };
+        let input: Vec<f32> = (0..CH * F_ENC).map(|i| value(i, 109, 0.0013)).collect();
+        let skip: Vec<f32> = (0..CH * F_ENC).map(|i| value(i, 103, 0.0011)).collect();
+        let expected = concat_mix_scalar(&conv, &input, &skip, F_ENC);
+        let got = accelerated_split_concat_mix(&conv, &input, &skip, F_ENC)
+            .expect("the Apple test build enables Accelerate SGEMM");
+        let max_abs = expected
+            .iter()
+            .zip(got.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 3.0e-6,
+            "split SGEMM vs scalar max abs error {max_abs}"
+        );
+    }
+
+    /// Exact-shape directional probe for the Apple decoder-concat seam. The
+    /// end-to-end iPhone ABBA receipt remains the promotion gate; this ignored
+    /// test only rejects candidates that cannot beat the incumbent even in
+    /// isolation.
+    #[cfg(all(
+        feature = "accelerate-sgemm",
+        any(target_os = "macos", target_os = "ios")
+    ))]
+    #[test]
+    #[ignore = "directional performance probe; run explicitly in release mode"]
+    fn profile_concat_mix_routes() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let value = |index: usize, modulus: usize, scale: f32| {
+            ((index.wrapping_mul(53).wrapping_add(23) % modulus) as f32 - (modulus / 2) as f32)
+                * scale
+        };
+        let conv = Conv1d {
+            weight: (0..CH * 2 * CH).map(|i| value(i, 131, 0.0007)).collect(),
+            bias: (0..CH).map(|i| value(i, 47, 0.001)).collect(),
+            out_ch: CH,
+            in_ch: 2 * CH,
+            k: 1,
+        };
+        let input: Vec<f32> = (0..CH * F_ENC).map(|i| value(i, 113, 0.0014)).collect();
+        let skip: Vec<f32> = (0..CH * F_ENC).map(|i| value(i, 107, 0.0012)).collect();
+        // Long enough to amortize scheduler pre-emption on a busy development
+        // host. The iPhone end-to-end harness still supplies the promotion row.
+        let calls_per_sample = 1_024;
+        let mut packed_us = Vec::with_capacity(24);
+        let mut split_us = Vec::with_capacity(24);
+
+        for sample in 0..24 {
+            let measure_packed = || {
+                let started = Instant::now();
+                for _ in 0..calls_per_sample {
+                    let output = accelerated_concat_mix_packed(&conv, &input, &skip, F_ENC)
+                        .expect("Apple SGEMM is available");
+                    black_box(output);
+                }
+                started.elapsed().as_secs_f64() * 1_000_000.0 / calls_per_sample as f64
+            };
+            let measure_split = || {
+                let started = Instant::now();
+                for _ in 0..calls_per_sample {
+                    let output = accelerated_split_concat_mix(&conv, &input, &skip, F_ENC)
+                        .expect("Apple SGEMM is available");
+                    black_box(output);
+                }
+                started.elapsed().as_secs_f64() * 1_000_000.0 / calls_per_sample as f64
+            };
+            if sample % 4 < 2 {
+                packed_us.push(measure_packed());
+                split_us.push(measure_split());
+            } else {
+                split_us.push(measure_split());
+                packed_us.push(measure_packed());
+            }
+        }
+        packed_us.sort_by(f64::total_cmp);
+        split_us.sort_by(f64::total_cmp);
+        let median = |values: &[f64]| (values[11] + values[12]) * 0.5;
+        let mean_cv = |values: &[f64]| {
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| (value - mean) * (value - mean))
+                .sum::<f64>()
+                / values.len() as f64;
+            (mean, variance.sqrt() / mean * 100.0)
+        };
+        let (packed_mean, packed_cv) = mean_cv(&packed_us);
+        let (split_mean, split_cv) = mean_cv(&split_us);
+        println!(
+            "{{\"event\":\"concat_mix_exact_shape\",\"samples_per_arm\":24,\"calls_per_sample\":{calls_per_sample},\"packed_median_us\":{:.3},\"packed_mean_us\":{packed_mean:.3},\"packed_cv_pct\":{packed_cv:.3},\"split_median_us\":{:.3},\"split_mean_us\":{split_mean:.3},\"split_cv_pct\":{split_cv:.3},\"speedup\":{:.4},\"packed_samples_us\":{packed_us:?},\"split_samples_us\":{split_us:?}}}",
+            median(&packed_us),
+            median(&split_us),
+            median(&packed_us) / median(&split_us),
+        );
     }
 }

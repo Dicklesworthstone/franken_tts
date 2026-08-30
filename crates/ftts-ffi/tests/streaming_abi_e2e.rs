@@ -148,7 +148,7 @@ fn streamed_packets_concatenate_to_the_whole_buffer_bit_for_bit() {
             speaker.len(),
             SEED,
             1,
-            collect,
+            Some(collect),
             (&raw mut collector).cast(),
         )
     };
@@ -208,7 +208,7 @@ fn a_nonzero_callback_return_cancels_with_the_distinct_status() {
             speaker.len(),
             SEED,
             1,
-            collect,
+            Some(collect),
             (&raw mut collector).cast(),
         )
     };

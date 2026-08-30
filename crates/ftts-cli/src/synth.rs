@@ -49,6 +49,7 @@ use std::cell::Cell;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use symphonia::core::audio::SampleBuffer;
@@ -67,6 +68,20 @@ const CANONICAL_MODEL_BASENAME: &str = "qwen3-tts-12hz-0.6b-base.fttsq";
 
 fn checkpoint_error(error: CheckpointError) -> FttsError {
     FttsError::ArtifactFormat(error.to_string())
+}
+
+/// Turns a scoped worker panic into the same typed error channel as every other
+/// hydration/synthesis failure. A panic is still an internal bug, but a caller-side
+/// `expect` used to discard the actionable worker identity and manufacture a second
+/// panic in unwind-capable builds. Production builds retain the workspace's explicit
+/// `panic = "abort"` policy; this helper does not pretend to catch an abort.
+fn worker_panic_error(worker: &str, payload: Box<dyn std::any::Any + Send + 'static>) -> FttsError {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned());
+    FttsError::Generic(format!("{worker} panicked: {detail}"))
 }
 
 /// The model resources `ftts say` needs, located relative to one model path.
@@ -252,7 +267,7 @@ impl LoadedModel {
         // The three heavyweight hydrations are independent, so the codec checkpoint and the
         // tokenizer build overlap the talker load instead of queueing behind it. Each result is
         // computed exactly as it was serially; only wall time changes.
-        let (talker, codec, tokenizer) = std::thread::scope(|scope| {
+        let (talker, codec, tokenizer) = std::thread::scope(|scope| -> Result<_, FttsError> {
             let codec = scope.spawn(|| CodecCheckpoint::load(&bundle.codec));
             let tokenizer = scope.spawn(|| {
                 QwenTokenizer::from_files_using_environment(TokenizerFiles {
@@ -271,12 +286,16 @@ impl LoadedModel {
                 ),
                 None => TalkerCheckpoint::load(&bundle.main),
             };
-            (
+            Ok((
                 talker,
-                codec.join().expect("codec loader panicked"),
-                tokenizer.join().expect("tokenizer builder panicked"),
-            )
-        });
+                codec
+                    .join()
+                    .map_err(|payload| worker_panic_error("codec loader", payload))?,
+                tokenizer
+                    .join()
+                    .map_err(|payload| worker_panic_error("tokenizer builder", payload))?,
+            ))
+        })?;
         let tokenizer = tokenizer
             .map_err(|error| FttsError::ArtifactFormat(format!("tokenizer unusable: {error}")))?;
         let talker = talker.map_err(checkpoint_error)?;
@@ -1108,7 +1127,10 @@ fn neural_denoise_reference(
     if !path.is_file() {
         return Ok(None);
     }
-    if std::env::var("FTTS_DENOISE_ENGINE").is_ok_and(|v| v.eq_ignore_ascii_case("omlsa")) {
+    static FORCE_CLASSIC_DENOISER: OnceLock<bool> = OnceLock::new();
+    if *FORCE_CLASSIC_DENOISER.get_or_init(|| {
+        std::env::var("FTTS_DENOISE_ENGINE").is_ok_and(|v| v.eq_ignore_ascii_case("omlsa"))
+    }) {
         return Ok(None);
     }
     let enhancer = ftts_artifacts::enhance_loader::open_enhancer(&path).map_err(|error| {
@@ -1793,6 +1815,20 @@ pub struct SynthesisProfile {
     pub talker: Duration,
     /// Active codec decode time on the concurrent worker.
     pub codec_active: Duration,
+    /// Time spent in synchronous channel handoff of completed frames to the codec worker.
+    ///
+    /// This includes the small fixed send-call overhead as well as any actual wait for queue
+    /// capacity, so it is an upper bound on codec backpressure rather than a pure blocking
+    /// measurement. It is included in `generation`; it is split out so a bounded-queue experiment
+    /// can distinguish reduced handoff pressure from a numerics/kernel change.
+    pub codec_backpressure: Duration,
+    /// Unhidden codec drain after generation closed the frame channel.
+    ///
+    /// This is the serial tail between the last generator step and the codec worker join. It is
+    /// not included in `generation`, but it is included in the whole synthesis call.
+    pub codec_tail: Duration,
+    /// Whether the Apple codec worker accepted the opt-in user-initiated QoS request.
+    pub codec_user_initiated_qos: bool,
     /// Frames emitted during this run.
     pub frames: u64,
     /// Int8 worker partitions used for this run.
@@ -1808,6 +1844,9 @@ impl SynthesisProfile {
         feedback: Duration::ZERO,
         talker: Duration::ZERO,
         codec_active: Duration::ZERO,
+        codec_backpressure: Duration::ZERO,
+        codec_tail: Duration::ZERO,
+        codec_user_initiated_qos: false,
         frames: 0,
         team_partitions: 0,
     };
@@ -1861,7 +1900,8 @@ pub trait PcmPacketSink: Send {
 ///
 /// Engine refusals (admission, budget, cancellation) and model refusals are mapped to their CLI
 /// exit classes; a zero-frame generation is reported rather than written out as an empty file.
-/// A `packet_frames` of zero is refused as a usage error.
+/// Packet cadences outside `1..=1024` are refused as usage errors; product profiles
+/// use 1, 2, or 4 and the wider range exists for conformance schedules.
 #[allow(clippy::too_many_arguments)]
 pub fn synthesize(
     model: &LoadedModel,
@@ -1932,7 +1972,10 @@ pub fn prepare_xvector_synthesis(
         .talker
         .gather_text_rows(&ids)
         .map_err(checkpoint_error)?;
-    let shared = if ftts_kernels::route::optimized_default("FTTS_VOICE_LAB_SHARED_PREFIX") {
+    static SHARED_PREFIX_ENABLED: OnceLock<bool> = OnceLock::new();
+    let shared = if *SHARED_PREFIX_ENABLED
+        .get_or_init(|| ftts_kernels::route::optimized_default("FTTS_VOICE_LAB_SHARED_PREFIX"))
+    {
         let prompt_ids = ftts_model_qwen::prompt::extract_prompt_text_ids(&wrapped, None)
             .map_err(|error| FttsError::Input(format!("prompt text extraction failed: {error}")))?;
         Some(SharedXVectorSetup {
@@ -2022,11 +2065,7 @@ fn synthesize_inner(
 ) -> Result<SynthesizedAudio, FttsError> {
     LAST_SYNTHESIS_PROFILE.with(|slot| slot.set(SynthesisProfile::EMPTY));
     let call_started = Instant::now();
-    if packet_frames == 0 {
-        return Err(FttsError::Usage(
-            "packet_frames must be at least 1 (one 80 ms codec frame)".to_owned(),
-        ));
-    }
+    let packet_code_capacity = codec_packet_code_capacity(packet_frames)?;
     // 1–2. Text and its sparse cold rows. A batch-owned x-vector plan lends both;
     // ordinary and ICL calls construct the same values locally.
     let owned_table: TextEmbeddingTable;
@@ -2184,18 +2223,14 @@ fn synthesize_inner(
         seed,
     };
     let int8 = model.int8_route.get_or_init(|| {
-        ftts_kernels::route::optimized_default("FTTS_INT8")
-            .then(|| {
-                prepare_int8_route(
-                    &generator_config.talker_config,
-                    &generator_config.talker_weights,
-                    &generator_config.microdecoder_config,
-                    &generator_config.microdecoder_weights,
-                    model.artifact.as_deref(),
-                )
-            })
-            .flatten()
-            .map(std::sync::Arc::new)
+        prepare_int8_route(
+            &generator_config.talker_config,
+            &generator_config.talker_weights,
+            &generator_config.microdecoder_config,
+            &generator_config.microdecoder_weights,
+            model.artifact.as_deref(),
+        )
+        .map(std::sync::Arc::new)
     });
     let generator = QwenGenerator::new_with_prepared_int8(generator_config, int8.clone());
     let mut generator = VoiceBatchGenerator {
@@ -2208,20 +2243,33 @@ fn synthesize_inner(
     // Streamed output is bit-identical to offline decode under every packet schedule (the
     // standing streaming==batch gate), so this overlap changes wall time and nothing else.
     // Deadlock shape: the worker only ever blocks on `recv` (it always drains), and the
-    // generator hands each completed frame directly to the worker through a rendezvous channel.
-    // The zero-capacity handoff is part of the cancellation contract: once a stop lands, the
-    // worker finishes only the frame the generator was already computing and the engine closes
-    // the channel at its next frame-boundary checkpoint. Generation and codec work still overlap,
-    // but no completed frame can sit queued where we would have to choose between losing it and
-    // making a cancelled caller wait behind avoidable codec work.
+    // generator hands every completed frame to it through a bounded channel. Shipping remains a
+    // zero-capacity rendezvous until a physical-device ABBA gate proves that a small queue removes
+    // codec backpressure without violating the cancellation-latency budget. The experimental
+    // capacity is capped at two codec packets: even a malformed environment cannot create an
+    // unbounded audio tail, and every accepted frame is still drained exactly once.
     let preparer = PreparedPassThrough { prepared };
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ftts_core::CodeFrame>(0);
+    let frame_queue_capacity = codec_queue_capacity(packet_frames);
+    let codec_user_initiated_qos = codec_user_initiated_qos_enabled();
+    let (frame_tx, frame_rx) =
+        std::sync::mpsc::sync_channel::<ftts_core::CodeFrame>(frame_queue_capacity);
     let codec = &model.codec;
     let synthesis_started = Instant::now();
-    let (result, decoded, generation) = std::thread::scope(
-        |scope| -> Result<(ftts_core::SynthesisResult, DecodedAudio, Duration), FttsError> {
+    let (result, decoded, generation, codec_backpressure, codec_tail) = std::thread::scope(
+        |scope| -> Result<
+            (
+                ftts_core::SynthesisResult,
+                DecodedAudio,
+                Duration,
+                Duration,
+                Duration,
+            ),
+            FttsError,
+        > {
             let mut pcm_sink = pcm_sink;
             let worker = scope.spawn(move || -> Result<DecodedAudio, FttsError> {
+                let codec_user_initiated_qos = codec_user_initiated_qos
+                    && ftts_kernels::team::request_user_initiated_qos_for_current_thread();
                 // Overlap for real: this thread's int8 ops run serially on a spare core
                 // instead of contending for the generator's worker team.
                 ftts_kernels::team::bypass_team_on_this_thread();
@@ -2230,7 +2278,7 @@ fn synthesize_inner(
                 // `stream_push` REPLACES its output buffer with one packet's samples (see the
                 // streaming==offline test), so packets decode into a scratch and append here.
                 let mut packet_pcm = Vec::new();
-                let mut packet: Vec<i32> = Vec::with_capacity(16 * packet_frames);
+                let mut packet: Vec<i32> = Vec::with_capacity(packet_code_capacity);
                 let mut buffered_frames = 0_usize;
                 let mut first_audio_at: Option<std::time::Duration> = None;
                 let mut first_audible_at: Option<std::time::Duration> = None;
@@ -2266,8 +2314,9 @@ fn synthesize_inner(
                     // Do not discard frames merely because cancellation has landed. Every frame
                     // returned by the generator was already reported through `FrameProgress` and
                     // must reach the sink exactly once. The engine observes the shared token at
-                    // its next frame boundary, closes the rendezvous channel, and lets the worker
-                    // settle the single in-flight tail before returning Cancelled.
+                    // its next frame boundary, closes the bounded channel, and lets the worker
+                    // settle the accepted tail before returning Cancelled. Shipping capacity is
+                    // zero by default; an experimental queue remains capped at two codec packets.
                     if frame.codes.len() != 16 {
                         return Err(FttsError::Generic(format!(
                             "generated frame carries {} codes, expected 16",
@@ -2322,6 +2371,7 @@ fn synthesize_inner(
                     ttfa: first_audio_at,
                     ttfa_audible: first_audible_at,
                     codec_active,
+                    codec_user_initiated_qos,
                 })
             });
 
@@ -2329,6 +2379,7 @@ fn synthesize_inner(
                 inner: &mut generator,
                 frames: frame_tx,
                 printed: 0,
+                channel_blocked: Duration::ZERO,
             };
             let generation_started = Instant::now();
             let result = engine
@@ -2342,8 +2393,11 @@ fn synthesize_inner(
                 )
                 .map_err(engine_error);
             let generation = generation_started.elapsed();
+            let codec_backpressure = tee.channel_blocked;
             drop(tee); // closes the channel; the worker drains the tail packet and exits
-            let worker_outcome = worker.join().expect("codec worker must not panic");
+            let codec_tail_started = Instant::now();
+            let worker_outcome = worker.join();
+            let codec_tail = codec_tail_started.elapsed();
             // A signal that landed mid-generation or mid-drain outranks every other
             // outcome: same terminal shape as an engine-loop cancel, keeping only the
             // audio already delivered through the sink (the CLI's cancelled disposition
@@ -2351,6 +2405,8 @@ fn synthesize_inner(
             if cancellation.is_cancelled() {
                 return Err(FttsError::Cancelled("synthesis cancelled".to_owned()));
             }
+            let worker_outcome = worker_outcome
+                .map_err(|payload| worker_panic_error("codec synthesis worker", payload))?;
             // Error precedence: a worker `Err` is always the ROOT cause. A worker merely
             // starved by an engine failure does not error — its recv loop ends on the
             // disconnect and it returns the partial PCM it decoded — so the only way the
@@ -2361,7 +2417,9 @@ fn synthesize_inner(
             match (result, worker_outcome) {
                 (_, Err(worker_error)) => Err(worker_error),
                 (Err(engine_failure), Ok(_)) => Err(engine_failure),
-                (Ok(result), Ok(decoded)) => Ok((result, decoded, generation)),
+                (Ok(result), Ok(decoded)) => {
+                    Ok((result, decoded, generation, codec_backpressure, codec_tail))
+                }
             }
         },
     )?;
@@ -2385,6 +2443,9 @@ fn synthesize_inner(
             feedback: timings.feedback,
             talker: timings.talker,
             codec_active: decoded.codec_active,
+            codec_backpressure,
+            codec_tail,
+            codec_user_initiated_qos: decoded.codec_user_initiated_qos,
             frames: timings.frames,
             team_partitions: ftts_kernels::team::partitions(),
         });
@@ -2406,12 +2467,60 @@ fn synthesize_inner(
 /// not to detect speech. Measurement-only — output samples are never altered.
 pub const AUDIBLE_FLOOR: f32 = 0.001;
 
+/// Product profiles use one, two, or four 80 ms frames per codec packet; conformance
+/// also exercises seven. Keeping a deliberately generous upper bound prevents an FFI
+/// caller from turning `16 * packet_frames` or a channel capacity into an allocator
+/// abort while preserving every meaningful packet schedule.
+const MAX_CODEC_PACKET_FRAMES: usize = 1_024;
+
+fn codec_packet_code_capacity(packet_frames: usize) -> Result<usize, FttsError> {
+    if !(1..=MAX_CODEC_PACKET_FRAMES).contains(&packet_frames) {
+        return Err(FttsError::Usage(format!(
+            "packet_frames must be between 1 and {MAX_CODEC_PACKET_FRAMES} (80 ms codec frames)"
+        )));
+    }
+    // Safe because the accepted bound is far below usize::MAX / 16 on every target.
+    Ok(packet_frames * 16)
+}
+
+/// Opt-in frame queue between generation and the concurrent codec worker.
+///
+/// Zero preserves the audited rendezvous/cancellation behavior. A candidate may request a small
+/// absolute frame count with `FTTS_CODEC_QUEUE_FRAMES`; the hard cap of two codec packets bounds
+/// post-cancel drain work regardless of external input. Invalid values fail closed to zero.
+fn codec_queue_capacity(packet_frames: usize) -> usize {
+    static REQUESTED_FRAMES: OnceLock<usize> = OnceLock::new();
+    let requested = *REQUESTED_FRAMES.get_or_init(|| {
+        codec_queue_requested_frames(std::env::var("FTTS_CODEC_QUEUE_FRAMES").ok().as_deref())
+    });
+    requested.min(packet_frames.saturating_mul(2))
+}
+
+fn codec_queue_requested_frames(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn codec_queue_capacity_from_value(value: Option<&str>, packet_frames: usize) -> usize {
+    codec_queue_requested_frames(value).min(packet_frames.saturating_mul(2))
+}
+
+fn codec_user_initiated_qos_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FTTS_CODEC_USER_INITIATED_QOS").is_ok_and(|value| value.trim() == "1")
+    })
+}
+
 /// What the codec worker hands back at join.
 struct DecodedAudio {
     pcm: Vec<f32>,
     ttfa: Option<std::time::Duration>,
     ttfa_audible: Option<std::time::Duration>,
     codec_active: Duration,
+    codec_user_initiated_qos: bool,
 }
 
 /// Forwards a generator's frames unchanged while teeing each one to the codec worker.
@@ -2423,6 +2532,7 @@ struct TeeGenerator<'a> {
     inner: &'a mut dyn FrameGenerator,
     frames: std::sync::mpsc::SyncSender<ftts_core::CodeFrame>,
     printed: usize,
+    channel_blocked: Duration,
 }
 
 impl FrameGenerator for TeeGenerator<'_> {
@@ -2475,7 +2585,13 @@ impl FrameGenerator for TeeGenerator<'_> {
                 }
                 self.printed += 1;
             }
-            if self.frames.send(frame.clone()).is_err() {
+            // Clone before the clock: the attribution is channel backpressure, not the fixed
+            // cost of duplicating sixteen small code integers for the codec worker.
+            let codec_frame = frame.clone();
+            let send_started = Instant::now();
+            let send_result = self.frames.send(codec_frame);
+            self.channel_blocked += send_started.elapsed();
+            if send_result.is_err() {
                 return Err(GenerationError::new(
                     "the codec worker stopped accepting frames; its error follows at join",
                 ));
@@ -2508,6 +2624,42 @@ pub fn generation_error(message: &str) -> GenerationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codec_queue_candidate_fails_closed_and_stays_bounded() {
+        assert_eq!(codec_queue_capacity_from_value(None, 4), 0);
+        assert_eq!(codec_queue_capacity_from_value(Some("not-a-number"), 4), 0);
+        assert_eq!(codec_queue_capacity_from_value(Some(" 4 "), 4), 4);
+        assert_eq!(codec_queue_capacity_from_value(Some("999"), 4), 8);
+        assert_eq!(codec_queue_capacity_from_value(Some("1"), 0), 0);
+    }
+
+    #[test]
+    fn codec_packet_cadence_has_a_safe_allocation_bound() {
+        assert_eq!(codec_packet_code_capacity(1).expect("one frame"), 16);
+        assert_eq!(
+            codec_packet_code_capacity(7).expect("conformance cadence"),
+            112
+        );
+        assert!(codec_packet_code_capacity(0).is_err());
+        assert!(codec_packet_code_capacity(MAX_CODEC_PACKET_FRAMES + 1).is_err());
+    }
+
+    #[test]
+    fn worker_panics_keep_the_worker_identity_in_the_error_channel() {
+        let error = worker_panic_error("codec test worker", Box::new("fixture panic"));
+        assert!(matches!(error, FttsError::Generic(_)));
+        assert_eq!(
+            error.to_string(),
+            "codec test worker panicked: fixture panic"
+        );
+
+        let opaque = worker_panic_error("opaque worker", Box::new(7_u32));
+        assert_eq!(
+            opaque.to_string(),
+            "opaque worker panicked: non-string panic payload"
+        );
+    }
 
     #[test]
     fn prepared_voice_plan_is_bound_to_its_loaded_model() {

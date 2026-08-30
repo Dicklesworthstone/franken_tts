@@ -28,11 +28,22 @@ use crate::talker::{
 };
 use ftts_artifacts::fttsq::{MappedFttsq, StoredDtype};
 use ftts_kernels::int8::{QuantLinearMode, QuantizedMatrix};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// The talker's pinned mRoPE base. The microdecoder and codec each use a different theta; crossing
 /// them is a silent correctness failure, so the constant lives next to its only call sites.
 const MROPE_THETA: f32 = 1.0e6;
+
+/// Largest per-row scale that keeps every representable signed Q8 byte finite.
+/// Canonical quantization emits only `[-127, 127]`, but an integrity-valid external
+/// artifact can still contain `i8::MIN`; validating against 128 avoids a multi-gigabyte
+/// payload scan while making even that hostile value safe to dequantize.
+pub(crate) const MAX_FINITE_Q8_SCALE: f32 = f32::MAX / 128.0;
+
+pub(crate) fn q8_scale_is_executable(scale: f32) -> bool {
+    scale.is_finite() && scale > 0.0 && scale <= MAX_FINITE_Q8_SCALE
+}
 
 /// Permanent, low-overhead attribution for one generator invocation.
 ///
@@ -72,19 +83,13 @@ pub(crate) fn q8_from_artifact(
     n: usize,
     k: usize,
 ) -> Option<QuantizedMatrix> {
-    let entry = artifact.reader().tensor(name)?;
-    if entry.dtype != StoredDtype::Q8 {
+    if q8_artifact_matrix_shape(artifact, name) != Some((n, k)) {
         return None;
     }
+    let entry = artifact.reader().tensor(name)?;
     let scales_name = entry.scales.clone()?;
     let data_bytes = artifact.tensor_bytes(name).ok()?;
-    if data_bytes.len() != n.checked_mul(k)? {
-        return None;
-    }
     let scales_bytes = artifact.tensor_bytes(&scales_name).ok()?;
-    if scales_bytes.len() != n.checked_mul(4)? {
-        return None;
-    }
     // Q8 payload bytes are the two's-complement values themselves; this cast-copy is the whole
     // hydration cost (a memcpy), replacing a widen + max-scan + rounding pass per row.
     let data = data_bytes.iter().map(|&byte| byte as i8).collect();
@@ -95,6 +100,111 @@ pub(crate) fn q8_from_artifact(
         .map(|chunk| f32::from_le_bytes(*chunk))
         .collect();
     Some(QuantizedMatrix { data, scales, n, k })
+}
+
+/// Validates the complete executable shape of one artifact-native Q8 matrix.
+///
+/// This is deliberately shared with checkpoint elision: the loader may discard a
+/// projection's f32 form only when the exact Q8 reader that will replace it can run.
+/// Merely seeing `dtype=q8` and a scale tensor name is insufficient—a transposed or
+/// flat declaration, short scale vector, NaN, infinity, or non-positive scale would
+/// otherwise survive hydration and fail much later inside synthesis.
+pub(crate) fn q8_artifact_matrix_shape(
+    artifact: &MappedFttsq,
+    name: &str,
+) -> Option<(usize, usize)> {
+    let entry = artifact.reader().tensor(name)?;
+    if entry.dtype != StoredDtype::Q8 || entry.shape.len() != 2 {
+        return None;
+    }
+    let rows = usize::try_from(entry.shape[0])
+        .ok()
+        .filter(|value| *value > 0)?;
+    let width = usize::try_from(entry.shape[1])
+        .ok()
+        .filter(|value| *value > 0)?;
+    let elements = rows.checked_mul(width)?;
+    if artifact.tensor_bytes(name).ok()?.len() != elements {
+        return None;
+    }
+
+    let scales_name = entry.scales.as_deref()?;
+    let scales_entry = artifact.reader().tensor(scales_name)?;
+    if scales_entry.dtype != StoredDtype::F32
+        || scales_entry.shape.as_slice() != [entry.shape[0]]
+        || scales_entry.scales.is_some()
+    {
+        return None;
+    }
+    let scales = artifact.tensor_bytes(scales_name).ok()?;
+    if scales.len() != rows.checked_mul(std::mem::size_of::<f32>())? {
+        return None;
+    }
+    if !scales.as_chunks::<4>().0.iter().all(|chunk| {
+        let scale = f32::from_le_bytes(*chunk);
+        q8_scale_is_executable(scale)
+    }) {
+        return None;
+    }
+    Some((rows, width))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Int8Scope {
+    Both,
+    Talker,
+    Micro,
+}
+
+impl Int8Scope {
+    const fn armed_stacks(self) -> (bool, bool) {
+        match self {
+            Self::Both => (true, true),
+            Self::Talker => (true, false),
+            Self::Micro => (false, true),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Int8ProcessConfiguration {
+    route_enabled: bool,
+    artifact_q8_enabled: bool,
+    scope: Int8Scope,
+}
+
+fn int8_configuration_from_values(
+    route_enabled: bool,
+    artifact_q8: Option<&str>,
+    scope: Option<&str>,
+) -> Int8ProcessConfiguration {
+    let artifact_q8_enabled = !matches!(artifact_q8, Some("0" | "off" | "false"));
+    let scope = match scope {
+        Some("talker") => Int8Scope::Talker,
+        Some("micro") => Int8Scope::Micro,
+        _ => Int8Scope::Both,
+    };
+    Int8ProcessConfiguration {
+        route_enabled,
+        artifact_q8_enabled,
+        scope,
+    }
+}
+
+/// One immutable snapshot drives both load-time elision and runtime route hydration.
+/// The project treats environment variables as process configuration, never mutable
+/// per-call controls; sharing this snapshot makes that rule a correctness invariant.
+fn int8_process_configuration() -> &'static Int8ProcessConfiguration {
+    static CONFIGURATION: OnceLock<Int8ProcessConfiguration> = OnceLock::new();
+    CONFIGURATION.get_or_init(|| {
+        let artifact_q8 = std::env::var("FTTS_ARTIFACT_Q8").ok();
+        let scope = std::env::var("FTTS_INT8_SCOPE").ok();
+        int8_configuration_from_values(
+            ftts_kernels::route::optimized_default("FTTS_INT8"),
+            artifact_q8.as_deref(),
+            scope.as_deref(),
+        )
+    })
 }
 
 /// The seven projections of one attention layer, artifact-native, in the same fused shape
@@ -219,7 +329,7 @@ pub fn micro_layers_from_artifact(
         .collect()
 }
 
-/// The hot-projection elision the CURRENT process environment permits.
+/// The hot-projection elision the process-stable environment snapshot permits.
 ///
 /// This is the load-time mirror of the generator's own hydration decision: a stack's f32
 /// projections may be skipped exactly when that stack will run int8 with artifact-native tables
@@ -228,15 +338,11 @@ pub fn micro_layers_from_artifact(
 /// verifies per tensor that the artifact really carries the Q8 payload before eliding it.
 #[must_use]
 pub fn hot_elision_from_environment() -> crate::checkpoint::HotElision {
-    if !ftts_kernels::route::optimized_default("FTTS_INT8") || !artifact_q8_enabled() {
+    let configuration = int8_process_configuration();
+    if !configuration.route_enabled || !configuration.artifact_q8_enabled {
         return crate::checkpoint::HotElision::default();
     }
-    let scope = std::env::var("FTTS_INT8_SCOPE").unwrap_or_default();
-    let (talker, micro) = match scope.as_str() {
-        "talker" => (true, false),
-        "micro" => (false, true),
-        _ => (true, true),
-    };
+    let (talker, micro) = configuration.scope.armed_stacks();
     crate::checkpoint::HotElision {
         talker,
         micro,
@@ -251,14 +357,6 @@ pub fn hot_elision_from_environment() -> crate::checkpoint::HotElision {
     }
 }
 
-/// `FTTS_ARTIFACT_Q8=0` forces the widen-then-requantize hydration even when a canonical
-/// artifact is available — the A/B and forensics switch for artifact-native hydration.
-fn artifact_q8_enabled() -> bool {
-    !matches!(
-        std::env::var("FTTS_ARTIFACT_Q8").as_deref(),
-        Ok("0") | Ok("off") | Ok("false")
-    )
-}
 /// The cold text embedding table and the learned biased SiLU text projection.
 ///
 /// Production widths are `(embed_width, intermediate, hidden) = (2048, 2048, 1024)`; the fields
@@ -469,17 +567,13 @@ pub fn prepare_int8_route(
     microdecoder_weights: &MicrodecoderWeights<'_>,
     artifact: Option<&MappedFttsq>,
 ) -> Option<Int8Route> {
-    ftts_kernels::route::optimized_default("FTTS_INT8").then(|| {
+    let configuration = int8_process_configuration();
+    configuration.route_enabled.then(|| {
         // FTTS_INT8_SCOPE narrows the lever for sensitivity attribution: `talker` or
         // `micro` quantizes one stack and leaves the other on the f32 reference. An empty
         // table below means "this stack stays f32" at the branch sites.
-        let scope = std::env::var("FTTS_INT8_SCOPE").unwrap_or_default();
-        let (arm_talker, arm_micro) = match scope.as_str() {
-            "talker" => (true, false),
-            "micro" => (false, true),
-            _ => (true, true),
-        };
-        let artifact = artifact.filter(|_| artifact_q8_enabled());
+        let (arm_talker, arm_micro) = configuration.scope.armed_stacks();
+        let artifact = artifact.filter(|_| configuration.artifact_q8_enabled);
         Int8Route {
             talker: if arm_talker {
                 talker_weights
@@ -656,18 +750,14 @@ impl<'a> QwenGenerator<'a> {
         config: QwenGeneratorConfig<'a>,
         artifact: Option<&MappedFttsq>,
     ) -> Self {
-        let int8 = ftts_kernels::route::optimized_default("FTTS_INT8")
-            .then(|| {
-                prepare_int8_route(
-                    &config.talker_config,
-                    &config.talker_weights,
-                    &config.microdecoder_config,
-                    &config.microdecoder_weights,
-                    artifact,
-                )
-            })
-            .flatten()
-            .map(std::sync::Arc::new);
+        let int8 = prepare_int8_route(
+            &config.talker_config,
+            &config.talker_weights,
+            &config.microdecoder_config,
+            &config.microdecoder_weights,
+            artifact,
+        )
+        .map(std::sync::Arc::new);
         Self::assemble(config, int8)
     }
 
@@ -1504,6 +1594,31 @@ mod tests {
     use crate::prompt::CloneMode;
     use crate::talker::{TALKER_LAYER_COUNT, TalkerLayerWeights};
     use ftts_core::{NormalizationMode, NormalizationTrace};
+
+    #[test]
+    fn int8_process_configuration_parses_once_shared_route_semantics() {
+        let default = int8_configuration_from_values(true, None, None);
+        assert!(default.route_enabled);
+        assert!(default.artifact_q8_enabled);
+        assert_eq!(default.scope, Int8Scope::Both);
+
+        let talker_only = int8_configuration_from_values(true, Some("0"), Some("talker"));
+        assert!(!talker_only.artifact_q8_enabled);
+        assert_eq!(talker_only.scope.armed_stacks(), (true, false));
+
+        let micro_only = int8_configuration_from_values(false, Some("false"), Some("micro"));
+        assert!(!micro_only.route_enabled);
+        assert_eq!(micro_only.scope.armed_stacks(), (false, true));
+    }
+
+    #[test]
+    fn q8_scale_validation_keeps_the_full_signed_byte_domain_finite() {
+        assert!(q8_scale_is_executable(MAX_FINITE_Q8_SCALE));
+        assert!((f32::from(i8::MIN) * MAX_FINITE_Q8_SCALE).is_finite());
+        assert!(!q8_scale_is_executable(f32::MAX / 127.0));
+        assert!(!q8_scale_is_executable(f32::NAN));
+        assert!(!q8_scale_is_executable(0.0));
+    }
 
     /// The feedback sum must be BIT-identical whether the fifteen per-depth tables are
     /// widened f32 or artifact-native Q8 dequantized on demand — elision (bead

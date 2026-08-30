@@ -258,7 +258,15 @@ pub(crate) fn widen(
     }
     let mut out = vec![0.0f32; view.len()];
     for (index, slot) in out.iter_mut().enumerate() {
-        *slot = view.get_f32(index).unwrap_or(0.0);
+        let value = view.get_f32(index).unwrap_or(0.0);
+        if !value.is_finite() {
+            return Err(CheckpointError::ArtifactTensor {
+                path: path.to_path_buf(),
+                tensor: name.to_owned(),
+                detail: format!("non-finite value at element {index}"),
+            });
+        }
+        *slot = value;
     }
     Ok(out)
 }
@@ -387,12 +395,24 @@ fn artifact_f32_values(
             "f32 payload length does not match its logical element count",
         ));
     }
-    Ok(bytes
+    let mut values = Vec::with_capacity(elements);
+    for (index, chunk) in bytes
         .as_chunks::<{ std::mem::size_of::<f32>() }>()
         .0
         .iter()
-        .map(|chunk| f32::from_le_bytes(*chunk))
-        .collect())
+        .enumerate()
+    {
+        let value = f32::from_le_bytes(*chunk);
+        if !value.is_finite() {
+            return Err(artifact_tensor_error(
+                path,
+                name,
+                format!("non-finite value at element {index}"),
+            ));
+        }
+        values.push(value);
+    }
+    Ok(values)
 }
 
 /// Open a canonical `.fttsq` artifact with its integrity checks, as a [`CheckpointError`].
@@ -438,15 +458,20 @@ pub(crate) fn widen_fttsq(
                     "bf16 payload length does not match its logical element count",
                 ));
             }
-            Ok(bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|chunk| {
-                    let bits = u32::from(u16::from_le_bytes(*chunk)) << 16;
-                    f32::from_bits(bits)
-                })
-                .collect())
+            let mut values = Vec::with_capacity(elements);
+            for (index, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
+                let bits = u32::from(u16::from_le_bytes(*chunk)) << 16;
+                let value = f32::from_bits(bits);
+                if !value.is_finite() {
+                    return Err(artifact_tensor_error(
+                        path,
+                        name,
+                        format!("non-finite value at element {index}"),
+                    ));
+                }
+                values.push(value);
+            }
+            Ok(values)
         }
         StoredDtype::F32 => artifact_f32_values(artifact, path, name),
         StoredDtype::Q8 => {
@@ -490,13 +515,23 @@ pub(crate) fn widen_fttsq(
                     ),
                 ));
             }
-            Ok(bytes
+            if let Some((index, scale)) = scales
                 .iter()
+                .copied()
                 .enumerate()
-                .map(|(index, value)| {
-                    f32::from(i8::from_ne_bytes([*value])) * scales[index / width]
-                })
-                .collect())
+                .find(|(_, scale)| !crate::generate::q8_scale_is_executable(*scale))
+            {
+                return Err(artifact_tensor_error(
+                    path,
+                    &scales_name,
+                    format!("invalid Q8 scale {scale} at row {index}"),
+                ));
+            }
+            let mut values = Vec::with_capacity(elements);
+            for (index, value) in bytes.iter().enumerate() {
+                values.push(f32::from(i8::from_ne_bytes([*value])) * scales[index / width]);
+            }
+            Ok(values)
         }
         StoredDtype::Q4 => Err(artifact_tensor_error(
             path,
@@ -1160,12 +1195,7 @@ impl TalkerCheckpoint {
         let source = TextEmbeddingSource::Fttsq(Arc::clone(&artifact));
         let q8_present = {
             let artifact = Arc::clone(&artifact);
-            move |name: &str| {
-                artifact
-                    .reader()
-                    .tensor(name)
-                    .is_some_and(|entry| entry.dtype == StoredDtype::Q8 && entry.scales.is_some())
-            }
+            move |name: &str| crate::generate::q8_artifact_matrix_shape(&artifact, name).is_some()
         };
         // Heads are all-or-nothing across the fifteen depths, and this ONE verdict must
         // gate BOTH the elide closure and the post-load Q8 read below: gating the read on
@@ -3029,8 +3059,79 @@ mod tests {
 
         let artifact = MappedFttsq::open(&path).expect("mapped artifact verifies");
         assert_eq!(
+            crate::generate::q8_artifact_matrix_shape(&artifact, tensor),
+            Some((2, 3))
+        );
+        let executable = crate::generate::q8_from_artifact(&artifact, tensor, 2, 3)
+            .expect("valid Q8 matrix is executable");
+        assert_eq!(executable.data.len(), 6);
+        assert_eq!(executable.scales, [0.25, 0.5]);
+        assert_eq!(
             widen_fttsq(&artifact, &path, tensor).expect("q8 tensor widens"),
             vec![-0.5, 0.25, 31.75, 1.5, -2.0, 0.0]
         );
+    }
+
+    #[test]
+    fn q8_artifact_refuses_nonfinite_scales_before_elision() {
+        let tensor = "test.q8.weight";
+        let scales = "test.q8.weight.scales";
+        let mut payload = vec![1_u8, 2, 3, 4, 5, 6];
+        payload.extend_from_slice(&0.25_f32.to_le_bytes());
+        payload.extend_from_slice(&f32::NAN.to_le_bytes());
+        let artifact = FttsqWriter::new("test-model", "d".repeat(64))
+            .license_notice("Apache-2.0")
+            .section(
+                "tensor:test.q8.weight",
+                AccessClass::HotRecurrentTalker,
+                payload,
+            )
+            .tensor(TensorEntry {
+                name: tensor.to_owned(),
+                section: "tensor:test.q8.weight".to_owned(),
+                dtype: StoredDtype::Q8,
+                shape: vec![2, 3],
+                offset: 0,
+                length: 6,
+                scales: Some(scales.to_owned()),
+            })
+            .tensor(TensorEntry {
+                name: scales.to_owned(),
+                section: "tensor:test.q8.weight".to_owned(),
+                dtype: StoredDtype::F32,
+                shape: vec![2],
+                offset: 6,
+                length: 8,
+                scales: None,
+            })
+            .finish()
+            .expect("integrity-valid artifact with semantically invalid scale");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ftts-checkpoint-q8-nan-{}-{nonce}.fttsq",
+            std::process::id()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("a fresh test artifact path");
+        file.write_all(&artifact).expect("write test artifact");
+        file.sync_all().expect("sync test artifact");
+        drop(file);
+
+        let artifact = MappedFttsq::open(&path).expect("digests alone still verify");
+        assert_eq!(
+            crate::generate::q8_artifact_matrix_shape(&artifact, tensor),
+            None
+        );
+        assert!(crate::generate::q8_from_artifact(&artifact, tensor, 2, 3).is_none());
+        let error = widen_fttsq(&artifact, &path, tensor)
+            .expect_err("the f32 fallback must reject the same NaN scale");
+        assert!(error.to_string().contains("non-finite"), "{error}");
     }
 }

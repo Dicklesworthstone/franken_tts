@@ -370,6 +370,13 @@ final class LabModel {
     var isSynthesizing = false
     /// True while Voice Lab owns the engine for an all-voice comparison run.
     var isComparingVoices = false
+    /// True while the hidden physical-device profiler owns the engine.
+    ///
+    /// The profiler deliberately exercises the shipping engine, but it is not a visible
+    /// synthesis run. Without a separate ownership bit, an ordinary memory-warning or
+    /// background notification can unload the engine underneath a benchmark and turn an
+    /// otherwise valid sample window into a misleading cancellation receipt.
+    private var isProfilingBenchmark = false
     var isLoadingModel = false
     var isEngineWarm = false
     var synthesisSeconds = 0.0
@@ -377,6 +384,7 @@ final class LabModel {
     var lastError: String?
     var textImportNotice: String?
     var isImportingText = false
+    var isClearingModel = false
     var lastAudio: [Float]?
     var lastRealTimeFactor: Double?
     var lastProfile: SynthesisProfile?
@@ -393,6 +401,7 @@ final class LabModel {
     var videoProgress = 0.0
     /// Bumped per synthesis so a slow export cannot stamp its output onto a newer clip.
     private var synthesisGeneration = 0
+    private var videoExportTask: Task<Void, Never>?
     private var importGeneration = 0
     private var importTask: Task<Void, Never>?
     private var cancellationRequested = false
@@ -410,6 +419,7 @@ final class LabModel {
     var canSynthesizeFromCommand: Bool {
         !isSynthesizing
             && !isComparingVoices
+            && !isClearingModel
             && !isLoadingModel
             && store.phase == .ready
             && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -418,10 +428,20 @@ final class LabModel {
     var canCompareVoices: Bool {
         !isSynthesizing
             && !isComparingVoices
+            && !isClearingModel
             && !isLoadingModel
             && store.phase == .ready
             && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !presets.isEmpty
+    }
+
+    var canClearModel: Bool {
+        !isSynthesizing
+            && !isComparingVoices
+            && !isEnrolling
+            && !recorder.isRecording
+            && !isProfilingBenchmark
+            && !isClearingModel
     }
 
     func speakerVector() throws -> [Float] {
@@ -628,6 +648,9 @@ final class LabModel {
     func runProfilingBenchmarkIfRequested() async {
         let environment = ProcessInfo.processInfo.environment
         guard environment["FTTS_IOS_PROFILE"] == "1" else { return }
+        guard !isProfilingBenchmark else { return }
+        isProfilingBenchmark = true
+        defer { isProfilingBenchmark = false }
 
         let requestedRuns = Int(environment["FTTS_IOS_PROFILE_RUNS"] ?? "20") ?? 20
         let runs = max(1, min(100, requestedRuns))
@@ -636,6 +659,9 @@ final class LabModel {
             ?? (scenario == "long" ? Self.longProfileText : Self.shortProfileText)
         let voice = environment["FTTS_IOS_PROFILE_VOICE"] ?? "matt"
         let streaming = environment["FTTS_IOS_PROFILE_STREAMING"] == "1"
+        let requestedPacketFrames = Int(
+            environment["FTTS_IOS_PROFILE_PACKET_FRAMES"] ?? "1") ?? 1
+        let packetFrames = max(1, min(1_024, requestedPacketFrames))
         let benchmarkSeed = UInt64(environment["FTTS_IOS_PROFILE_SEED"] ?? "0") ?? 0
 
         let documents = FileManager.default.urls(
@@ -686,17 +712,21 @@ final class LabModel {
             }
             try appendReceipt([
                 "event": "run_start",
-                "schema_version": 1,
+                "schema_version": 2,
                 "runs": runs,
                 "scenario": scenario,
                 "voice": voice,
                 "seed": benchmarkSeed,
+                "streaming_packet_frames": packetFrames,
                 "device_model": UIDevice.current.model,
                 "system_name": UIDevice.current.systemName,
                 "system_version": UIDevice.current.systemVersion,
                 "active_processors": ProcessInfo.processInfo.activeProcessorCount,
                 "physical_memory_bytes": ProcessInfo.processInfo.physicalMemory,
                 "team_threads": environment["FTTS_INT8_THREADS"] ?? "unset",
+                "codec_queue_frames": environment["FTTS_CODEC_QUEUE_FRAMES"] ?? "unset",
+                "codec_user_initiated_qos": environment["FTTS_CODEC_USER_INITIATED_QOS"] ?? "unset",
+                "accelerate_row_block": environment["FTTS_ACCELERATE_ROW_BLOCK"] ?? "default",
                 "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
                 "receipt_path": receiptURL.path,
                 "model_manifest": ModelManifest.files.map { file in
@@ -709,11 +739,11 @@ final class LabModel {
                 },
             ])
 
-            let loadStarted = Date()
+            let loadStartedUptime = ProcessInfo.processInfo.systemUptime
             try await engine.load(modelDirectory: store.modelDirectory)
             try appendReceipt([
                 "event": "engine_loaded",
-                "load_ms": Date().timeIntervalSince(loadStarted) * 1_000,
+                "load_ms": (ProcessInfo.processInfo.systemUptime - loadStartedUptime) * 1_000,
                 "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
             ])
 
@@ -721,13 +751,13 @@ final class LabModel {
             var validRuns = 0
             var allAudioIdentical = true
             for index in 0..<runs {
-                let started = Date()
+                let startedUptime = ProcessInfo.processInfo.systemUptime
                 let output = try await engine.synthesize(
                     text: benchmarkText,
                     speaker: speaker,
                     seed: benchmarkSeed
                 )
-                let wallMs = Date().timeIntervalSince(started) * 1_000
+                let wallMs = (ProcessInfo.processInfo.systemUptime - startedUptime) * 1_000
                 let audioSeconds = Double(output.pcm.count) / Double(WavWriter.sampleRate)
                 let realtimeSpeed = audioSeconds / max(wallMs / 1_000, 0.000_001)
                 let wav = WavWriter.data(from: output.pcm)
@@ -741,18 +771,44 @@ final class LabModel {
                 allAudioIdentical = allAudioIdentical && matchesFirstAudio
                 var ttfaMs = 0.0
                 var streamingMatches = false
+                var streamingEquivalent = false
+                var streamingDigest = ""
+                var streamingSampleCount = 0
+                var firstStreamingMismatch = -1
+                var maxStreamingSampleDelta = 0.0
                 if streaming {
                     let streamed = try await engine.synthesizeStreaming(
                         text: benchmarkText,
                         speaker: speaker,
                         seed: benchmarkSeed,
-                        packetFrames: 1
+                        packetFrames: packetFrames
                     )
                     ttfaMs = Double(streamed.firstAudioNanos) / 1_000_000
                     let streamingWav = WavWriter.data(from: streamed.pcm)
-                    let streamingDigest = SHA256.hash(data: streamingWav)
+                    streamingDigest = SHA256.hash(data: streamingWav)
                         .map { String(format: "%02x", $0) }.joined()
+                    streamingSampleCount = streamed.pcm.count
                     streamingMatches = streamingDigest == digest
+                    for index in 0..<min(output.pcm.count, streamed.pcm.count) {
+                        let whole = output.pcm[index]
+                        let packetized = streamed.pcm[index]
+                        if firstStreamingMismatch < 0,
+                           whole.bitPattern != packetized.bitPattern
+                        {
+                            firstStreamingMismatch = index
+                        }
+                        maxStreamingSampleDelta = max(
+                            maxStreamingSampleDelta,
+                            Double(abs(whole - packetized))
+                        )
+                    }
+                    if firstStreamingMismatch < 0,
+                       output.pcm.count != streamed.pcm.count
+                    {
+                        firstStreamingMismatch = min(output.pcm.count, streamed.pcm.count)
+                    }
+                    streamingEquivalent = output.pcm.count == streamed.pcm.count
+                        && maxStreamingSampleDelta <= 0.000_001
                 }
                 try appendReceipt([
                     "event": "sample",
@@ -769,13 +825,22 @@ final class LabModel {
                     "microdecoder_ms": profile.microdecoderMs,
                     "feedback_ms": profile.feedbackMs,
                     "codec_active_ms": profile.codecActiveMs,
+                    "codec_backpressure_ms": profile.codecBackpressureMs,
+                    "codec_tail_ms": profile.codecTailMs,
+                    "codec_user_initiated_qos_applied": profile.codecUserInitiatedQos,
                     "other_generation_ms": profile.otherGenerationMs,
+                    "generator_glue_ms": profile.generatorGlueMs,
                     "frames": profile.frames,
                     "team_partitions": profile.teamPartitions,
                     "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
                     "ttfa_ms": ttfaMs,
                     "streaming_measured": streaming,
                     "streaming_matches_whole_buffer": streamingMatches,
+                    "streaming_pcm_equivalent": streamingEquivalent,
+                    "streaming_wav_sha256": streamingDigest,
+                    "streaming_sample_count": streamingSampleCount,
+                    "streaming_first_mismatch_sample": firstStreamingMismatch,
+                    "streaming_max_abs_sample_delta": maxStreamingSampleDelta,
                 ])
                 validRuns += 1
             }
@@ -841,6 +906,12 @@ final class LabModel {
             .appendingPathComponent(
                 "franken_tts-\(ProcessInfo.processInfo.globallyUniqueString).wav")
         try wav.write(to: url)
+        // A completed synthesis supersedes the previous clip. Stop only now—not when
+        // synthesis begins—so a failed/cancelled forge leaves its prior export usable.
+        videoExportTask?.cancel()
+        videoExportTask = nil
+        isExportingVideo = false
+        videoProgress = 0
         wavUrl = url
         m4aUrl = nil
         videoUrl = nil
@@ -887,17 +958,30 @@ final class LabModel {
         videoProgress = 0
         let label = currentVoiceLabel
         let generation = synthesisGeneration
-        Task {
-            defer { isExportingVideo = false }
+        videoExportTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if generation == self.synthesisGeneration {
+                    self.isExportingVideo = false
+                    self.videoExportTask = nil
+                }
+            }
             do {
                 let rendered = try await MediaExporter.exportVideo(
                     pcm: audio, voiceLabel: label, wavUrl: wavUrl
                 ) { [weak self] fraction in
-                    Task { @MainActor in self?.videoProgress = fraction }
+                    Task { @MainActor in
+                        guard let self, generation == self.synthesisGeneration else { return }
+                        self.videoProgress = fraction
+                    }
                 }
-                if generation == synthesisGeneration { videoUrl = rendered }
+                if generation == self.synthesisGeneration { self.videoUrl = rendered }
+            } catch is CancellationError {
+                // A newer successful synthesis owns the share surface now.
             } catch {
-                lastError = error.localizedDescription
+                if generation == self.synthesisGeneration {
+                    self.lastError = error.localizedDescription
+                }
             }
         }
     }
@@ -934,6 +1018,7 @@ final class LabModel {
                         "the noise-removal file is missing; it downloads automatically — check the connection, relaunch, and try again")
                 }
                 let vector = try await engine.enroll(pcm: pcm)
+                isEngineWarm = true
                 let selected: UUID
                 if let target = enrollmentTarget {
                     try library.update(id: target, name: trimmedName, vector: vector)
@@ -976,7 +1061,12 @@ final class LabModel {
 
     /// Frees the ~2.3 GB engine heap; the next synthesis reloads it.
     func unloadEngineForMemoryPressure() {
-        guard !isSynthesizing, !isComparingVoices else { return }
+        guard !isSynthesizing,
+              !isComparingVoices,
+              !isEnrolling,
+              !isClearingModel,
+              !isProfilingBenchmark
+        else { return }
         // A callback already queued onto the main actor can outlive cancellation of
         // the warm task. Fence it before changing the visible warm/loading state.
         progressGeneration &+= 1
@@ -996,7 +1086,10 @@ final class LabModel {
               !isEngineWarm,
               engineWarmTask == nil,
               !isSynthesizing,
-              !isComparingVoices
+              !isComparingVoices,
+              !isEnrolling,
+              !isClearingModel,
+              !recorder.isRecording
         else { return }
 
         isLoadingModel = true
@@ -1039,8 +1132,34 @@ final class LabModel {
     }
 
     func clearModel() {
+        guard canClearModel else {
+            lastError = "Wait for the current voice operation to finish before clearing the model."
+            return
+        }
+
+        isClearingModel = true
+        progressGeneration &+= 1
+        engine.cancelCurrentWork()
+        engineWarmTask?.cancel()
+        engineWarmTask = nil
+        isEngineWarm = false
+        isLoadingModel = false
+        Task {
+            await engine.unload()
+            store.clear()
+            isClearingModel = false
+        }
+    }
+
+    /// A microphone capture must never continue after the app leaves the foreground.
+    /// Enrollment computation, however, already owns a completed in-memory take; keep
+    /// that work alive and let the engine actor finish when iOS resumes the process.
+    func prepareForBackground() {
+        if recorder.isRecording {
+            _ = recorder.stop()
+            lastError = "Recording stopped when FrankenTTS left the foreground. Tap Start recording to try again."
+        }
         unloadEngineForMemoryPressure()
-        store.clear()
     }
 
     func importDesktopFile(_ url: URL) {
@@ -1458,7 +1577,7 @@ struct LabView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background {
-                model.unloadEngineForMemoryPressure()
+                model.prepareForBackground()
             } else if phase == .active {
                 if !profilingRequested { model.warmEngineIfPossible() }
                 consumeStagedText()
@@ -1807,8 +1926,17 @@ struct LabView: View {
                                 .font(.system(size: Lab.typeSize(13), design: .monospaced))
                                 .foregroundStyle(Lab.textPrimary)
                             Spacer()
-                            Button("Clear") { model.clearModel() }
-                                .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                            Button {
+                                model.clearModel()
+                            } label: {
+                                if model.isClearingModel {
+                                    ProgressView().controlSize(.small).tint(Lab.danger)
+                                } else {
+                                    Text("Clear")
+                                }
+                            }
+                            .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                            .disabled(!model.canClearModel)
                         }
                         HStack(spacing: 8) {
                             if model.isLoadingModel {

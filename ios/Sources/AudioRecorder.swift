@@ -83,6 +83,7 @@ final class AudioRecorder {
     private let audioEngine = AVAudioEngine()
     private var sink: CaptureSink?
     private var timer: Timer?
+    private var recordingStartedUptime: TimeInterval?
 
     func start() throws {
         guard !isRecording else {
@@ -121,10 +122,13 @@ final class AudioRecorder {
         }
         isRecording = true
         seconds = 0
+        recordingStartedUptime = ProcessInfo.processInfo.systemUptime
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                self.seconds += 0.25
+                if let started = self.recordingStartedUptime {
+                    self.seconds = max(0, ProcessInfo.processInfo.systemUptime - started)
+                }
                 self.level = min(1, (self.sink?.levelPeek() ?? 0) * 1.6)
             }
         }
@@ -138,6 +142,7 @@ final class AudioRecorder {
         audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine.stop()
         isRecording = false
+        recordingStartedUptime = nil
         try? AVAudioSession.sharedInstance().setCategory(.playback)
         let samples = sink?.drain() ?? []
         sink = nil
