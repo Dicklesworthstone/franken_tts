@@ -90,6 +90,47 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertFalse(invalid)
     }
 
+    func testSafetensorsHeaderRejectsGapsOverlapsAndTrailingPayload() async throws {
+        let headers = [
+            "{\"a\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]},\"b\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[8,12]}}",
+            "{\"a\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]},\"b\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[4,8]}}",
+            "{\"a\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}",
+        ]
+        for header in headers {
+            let data = safetensorsFixture(header: header)
+            let url = temporaryURL(extension: "safetensors")
+            defer { try? FileManager.default.removeItem(at: url) }
+            try data.write(to: url)
+            let file = ModelFile(
+                asset: "fixture.safetensors",
+                relativePath: "fixture.safetensors",
+                bytes: Int64(data.count),
+                sha256: "unused"
+            )
+
+            let valid = try await ModelStore.hasValidContainerHeader(file: file, at: url)
+            XCTAssertFalse(valid)
+        }
+    }
+
+    func testSafetensorsHeaderAcceptsAZeroSizedTensorAtTheNextTensorStart() async throws {
+        let data = safetensorsFixture(
+            header: "{\"empty\":{\"dtype\":\"F32\",\"shape\":[0],\"data_offsets\":[0,0]},\"weight\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[0,16]}}"
+        )
+        let url = temporaryURL(extension: "safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try data.write(to: url)
+        let file = ModelFile(
+            asset: "fixture.safetensors",
+            relativePath: "fixture.safetensors",
+            bytes: Int64(data.count),
+            sha256: "unused"
+        )
+
+        let valid = try await ModelStore.hasValidContainerHeader(file: file, at: url)
+        XCTAssertTrue(valid)
+    }
+
     private func fttsqFixture() throws -> Data {
         let payloadOffset = 2_048
         let fileLength = 4_096

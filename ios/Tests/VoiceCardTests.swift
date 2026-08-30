@@ -29,4 +29,8 @@ final class VoiceCardTests: XCTestCase {
 
         XCTAssertEqual(analysis.waveHighs.last, 0.75)
     }
+
+    func testMosaicDecoderRefusesOverflowingImageGeometry() {
+        XCTAssertNil(VoiceCode.decode(pixels: [], width: Int.max, height: Int.max))
+    }
 }

@@ -710,11 +710,18 @@ final class ModelStore {
             else { return false }
             ranges.append((begin, end))
         }
-        ranges.sort { $0.0 < $1.0 }
-        for index in 1..<ranges.count where ranges[index - 1].1 > ranges[index].0 {
-            return false
+        ranges.sort {
+            $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 < $1.0
         }
-        return true
+        var cursor: UInt64 = 0
+        for range in ranges {
+            // Safetensors requires the payload to be indexed exactly once. Refusing
+            // gaps, trailers, and overlaps keeps this bounded launch check aligned
+            // with the Rust parser that will consume the same file during warm-up.
+            guard range.0 == cursor else { return false }
+            cursor = range.1
+        }
+        return cursor == payloadLength
     }
 
     private nonisolated static func nonemptyString(_ value: Any?) -> String? {

@@ -206,13 +206,19 @@ enum VoicePrintCard {
         // mosaic survives as long as its cells stay a couple of pixels wide, and the
         // decode buffers stay a sane size.
         let maxPixels = 24_000_000
-        let oversized = width * height > maxPixels
+        let sourcePixelCount = width.multipliedReportingOverflow(by: height)
+        guard !sourcePixelCount.overflow else { return nil }
+        let oversized = sourcePixelCount.partialValue > maxPixels
         if oversized {
-            let scale = (Double(maxPixels) / Double(width * height)).squareRoot()
+            let scale = (Double(maxPixels) / Double(sourcePixelCount.partialValue)).squareRoot()
             width = max(Int(Double(width) * scale), 1)
             height = max(Int(Double(height) * scale), 1)
         }
-        var rgba = [UInt8](repeating: 0, count: width * height * 4)
+        let pixelCount = width.multipliedReportingOverflow(by: height)
+        guard !pixelCount.overflow, pixelCount.partialValue <= maxPixels else { return nil }
+        let rgbaByteCount = pixelCount.partialValue.multipliedReportingOverflow(by: 4)
+        guard !rgbaByteCount.overflow else { return nil }
+        var rgba = [UInt8](repeating: 0, count: rgbaByteCount.partialValue)
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         guard let context = CGContext(
             data: &rgba, width: width, height: height, bitsPerComponent: 8,
@@ -222,8 +228,10 @@ enum VoicePrintCard {
         // Exact pixels when unscaled; proper area filtering when downscaling.
         context.interpolationQuality = oversized ? .high : .none
         context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-        var rgb = [UInt8](repeating: 0, count: width * height * 3)
-        for index in 0..<(width * height) {
+        let rgbByteCount = pixelCount.partialValue.multipliedReportingOverflow(by: 3)
+        guard !rgbByteCount.overflow else { return nil }
+        var rgb = [UInt8](repeating: 0, count: rgbByteCount.partialValue)
+        for index in 0..<pixelCount.partialValue {
             rgb[index * 3] = rgba[index * 4]
             rgb[index * 3 + 1] = rgba[index * 4 + 1]
             rgb[index * 3 + 2] = rgba[index * 4 + 2]

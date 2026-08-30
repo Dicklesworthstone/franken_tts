@@ -201,13 +201,17 @@ enum VoiceCode {
     /// Decode a voice from RGB24 pixels of any image containing the mosaic:
     /// original PNG, recompressed JPEG, or a screenshot from any size of phone.
     static func decode(pixels: [UInt8], width: Int, height: Int) -> (String, [Float])? {
-        guard width >= gridN, height >= gridN, pixels.count >= width * height * 3 else {
+        guard width >= gridN, height >= gridN else { return nil }
+        let pixelCount = width.multipliedReportingOverflow(by: height)
+        guard !pixelCount.overflow else { return nil }
+        let rgbByteCount = pixelCount.partialValue.multipliedReportingOverflow(by: 3)
+        guard !rgbByteCount.overflow, pixels.count >= rgbByteCount.partialValue else {
             return nil
         }
-        var luma = [Float](repeating: 0, count: width * height)
+        var luma = [Float](repeating: 0, count: pixelCount.partialValue)
         var minLuma = 255.0
         var maxLuma = 0.0
-        for index in 0..<(width * height) {
+        for index in 0..<pixelCount.partialValue {
             let at = index * 3
             let value = 0.299 * Double(pixels[at]) + 0.587 * Double(pixels[at + 1])
                 + 0.114 * Double(pixels[at + 2])

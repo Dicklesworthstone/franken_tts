@@ -24,6 +24,13 @@ use serde_json::Value;
 /// while keeping a corrupt `u64` from provoking a huge allocation.
 const MAX_HEADER_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Largest tensor directory accepted from one checkpoint.
+///
+/// The pinned model has fewer than one thousand tensors. This deliberately generous cap matches
+/// the canonical `.fttsq` reader and prevents a hostile 64 MiB JSON header from expanding into an
+/// effectively unbounded tree of owned names, shapes, and map nodes.
+const MAX_TENSORS: usize = 16_384;
+
 /// Element types we accept from a checkpoint.
 ///
 /// Deliberately narrow: the pinned Qwen3-TTS checkpoint is BF16 (talker) and F32 (speech
@@ -176,6 +183,31 @@ pub enum WeightsError {
         /// Declared shape.
         shape: Vec<usize>,
     },
+    /// The directory contains more tensor entries than this engine will allocate for.
+    TooManyTensors {
+        /// Tensor entries declared, excluding `__metadata__`.
+        count: usize,
+        /// Stable parser limit.
+        limit: usize,
+    },
+    /// Two tensors claim at least one of the same payload bytes.
+    OverlappingSpans {
+        /// Earlier tensor in payload order.
+        first: String,
+        /// Later tensor whose start lies inside `first`.
+        second: String,
+        /// Absolute end of `first`.
+        first_end: usize,
+        /// Absolute start of `second`.
+        second_begin: usize,
+    },
+    /// Some payload bytes are not claimed by any tensor.
+    UnindexedPayload {
+        /// First unclaimed absolute byte offset.
+        begin: usize,
+        /// End of the unclaimed absolute byte range.
+        end: usize,
+    },
 }
 
 impl fmt::Display for WeightsError {
@@ -222,6 +254,22 @@ impl fmt::Display for WeightsError {
             ),
             Self::ShapeOverflow { name, shape } => {
                 write!(f, "tensor `{name}`: shape {shape:?} overflows usize")
+            }
+            Self::TooManyTensors { count, limit } => {
+                write!(f, "checkpoint declares {count} tensors; limit is {limit}")
+            }
+            Self::OverlappingSpans {
+                first,
+                second,
+                first_end,
+                second_begin,
+            } => write!(
+                f,
+                "tensor `{second}` starts at byte {second_begin}, before tensor `{first}` ends at \
+                 byte {first_end}"
+            ),
+            Self::UnindexedPayload { begin, end } => {
+                write!(f, "safetensors payload has unindexed bytes {begin}..{end}")
             }
         }
     }
@@ -293,6 +341,16 @@ impl SafetensorsIndex {
 
         let payload_len = bytes.len() - payload_begin;
         let mut entries = BTreeMap::new();
+        let tensor_count = directory
+            .keys()
+            .filter(|name| *name != "__metadata__")
+            .count();
+        if tensor_count > MAX_TENSORS {
+            return Err(WeightsError::TooManyTensors {
+                count: tensor_count,
+                limit: MAX_TENSORS,
+            });
+        }
         for (name, value) in directory {
             // `__metadata__` is a free-form string map, not a tensor; skipping it is part of the
             // format, not a leniency.
@@ -301,6 +359,44 @@ impl SafetensorsIndex {
             }
             let entry = parse_entry(&name, &value, payload_begin, payload_len)?;
             entries.insert(name, entry);
+        }
+
+        // The safetensors byte buffer must be covered exactly once. Besides rejecting aliasing,
+        // complete coverage prevents a nominal checkpoint from doubling as a polyglot container
+        // with an unrelated payload hidden in a gap or trailer.
+        let mut spans: Vec<&TensorEntry> = entries.values().collect();
+        spans.sort_by(|left, right| {
+            left.begin
+                .cmp(&right.begin)
+                .then_with(|| left.end.cmp(&right.end))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        let mut cursor = payload_begin;
+        let mut previous: Option<&TensorEntry> = None;
+        for entry in spans {
+            if entry.begin < cursor {
+                return Err(WeightsError::OverlappingSpans {
+                    first: previous
+                        .map_or_else(|| "<payload>".to_owned(), |tensor| tensor.name.clone()),
+                    second: entry.name.clone(),
+                    first_end: cursor,
+                    second_begin: entry.begin,
+                });
+            }
+            if entry.begin > cursor {
+                return Err(WeightsError::UnindexedPayload {
+                    begin: cursor,
+                    end: entry.begin,
+                });
+            }
+            cursor = entry.end;
+            previous = Some(entry);
+        }
+        if cursor < bytes.len() {
+            return Err(WeightsError::UnindexedPayload {
+                begin: cursor,
+                end: bytes.len(),
+            });
         }
 
         Ok(Self {
@@ -861,6 +957,66 @@ mod tests {
         );
         let error = SafetensorsIndex::parse(&buffer).expect_err("must refuse");
         assert!(matches!(error, WeightsError::ShapeOverflow { .. }));
+    }
+
+    #[test]
+    fn refuses_overlapping_tensor_spans() {
+        let buffer = assemble(
+            &serde_json::json!({
+                "a": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]},
+                "b": {"dtype": "F32", "shape": [1], "data_offsets": [4, 8]}
+            }),
+            &[0u8; 8],
+        );
+
+        let error = SafetensorsIndex::parse(&buffer).expect_err("overlap must refuse");
+
+        assert!(matches!(error, WeightsError::OverlappingSpans { .. }));
+    }
+
+    #[test]
+    fn refuses_unindexed_payload_gaps_and_trailers() {
+        let gap = assemble(
+            &serde_json::json!({
+                "a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+                "b": {"dtype": "F32", "shape": [1], "data_offsets": [8, 12]}
+            }),
+            &[0u8; 12],
+        );
+        let trailer = assemble(
+            &serde_json::json!({
+                "a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}
+            }),
+            &[0u8; 8],
+        );
+
+        assert!(matches!(
+            SafetensorsIndex::parse(&gap).expect_err("gap must refuse"),
+            WeightsError::UnindexedPayload { .. }
+        ));
+        assert!(matches!(
+            SafetensorsIndex::parse(&trailer).expect_err("trailer must refuse"),
+            WeightsError::UnindexedPayload { .. }
+        ));
+    }
+
+    #[test]
+    fn refuses_an_excessive_tensor_directory_before_parsing_entries() {
+        let mut directory = serde_json::Map::new();
+        for index in 0..=MAX_TENSORS {
+            // Deliberately-invalid values prove that the allocation bound is checked
+            // before the parser starts cloning and validating every tensor entry.
+            directory.insert(format!("tensor_{index}"), Value::Null);
+        }
+        let buffer = assemble(&Value::Object(directory), &[]);
+
+        assert!(matches!(
+            SafetensorsIndex::parse(&buffer).expect_err("oversized directory must refuse"),
+            WeightsError::TooManyTensors {
+                count,
+                limit: MAX_TENSORS
+            } if count == MAX_TENSORS + 1
+        ));
     }
 
     #[test]

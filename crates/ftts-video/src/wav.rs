@@ -49,11 +49,28 @@ pub fn decode(data: &[u8]) -> Result<MonoAudio, String> {
                 let rate = le_u32(body, 4).ok_or("fmt chunk truncated")?;
                 let bits = le_u16(body, 14).ok_or("fmt chunk truncated")?;
                 // WAVE_FORMAT_EXTENSIBLE: the real format code is the first
-                // two bytes of the SubFormat GUID at offset 24.
-                if tag == 0xFFFE
-                    && let Some(subformat) = le_u16(body, 24)
-                {
-                    tag = subformat;
+                // two bytes of the SubFormat GUID at offset 24. The remaining GUID
+                // bytes are fixed; checking only the prefix would misclassify an
+                // unrelated or truncated extensible format as PCM.
+                if tag == 0xFFFE {
+                    let extension_size =
+                        le_u16(body, 16).ok_or("extensible fmt chunk truncated")?;
+                    let valid_bits = le_u16(body, 18).ok_or("extensible fmt chunk truncated")?;
+                    let subformat = body.get(24..40).ok_or("extensible fmt chunk truncated")?;
+                    let declared_end = 18usize + usize::from(extension_size);
+                    const WAVE_SUBFORMAT_TAIL: [u8; 14] = [
+                        0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+                        0x9B, 0x71,
+                    ];
+                    if extension_size < 22
+                        || body.len() < declared_end
+                        || valid_bits == 0
+                        || valid_bits > bits
+                        || subformat[2..] != WAVE_SUBFORMAT_TAIL
+                    {
+                        return Err("unsupported WAVE_FORMAT_EXTENSIBLE descriptor".to_owned());
+                    }
+                    tag = u16::from_le_bytes([subformat[0], subformat[1]]);
                 }
                 format = Some((tag, channels, rate, bits));
             }
@@ -115,13 +132,18 @@ pub fn decode(data: &[u8]) -> Result<MonoAudio, String> {
             .iter()
             .map(|b| i32::from_le_bytes(*b) as f32 / 2_147_483_648.0)
             .collect(),
-        (3, 32) => payload
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect(),
-        _ => unreachable!("encoding was validated above"),
+        (3, 32) => {
+            let mut decoded = Vec::with_capacity(payload.len() / 4);
+            for bytes in payload.as_chunks::<4>().0 {
+                let sample = f32::from_le_bytes(*bytes);
+                if !sample.is_finite() {
+                    return Err("IEEE-float WAV contains a non-finite sample".to_owned());
+                }
+                decoded.push(sample.clamp(-1.0, 1.0));
+            }
+            decoded
+        }
+        _ => return Err("internal WAV encoding validation drift".to_owned()),
     };
 
     if !frames.len().is_multiple_of(channels) {
@@ -213,8 +235,10 @@ mod tests {
         extra.extend_from_slice(&22_u16.to_le_bytes());
         extra.extend_from_slice(&32_u16.to_le_bytes());
         extra.extend_from_slice(&0_u32.to_le_bytes());
-        extra.extend_from_slice(&3_u16.to_le_bytes()); // SubFormat: IEEE float
-        extra.extend_from_slice(&[0; 14]);
+        extra.extend_from_slice(&[
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+            0x9B, 0x71,
+        ]); // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
         let data: Vec<u8> = [0.25_f32, -1.0]
             .iter()
             .flat_map(|s| s.to_le_bytes())
@@ -222,6 +246,49 @@ mod tests {
         let audio =
             decode(&wav_with_fmt_extra(0xFFFE, 1, 24000, 32, &extra, &data)).expect("valid wav");
         assert_eq!(audio.samples, [0.25, -1.0]);
+    }
+
+    #[test]
+    fn extensible_rejects_a_nonstandard_subformat_guid() {
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&22_u16.to_le_bytes());
+        extra.extend_from_slice(&32_u16.to_le_bytes());
+        extra.extend_from_slice(&0_u32.to_le_bytes());
+        extra.extend_from_slice(&3_u16.to_le_bytes());
+        extra.extend_from_slice(&[0; 14]);
+
+        assert!(decode(&wav_with_fmt_extra(0xFFFE, 1, 24000, 32, &extra, &[0; 4])).is_err());
+    }
+
+    #[test]
+    fn extensible_rejects_a_declared_extension_larger_than_the_fmt_chunk() {
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&23_u16.to_le_bytes());
+        extra.extend_from_slice(&32_u16.to_le_bytes());
+        extra.extend_from_slice(&0_u32.to_le_bytes());
+        extra.extend_from_slice(&[
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+            0x9B, 0x71,
+        ]);
+
+        assert!(decode(&wav_with_fmt_extra(0xFFFE, 1, 24000, 32, &extra, &[0; 4])).is_err());
+    }
+
+    #[test]
+    fn ieee_float_refuses_nonfinite_and_clamps_finite_overrange_samples() {
+        let finite: Vec<u8> = [-2.0_f32, 0.25, 1.5]
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let decoded = decode(&wav(3, 1, 24000, 32, &finite)).expect("finite float WAV");
+        assert_eq!(decoded.samples, [-1.0, 0.25, 1.0]);
+
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                decode(&wav(3, 1, 24000, 32, &invalid.to_le_bytes())).is_err(),
+                "non-finite sample {invalid:?} must refuse"
+            );
+        }
     }
 
     #[test]
