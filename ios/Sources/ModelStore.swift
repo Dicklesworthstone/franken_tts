@@ -303,7 +303,7 @@ final class ModelStore {
             try? directory.setResourceValues(values)
             try requireEnoughFreeStorage()
 
-            let started = Date()
+            let started = ProcessInfo.processInfo.systemUptime
             let startingBytes = cachedBytes
             for (index, file) in ModelManifest.files.enumerated() {
                 try requireActive(taskID)
@@ -334,7 +334,7 @@ final class ModelStore {
 
     private func ensure(
         file: ModelFile,
-        started: Date,
+        started: TimeInterval,
         startingBytes: Int64,
         taskID: UUID
     ) async throws {
@@ -451,8 +451,8 @@ final class ModelStore {
         guard activeTaskID == taskID else { throw CancellationError() }
     }
 
-    private func updateProgress(asset: String, started: Date, startingBytes: Int64) {
-        let elapsed = Date().timeIntervalSince(started)
+    private func updateProgress(asset: String, started: TimeInterval, startingBytes: Int64) {
+        let elapsed = max(0, ProcessInfo.processInfo.systemUptime - started)
         let transferred = max(0, cachedBytes - startingBytes)
         let measuredRate = elapsed > 0.8 ? Double(transferred) / elapsed : 0
         if measuredRate > 0 {

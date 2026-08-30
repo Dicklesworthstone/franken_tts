@@ -24,6 +24,18 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertFalse(model.canClearModel)
     }
 
+    @MainActor
+    func testFinishedAudioKeepsItsProducingVoiceLabelAfterSelectionChanges() {
+        let model = LabModel()
+        model.selectedVoice = "matt"
+        model.lastAudioVoiceLabel = model.currentVoiceLabel
+
+        model.selectedVoice = "james"
+
+        XCTAssertEqual(model.currentVoiceLabel, "James")
+        XCTAssertEqual(model.lastAudioExportVoiceLabel, "Matt")
+    }
+
     func testFttsqHeaderRejectsAnExactSizeZeroFilledFile() async throws {
         let file = ModelFile(
             asset: "fixture.fttsq",

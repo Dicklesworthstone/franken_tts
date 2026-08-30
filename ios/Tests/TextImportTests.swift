@@ -74,6 +74,39 @@ final class TextImportTests: XCTestCase {
     }
 
     @MainActor
+    func testClearRevokesAnInFlightPDFImport() async throws {
+        let renderer = UIGraphicsPDFRenderer(
+            bounds: CGRect(x: 0, y: 0, width: 612, height: 792)
+        )
+        let data = renderer.pdfData { context in
+            for page in 0..<80 {
+                context.beginPage()
+                (("Laboratory page \(page) " + String(repeating: "specimen ", count: 80)) as NSString)
+                    .draw(in: CGRect(x: 48, y: 48, width: 516, height: 690))
+            }
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("frankentts-cancelled-pdf-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try data.write(to: url)
+
+        let model = LabModel()
+        model.text = "Text that should be replaced only if the import still owns the editor."
+        model.importDesktopFile(url)
+        await Task.yield()
+
+        model.clearUtterance()
+        XCTAssertEqual(model.text, "")
+        XCTAssertFalse(model.isImportingText)
+
+        // PDFKit does not cooperatively cancel page extraction. Give the detached worker
+        // time to finish and prove its stale result cannot resurrect the cleared document.
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(model.text, "")
+        XCTAssertFalse(model.isImportingText)
+    }
+
+    @MainActor
     func testReadableHTMLPrefersArticleAndDropsNavigation() async throws {
         let html = """
         <!doctype html><html><head><title>Test page</title></head><body>

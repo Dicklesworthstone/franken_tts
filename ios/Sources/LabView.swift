@@ -52,6 +52,7 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
     let maximumLength: Int
     let focusRequest: Int
     let selectAllRequest: Int
+    let externalRevision: Int
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -82,9 +83,17 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
         context.coordinator.parent = self
 
         // A delegate edit updates the binding before this method is called, so the
-        // strings normally match. Only assign for an external action (clear, joke,
-        // import), and never tear down an active IME composition.
-        if textView.text != text, textView.markedTextRange == nil {
+        // strings normally match. Explicit external actions carry a revision: they own
+        // the requested replacement and must also work while autocorrect/IME has marked
+        // text. Commit that composition before applying Clear/import/joke, rather than
+        // ignoring the action and letting the old document overwrite the model later.
+        let externalChange = context.coordinator.lastExternalRevision != externalRevision
+        if externalChange {
+            context.coordinator.isApplyingExternalChange = true
+            context.coordinator.lastExternalRevision = externalRevision
+            if textView.markedTextRange != nil { textView.unmarkText() }
+        }
+        if textView.text != text, externalChange || textView.markedTextRange == nil {
             let oldSelection = textView.selectedRange
             textView.text = text
             let utf16Count = (text as NSString).length
@@ -94,6 +103,7 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
                 length: min(oldSelection.length, max(0, utf16Count - location))
             )
         }
+        if externalChange { context.coordinator.isApplyingExternalChange = false }
 
         // UIKit remains the source of truth for ordinary tap focus. SwiftUI view
         // updates can arrive with a stale boolean during the same event; using that
@@ -119,11 +129,14 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
         var parent: NativeUtteranceEditor
         var lastFocusRequest: Int
         var lastSelectAllRequest: Int
+        var lastExternalRevision: Int
+        var isApplyingExternalChange = false
 
         init(parent: NativeUtteranceEditor) {
             self.parent = parent
             lastFocusRequest = parent.focusRequest
             lastSelectAllRequest = parent.selectAllRequest
+            lastExternalRevision = parent.externalRevision
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
@@ -135,6 +148,7 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
         }
 
         func textViewDidChange(_ textView: UITextView) {
+            guard !isApplyingExternalChange else { return }
             // Do not normalize or truncate marked text mid-composition. The delegate
             // range gate below handles ordinary edits; this is a defensive backstop
             // for input systems that commit marked text in one operation.
@@ -365,6 +379,9 @@ final class LabModel {
     var enrollmentSaved = false
 
     var text = JokeLibrary.random()
+    /// Bumped only for non-keyboard replacements so UIKit can reliably distinguish
+    /// an explicit Clear/import/joke from an ordinary delegate-driven keystroke.
+    var utteranceExternalRevision = 0
     var seed: UInt64 = 0
 
     var isSynthesizing = false
@@ -386,6 +403,11 @@ final class LabModel {
     var isImportingText = false
     var isClearingModel = false
     var lastAudio: [Float]?
+    /// The voice that produced `lastAudio`, snapshotted when the run starts.
+    ///
+    /// `selectedVoice` remains freely browsable after synthesis. Export metadata must
+    /// describe the audio the user actually hears, not whichever tile they tapped later.
+    var lastAudioVoiceLabel: String?
     var lastRealTimeFactor: Double?
     var lastProfile: SynthesisProfile?
     var synthesisChunkIndex = 1
@@ -468,6 +490,16 @@ final class LabModel {
         let text = self.text
         let chunks = UtteranceChunker.split(text)
         guard !chunks.isEmpty else { return }
+        let speaker: [Float]
+        let voiceLabel = currentVoiceLabel
+        do {
+            // Snapshot the exact conditioning at button press. Resolving it after the
+            // asynchronous task starts lets a fast voice-tile tap silently change the run.
+            speaker = try speakerVector()
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
         player?.pause()
         isSynthesizing = true
         progressGeneration &+= 1
@@ -486,11 +518,12 @@ final class LabModel {
         eta.reset(text: text, warm: beganWarm)
         activity.begin()
         let seed = self.seed
-        let runStartedAt = Date()
+        let runStartedAt = ProcessInfo.processInfo.systemUptime
         let ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                self.synthesisSeconds = Date().timeIntervalSince(runStartedAt)
+                self.synthesisSeconds = max(
+                    0, ProcessInfo.processInfo.systemUptime - runStartedAt)
                 self.estimatedRemainingSeconds = self.eta.remainingSeconds(
                     at: self.synthesisSeconds
                 )
@@ -504,7 +537,6 @@ final class LabModel {
                 UIApplication.shared.isIdleTimerDisabled = false
             }
             do {
-                let speaker = try speakerVector()
                 if await !engine.isLoaded {
                     isLoadingModel = true
                     try await engine.load(modelDirectory: store.modelDirectory) { [weak self] event in
@@ -527,7 +559,7 @@ final class LabModel {
                     guard !cancellationRequested else { throw EngineError.cancelled }
                     synthesisChunkIndex = index + 1
                     let frameOffset = completedSynthesisFrames
-                    let started = Date()
+                    let started = ProcessInfo.processInfo.systemUptime
                     let output = try await engine.synthesize(
                         text: chunk.text,
                         speaker: speaker,
@@ -542,7 +574,8 @@ final class LabModel {
                             )
                         }
                     }
-                    synthesisElapsed += Date().timeIntervalSince(started)
+                    synthesisElapsed += max(
+                        0, ProcessInfo.processInfo.systemUptime - started)
                     guard !cancellationRequested else { throw EngineError.cancelled }
 
                     if let profile = output.profile {
@@ -560,7 +593,9 @@ final class LabModel {
                     if denoiseAvailable {
                         forge.phase = .denoising
                         if index == chunks.count - 1 {
-                            eta.beginDenoise(elapsed: Date().timeIntervalSince(runStartedAt))
+                            eta.beginDenoise(
+                                elapsed: max(
+                                    0, ProcessInfo.processInfo.systemUptime - runStartedAt))
                         }
                         chunkPCM = (try? await engine.denoise(pcm: chunkPCM)) ?? chunkPCM
                     }
@@ -580,27 +615,28 @@ final class LabModel {
                     completedCharacters += chunk.text.count
                     eta.observeCompletedFraction(
                         Double(completedCharacters) / Double(max(1, text.count)),
-                        elapsed: Date().timeIntervalSince(runStartedAt)
+                        elapsed: max(0, ProcessInfo.processInfo.systemUptime - runStartedAt)
                     )
                 }
 
                 guard !cancellationRequested else { throw EngineError.cancelled }
-                lastProfile = everyProfileAvailable ? aggregateProfile : nil
+                let completedProfile = everyProfileAvailable ? aggregateProfile : nil
                 forge.generatedFrames = completedSynthesisFrames
                 forge.decodedFrames = max(forge.decodedFrames, completedSynthesisFrames)
                 forge.decodedSamples = UInt64(generatedSampleCount)
                 let factor = (Double(generatedSampleCount) / Double(WavWriter.sampleRate))
                     / max(0.000_001, synthesisElapsed)
-                lastRealTimeFactor = factor
-                UserDefaults.standard.set(factor, forKey: "measuredRealTimeFactor")
-                synthesisSeconds = Date().timeIntervalSince(runStartedAt)
+                synthesisSeconds = max(
+                    0, ProcessInfo.processInfo.systemUptime - runStartedAt)
                 eta.finish(
                     elapsed: synthesisSeconds,
                     frames: completedSynthesisFrames
                 )
                 estimatedRemainingSeconds = nil
-                lastAudio = pcm
-                try startPlayback(of: pcm)
+                try startPlayback(of: pcm, voiceLabel: voiceLabel)
+                lastProfile = completedProfile
+                lastRealTimeFactor = factor
+                UserDefaults.standard.set(factor, forKey: "measuredRealTimeFactor")
                 progressGeneration &+= 1
                 forge.phase = .complete
                 activity.finish(
@@ -898,14 +934,24 @@ final class LabModel {
         }
     }
 
-    private func startPlayback(of pcm: [Float]) throws {
+    private func startPlayback(of pcm: [Float], voiceLabel: String) throws {
         let wav = WavWriter.data(from: pcm)
         // Unique per synthesis: an in-flight video export reads the previous WAV for its
         // audio track, and overwriting it mid-read would mux corrupt audio.
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "franken_tts-\(ProcessInfo.processInfo.globallyUniqueString).wav")
+        var committed = false
+        defer {
+            if !committed { try? FileManager.default.removeItem(at: url) }
+        }
         try wav.write(to: url)
+        try AVAudioSession.sharedInstance().setCategory(.playback)
+        let preparedPlayer = try AVAudioPlayer(contentsOf: url)
+
+        // Everything that can fail is complete. Publish the PCM, player, URLs, and
+        // producing voice as one coherent result so the UI can never pair new samples
+        // with the previous run's player or share artifacts.
         // A completed synthesis supersedes the previous clip. Stop only now—not when
         // synthesis begins—so a failed/cancelled forge leaves its prior export usable.
         videoExportTask?.cancel()
@@ -917,9 +963,11 @@ final class LabModel {
         videoUrl = nil
         synthesisGeneration += 1
         let generation = synthesisGeneration
-        try AVAudioSession.sharedInstance().setCategory(.playback)
-        player = try AVAudioPlayer(contentsOf: url)
+        lastAudio = pcm
+        player = preparedPlayer
+        lastAudioVoiceLabel = voiceLabel
         player?.play()
+        committed = true
         // The share default is the small file; convert as soon as audio exists.
         Task {
             let converted = try? await MediaExporter.exportM4A(fromWav: url)
@@ -952,11 +1000,15 @@ final class LabModel {
         return selectedVoice.capitalized
     }
 
+    var lastAudioExportVoiceLabel: String {
+        lastAudioVoiceLabel ?? currentVoiceLabel
+    }
+
     func exportVideo() {
         guard let wavUrl, let audio = lastAudio, !isExportingVideo else { return }
         isExportingVideo = true
         videoProgress = 0
-        let label = currentVoiceLabel
+        let label = lastAudioExportVoiceLabel
         let generation = synthesisGeneration
         videoExportTask = Task { [weak self] in
             guard let self else { return }
@@ -1253,7 +1305,40 @@ final class LabModel {
         }
     }
 
+    /// Replaces the editor contents in response to an explicit user action.
+    ///
+    /// PDFKit extraction is deliberately off the main actor and can outlive the tap that
+    /// started it. A manual edit, Clear, joke selection, or system handoff must revoke that
+    /// task's publication right; otherwise a late PDF result can resurrect text the user
+    /// already removed and make the editor appear impossible to clear.
+    func replaceUtteranceFromUser(with value: String) {
+        cancelTextImport()
+        utteranceExternalRevision &+= 1
+        text = String(value.prefix(JokeLibrary.maximumUtteranceLength))
+    }
+
+    func updateUtteranceFromEditor(_ value: String) {
+        cancelTextImport()
+        text = String(value.prefix(JokeLibrary.maximumUtteranceLength))
+    }
+
+    func clearUtterance() {
+        cancelTextImport()
+        textImportNotice = nil
+        utteranceExternalRevision &+= 1
+        text = ""
+    }
+
+    private func cancelTextImport() {
+        guard importTask != nil || isImportingText else { return }
+        importGeneration &+= 1
+        importTask?.cancel()
+        importTask = nil
+        isImportingText = false
+    }
+
     private func replaceUtterance(with imported: String, wasTruncated: Bool = false) {
+        utteranceExternalRevision &+= 1
         text = String(imported.prefix(JokeLibrary.maximumUtteranceLength))
         if wasTruncated || imported.count > JokeLibrary.maximumUtteranceLength {
             textImportNotice = "Imported the first 50,000 characters. The source was longer than the utterance limit."
@@ -1653,7 +1738,7 @@ struct LabView: View {
 
     private func consumeStagedText() {
         guard let staged = FrankenTTSSharedStore.consumeStagedText(), !staged.isEmpty else { return }
-        model.text = String(staged.prefix(JokeLibrary.maximumUtteranceLength))
+        model.replaceUtteranceFromUser(with: staged)
         focusUtteranceAfterCurrentTap()
     }
 
@@ -2289,7 +2374,7 @@ struct LabView: View {
                         .accessibilityLabel("Select all")
                         .accessibilityHint("Selects the entire utterance so typing replaces it")
                         Button {
-                            model.text = ""
+                            model.clearUtterance()
                             focusUtteranceAfterCurrentTap()
                         } label: {
                             Image(systemName: "xmark.circle.fill")
@@ -2311,7 +2396,7 @@ struct LabView: View {
                             .disabled(model.text.isEmpty)
                             .accessibilityHint("Selects the entire utterance so typing replaces it")
                         Button {
-                            model.text = ""
+                            model.clearUtterance()
                             focusUtteranceAfterCurrentTap()
                         } label: {
                             Label("Clear", systemImage: "xmark.circle.fill")
@@ -2332,11 +2417,15 @@ struct LabView: View {
                             .allowsHitTesting(false)
                     }
                     NativeUtteranceEditor(
-                        text: $model.text,
+                        text: Binding(
+                            get: { model.text },
+                            set: { model.updateUtteranceFromEditor($0) }
+                        ),
                         isFocused: $isUtteranceFocused,
                         maximumLength: JokeLibrary.maximumUtteranceLength,
                         focusRequest: utteranceFocusRequest,
-                        selectAllRequest: utteranceSelectAllRequest
+                        selectAllRequest: utteranceSelectAllRequest,
+                        externalRevision: model.utteranceExternalRevision
                     )
                 }
                 // More vertical room makes drag handles and the magnifier
@@ -2358,7 +2447,9 @@ struct LabView: View {
                         .font(.system(size: Lab.typeSize(11), design: .monospaced))
                         .foregroundStyle(Lab.textSecondary)
                     Button {
-                        model.text = JokeLibrary.random(excluding: model.text)
+                        model.replaceUtteranceFromUser(
+                            with: JokeLibrary.random(excluding: model.text)
+                        )
                         dismissKeyboard()
                     } label: {
                         Image(systemName: "dice.fill")
@@ -2739,7 +2830,7 @@ struct LabView: View {
             let url = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ftts-debug-video.wav")
             try? wav.write(to: url)
-            let started = Date()
+            let started = ProcessInfo.processInfo.systemUptime
             NSLog("FTTS_DEBUG_VIDEO starting: \(pcm.count) samples")
             Task {
                 do {
@@ -2749,11 +2840,11 @@ struct LabView: View {
                         let percent = Int(fraction * 100)
                         if percent % 10 == 0 {
                             NSLog("FTTS_DEBUG_VIDEO %d%% at %.1fs", percent,
-                                Date().timeIntervalSince(started))
+                                ProcessInfo.processInfo.systemUptime - started)
                         }
                     }
                     NSLog("FTTS_DEBUG_VIDEO done in %.1fs: %@",
-                        Date().timeIntervalSince(started), out.path)
+                        ProcessInfo.processInfo.systemUptime - started, out.path)
                 } catch {
                     NSLog("FTTS_DEBUG_VIDEO FAILED: \(error.localizedDescription)")
                 }

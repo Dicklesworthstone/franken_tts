@@ -175,12 +175,12 @@ final class VoiceComparisonSession {
         observedVoiceSeconds = 0
         model.isComparingVoices = true
 
-        let started = Date()
+        let started = ProcessInfo.processInfo.systemUptime
         tickerTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(250))
                 guard let self, self.runID == thisRun, self.isRunning else { return }
-                self.elapsed = Date().timeIntervalSince(started)
+                self.elapsed = max(0, ProcessInfo.processInfo.systemUptime - started)
             }
         }
 
@@ -253,10 +253,10 @@ final class VoiceComparisonSession {
                 // Native delivery is complete here, but each card's mastering and
                 // atomic WAV write happens off the main actor. Retain run ownership
                 // until every delivered voice is genuinely playable (or failed).
-                let masteringDeadline = Date().addingTimeInterval(60)
+                let masteringDeadline = ProcessInfo.processInfo.systemUptime + 60
                 while self.settledCount < self.candidates.count {
                     try Task.checkCancellation()
-                    guard Date() < masteringDeadline else {
+                    guard ProcessInfo.processInfo.systemUptime < masteringDeadline else {
                         throw EngineError.native(
                             "audio mastering did not settle after the voice engine finished")
                     }
