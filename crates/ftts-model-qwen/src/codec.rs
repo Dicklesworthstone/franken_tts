@@ -701,14 +701,15 @@ pub fn forward_codec_pre_transformer(
 /// fingerprint ever disagrees (a dropped checkpoint's allocation reused), the entry is
 /// requantized rather than trusted. This stays a private implementation detail of
 /// [`dense_linear`]; the artifact-fed `.fttspack` route replaces it when that lands.
-/// One memoized quantization: the weight's first/last element bits plus its Q8 form.
+type QuantMemoKey = (usize, usize, usize, usize);
 type QuantMemoEntry = Arc<(u32, u32, QuantizedMatrix)>;
+type QuantMemoMap = Mutex<HashMap<QuantMemoKey, QuantMemoEntry>>;
 
 struct CodecInt8Route {
     plan: KernelPlanV0,
     transformer: bool,
     convnext: bool,
-    memo: Mutex<HashMap<(usize, usize, usize, usize), QuantMemoEntry>>,
+    memo: QuantMemoMap,
 }
 
 /// Which family of dense projections a [`dense_linear`] call belongs to.
@@ -770,9 +771,7 @@ pub(crate) fn clear_codec_int8_memo() {
     }
 }
 
-fn clear_codec_int8_memo_entries(
-    memo: &Mutex<HashMap<(usize, usize, usize, usize), QuantMemoEntry>>,
-) {
+fn clear_codec_int8_memo_entries(memo: &QuantMemoMap) {
     memo.lock().expect("codec int8 memo poisoned").clear();
 }
 
