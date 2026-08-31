@@ -1275,6 +1275,12 @@ pub fn quantize_output_channel_q8(
     }
 
     let scale = maximum / 127.0;
+    if scale == 0.0 {
+        // A subnormal maximum can flush the division to zero; value/scale would then be inf or
+        // NaN. A row this close to zero rounds to the zero row it effectively is.
+        output.fill(0);
+        return Ok(1.0);
+    }
     for (&value, slot) in row.iter().zip(output) {
         let rounded = (value / scale).clamp(-127.0, 127.0).round_ties_even();
         // The clamp above proves this conversion is in the i8 range, and the symmetric contract
