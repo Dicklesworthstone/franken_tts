@@ -328,7 +328,8 @@ impl AudioDiagnostics {
         let mut warnings = Vec::new();
         if self.clipping_fraction > CLIP_WARN_FRACTION {
             warnings.push(format!(
-                "reference is hard-clipped ({:.2}% of samples at rail; longest run {}                  samples) - clipping survives cleanup and clones as distortion",
+                "reference is hard-clipped ({:.2}% of samples at rail; longest run {} \
+                 samples) - clipping survives cleanup and clones as distortion",
                 self.clipping_fraction * 100.0,
                 self.longest_clip_run
             ));
@@ -343,7 +344,8 @@ impl AudioDiagnostics {
         }
         if self.music_bed_likelihood > MUSIC_WARN_FRACTION {
             warnings.push(format!(
-                "sustained tonal background detected ({:.0}% of frames) - background music                  reproduces in the clone under continuation-style conditioning",
+                "sustained tonal background detected ({:.0}% of frames) - background music \
+                 reproduces in the clone under continuation-style conditioning",
                 self.music_bed_likelihood * 100.0
             ));
         }
