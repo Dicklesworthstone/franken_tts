@@ -67,6 +67,29 @@ final class VoiceLibrary {
         voices.first { $0.id == id }
     }
 
+    /// Return a friendly, unused label so a new enrollment can begin immediately.
+    /// Voice names are presentation labels rather than storage keys, but avoiding
+    /// duplicates makes the library and the synthesis picker unambiguous.
+    func suggestedEnrollmentName(base: String = "My Voice") -> String {
+        let trimmedBase = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        let root = trimmedBase.isEmpty ? "My Voice" : trimmedBase
+
+        func isAvailable(_ candidate: String) -> Bool {
+            !voices.contains { voice in
+                voice.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .localizedCaseInsensitiveCompare(candidate) == .orderedSame
+            }
+        }
+
+        if isAvailable(root) { return root }
+
+        var suffix = 2
+        while !isAvailable("\(root) \(suffix)") {
+            suffix += 1
+        }
+        return "\(root) \(suffix)"
+    }
+
     @discardableResult
     func add(name: String, vector: [Float]) throws -> EnrolledVoice {
         let voice = EnrolledVoice(id: UUID(), name: name, vector: vector)

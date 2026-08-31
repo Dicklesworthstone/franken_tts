@@ -1374,7 +1374,8 @@ struct LabView: View {
     }
 
     @State private var model = LabModel()
-    @State private var showEnrollment = false
+    @State private var showEnrollment =
+        ProcessInfo.processInfo.environment["FTTS_DEBUG_ENROLLMENT"] == "1"
     @State private var showGalaxy = false
     @State private var showSpecimen = false
     @State private var showVoiceLab = ProcessInfo.processInfo.environment["FTTS_OPEN_VOICE_LIBRARY"] == "1"
@@ -3274,7 +3275,18 @@ struct EnrolledVoiceTile: View {
 struct EnrollmentSheet: View {
     @Bindable var model: LabModel
     @Environment(\.dismiss) private var dismiss
-    @State private var cloneName = ""
+    @State private var cloneName: String
+
+    init(model: LabModel) {
+        self.model = model
+        if let target = model.enrollmentTarget,
+           let voice = model.library.voice(id: target)
+        {
+            _cloneName = State(initialValue: voice.name)
+        } else {
+            _cloneName = State(initialValue: model.library.suggestedEnrollmentName())
+        }
+    }
 
     private static let script = """
         Please call Stella. Ask her to bring these things with her from the store: six \
@@ -3312,6 +3324,7 @@ struct EnrollmentSheet: View {
                     // Locked once recording starts: the name is required to save, and
                     // clearing it mid-read would cost the whole take at auto-stop.
                     .disabled(model.isEnrolling || model.recorder.isRecording)
+                    .accessibilityIdentifier("enrollment-name")
                 if model.recorder.isRecording {
                     // The live meter is the tell that the microphone is actually hearing
                     // you; a silent bar during the script means stop and fix it now, not
@@ -3356,6 +3369,14 @@ struct EnrollmentSheet: View {
                         .buttonStyle(PrimaryButtonStyle())
                     } else if !model.isEnrolling {
                         Button("🎙 Start recording") {
+                            // Starting a recording must never be a silent no-op. If the
+                            // user cleared the suggested label, restore a unique one;
+                            // it remains editable until the microphone actually starts.
+                            if cloneName.trimmingCharacters(in: .whitespacesAndNewlines)
+                                .isEmpty
+                            {
+                                cloneName = model.library.suggestedEnrollmentName()
+                            }
                             do {
                                 try model.recorder.start()
                             } catch {
@@ -3363,10 +3384,10 @@ struct EnrollmentSheet: View {
                             }
                         }
                         .buttonStyle(PrimaryButtonStyle())
-                        // The name is the save key; requiring it up front beats losing a
-                        // recording to a validation error after the read.
-                        .disabled(
-                            cloneName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityIdentifier("enrollment-start-recording")
+                        .accessibilityHint(
+                            "Starts recording immediately. You can edit the suggested voice name first."
+                        )
                     }
                     Spacer()
                     Button("Cancel") {
@@ -3403,11 +3424,6 @@ struct EnrollmentSheet: View {
         .onAppear {
             model.lastError = nil
             model.enrollmentSaved = false
-            if let target = model.enrollmentTarget,
-                let voice = model.library.voice(id: target)
-            {
-                cloneName = voice.name
-            }
         }
         .onDisappear {
             // Failsafe for any dismissal path: the microphone never outlives the sheet.
