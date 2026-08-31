@@ -1514,7 +1514,7 @@ static SIGNAL_HOOK: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| {
         let Ok(guard) = ACTIVE_CANCEL.lock() else {
             return;
         };
-        let Some(state) = guard.as_ref() else {
+        let Some(state) = guard.as_ref().cloned() else {
             drop(guard);
             // No `say` run is served: the strike belongs to a live `ftts talk`
             // session. Strike one cancels cooperatively through the router; any
@@ -1542,7 +1542,10 @@ static SIGNAL_HOOK: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| {
             + 1;
         drop(guard);
         match next_strike_action(seen) {
-            StrikeAction::Trip => trip_active_cancel(),
+            // SAFETY: trip the exact run observed above. Re-reading ACTIVE_CANCEL
+            // here would let a completed run A be replaced by run B between the
+            // lookup and the trip, incorrectly delivering A's signal to B.
+            StrikeAction::Trip => trip_cancel_state(&state),
             StrikeAction::ForceExit => {
                 std::process::exit(i32::from(FttsExitCode::Cancelled.as_u8()));
             }
@@ -1581,17 +1584,12 @@ fn install_talk_signal_handler() {
     LazyLock::force(&SIGNAL_HOOK);
 }
 
-/// Record the cancellation and trip whichever engine token is currently serving.
-fn trip_active_cancel() {
-    let Ok(guard) = ACTIVE_CANCEL.lock() else {
-        return;
-    };
-    if let Some(state) = guard.as_ref() {
-        state
-            .tripped
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        state.token.cancel();
-    }
+/// Record cancellation on the exact run selected by the signal handler.
+fn trip_cancel_state(state: &CancelState) {
+    state
+        .tripped
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state.token.cancel();
 }
 
 /// Finalize what a cancelled run already delivered and word the disposition for the
@@ -5435,18 +5433,29 @@ mod tests {
     /// the same routine the hook calls must flip both the flag and the engine token,
     /// which is what `was_tripped` reports to the run's error paths.
     #[test]
-    fn trip_active_cancel_marks_the_state_and_token() {
-        let cancel = std::sync::Arc::new(CancelState::new());
-        assert!(!cancel.was_tripped(), "fresh state starts untripped");
+    fn a_signal_never_crosses_from_the_observed_run_into_its_successor() {
+        for _ in 0..10 {
+            let observed = std::sync::Arc::new(CancelState::new());
+            let successor = std::sync::Arc::new(CancelState::new());
 
-        // Install as the served run, then trip exactly as the signal hook would.
-        *ACTIVE_CANCEL.lock().expect("lock") = Some(cancel.clone());
-        cancel.token.cancel();
-        trip_active_cancel();
+            // This is the handler's exact TOCTOU boundary: it cloned A while
+            // holding ACTIVE_CANCEL, then B became active before the trip.
+            *ACTIVE_CANCEL.lock().expect("lock") = Some(observed.clone());
+            let selected = ACTIVE_CANCEL
+                .lock()
+                .expect("lock")
+                .as_ref()
+                .expect("installed run")
+                .clone();
+            *ACTIVE_CANCEL.lock().expect("lock") = Some(successor.clone());
+            trip_cancel_state(&selected);
 
-        assert!(cancel.tripped.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(cancel.was_tripped(), "both routes must report tripped");
-        // Restore so other tests never observe this state.
+            assert!(observed.was_tripped(), "the observed run receives its signal");
+            assert!(
+                !successor.was_tripped(),
+                "a later run must never inherit an earlier run's signal"
+            );
+        }
         *ACTIVE_CANCEL.lock().expect("lock") = None;
     }
 
