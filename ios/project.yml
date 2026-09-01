@@ -37,6 +37,9 @@ targets:
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: false
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: false
         MACCATALYST_USE_NATIVE_DESIGN: true
+        # The existing macOS storefront is version 1.0. Keep the rejected iOS
+        # version on 0.1.0 while stamping Catalyst archives for that Mac train.
+        "MARKETING_VERSION[sdk=macosx*]": "1.0"
         "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": FrankenTTS-Mac.entitlements
     sources:
       - Sources
