@@ -2002,7 +2002,7 @@ struct LabView: View {
                             Image(systemName: "chevron.right")
                         }
                         .font(.system(size: Lab.typeSize(9), weight: .black, design: .monospaced))
-                        .foregroundStyle(Color.black.opacity(0.84))
+                        .foregroundStyle(Lab.onEmerald)
                         .lineLimit(1)
                         .minimumScaleFactor(0.72)
                         .padding(.horizontal, 11)
@@ -2428,7 +2428,7 @@ struct LabView: View {
                         } label: {
                             Label(filter.rawValue, systemImage: filter.symbol)
                                 .font(.system(size: Lab.typeSize(11), weight: .bold))
-                                .foregroundStyle(voiceLibraryFilter == filter ? Color.black : Lab.textPrimary)
+                                .foregroundStyle(voiceLibraryFilter == filter ? Lab.onEmerald : Lab.textPrimary)
                                 .padding(.horizontal, 13)
                                 .frame(height: 38)
                                 .background(

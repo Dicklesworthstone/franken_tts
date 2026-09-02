@@ -44,6 +44,10 @@ enum Lab {
         dark: UIColor(red: 0.204, green: 0.827, blue: 0.6, alpha: 1),
         light: UIColor(red: 0.015, green: 0.405, blue: 0.235, alpha: 1)
     )
+    static let onEmerald = adaptive(
+        dark: UIColor(white: 0, alpha: 0.88),
+        light: UIColor(white: 1, alpha: 0.98)
+    )
     static let emeraldDeep = adaptive(
         dark: UIColor(red: 0.0, green: 0.259, blue: 0.145, alpha: 1),
         light: UIColor(red: 0.02, green: 0.34, blue: 0.19, alpha: 1)
