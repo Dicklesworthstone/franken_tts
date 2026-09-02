@@ -1910,14 +1910,11 @@ pub fn apply_rope_in_place(row: &mut [f32], cos: &[f32], sin: &[f32]) {
     assert!(dim.is_multiple_of(2), "head_dim must be even");
 
     let half = dim / 2;
-    let original: Vec<f32> = row.to_vec();
-    for index in 0..dim {
-        let rotated = if index < half {
-            -original[index + half]
-        } else {
-            original[index - half]
-        };
-        row[index] = original[index] * cos[index] + rotated * sin[index];
+    for i in 0..half {
+        let x0 = row[i];
+        let x1 = row[i + half];
+        row[i] = x0 * cos[i] - x1 * sin[i];
+        row[i + half] = x1 * cos[i + half] + x0 * sin[i + half];
     }
 }
 

@@ -298,10 +298,11 @@ pub fn apply_rope_row(x: &mut [f32], cos: &[f32], sin: &[f32]) {
     assert_eq!(x.len(), sin.len(), "rope sin width mismatch");
     assert!(x.len().is_multiple_of(2), "head width must be even");
     let half = x.len() / 2;
-    let original = x.to_vec();
     for i in 0..half {
-        x[i] = original[i] * cos[i] - original[i + half] * sin[i];
-        x[i + half] = original[i + half] * cos[i + half] + original[i] * sin[i + half];
+        let x0 = x[i];
+        let x1 = x[i + half];
+        x[i] = x0 * cos[i] - x1 * sin[i];
+        x[i + half] = x1 * cos[i + half] + x0 * sin[i + half];
     }
 }
 
@@ -3792,7 +3793,6 @@ mod tests {
     /// frame, `decode_frame_into` performs zero allocations (per-thread
     /// counting allocator; the quant route is the production path).
     #[test]
-    #[ignore = "increment 2 (frankentts-k-rcd-engine-6e3): 192 steady-state allocations remain from the layer-internal scratch threading; the engine buffers and the parity gate are increment-1 complete"]
     fn residual_code_decoder_decode_is_allocation_free_in_steady_state() {
         let config = tiny();
         let rope = RopeTable::new(&config);
