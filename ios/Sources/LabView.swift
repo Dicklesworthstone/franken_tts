@@ -1369,6 +1369,7 @@ final class LabModel {
 }
 
 struct LabView: View {
+    @AppStorage(LabAppearance.storageKey) private var appearance = LabAppearance.dark.rawValue
     private enum EditorFocus: Hashable {
         case seed
     }
@@ -1544,7 +1545,6 @@ struct LabView: View {
                         }
                     }
             }
-            .preferredColorScheme(.dark)
             .presentationDetents([.medium, .large])
         }
         .fullScreenCover(isPresented: $showVoiceLab) {
@@ -1559,7 +1559,6 @@ struct LabView: View {
                         }
                     }
             }
-            .preferredColorScheme(.dark)
             // The share button lives inside this full-screen cover, so this cover
             // must own the card sheet. Asking the obscured root view to present a
             // second modal could be delayed or silently dropped by UIKit.
@@ -1573,7 +1572,6 @@ struct LabView: View {
                     showVoiceComparison = false
                 }
             }
-            .preferredColorScheme(.dark)
         }
         #if DEBUG
             .fullScreenCover(isPresented: $showSynthesisInstrument) {
@@ -1775,6 +1773,7 @@ struct LabView: View {
                     model.player != nil && focusedField == nil && !isUtteranceFocused
             )
         )
+        .preferredColorScheme((LabAppearance(rawValue: appearance) ?? .dark).colorScheme)
     }
 
     private func consumeStagedText() {
@@ -1805,9 +1804,9 @@ struct LabView: View {
                     .foregroundStyle(Lab.emerald)
             }
             Spacer()
+            LabAppearanceButton(selection: $appearance)
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("FrankenTTS, the monster voice engine")
+        .accessibilityElement(children: .contain)
     }
 
     private var monsterMood: MonsterMood {
@@ -2174,7 +2173,7 @@ struct LabView: View {
                     .font(.system(size: Lab.typeSize(14), weight: .bold))
                     .foregroundStyle(Lab.textSecondary)
                     .frame(maxWidth: .infinity, minHeight: 110)
-                    .background(Color.black.opacity(0.32), in: RoundedRectangle(cornerRadius: 18))
+                    .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 18))
             }
 
             PhotosPicker(
@@ -2203,7 +2202,7 @@ struct LabView: View {
                         .foregroundStyle(Lab.cyan)
                 }
                 .padding(14)
-                .background(Color.black.opacity(0.42), in: RoundedRectangle(cornerRadius: 17))
+                .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 17))
                 .overlay(RoundedRectangle(cornerRadius: 17).stroke(Lab.cyan.opacity(0.28)))
             }
             .accessibilityHint("Pick a voice card someone sent you; the voice joins your library")
@@ -2248,7 +2247,7 @@ struct LabView: View {
             RoundedRectangle(cornerRadius: 24, style: .continuous)
                 .fill(
                     LinearGradient(
-                        colors: [Lab.emeraldDeep.opacity(0.78), Color.black.opacity(0.88), Lab.cyan.opacity(0.08)],
+                        colors: [Lab.emeraldDeep.opacity(0.78), Lab.panelStrong, Lab.cyan.opacity(0.08)],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
@@ -2322,7 +2321,7 @@ struct LabView: View {
         }
         .padding(.horizontal, 14)
         .frame(height: 50)
-        .background(Color.black.opacity(0.46), in: RoundedRectangle(cornerRadius: 15))
+        .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 15))
         .overlay(RoundedRectangle(cornerRadius: 15).stroke(Lab.stroke))
     }
 
@@ -2392,7 +2391,7 @@ struct LabView: View {
                     .foregroundStyle(Lab.emerald)
             }
             .padding(15)
-            .background(Color.black.opacity(0.36), in: RoundedRectangle(cornerRadius: 17))
+            .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 17))
             .overlay(RoundedRectangle(cornerRadius: 17).stroke(Lab.emerald.opacity(0.22)))
         }
         .buttonStyle(.plain)
@@ -2474,7 +2473,7 @@ struct LabView: View {
                 // Never let keyboard-driven relayout stretch the empty editor into
                 // a large black void. Long utterances scroll inside this native field.
                 .frame(height: isUtteranceFocused ? 108 : (compact ? 104 : 138))
-                .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+                .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 10))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10)
                         .strokeBorder(
@@ -2538,7 +2537,7 @@ struct LabView: View {
                     .frame(width: 74)
                     .padding(.vertical, 5)
                     .padding(.horizontal, 8)
-                    .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+                    .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 8))
                     .accessibilityLabel("Seed")
                     Button {
                         model.seed = UInt64.random(in: 0..<100_000)
@@ -2719,7 +2718,7 @@ struct LabView: View {
         }
         .font(.system(size: Lab.typeSize(10), design: .monospaced))
         .padding(10)
-        .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 9))
+        .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 9))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
             "On-device synthesis profile. \(profile.teamPartitions) workers, "
@@ -2921,7 +2920,7 @@ private struct ModelPromise: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
-        .background(Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
+        .background(Lab.panelSoft, in: RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -2947,7 +2946,7 @@ private struct VoiceEnrollmentCallout: View {
                         Lab.emeraldDeep.opacity(0.90),
                         Lab.emerald.opacity(0.13),
                         Lab.cyan.opacity(0.055),
-                        Color.black.opacity(0.80)
+                        Lab.panelStrong
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -3170,8 +3169,8 @@ struct VoiceTile: View {
             .background(
                 LinearGradient(
                     colors: [
-                        selected ? Lab.emerald.opacity(0.13) : Color.black.opacity(0.48),
-                        Color.black.opacity(0.42)
+                        selected ? Lab.emerald.opacity(0.13) : Lab.panelStrong,
+                        Lab.panel
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -3261,7 +3260,7 @@ struct EnrolledVoiceTile: View {
         }
         .padding(13)
         .background(
-            selected ? Lab.emerald.opacity(0.11) : Color.black.opacity(0.45),
+            selected ? Lab.emerald.opacity(0.11) : Lab.panelStrong,
             in: RoundedRectangle(cornerRadius: 17)
         )
         .overlay(
@@ -3315,11 +3314,11 @@ struct EnrollmentSheet: View {
                         .foregroundStyle(Lab.textPrimary)
                         .padding(12)
                 }
-                .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+                .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 12))
                 TextField("name your voice", text: $cloneName)
                     .textFieldStyle(.plain)
                     .padding(10)
-                    .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+                    .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 10))
                     .foregroundStyle(Lab.textPrimary)
                     // Locked once recording starts: the name is required to save, and
                     // clearing it mid-read would cost the whole take at auto-stop.
@@ -3334,7 +3333,7 @@ struct EnrollmentSheet: View {
                             .foregroundStyle(Lab.emerald)
                         GeometryReader { proxy in
                             ZStack(alignment: .leading) {
-                                Capsule().fill(Color.white.opacity(0.06))
+                                Capsule().fill(Lab.panelSoft)
                                 Capsule()
                                     .fill(Lab.emerald)
                                     .frame(

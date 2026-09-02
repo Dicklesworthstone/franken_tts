@@ -558,7 +558,6 @@ private struct ForgeMetric: View {
                     }
                 }
             }
-            .preferredColorScheme(.dark)
             .task { await run() }
         }
 
