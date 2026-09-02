@@ -6,6 +6,7 @@ final class VoiceLabUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         app = XCUIApplication()
+        app.launchArguments += ["-frankentts.appearance", "light"]
         app.launchEnvironment["FTTS_OPEN_VOICE_COMPARISON"] = "1"
         app.launchEnvironment["FTTS_VOICE_LAB_FIXTURE"] = "1"
         app.launch()

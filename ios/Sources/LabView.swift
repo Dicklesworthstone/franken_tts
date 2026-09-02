@@ -429,6 +429,12 @@ final class LabModel {
     private var cancellationRequested = false
     private var completedSynthesisFrames: UInt64 = 0
     private var engineWarmTask: Task<Void, Never>?
+    private var backgroundEvictionTask: Task<Void, Never>?
+    private var backgroundTaskIdentifier: UIBackgroundTaskIdentifier = .invalid
+    private var warmRetentionFence = EngineWarmRetentionFence()
+    private var pendingMemoryPressureUnload = false
+    private var pendingBackgroundUnload = false
+    private let backgroundRetentionDuration: Duration
     /// Allocated before lifecycle tasks are spawned so actor mailbox reordering cannot
     /// let an old memory-pressure unload close a newly claimed engine.
     private var engineLifecycleToken: UInt64 = 0
@@ -436,6 +442,10 @@ final class LabModel {
     private var progressGeneration = 0
     private let activity = VoiceForgeActivityController.shared
     private var eta = TTSAdaptiveETA()
+
+    init(backgroundRetentionDuration: Duration = .seconds(20)) {
+        self.backgroundRetentionDuration = backgroundRetentionDuration
+    }
 
     func nextEngineLifecycleToken() -> UInt64 {
         engineLifecycleToken &+= 1
@@ -676,6 +686,7 @@ final class LabModel {
             isLoadingModel = false
             isSynthesizing = false
             estimatedRemainingSeconds = nil
+            drainPendingEngineUnloadIfIdle()
         }
     }
 
@@ -696,7 +707,10 @@ final class LabModel {
         guard environment["FTTS_IOS_PROFILE"] == "1" else { return }
         guard !isProfilingBenchmark else { return }
         isProfilingBenchmark = true
-        defer { isProfilingBenchmark = false }
+        defer {
+            isProfilingBenchmark = false
+            drainPendingEngineUnloadIfIdle()
+        }
         let lifecycleToken = nextEngineLifecycleToken()
 
         let requestedRuns = Int(environment["FTTS_IOS_PROFILE_RUNS"] ?? "20") ?? 20
@@ -1065,7 +1079,10 @@ final class LabModel {
         enrollmentSaved = false
         let lifecycleToken = nextEngineLifecycleToken()
         Task {
-            defer { isEnrolling = false }
+            defer {
+                isEnrolling = false
+                drainPendingEngineUnloadIfIdle()
+            }
             do {
                 let pcm = try await Task.detached(priority: .userInitiated) {
                     try Self.conditioned(raw)
@@ -1127,14 +1144,29 @@ final class LabModel {
         )
     }
 
-    /// Frees the ~2.3 GB engine heap; the next synthesis reloads it.
+    /// Requests release of the ~2.3 GB engine heap. Work already using the native
+    /// handle owns it until completion; the pending request drains immediately after.
     func unloadEngineForMemoryPressure() {
+        pendingMemoryPressureUnload = true
+        warmRetentionFence.invalidateEvictionToken()
+        cancelBackgroundEvictionTask()
+        drainPendingEngineUnloadIfIdle()
+    }
+
+    /// Shared completion seam for synthesis, enrollment, comparison, profiling, and
+    /// warming. A memory warning must not be forgotten merely because work was active
+    /// when the notification arrived.
+    func drainPendingEngineUnloadIfIdle() {
+        guard pendingMemoryPressureUnload || pendingBackgroundUnload else { return }
         guard !isSynthesizing,
               !isComparingVoices,
               !isEnrolling,
               !isClearingModel,
-              !isProfilingBenchmark
+              !isProfilingBenchmark,
+              !isLoadingModel
         else { return }
+        pendingMemoryPressureUnload = false
+        pendingBackgroundUnload = false
         // A callback already queued onto the main actor can outlive cancellation of
         // the warm task. Fence it before changing the visible warm/loading state.
         progressGeneration &+= 1
@@ -1170,6 +1202,7 @@ final class LabModel {
             defer {
                 self.isLoadingModel = false
                 self.engineWarmTask = nil
+                self.drainPendingEngineUnloadIfIdle()
             }
             do {
                 if await !self.engine.isLoaded {
@@ -1210,6 +1243,10 @@ final class LabModel {
             return
         }
 
+        pendingMemoryPressureUnload = false
+        pendingBackgroundUnload = false
+        warmRetentionFence.invalidateEvictionToken()
+        cancelBackgroundEvictionTask()
         isClearingModel = true
         progressGeneration &+= 1
         engine.cancelCurrentWork()
@@ -1222,18 +1259,69 @@ final class LabModel {
             await engine.unload(lifecycleToken: lifecycleToken)
             store.clear()
             isClearingModel = false
+            drainPendingEngineUnloadIfIdle()
         }
     }
 
-    /// A microphone capture must never continue after the app leaves the foreground.
-    /// Enrollment computation, however, already owns a completed in-memory take; keep
-    /// that work alive and let the engine actor finish when iOS resumes the process.
+    /// A brief app switch should not force another 2.3 GB hydration. Keep the verified
+    /// engine warm for a bounded grace interval; iOS can still expire the background
+    /// task immediately when resources are scarce, and memory warnings bypass the grace.
     func prepareForBackground() {
         if recorder.isRecording {
             _ = recorder.stop()
             lastError = "Recording stopped when FrankenTTS left the foreground. Tap Start recording to try again."
         }
-        unloadEngineForMemoryPressure()
+        let retentionToken = warmRetentionFence.enterBackground()
+        cancelBackgroundEvictionTask()
+
+        guard isEngineWarm || isLoadingModel || isSynthesizing || isComparingVoices
+            || isEnrolling || isProfilingBenchmark
+        else { return }
+
+        backgroundTaskIdentifier = UIApplication.shared.beginBackgroundTask(
+            withName: "Retain warm voice core"
+        ) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.expireBackgroundRetention(token: retentionToken)
+            }
+        }
+        let duration = backgroundRetentionDuration
+        backgroundEvictionTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: duration)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.expireBackgroundRetention(token: retentionToken)
+        }
+    }
+
+    func prepareForForeground() {
+        warmRetentionFence.enterForeground()
+        pendingBackgroundUnload = false
+        cancelBackgroundEvictionTask()
+    }
+
+    private func expireBackgroundRetention(token: UInt64) {
+        guard warmRetentionFence.permitsEviction(token: token) else { return }
+        backgroundEvictionTask = nil
+        endBackgroundTaskIfNeeded()
+        pendingBackgroundUnload = true
+        drainPendingEngineUnloadIfIdle()
+    }
+
+    private func cancelBackgroundEvictionTask() {
+        backgroundEvictionTask?.cancel()
+        backgroundEvictionTask = nil
+        endBackgroundTaskIfNeeded()
+    }
+
+    private func endBackgroundTaskIfNeeded() {
+        guard backgroundTaskIdentifier != .invalid else { return }
+        let identifier = backgroundTaskIdentifier
+        backgroundTaskIdentifier = .invalid
+        UIApplication.shared.endBackgroundTask(identifier)
     }
 
     func importDesktopFile(_ url: URL) {
@@ -1703,6 +1791,7 @@ struct LabView: View {
             if phase == .background {
                 model.prepareForBackground()
             } else if phase == .active {
+                model.prepareForForeground()
                 if !automaticWarmSuppressed { model.warmEngineIfPossible() }
                 consumeStagedText()
             }
@@ -2247,7 +2336,11 @@ struct LabView: View {
             RoundedRectangle(cornerRadius: 24, style: .continuous)
                 .fill(
                     LinearGradient(
-                        colors: [Lab.emeraldDeep.opacity(0.78), Lab.panelStrong, Lab.cyan.opacity(0.08)],
+                        colors: [
+                            Color(red: 0.01, green: 0.25, blue: 0.14),
+                            Color(red: 0.01, green: 0.11, blue: 0.075),
+                            Color(red: 0.02, green: 0.075, blue: 0.09),
+                        ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
@@ -2267,7 +2360,7 @@ struct LabView: View {
                     Text("\(model.presets.count) BUILT-IN VOICES · \(model.library.voices.count) YOURS")
                         .font(.system(size: Lab.typeSize(9), weight: .black, design: .monospaced))
                         .kerning(1.2)
-                        .foregroundStyle(Lab.emerald)
+                        .foregroundStyle(Color(red: 0.36, green: 0.90, blue: 0.69))
                     Text(model.currentVoiceLabel.capitalized)
                         .font(.system(
                             size: Lab.typeSize(voiceArchiveNamePointSize),
@@ -2281,11 +2374,11 @@ struct LabView: View {
                         .layoutPriority(1)
                     Text(selectedVoiceCharacter)
                         .font(.system(size: Lab.typeSize(12), weight: .medium))
-                        .foregroundStyle(Lab.textPrimary.opacity(0.78))
+                        .foregroundStyle(Color.white.opacity(0.74))
                         .fixedSize(horizontal: false, vertical: true)
                     Text("CURRENT SPECIMEN")
                         .font(.system(size: Lab.typeSize(8), weight: .black, design: .monospaced))
-                        .foregroundStyle(Lab.cyan)
+                        .foregroundStyle(Color(red: 0.38, green: 0.82, blue: 0.92))
                 }
                 Spacer(minLength: 0)
             }
@@ -2339,7 +2432,7 @@ struct LabView: View {
                                 .padding(.horizontal, 13)
                                 .frame(height: 38)
                                 .background(
-                                    voiceLibraryFilter == filter ? Lab.emerald : Color.black.opacity(0.38),
+                                    voiceLibraryFilter == filter ? Lab.emerald : Lab.panelSoft,
                                     in: Capsule()
                                 )
                                 .overlay(Capsule().stroke(voiceLibraryFilter == filter ? .clear : Lab.stroke))
@@ -2602,62 +2695,7 @@ struct LabView: View {
                         model.seekPlayback(to: progress)
                     }
                         .frame(height: compact ? 112 : 148)
-                    HStack(spacing: 10) {
-                        Button {
-                            model.togglePlayback()
-                            playbackTick += 1
-                        } label: {
-                            Image(
-                                systemName: model.player?.isPlaying == true
-                                    ? "pause.fill" : "play.fill")
-                        }
-                        .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
-                        .accessibilityLabel(
-                            model.player?.isPlaying == true ? "Pause" : "Play")
-                        .onReceive(
-                            Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
-                        ) { _ in
-                            playbackTick += 1
-                        }
-                        if let url = model.m4aUrl ?? model.wavUrl {
-                            // M4A once the fast transcode lands; the WAV covers the gap.
-                            ShareLink(item: url) {
-                                Text(url.pathExtension == "m4a" ? "Share M4A" : "Share…")
-                            }
-                            .buttonStyle(GhostButtonStyle())
-                        }
-                        if let video = model.videoUrl {
-                            ShareLink(item: video) {
-                                Text("Share Video")
-                            }
-                            .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
-                        } else if model.isExportingVideo {
-                            HStack(spacing: 6) {
-                                ProgressView().tint(Lab.emerald).controlSize(.small)
-                                Text("\(Int(model.videoProgress * 100))%")
-                                    .font(.system(size: Lab.typeSize(11), design: .monospaced))
-                                    .foregroundStyle(Lab.textSecondary)
-                            }
-                        } else {
-                            Button("Make video") { model.exportVideo() }
-                                .buttonStyle(GhostButtonStyle())
-                        }
-                        Spacer()
-                        if let factor = model.lastRealTimeFactor {
-                            Text(
-                                factor >= 1
-                                    ? String(format: "%.2f× real-time speed", factor)
-                                    : String(
-                                        format: "%.2f× speed · %.1fs per 1s audio",
-                                        factor, 1 / max(factor, 0.001)
-                                    )
-                            )
-                                .font(.system(size: Lab.typeSize(11), design: .monospaced))
-                                .foregroundStyle(factor >= 1 ? Lab.emerald : Lab.textSecondary)
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.7)
-                        }
-                    }
+                    playbackControlBar
                     if let profile = model.lastProfile {
                         DisclosureGroup(isExpanded: $showMachineProfile) {
                             synthesisProfile(profile)
@@ -2670,9 +2708,11 @@ struct LabView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(Lab.textPrimary)
                                 Spacer()
-                                Text("timings · kernels · frames")
-                                    .font(.caption2.monospaced())
-                                    .foregroundStyle(Lab.textSecondary)
+                                if !compact {
+                                    Text("timings · kernels · frames")
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(Lab.textSecondary)
+                                }
                             }
                         }
                         .tint(Lab.cyan)
@@ -2684,6 +2724,82 @@ struct LabView: View {
             }
         }
         .id("utterance-card")
+    }
+
+    private var playbackControlBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                playbackExportControls
+                Spacer(minLength: 8)
+                playbackPerformanceSummary
+            }
+            VStack(alignment: .leading, spacing: 9) {
+                playbackExportControls
+                playbackPerformanceSummary
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private var playbackExportControls: some View {
+        HStack(spacing: 10) {
+            Button {
+                model.togglePlayback()
+                playbackTick += 1
+            } label: {
+                Image(
+                    systemName: model.player?.isPlaying == true
+                        ? "pause.fill" : "play.fill")
+            }
+            .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+            .accessibilityLabel(model.player?.isPlaying == true ? "Pause" : "Play")
+            .onReceive(
+                Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+            ) { _ in
+                playbackTick += 1
+            }
+            if let url = model.m4aUrl ?? model.wavUrl {
+                // M4A once the fast transcode lands; the WAV covers the gap.
+                ShareLink(item: url) {
+                    Text(url.pathExtension == "m4a" ? "Share M4A" : "Share…")
+                }
+                .buttonStyle(GhostButtonStyle())
+            }
+            if let video = model.videoUrl {
+                ShareLink(item: video) {
+                    Text("Share Video")
+                }
+                .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+            } else if model.isExportingVideo {
+                HStack(spacing: 6) {
+                    ProgressView().tint(Lab.emerald).controlSize(.small)
+                    Text("\(Int(model.videoProgress * 100))%")
+                        .font(.system(size: Lab.typeSize(11), design: .monospaced))
+                        .foregroundStyle(Lab.textSecondary)
+                }
+            } else {
+                Button("Make video") { model.exportVideo() }
+                    .buttonStyle(GhostButtonStyle())
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var playbackPerformanceSummary: some View {
+        if let factor = model.lastRealTimeFactor {
+            Text(
+                factor >= 1
+                    ? String(format: "%.2f× real-time speed", factor)
+                    : String(
+                        format: "%.2f× speed · %.1fs per 1s audio",
+                        factor, 1 / max(factor, 0.001)
+                    )
+            )
+            .font(.system(size: Lab.typeSize(11), design: .monospaced))
+            .foregroundStyle(factor >= 1 ? Lab.emerald : Lab.textSecondary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+        }
     }
 
     private func synthesisProfile(_ profile: SynthesisProfile) -> some View {
@@ -2943,10 +3059,10 @@ private struct VoiceEnrollmentCallout: View {
             .background {
                 LinearGradient(
                     colors: [
-                        Lab.emeraldDeep.opacity(0.90),
-                        Lab.emerald.opacity(0.13),
-                        Lab.cyan.opacity(0.055),
-                        Lab.panelStrong
+                        Color(red: 0.00, green: 0.27, blue: 0.15),
+                        Color(red: 0.01, green: 0.16, blue: 0.10),
+                        Color(red: 0.015, green: 0.09, blue: 0.075),
+                        Color(red: 0.018, green: 0.065, blue: 0.07),
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -3001,7 +3117,7 @@ private struct VoiceEnrollmentCallout: View {
                 Text("SIGNATURE FEATURE")
                     .font(.system(size: Lab.typeSize(compact ? 8 : 9), weight: .black, design: .monospaced))
                     .kerning(1.35)
-                    .foregroundStyle(Lab.emerald)
+                    .foregroundStyle(Color(red: 0.36, green: 0.90, blue: 0.69))
                     .lineLimit(1)
                 Text("Create your own voice")
                     .font(.system(size: Lab.typeSize(compact ? 15 : 17), weight: .black))
@@ -3014,7 +3130,7 @@ private struct VoiceEnrollmentCallout: View {
                         : "Finish model setup, then record privately on-device"
                 )
                 .font(.system(size: Lab.typeSize(compact ? 10 : 11), weight: .medium))
-                .foregroundStyle(Lab.textPrimary.opacity(0.78))
+                .foregroundStyle(Color.white.opacity(0.72))
                 // The dashboard sidebar is narrower than an iPhone. Keep the
                 // headline intact and let this supporting promise wrap instead.
                 .lineLimit(2)
@@ -3033,11 +3149,11 @@ private struct VoiceEnrollmentCallout: View {
                 .foregroundStyle(Color.black.opacity(0.82))
                 .padding(.horizontal, 11)
                 .frame(minHeight: 34)
-                .background(Lab.emerald, in: Capsule())
+                .background(Color(red: 0.36, green: 0.90, blue: 0.69), in: Capsule())
             } else {
                 Image(systemName: "arrow.right.circle.fill")
                     .font(.system(size: Lab.typeSize(24), weight: .bold))
-                    .foregroundStyle(Lab.emerald)
+                    .foregroundStyle(Color(red: 0.36, green: 0.90, blue: 0.69))
             }
         }
     }

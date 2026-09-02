@@ -411,6 +411,32 @@ struct EngineLifecycleFence {
     }
 }
 
+/// Identifies one background interval so a delayed eviction from an older interval
+/// cannot unload an engine after the user has already returned to the app.
+struct EngineWarmRetentionFence {
+    private(set) var generation: UInt64 = 0
+    private(set) var isBackground = false
+
+    mutating func enterBackground() -> UInt64 {
+        generation &+= 1
+        isBackground = true
+        return generation
+    }
+
+    mutating func enterForeground() {
+        generation &+= 1
+        isBackground = false
+    }
+
+    mutating func invalidateEvictionToken() {
+        generation &+= 1
+    }
+
+    func permitsEviction(token: UInt64) -> Bool {
+        isBackground && token == generation
+    }
+}
+
 /// All engine access lives here. The Rust handle is not thread-safe; an actor's
 /// serialization is the whole safety argument, so no engine call may leave this type.
 actor Engine {

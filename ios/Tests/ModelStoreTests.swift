@@ -12,6 +12,60 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertEqual(fence.latestToken, 2)
     }
 
+    func testWarmRetentionFenceRejectsEvictionAfterForegroundReturn() {
+        var fence = EngineWarmRetentionFence()
+
+        let firstBackground = fence.enterBackground()
+        XCTAssertTrue(fence.permitsEviction(token: firstBackground))
+
+        fence.enterForeground()
+        XCTAssertFalse(fence.permitsEviction(token: firstBackground))
+
+        let secondBackground = fence.enterBackground()
+        XCTAssertFalse(fence.permitsEviction(token: firstBackground))
+        XCTAssertTrue(fence.permitsEviction(token: secondBackground))
+
+        fence.invalidateEvictionToken()
+        XCTAssertFalse(fence.permitsEviction(token: secondBackground))
+    }
+
+    @MainActor
+    func testMemoryPressureEvictionWaitsForActiveSynthesisThenDrains() {
+        let model = LabModel()
+        model.isEngineWarm = true
+        model.isSynthesizing = true
+
+        model.unloadEngineForMemoryPressure()
+        XCTAssertTrue(model.isEngineWarm)
+
+        model.isSynthesizing = false
+        model.drainPendingEngineUnloadIfIdle()
+        XCTAssertFalse(model.isEngineWarm)
+    }
+
+    @MainActor
+    func testBriefBackgroundIntervalKeepsWarmEngineMarker() async throws {
+        let model = LabModel(backgroundRetentionDuration: .milliseconds(10))
+        model.isEngineWarm = true
+
+        model.prepareForBackground()
+        model.prepareForForeground()
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertTrue(model.isEngineWarm)
+    }
+
+    @MainActor
+    func testBackgroundGraceExpiryUnloadsWarmEngineMarker() async throws {
+        let model = LabModel(backgroundRetentionDuration: .milliseconds(10))
+        model.isEngineWarm = true
+
+        model.prepareForBackground()
+        try await Task.sleep(for: .milliseconds(250))
+
+        XCTAssertFalse(model.isEngineWarm)
+    }
+
     @MainActor
     func testModelClearIsBlockedWhileVoiceWorkOwnsTheEngine() {
         let model = LabModel()

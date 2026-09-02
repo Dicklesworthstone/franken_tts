@@ -216,6 +216,7 @@ final class VoiceComparisonSession {
                 self.isRunning = false
                 self.isStopping = false
                 self.model.isComparingVoices = false
+                self.model.drainPendingEngineUnloadIfIdle()
                 self.activeIndex = nil
                 self.activeFraction = 0
                 if self.completedCount == self.candidates.count {
@@ -554,6 +555,8 @@ struct VoiceComparisonView: View {
         .background(LaboratoryBackground())
         .navigationTitle("Voice Lab")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(Lab.backgroundDeep, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button("Done") {
@@ -563,6 +566,9 @@ struct VoiceComparisonView: View {
                         dismiss()
                     }
                 }
+                .buttonStyle(.borderedProminent)
+                .tint(Lab.emeraldDeep)
+                .foregroundStyle(.white)
                 .accessibilityHint(
                     session.isRunning
                         ? "Asks before stopping the active all-voice generation"
@@ -633,8 +639,8 @@ struct VoiceComparisonView: View {
                 .foregroundStyle(Lab.textPrimary)
                 .padding(8)
                 .frame(minHeight: 112, maxHeight: 180)
-                .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Lab.emerald.opacity(0.24)))
+                .background(Lab.editorBackground, in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Lab.stroke, lineWidth: 1))
                 .disabled(session.isRunning)
                 Text(
                     "Voice Lab is a focused audition, so it uses one exact model-sized excerpt. After choosing a favorite, the main forge can speak the complete 50,000-character document."
@@ -726,12 +732,11 @@ struct VoiceComparisonView: View {
             HStack {
                 LabLabel(text: "The cast")
                 Spacer()
-                Picker("Voice filter", selection: $showFavoritesOnly) {
-                    Text("All \(session.candidates.count)").tag(false)
-                    Text("Favorites \(session.favorites.count)").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 260)
+                VoiceFilterControl(
+                    showsFavoritesOnly: $showFavoritesOnly,
+                    allCount: session.candidates.count,
+                    favoriteCount: session.favorites.count
+                )
             }
             if visibleCandidates.isEmpty {
                 ContentUnavailableView(
@@ -869,11 +874,9 @@ private struct VoiceComparisonCard: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 }
             }
-            // Every card reserves the result controls from the start. As earlier
-            // voices finish, later cards no longer jump dramatically up and down.
-            .frame(height: 150, alignment: .top)
+            .frame(height: session.results[candidate.id] == nil ? 56 : 150, alignment: .top)
         }
-        .frame(minHeight: 218, alignment: .top)
+        .frame(minHeight: session.results[candidate.id] == nil ? 132 : 218, alignment: .top)
         .padding(15)
         .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
