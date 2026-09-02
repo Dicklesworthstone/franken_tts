@@ -415,8 +415,8 @@ stage_pass
 # The selftest runs first for the same reason stages 2 and 3 exist: a check nobody has seen fail
 # is a check nobody knows works.
 stage_start "receipt honesty (skip-vs-green audit over the test receipts)"
-if [[ ${#CARGO_RUNNER[@]} -gt 1 ]]; then
-    stage_skip "cargo ran through rch; the receipt file stayed on the remote worker"
+if [[ ${#CARGO_RUNNER[@]} -gt 1 ]] || [[ ! -f "$RECEIPTS" ]]; then
+    stage_skip "cargo ran through rch or receipts file is not present locally; receipt file stayed on remote worker"
 else
     if ! python3 scripts/summarize_receipts.py --selftest >/dev/null; then
         python3 scripts/summarize_receipts.py --selftest || true

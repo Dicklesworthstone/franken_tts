@@ -5450,7 +5450,10 @@ mod tests {
             *ACTIVE_CANCEL.lock().expect("lock") = Some(successor.clone());
             trip_cancel_state(&selected);
 
-            assert!(observed.was_tripped(), "the observed run receives its signal");
+            assert!(
+                observed.was_tripped(),
+                "the observed run receives its signal"
+            );
             assert!(
                 !successor.was_tripped(),
                 "a later run must never inherit an earlier run's signal"
