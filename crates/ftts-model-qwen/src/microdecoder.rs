@@ -1555,6 +1555,12 @@ pub fn decode_frame_greedy_speculative(
         )
     };
     drafter.observe(&codes);
+    if spec_probe_enabled() {
+        eprintln!(
+            "{{\"probe\":\"frankenmtp_greedy\",\"accepted_prefix\":{accepted_prefix_len},\"full_accept\":{},\"repaired\":{repaired}}}",
+            accepted_prefix_len == RESIDUAL_DEPTHS
+        );
+    }
     GreedySpeculativeFrame {
         drafted_codes,
         codes,
@@ -2117,6 +2123,35 @@ impl ResidualCodeScratch {
             PROBE_DRAFTER.with(|drafter| drafter.borrow_mut().observe(&frame_codes));
         }
     }
+
+    /// Decodes one frame using strict-greedy FrankenMTP speculation into `codes_out`,
+    /// reusing the scratch state and buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_frame_greedy_speculative(
+        &mut self,
+        config: &MicrodecoderConfig,
+        rope: &RopeTable,
+        weights: &MicrodecoderWeights<'_>,
+        quant: Option<&MicroQuantRoute<'_>>,
+        drafter: &mut FrankenMtpDrafter,
+        talker_hidden: &[f32],
+        primary_code: usize,
+        codes_out: &mut Vec<usize>,
+    ) -> GreedySpeculativeFrame {
+        let result = decode_frame_greedy_speculative(
+            config,
+            rope,
+            weights,
+            quant,
+            &mut self.state,
+            drafter,
+            talker_hidden,
+            primary_code,
+        );
+        codes_out.clear();
+        codes_out.extend_from_slice(&result.codes);
+        result
+    }
 }
 
 impl<'a> ResidualCodeDecoder<'a> {
@@ -2208,13 +2243,36 @@ pub fn decode_frame_with_selector_q8(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+static SPEC_MTP_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Overrides `spec_mtp_enabled` for tests in the current process.
+/// Pass `Some(true)` or `Some(false)` to force an outcome; `None` to restore env resolution.
+pub fn set_spec_mtp_override(override_value: Option<bool>) {
+    let val = match override_value {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    };
+    SPEC_MTP_OVERRIDE.store(val, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `FTTS_SPEC_MTP=1` arms greedy FrankenMTP speculative decode on the Base microdecoder.
+/// When unset or `0`, the microdecoder runs its authoritative sequential loop.
+#[must_use]
+pub fn spec_mtp_enabled() -> bool {
+    match SPEC_MTP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        0 => false,
+        _ => std::env::var("FTTS_SPEC_MTP").as_deref() == Ok("1"),
+    }
+}
+
 /// `FTTS_SPEC_PROBE=1` measures the speculative-sampling precondition without changing any
 /// output: a shadow drafter proposes each frame, and the loop logs the production-sampling
 /// probability each draft would have been accepted with (NDJSON on stderr, one line per
 /// depth). Bead w4q's go/no-go is decided by this number, per §7.5's warning that a partial
 /// accept can cost more than the sequential loop it replaces.
-fn spec_probe_enabled() -> bool {
+pub(crate) fn spec_probe_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("FTTS_SPEC_PROBE").as_deref() == Ok("1"))
@@ -3821,5 +3879,50 @@ mod tests {
             engine.decode_frame_into(&talker_hidden, 11, argmax, &mut codes);
         });
         assert_eq!(count, 0, "steady-state decode must not allocate");
+    }
+
+    #[test]
+    fn measure_frankenmtp_drafter_greedy_acceptance_across_utterance() {
+        let config = tiny();
+        let rope = RopeTable::new(&config);
+        let bundle = TestBundle::new(&config);
+        let (layers, embeddings, heads) = bundle.views();
+        let weights = bundle.weights(&layers, &embeddings, &heads);
+
+        let mut drafter = FrankenMtpDrafter::new();
+        let mut total_tokens = 0;
+        let mut accepted_tokens = 0;
+        let mut full_accept_frames = 0;
+        let num_frames = 32;
+
+        for frame_idx in 0..num_frames {
+            let talker_hidden = weights_of(config.hidden_size, 1000 + frame_idx as u32);
+            let primary_code = (frame_idx * 17) % TALKER_CODEC_VOCAB;
+
+            let mut state = FrameState::new(&config);
+            let result = decode_frame_greedy_speculative(
+                &config,
+                &rope,
+                &weights,
+                None,
+                &mut state,
+                &mut drafter,
+                &talker_hidden,
+                primary_code,
+            );
+
+            total_tokens += RESIDUAL_DEPTHS;
+            accepted_tokens += result.accepted_prefix_len;
+            if result.accepted_prefix_len == RESIDUAL_DEPTHS {
+                full_accept_frames += 1;
+            }
+        }
+
+        let p_token = accepted_tokens as f64 / total_tokens as f64;
+        let alpha_full = full_accept_frames as f64 / num_frames as f64;
+        println!(
+            "FrankenMTP v1 greedy measurement: num_frames={num_frames}, p_token={p_token:.4}, alpha_full={alpha_full:.4}"
+        );
+        assert!(p_token <= 1.0);
     }
 }

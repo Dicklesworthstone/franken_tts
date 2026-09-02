@@ -15,8 +15,8 @@ use ftts_core::{
 };
 
 use crate::microdecoder::{
-    self, MicroLayerQuant, MicrodecoderConfig, MicrodecoderWeights, RESIDUAL_VOCAB,
-    ResidualCodeScratch, RopeTable,
+    self, FrankenMtpDrafter, MicroLayerQuant, MicrodecoderConfig, MicrodecoderWeights,
+    RESIDUAL_VOCAB, ResidualCodeScratch, RopeTable,
 };
 use crate::prompt::{
     self, CloneMode, HiddenState, PromptAssemblyInput, PromptError, PromptHeader, PromptMode,
@@ -701,6 +701,7 @@ pub struct QwenGenerator<'a> {
     /// life. Layer-internal scratch has its own independent allocation gate.
     microdecoder_scratch: ResidualCodeScratch,
     microdecoder_codes: Vec<usize>,
+    mtp_drafter: FrankenMtpDrafter,
     utterance: Option<UtteranceState>,
     /// Shared rather than owned: the engine builds these once during hydration and lends the
     /// same tables to every utterance, which is what lets the artifact they came from be dropped.
@@ -848,6 +849,7 @@ impl<'a> QwenGenerator<'a> {
             kv: TalkerKvCache::new(),
             microdecoder_scratch,
             microdecoder_codes: Vec::with_capacity(microdecoder::RESIDUAL_DEPTHS),
+            mtp_drafter: FrankenMtpDrafter::new(),
             utterance: None,
             cold_rows: config.cold_rows,
             overlay_ids: Vec::new(),
@@ -1252,6 +1254,7 @@ impl FrameGenerator for QwenGenerator<'_> {
             ));
         }
         self.utterance = None;
+        self.mtp_drafter = FrankenMtpDrafter::new();
 
         let ids = prompt::extract_prompt_text_ids(
             &prepared.token_ids,
@@ -1438,16 +1441,31 @@ impl FrameGenerator for QwenGenerator<'_> {
                 heads: (!route.micro_heads.is_empty()).then_some(route.micro_heads.as_slice()),
                 mode: route.mode,
             });
-        self.microdecoder_scratch.decode_frame_into(
-            &self.microdecoder_config,
-            &self.microdecoder_rope,
-            &self.microdecoder_weights,
-            quant.as_ref(),
-            &utterance.pending_hidden,
-            primary as usize,
-            select,
-            &mut self.microdecoder_codes,
-        );
+        let spec_mtp = sampling_mode == SamplingMode::CanonicalGreedy
+            && microdecoder::spec_mtp_enabled();
+        if spec_mtp {
+            self.microdecoder_scratch.decode_frame_greedy_speculative(
+                &self.microdecoder_config,
+                &self.microdecoder_rope,
+                &self.microdecoder_weights,
+                quant.as_ref(),
+                &mut self.mtp_drafter,
+                &utterance.pending_hidden,
+                primary as usize,
+                &mut self.microdecoder_codes,
+            );
+        } else {
+            self.microdecoder_scratch.decode_frame_into(
+                &self.microdecoder_config,
+                &self.microdecoder_rope,
+                &self.microdecoder_weights,
+                quant.as_ref(),
+                &utterance.pending_hidden,
+                primary as usize,
+                select,
+                &mut self.microdecoder_codes,
+            );
+        }
         if let Some(error) = sampler_failure {
             return Err(generation_error(error));
         }
@@ -2112,6 +2130,25 @@ mod tests {
         let right = drive(&weights, 42, SamplingMode::Production, 6);
         assert!(!left.is_empty());
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn speculative_greedy_mode_produces_identical_code_streams_to_sequential() {
+        let weights = TinyWeights::new(1.0);
+        // Baseline: sequential greedy execution
+        microdecoder::set_spec_mtp_override(Some(false));
+        let sequential_frames = drive(&weights, 1, SamplingMode::CanonicalGreedy, 10);
+        assert!(!sequential_frames.is_empty());
+
+        // Speculative: FrankenMTP v1 greedy execution
+        microdecoder::set_spec_mtp_override(Some(true));
+        let speculative_frames = drive(&weights, 1, SamplingMode::CanonicalGreedy, 10);
+        microdecoder::set_spec_mtp_override(None);
+
+        assert_eq!(
+            sequential_frames, speculative_frames,
+            "FrankenMTP greedy speculation must be token-identical to sequential greedy decode by construction"
+        );
     }
 
     #[test]
