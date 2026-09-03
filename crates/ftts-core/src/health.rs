@@ -115,6 +115,14 @@ pub enum HealthViolation {
         /// Percent below baseline, rounded down.
         percent_below_baseline: u32,
     },
+    /// FrankenMTP speculative decode misbehavior exceeded the sequential-test e-value threshold;
+    /// speculative decode alarmed and demoted to authoritative sequential execution (AF-3).
+    SpeculationDemoted {
+        /// The e-value observed when the alarm threshold was crossed, scaled by 100 as integer.
+        e_value_x100: u64,
+        /// Number of speculative proposals evaluated before demotion.
+        steps_observed: u64,
+    },
 }
 
 impl HealthViolation {
@@ -129,6 +137,7 @@ impl HealthViolation {
             Self::OutputSilent { .. } => "output_silent",
             Self::KernelDemoted { .. } => "kernel_demoted",
             Self::ThermalDegraded { .. } => "thermal_degraded",
+            Self::SpeculationDemoted { .. } => "speculation_demoted",
         }
     }
 
@@ -140,7 +149,9 @@ impl HealthViolation {
     pub const fn invalidates_output(self) -> bool {
         !matches!(
             self,
-            Self::KernelDemoted { .. } | Self::ThermalDegraded { .. }
+            Self::KernelDemoted { .. }
+                | Self::ThermalDegraded { .. }
+                | Self::SpeculationDemoted { .. }
         )
     }
 
@@ -175,6 +186,11 @@ impl HealthViolation {
             Self::ThermalDegraded { .. } => {
                 "sustained throughput fell below the opening window: expected under thermal load; \
                  do not quote this run's rate as a steady-state number"
+            }
+            Self::SpeculationDemoted { .. } => {
+                "the speculative drafter exceeded the sequential-test error threshold (AF-3); \
+                 execution automatically demoted to authoritative sequential decode. The output \
+                 remains bit-exact; no action is required unless investigating drafter quality"
             }
         }
     }
@@ -226,6 +242,14 @@ impl fmt::Display for HealthViolation {
             } => write!(
                 formatter,
                 "throughput {percent_below_baseline}% below the opening window"
+            ),
+            Self::SpeculationDemoted {
+                e_value_x100,
+                steps_observed,
+            } => write!(
+                formatter,
+                "speculation demoted to sequential at e-value {:.2} after {steps_observed} step(s)",
+                *e_value_x100 as f64 / 100.0
             ),
         }
     }
@@ -913,6 +937,10 @@ mod tests {
             },
             HealthViolation::ThermalDegraded {
                 percent_below_baseline: 11,
+            },
+            HealthViolation::SpeculationDemoted {
+                e_value_x100: 10000,
+                steps_observed: 5,
             },
         ];
         for violation in violations {

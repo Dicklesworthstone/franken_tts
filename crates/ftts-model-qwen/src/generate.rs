@@ -15,8 +15,8 @@ use ftts_core::{
 };
 
 use crate::microdecoder::{
-    self, FrankenMtpDrafter, MicroLayerQuant, MicrodecoderConfig, MicrodecoderWeights,
-    RESIDUAL_VOCAB, ResidualCodeScratch, RopeTable,
+    self, FrankenMtpDrafter, FrankenMtpEProcessMonitor, MicroLayerQuant, MicrodecoderConfig,
+    MicrodecoderWeights, RESIDUAL_VOCAB, ResidualCodeScratch, RopeTable,
 };
 use crate::prompt::{
     self, CloneMode, HiddenState, PromptAssemblyInput, PromptError, PromptHeader, PromptMode,
@@ -702,6 +702,7 @@ pub struct QwenGenerator<'a> {
     microdecoder_scratch: ResidualCodeScratch,
     microdecoder_codes: Vec<usize>,
     mtp_drafter: FrankenMtpDrafter,
+    mtp_monitor: FrankenMtpEProcessMonitor,
     utterance: Option<UtteranceState>,
     /// Shared rather than owned: the engine builds these once during hydration and lends the
     /// same tables to every utterance, which is what lets the artifact they came from be dropped.
@@ -850,6 +851,7 @@ impl<'a> QwenGenerator<'a> {
             microdecoder_scratch,
             microdecoder_codes: Vec::with_capacity(microdecoder::RESIDUAL_DEPTHS),
             mtp_drafter: FrankenMtpDrafter::new(),
+            mtp_monitor: FrankenMtpEProcessMonitor::from_env(),
             utterance: None,
             cold_rows: config.cold_rows,
             overlay_ids: Vec::new(),
@@ -869,6 +871,17 @@ impl<'a> QwenGenerator<'a> {
     #[must_use]
     pub fn cached_positions(&self) -> usize {
         self.kv.len()
+    }
+
+    /// Returns a reference to the AF-3 e-process reliability monitor.
+    #[must_use]
+    pub const fn mtp_monitor(&self) -> &FrankenMtpEProcessMonitor {
+        &self.mtp_monitor
+    }
+
+    /// Returns a mutable reference to the AF-3 e-process reliability monitor.
+    pub fn mtp_monitor_mut(&mut self) -> &mut FrankenMtpEProcessMonitor {
+        &mut self.mtp_monitor
     }
 
     fn prompt_prefix_identity(&self) -> TalkerPromptPrefixIdentity {
@@ -1255,6 +1268,7 @@ impl FrameGenerator for QwenGenerator<'_> {
         }
         self.utterance = None;
         self.mtp_drafter = FrankenMtpDrafter::new();
+        self.mtp_monitor.reset();
 
         let ids = prompt::extract_prompt_text_ids(
             &prepared.token_ids,
@@ -1441,10 +1455,11 @@ impl FrameGenerator for QwenGenerator<'_> {
                 heads: (!route.micro_heads.is_empty()).then_some(route.micro_heads.as_slice()),
                 mode: route.mode,
             });
-        let spec_mtp =
-            sampling_mode == SamplingMode::CanonicalGreedy && microdecoder::spec_mtp_enabled();
+        let spec_mtp = sampling_mode == SamplingMode::CanonicalGreedy
+            && microdecoder::spec_mtp_enabled()
+            && !self.mtp_monitor.is_demoted();
         if spec_mtp {
-            self.microdecoder_scratch.decode_frame_greedy_speculative(
+            let spec_frame = self.microdecoder_scratch.decode_frame_greedy_speculative(
                 &self.microdecoder_config,
                 &self.microdecoder_rope,
                 &self.microdecoder_weights,
@@ -1454,6 +1469,8 @@ impl FrameGenerator for QwenGenerator<'_> {
                 primary as usize,
                 &mut self.microdecoder_codes,
             );
+            let is_anomaly = spec_frame.accepted_prefix_len == 0;
+            self.mtp_monitor.observe(is_anomaly);
         } else {
             self.microdecoder_scratch.decode_frame_into(
                 &self.microdecoder_config,
@@ -2148,6 +2165,122 @@ mod tests {
         assert_eq!(
             sequential_frames, speculative_frames,
             "FrankenMTP greedy speculation must be token-identical to sequential greedy decode by construction"
+        );
+    }
+
+    #[test]
+    fn af3_e_process_monitor_fault_injection_demotes_to_sequential() {
+        let weights = TinyWeights::new(1.0);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+
+        // Arm speculative decode
+        microdecoder::set_spec_mtp_override(Some(true));
+        let mut gen = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback,
+            1,
+            SamplingMode::CanonicalGreedy,
+        );
+
+        // Configure monitor with aggressive alpha=0.05 (threshold=20.0)
+        *gen.mtp_monitor_mut() = FrankenMtpEProcessMonitor::new(
+            crate::af3::FrankenMtpEProcessConfig::new(0.10, 2.0, 0.05),
+        );
+
+        gen.begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
+            .expect("valid tiny prompt");
+
+        let mut frames = Vec::new();
+        for _ in 0..10 {
+            match gen.next_frame().expect("next_frame succeeds") {
+                FrameStep::Frame(f) => frames.push(f),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("unexpected awaiting text"),
+            }
+        }
+        microdecoder::set_spec_mtp_override(None);
+
+        // Monitor must be alarmed and demoted!
+        assert!(gen.mtp_monitor().is_demoted(), "AF-3 monitor must demote on repeated anomalies");
+        assert!(gen.mtp_monitor().e_value() >= 20.0, "e-value must have crossed threshold 1/alpha");
+
+        // Ground truth comparison: verify that the emitted frames are still bit-identical to sequential!
+        microdecoder::set_spec_mtp_override(Some(false));
+        let seq_frames = drive(&weights, 1, SamplingMode::CanonicalGreedy, 10);
+        microdecoder::set_spec_mtp_override(None);
+
+        assert_eq!(
+            frames, seq_frames,
+            "AF-3 demotion must preserve exact sequential token identity"
+        );
+    }
+
+    #[test]
+    fn af3_deterministic_fallback_when_alpha_zero_matches_sequential_exactly() {
+        let weights = TinyWeights::new(1.0);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let residual_feedback: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+
+        // Enable speculation globally, but configure AF-3 with alpha=0.0 (deterministic fallback)
+        microdecoder::set_spec_mtp_override(Some(true));
+        let mut gen = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback,
+            1,
+            SamplingMode::CanonicalGreedy,
+        );
+        *gen.mtp_monitor_mut() = FrankenMtpEProcessMonitor::new(
+            crate::af3::FrankenMtpEProcessConfig::new(0.10, 2.0, 0.0),
+        );
+        assert!(gen.mtp_monitor().is_demoted(), "alpha=0 must be demoted before any steps");
+
+        gen.begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
+            .expect("valid tiny prompt");
+        let mut fallback_frames = Vec::new();
+        for _ in 0..10 {
+            match gen.next_frame().expect("next_frame succeeds") {
+                FrameStep::Frame(f) => fallback_frames.push(f),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("unexpected awaiting text"),
+            }
+        }
+        microdecoder::set_spec_mtp_override(None);
+
+        // Verify that alpha=0 produces bit-for-bit identical frames to sequential
+        microdecoder::set_spec_mtp_override(Some(false));
+        let seq_frames = drive(&weights, 1, SamplingMode::CanonicalGreedy, 10);
+        microdecoder::set_spec_mtp_override(None);
+
+        assert_eq!(
+            fallback_frames, seq_frames,
+            "AF-3 alpha=0 deterministic fallback must match sequential decode bit-for-bit"
         );
     }
 

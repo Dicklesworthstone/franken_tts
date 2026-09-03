@@ -40,6 +40,10 @@
 
 use ftts_kernels::int8::{QuantLinearMode, QuantizedMatrix, quant_linear};
 
+pub use crate::af3::{
+    set_af3_monitor_override, FrankenMtpEProcessConfig, FrankenMtpEProcessMonitor, MonitorDecision,
+};
+
 /// Number of code groups per frame: one primary code plus 15 residuals.
 pub const CODES_PER_FRAME: usize = 16;
 

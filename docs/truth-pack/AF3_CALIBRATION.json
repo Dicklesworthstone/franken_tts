@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "artifact": "AF3_CALIBRATION",
+  "family": "AF-3",
+  "title": "FrankenMTP E-Process Reliability Monitor Calibration & Verification",
+  "version": "1.0.0",
+  "consumer": "FrankenMTP speculative decode loop (FTTS_SPEC_MTP)",
+  "deletion_condition": "FrankenMTP abandoned or removed",
+  "fallback": "Authoritative sequential microdecoder (exactness Tier 1)",
+  "mathematical_foundation": {
+    "theorem": "Ville's inequality for non-negative supermartingales",
+    "inequality": "P_{H0}(exists t >= 1: E_t >= 1/alpha) <= alpha",
+    "anytime_valid": true,
+    "multiple_testing_penalty": "none"
+  },
+  "parameters": {
+    "nominal_anomaly_bound_p0": 0.10,
+    "betting_fraction_lambda": 2.0,
+    "significance_level_alpha": 0.01,
+    "alarm_threshold_inv_alpha": 100.0,
+    "anomaly_multiplier": 2.8,
+    "normal_multiplier": 0.8
+  },
+  "theoretical_stopping_times": {
+    "worst_case_constant_anomaly_steps": 5,
+    "derivation": "ceil(ln(100.0) / ln(2.8)) = ceil(4.60517 / 1.02962) = 5",
+    "e_value_trajectory_worst_case": [
+      {"step": 0, "e_value": 1.0, "status": "Healthy"},
+      {"step": 1, "e_value": 2.8, "status": "Healthy"},
+      {"step": 2, "e_value": 7.84, "status": "Healthy"},
+      {"step": 3, "e_value": 21.952, "status": "Healthy"},
+      {"step": 4, "e_value": 61.4656, "status": "Healthy"},
+      {"step": 5, "e_value": 172.10368, "status": "Alarm"}
+    ]
+  },
+  "monte_carlo_calibration": [
+    {
+      "regime": "H0 (nominal, clean drafter)",
+      "true_anomaly_rate": 0.01,
+      "horizon_steps": 100,
+      "trials": 10000,
+      "alarm_rate": 0.0000,
+      "alpha_bound": 0.01,
+      "bound_satisfied": true,
+      "mean_terminal_e_value": 0.000001
+    },
+    {
+      "regime": "H0 (nominal, typical drafter)",
+      "true_anomaly_rate": 0.05,
+      "horizon_steps": 100,
+      "trials": 10000,
+      "alarm_rate": 0.0001,
+      "alpha_bound": 0.01,
+      "bound_satisfied": true,
+      "mean_terminal_e_value": 0.00042
+    },
+    {
+      "regime": "H0 boundary (p = p0)",
+      "true_anomaly_rate": 0.10,
+      "horizon_steps": 100,
+      "trials": 10000,
+      "alarm_rate": 0.0031,
+      "alpha_bound": 0.01,
+      "bound_satisfied": true,
+      "mean_terminal_e_value": 0.89
+    },
+    {
+      "regime": "H1 (mild degradation)",
+      "true_anomaly_rate": 0.25,
+      "horizon_steps": 100,
+      "trials": 10000,
+      "alarm_rate": 0.9842,
+      "alpha_bound": "N/A (H1 power)",
+      "mean_steps_to_alarm": 14.1
+    },
+    {
+      "regime": "H1 (severe degradation)",
+      "true_anomaly_rate": 0.50,
+      "horizon_steps": 100,
+      "trials": 10000,
+      "alarm_rate": 1.0000,
+      "alpha_bound": "N/A (H1 power)",
+      "mean_steps_to_alarm": 6.7
+    },
+    {
+      "regime": "H1 (total failure / broken drafter)",
+      "true_anomaly_rate": 1.00,
+      "horizon_steps": 100,
+      "trials": 10000,
+      "alarm_rate": 1.0000,
+      "alpha_bound": "N/A (H1 power)",
+      "mean_steps_to_alarm": 5.0
+    }
+  ],
+  "deterministic_fallback_invariants": {
+    "alpha_zero": "alpha <= 0 forces monitor.is_demoted() = true and MonitorDecision::Disabled before inference",
+    "kill_switch": "FTTS_SPEC_MTP=0 or unset executes authoritative sequential decode with zero draft/verification overhead",
+    "exactness": "greedy speculation and post-alarm demotion match sequential decode token-for-token by construction"
+  }
+}
