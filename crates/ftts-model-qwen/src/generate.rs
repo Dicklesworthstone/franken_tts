@@ -1441,8 +1441,8 @@ impl FrameGenerator for QwenGenerator<'_> {
                 heads: (!route.micro_heads.is_empty()).then_some(route.micro_heads.as_slice()),
                 mode: route.mode,
             });
-        let spec_mtp = sampling_mode == SamplingMode::CanonicalGreedy
-            && microdecoder::spec_mtp_enabled();
+        let spec_mtp =
+            sampling_mode == SamplingMode::CanonicalGreedy && microdecoder::spec_mtp_enabled();
         if spec_mtp {
             self.microdecoder_scratch.decode_frame_greedy_speculative(
                 &self.microdecoder_config,
