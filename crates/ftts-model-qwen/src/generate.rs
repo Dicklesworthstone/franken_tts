@@ -2186,7 +2186,7 @@ mod tests {
 
         // Arm speculative decode
         microdecoder::set_spec_mtp_override(Some(true));
-        let mut gen = generator(
+        let mut generator_inst = generator(
             &weights,
             &micro_layers,
             &micro_residual,
@@ -2197,16 +2197,17 @@ mod tests {
         );
 
         // Configure monitor with aggressive alpha=0.05 (threshold=20.0)
-        *gen.mtp_monitor_mut() = FrankenMtpEProcessMonitor::new(
+        *generator_inst.mtp_monitor_mut() = FrankenMtpEProcessMonitor::new(
             crate::af3::FrankenMtpEProcessConfig::new(0.10, 2.0, 0.05),
         );
 
-        gen.begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
+        generator_inst
+            .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
             .expect("valid tiny prompt");
 
         let mut frames = Vec::new();
         for _ in 0..10 {
-            match gen.next_frame().expect("next_frame succeeds") {
+            match generator_inst.next_frame().expect("next_frame succeeds") {
                 FrameStep::Frame(f) => frames.push(f),
                 FrameStep::Finished => break,
                 FrameStep::AwaitingText => panic!("unexpected awaiting text"),
@@ -2215,8 +2216,14 @@ mod tests {
         microdecoder::set_spec_mtp_override(None);
 
         // Monitor must be alarmed and demoted!
-        assert!(gen.mtp_monitor().is_demoted(), "AF-3 monitor must demote on repeated anomalies");
-        assert!(gen.mtp_monitor().e_value() >= 20.0, "e-value must have crossed threshold 1/alpha");
+        assert!(
+            generator_inst.mtp_monitor().is_demoted(),
+            "AF-3 monitor must demote on repeated anomalies"
+        );
+        assert!(
+            generator_inst.mtp_monitor().e_value() >= 20.0,
+            "e-value must have crossed threshold 1/alpha"
+        );
 
         // Ground truth comparison: verify that the emitted frames are still bit-identical to sequential!
         microdecoder::set_spec_mtp_override(Some(false));
@@ -2247,7 +2254,7 @@ mod tests {
 
         // Enable speculation globally, but configure AF-3 with alpha=0.0 (deterministic fallback)
         microdecoder::set_spec_mtp_override(Some(true));
-        let mut gen = generator(
+        let mut generator_inst = generator(
             &weights,
             &micro_layers,
             &micro_residual,
@@ -2256,16 +2263,20 @@ mod tests {
             1,
             SamplingMode::CanonicalGreedy,
         );
-        *gen.mtp_monitor_mut() = FrankenMtpEProcessMonitor::new(
+        *generator_inst.mtp_monitor_mut() = FrankenMtpEProcessMonitor::new(
             crate::af3::FrankenMtpEProcessConfig::new(0.10, 2.0, 0.0),
         );
-        assert!(gen.mtp_monitor().is_demoted(), "alpha=0 must be demoted before any steps");
+        assert!(
+            generator_inst.mtp_monitor().is_demoted(),
+            "alpha=0 must be demoted before any steps"
+        );
 
-        gen.begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
+        generator_inst
+            .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
             .expect("valid tiny prompt");
         let mut fallback_frames = Vec::new();
         for _ in 0..10 {
-            match gen.next_frame().expect("next_frame succeeds") {
+            match generator_inst.next_frame().expect("next_frame succeeds") {
                 FrameStep::Frame(f) => fallback_frames.push(f),
                 FrameStep::Finished => break,
                 FrameStep::AwaitingText => panic!("unexpected awaiting text"),
