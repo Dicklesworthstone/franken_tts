@@ -2170,7 +2170,12 @@ mod tests {
 
     #[test]
     fn af3_e_process_monitor_fault_injection_demotes_to_sequential() {
-        let weights = TinyWeights::new(1.0);
+        let mut weights = TinyWeights::new(0.0);
+        for head in &mut weights.micro_heads {
+            // Set row 42 of each head to 1.0 so argmax is token 42,
+            // while the drafter's proposal (0) is rejected immediately at depth 0.
+            head[42 * HIDDEN..42 * HIDDEN + HIDDEN].fill(1.0);
+        }
         let micro_layers = vec![weights.micro_layer(); 2];
         let micro_residual: Vec<&[f32]> = weights
             .micro_residual_embeddings
@@ -2191,7 +2196,7 @@ mod tests {
             &micro_layers,
             &micro_residual,
             &micro_heads,
-            residual_feedback,
+            residual_feedback.clone(),
             1,
             SamplingMode::CanonicalGreedy,
         );
@@ -2227,7 +2232,26 @@ mod tests {
 
         // Ground truth comparison: verify that the emitted frames are still bit-identical to sequential!
         microdecoder::set_spec_mtp_override(Some(false));
-        let seq_frames = drive(&weights, 1, SamplingMode::CanonicalGreedy, 10);
+        let mut seq_gen = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback,
+            1,
+            SamplingMode::CanonicalGreedy,
+        );
+        seq_gen
+            .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
+            .expect("valid tiny prompt");
+        let mut seq_frames = Vec::new();
+        for _ in 0..10 {
+            match seq_gen.next_frame().expect("next_frame succeeds") {
+                FrameStep::Frame(f) => seq_frames.push(f),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("unexpected awaiting text"),
+            }
+        }
         microdecoder::set_spec_mtp_override(None);
 
         assert_eq!(
@@ -2238,7 +2262,7 @@ mod tests {
 
     #[test]
     fn af3_deterministic_fallback_when_alpha_zero_matches_sequential_exactly() {
-        let weights = TinyWeights::new(1.0);
+        let weights = TinyWeights::new(0.0);
         let micro_layers = vec![weights.micro_layer(); 2];
         let micro_residual: Vec<&[f32]> = weights
             .micro_residual_embeddings
