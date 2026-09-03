@@ -12,6 +12,7 @@ pub mod audio;
 pub mod batching;
 pub mod health;
 pub mod ragged;
+pub mod server_admission;
 
 use std::{
     env, fmt,

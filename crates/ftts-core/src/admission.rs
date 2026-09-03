@@ -39,6 +39,12 @@
 
 use core::fmt;
 
+pub use crate::server_admission::{
+    AdmissionTicket, CapacityCertificate, QueueingLatencySummary, ServerAdmissionController,
+    ServerAdmissionRejection, ServerAdmissionRequest, ServerCapacityModel, ServerQueueingConfig,
+    SocketTopology,
+};
+
 /// Talker KV values retained per token.
 ///
 /// 28 layers × 2 (key and value) × 8 KV heads × 128 head_dim = 57,344. Grouped-query attention is
