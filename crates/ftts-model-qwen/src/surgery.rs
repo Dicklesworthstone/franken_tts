@@ -107,7 +107,7 @@ impl AdaptiveDepthController {
             self.config.max_depth
         } else {
             // Steady-state vowels or unvoiced segments tolerate early exit at d=10..12
-            10.max(self.config.min_depth)
+            10.max(self.config.min_depth).min(self.config.max_depth)
         };
 
         if chosen_depth <= RESIDUAL_DEPTHS {

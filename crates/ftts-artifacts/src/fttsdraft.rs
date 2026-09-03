@@ -420,7 +420,7 @@ impl FttsDraft {
             return Err(DraftError::KillSwitched(self.header.drafter_name.clone()));
         }
 
-        if self.header.base_model_hash != base_model_hash {
+        if !self.header.base_model_hash.trim().eq_ignore_ascii_case(base_model_hash.trim()) {
             return Err(DraftError::IncompatibleBaseModel {
                 expected: base_model_hash.to_string(),
                 actual: self.header.base_model_hash.clone(),

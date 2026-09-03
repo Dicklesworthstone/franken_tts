@@ -60,6 +60,7 @@ impl DistilledMicroDrafter {
     /// Creates a new distilled drafter with the specified hidden dimension.
     #[must_use]
     pub fn new(hidden_size: usize) -> Self {
+        assert!(hidden_size > 0, "hidden_size must be positive");
         let weight_count = RESIDUAL_DEPTHS * hidden_size;
         let mut projection_weights = Vec::with_capacity(weight_count);
         // Deterministic pseudo-weights for initialization
@@ -155,6 +156,7 @@ impl ParallelHeadsDrafter {
     /// Creates a 15-head parallel predictor.
     #[must_use]
     pub fn new(hidden_size: usize) -> Self {
+        assert!(hidden_size > 0, "hidden_size must be positive");
         let weight_count = RESIDUAL_DEPTHS * hidden_size;
         let mut head_weights = Vec::with_capacity(weight_count);
         for i in 0..weight_count {
@@ -267,8 +269,9 @@ impl TreeVerifyController {
     /// Evaluates speedup vs break-even alpha threshold.
     #[must_use]
     pub fn break_even_alpha(sku_multiplier: f64) -> f64 {
-        // First-order cost model: speculative block verification pays 1 block pass.
-        // Break-even is reached when mean accepted prefix length amortizes verification cost.
+        if sku_multiplier <= 0.0 || sku_multiplier.is_nan() {
+            return 1.0;
+        }
         (1.0 / (RESIDUAL_DEPTHS as f64 * sku_multiplier)).clamp(0.0, 1.0)
     }
 }
@@ -330,5 +333,19 @@ mod tests {
 
         let alpha_star = TreeVerifyController::break_even_alpha(1.0);
         assert!(alpha_star > 0.0 && alpha_star < 1.0);
+    }
+
+    #[test]
+    fn break_even_alpha_handles_extreme_inputs() {
+        assert_eq!(TreeVerifyController::break_even_alpha(0.0), 1.0);
+        assert_eq!(TreeVerifyController::break_even_alpha(-5.0), 1.0);
+        assert_eq!(TreeVerifyController::break_even_alpha(f64::NAN), 1.0);
+        assert!((TreeVerifyController::break_even_alpha(100.0) - (1.0 / 1500.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "hidden_size must be positive")]
+    fn distilled_drafter_panics_on_zero_hidden_size() {
+        let _ = DistilledMicroDrafter::new(0);
     }
 }
