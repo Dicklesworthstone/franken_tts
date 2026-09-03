@@ -54,6 +54,9 @@ pub enum SpeculativeStepOutcome {
 
 /// Extended generator trait supporting FrankenMTP speculative block verification.
 pub trait SpeculativeFrameGenerator: FrameGenerator {
+    /// Returns true if all frames for the utterance have been completed.
+    fn is_finished(&self) -> bool;
+
     /// Attempts a speculative block draft and causal verification pass.
     ///
     /// If speculation is disabled or demoted, implementations can return `PartialAccept` with
@@ -295,8 +298,12 @@ impl<G: SpeculativeFrameGenerator> RaggedBatchScheduler<G> {
         for &id in &cohort {
             let stream = self.streams.get_mut(&id).expect("stream exists");
 
+            if stream.generator.is_finished() {
+                stream.status = StreamStatus::Finished;
+                continue;
+            }
+
             if !stream.speculation_enabled {
-                // Direct to sequential repair lane starting from depth 0
                 stream.lane = StreamLane::SequentialRepair {
                     partial_codes: Vec::new(),
                     next_depth: 0,
@@ -450,8 +457,12 @@ mod tests {
     }
 
     impl SpeculativeFrameGenerator for ConfigurableSpecGenerator {
+        fn is_finished(&self) -> bool {
+            self.current_frame >= self.total_frames
+        }
+
         fn step_speculative_block(&mut self) -> Result<SpeculativeStepOutcome, GenerationError> {
-            if self.current_frame >= self.total_frames {
+            if self.is_finished() {
                 return Ok(SpeculativeStepOutcome::Finished);
             }
 
@@ -617,5 +628,96 @@ mod tests {
         assert!(metrics.lane1_full_accepts > 0);
         assert!(metrics.lane2_repair_frames > 0);
         assert!(metrics.total_repair_steps > 0);
+    }
+
+    #[test]
+    fn ab_benchmark_dual_lane_speculation_vs_pure_sequential() {
+        let prep = sample_prep();
+        let num_streams = 8;
+        let frames_per_stream = 10;
+
+        // Realistic acceptance mix (from 3A alpha):
+        // 60% full-accept (depth 16), 30% partial-accept (depth 8-12), 10% low-accept (depth 2-4)
+        let spec_patterns: Vec<Vec<usize>> = (0..num_streams)
+            .map(|s| {
+                (0..frames_per_stream)
+                    .map(|f| match (s + f) % 10 {
+                        0..=5 => 16, // full accept in 1 block step
+                        6..=8 => 10, // partial accept
+                        _ => 3,      // low accept
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // 1. Benchmark Condition A: Dual-Lane with speculation enabled
+        let config = BatchSchedulerConfig {
+            policy: BatchingPolicy::Throughput {
+                max_batch_size: num_streams,
+                queue_delay: Duration::ZERO,
+            },
+            max_admitted_streams: 32,
+            quantum_slice: Duration::from_micros(10),
+        };
+        let mut sched_a = RaggedBatchScheduler::new(config);
+
+        for s in 0..num_streams {
+            let generator_inst = ConfigurableSpecGenerator::new(s, frames_per_stream, spec_patterns[s].clone());
+            sched_a.admit(generator_inst, &prep, UtteranceStart::Fresh, true).unwrap();
+        }
+
+        while sched_a.active_stream_count() > 0 {
+            sched_a.step_quantum().unwrap();
+        }
+        let metrics_a = *sched_a.metrics();
+
+        // 2. Benchmark Condition B: Pure sequential batching (speculation disabled)
+        let mut sched_b = RaggedBatchScheduler::new(config);
+
+        for s in 0..num_streams {
+            let generator_inst = ConfigurableSpecGenerator::new(s, frames_per_stream, spec_patterns[s].clone());
+            sched_b.admit(generator_inst, &prep, UtteranceStart::Fresh, false).unwrap();
+        }
+
+        while sched_b.active_stream_count() > 0 {
+            sched_b.step_quantum().unwrap();
+        }
+        let metrics_b = *sched_b.metrics();
+
+        // Total frames completed is equal across both conditions
+        assert_eq!(metrics_a.total_frames_completed, (num_streams * frames_per_stream) as u64);
+        assert_eq!(metrics_b.total_frames_completed, (num_streams * frames_per_stream) as u64);
+
+        // Dual-Lane speculation resolves majority of frames in Lane 1
+        assert!(metrics_a.full_accept_rate() >= 0.50, "full accept rate should be >= 50%");
+        assert_eq!(metrics_b.lane1_full_accepts, 0, "Condition B has 0 speculation");
+
+        // Dual-Lane achieves massive reduction in sequential repair steps:
+        // Pure sequential evaluated 16 steps/frame * 80 frames = 1280 steps
+        // Speculative dual-lane skips ~60% of steps completely
+        assert!(metrics_a.total_repair_steps < metrics_b.total_repair_steps);
+        let step_reduction = 1.0 - (metrics_a.total_repair_steps as f64 / metrics_b.total_repair_steps as f64);
+        assert!(
+            step_reduction >= 0.50,
+            "Dual-lane should eliminate at least 50% of sequential repair steps (got {:.1}%)",
+            step_reduction * 100.0
+        );
+
+        println!(
+            "Ragged Dual-Lane A/B Benchmark Results (N={} streams, {} frames/stream):\n\
+             - Condition A (Dual-Lane Speculation): {} total repair steps, {:.1}% full accept rate\n\
+             - Condition B (Pure Sequential):      {} total repair steps, {:.1}% full accept rate\n\
+             - Sequential Step Reduction:          {:.1}%\n\
+             - Lane 1 Full Accepts:                {}/{}",
+            num_streams,
+            frames_per_stream,
+            metrics_a.total_repair_steps,
+            metrics_a.full_accept_rate() * 100.0,
+            metrics_b.total_repair_steps,
+            metrics_b.full_accept_rate() * 100.0,
+            step_reduction * 100.0,
+            metrics_a.lane1_full_accepts,
+            metrics_a.total_frames_completed,
+        );
     }
 }
