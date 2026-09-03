@@ -60,6 +60,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Debug info is not consumed by any CI gate, but it makes the dev/test artifact set large
+  # enough to exhaust the runner filesystem before tests execute. Keep the exact same code,
+  # lints, and assertions while omitting that non-gating payload from transient CI builds.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
   # A stray ~/.cargo/config or CI default must not silently change what we build.
   RUSTFLAGS: ""
   # Sibling repositories are pinned by commit, not by branch: the workspace consumes them
