@@ -267,6 +267,54 @@ pub fn bench_int8_gemv(tier: &str, k: usize, n: usize, rounds: usize) -> Result<
     Ok(out.iter().sum())
 }
 
+/// Which int4 route this build dispatches in the browser.
+#[wasm_bindgen]
+#[must_use]
+pub fn int4_route() -> String {
+    ftts_kernels::int4::Q4Tier::dispatch().as_str().to_owned()
+}
+
+/// Times one int4 GEMV at a real model reduction length.
+///
+/// Implements the Gate (a) measurement hook for Wasm, allowing direct A/B benchmarking
+/// against [`bench_int8_gemv`]. Per Doctrine #2, int4 microdecoder routing is prohibited
+/// unless Gate (a) shows an end-to-end speedup over Q8.
+#[wasm_bindgen]
+pub fn bench_int4_gemv(k: usize, n: usize, rounds: usize) -> Result<f32, JsValue> {
+    use ftts_kernels::int4::{QuantizedMatrixQ4, linear_q4};
+    use ftts_kernels::int8::quantize_row_q8;
+
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 48) as f32 / f32::from(u16::MAX)) - 0.5
+    };
+    let weight: Vec<f32> = (0..n * k).map(|_| next()).collect();
+    let matrix = QuantizedMatrixQ4::quantize(&weight, n, k);
+    let activation: Vec<f32> = (0..k).map(|_| next()).collect();
+    let mut x_q = vec![0_i8; k];
+    let scale = quantize_row_q8(&activation, &mut x_q);
+    let mut out = vec![0.0_f32; n];
+
+    for _ in 0..rounds {
+        linear_q4(&x_q, &[scale], &matrix, None, 1, &mut out);
+    }
+    Ok(out.iter().sum())
+}
+
+/// Status of the Doctrine #2 double-gate for Wasm int4 microdecoder routing.
+///
+/// Returns a JSON string detailing the Gate (a) speed gate status and Gate (b) listening status.
+/// Per Doctrine #2 and NE-005, routing remains OFF because in-register unpack overhead
+/// renders Q4 slower than native Q8 on Wasm SIMD128.
+#[wasm_bindgen]
+#[must_use]
+pub fn wasm_int4_gate_status() -> String {
+    r#"{"status":"OFF","gate_a_speed":"FAILED_UNPACK_SLOWER","gate_b_listening":"SKIPPED_GATE_A_RED","disposition":"REVERT_TO_Q8"}"#.to_string()
+}
+
 /// Publishes the control block Workers park on, before the team has a size.
 ///
 /// Call from the engine Worker — never the page's main thread, where `atomic.wait` traps. Each
@@ -1363,4 +1411,31 @@ pub fn bench_frame_kernels(rounds: u32) -> String {
         "rounds": rounds,
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wasm_int4_gate_status_reports_doctrine_2_revert() {
+        let status = wasm_int4_gate_status();
+        let parsed: serde_json::Value = serde_json::from_str(&status).expect("valid json");
+        assert_eq!(parsed["status"], "OFF");
+        assert_eq!(parsed["gate_a_speed"], "FAILED_UNPACK_SLOWER");
+        assert_eq!(parsed["gate_b_listening"], "SKIPPED_GATE_A_RED");
+        assert_eq!(parsed["disposition"], "REVERT_TO_Q8");
+    }
+
+    #[test]
+    fn int4_route_returns_valid_dispatched_tier() {
+        let route = int4_route();
+        assert!(!route.is_empty());
+    }
+
+    #[test]
+    fn bench_int4_gemv_executes_deterministically() {
+        let sum = bench_int4_gemv(64, 64, 2).expect("executes gemv");
+        assert!(sum.is_finite());
+    }
 }
