@@ -11,6 +11,7 @@ pub mod admission;
 pub mod audio;
 pub mod batching;
 pub mod health;
+pub mod ragged;
 
 use std::{
     env, fmt,
