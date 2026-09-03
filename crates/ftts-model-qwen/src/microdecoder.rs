@@ -1452,6 +1452,116 @@ impl FrankenMtpDrafter {
         }
         self.previous_frame = Some(*codes);
     }
+
+    /// Exports this drafter state to a versioned `.fttsdraft` container.
+    pub fn to_draft_artifact(&self, base_model_hash: &str) -> ftts_artifacts::fttsdraft::FttsDraft {
+        use ftts_artifacts::fttsdraft::{DraftHeader, DraftTensor, DrafterType, FttsDraft};
+        use std::collections::BTreeMap;
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("drafter_family".into(), "frankenmtp_v1_transition_sketch".into());
+        if let Some(prev) = self.previous_frame {
+            let prev_str = prev.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
+            metadata.insert("previous_frame".into(), prev_str);
+        }
+
+        let header = DraftHeader {
+            base_model_hash: base_model_hash.to_string(),
+            engine_abi_version: ftts_artifacts::fttsdraft::CURRENT_ENGINE_ABI_VERSION,
+            drafter_type: DrafterType::DistilledMtp,
+            drafter_name: "frankenmtp-v1-drafter".to_string(),
+            is_kill_switched: false,
+            target_layers: (1..=RESIDUAL_DEPTHS as u32).collect(),
+            metadata,
+        };
+
+        let mut data = Vec::with_capacity(RESIDUAL_DEPTHS * TRANSITION_BUCKETS * 8);
+        for depth in 0..RESIDUAL_DEPTHS {
+            for bucket in &self.transitions[depth] {
+                data.extend_from_slice(&bucket.source.to_le_bytes());
+                data.extend_from_slice(&bucket.target.to_le_bytes());
+                data.extend_from_slice(&bucket.count.to_le_bytes());
+            }
+        }
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "transition_buckets".to_string(),
+            DraftTensor {
+                name: "transition_buckets".to_string(),
+                rows: RESIDUAL_DEPTHS,
+                cols: TRANSITION_BUCKETS * 8,
+                scales: vec![1.0; RESIDUAL_DEPTHS],
+                data: data.into_iter().map(|b| b as i8).collect(),
+            },
+        );
+
+        FttsDraft::new(header, tensors)
+    }
+
+    /// Reconstructs a `FrankenMtpDrafter` from a validated `.fttsdraft` container.
+    pub fn from_draft_artifact(
+        artifact: &ftts_artifacts::fttsdraft::FttsDraft,
+    ) -> Result<Self, ftts_artifacts::fttsdraft::DraftError> {
+        use ftts_artifacts::fttsdraft::DraftError;
+
+        let tensor = artifact
+            .tensors
+            .get("transition_buckets")
+            .ok_or_else(|| DraftError::CorruptHeader("missing transition_buckets tensor".into()))?;
+
+        if tensor.rows != RESIDUAL_DEPTHS || tensor.cols != TRANSITION_BUCKETS * 8 {
+            return Err(DraftError::CorruptHeader("invalid transition_buckets shape".into()));
+        }
+
+        let mut transitions = [[TransitionBucket::EMPTY; TRANSITION_BUCKETS]; RESIDUAL_DEPTHS];
+        let bytes: Vec<u8> = tensor.data.iter().map(|&b| b as u8).collect();
+
+        for depth in 0..RESIDUAL_DEPTHS {
+            let row_offset = depth * TRANSITION_BUCKETS * 8;
+            for bucket_idx in 0..TRANSITION_BUCKETS {
+                let offset = row_offset + bucket_idx * 8;
+                let source = u16::from_le_bytes(
+                    bytes[offset..offset + 2]
+                        .try_into()
+                        .map_err(|_| DraftError::CorruptHeader("invalid bucket source".into()))?,
+                );
+                let target = u16::from_le_bytes(
+                    bytes[offset + 2..offset + 4]
+                        .try_into()
+                        .map_err(|_| DraftError::CorruptHeader("invalid bucket target".into()))?,
+                );
+                let count = u32::from_le_bytes(
+                    bytes[offset + 4..offset + 8]
+                        .try_into()
+                        .map_err(|_| DraftError::CorruptHeader("invalid bucket count".into()))?,
+                );
+
+                transitions[depth][bucket_idx] = TransitionBucket { source, target, count };
+            }
+        }
+
+        let previous_frame = artifact
+            .header
+            .metadata
+            .get("previous_frame")
+            .and_then(|s| {
+                let parts: Vec<usize> = s.split(',').filter_map(|p| p.parse().ok()).collect();
+                if parts.len() == RESIDUAL_DEPTHS {
+                    let mut arr = [0usize; RESIDUAL_DEPTHS];
+                    arr.copy_from_slice(&parts);
+                    Some(arr)
+                } else {
+                    None
+                }
+            });
+
+        Ok(Self {
+            previous_frame,
+            transitions,
+            fault_injected: false,
+        })
+    }
 }
 
 impl Default for FrankenMtpDrafter {
@@ -3938,5 +4048,39 @@ mod tests {
             "FrankenMTP v1 greedy measurement: num_frames={num_frames}, p_token={p_token:.4}, alpha_full={alpha_full:.4}"
         );
         assert!(p_token <= 1.0);
+    }
+
+    #[test]
+    fn test_frankenmtp_drafter_roundtrip_through_fttsdraft_abi() {
+        let mut original = FrankenMtpDrafter::new();
+        let frame1 = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150];
+        let frame2 = [11, 21, 31, 41, 51, 61, 71, 81, 91, 101, 111, 121, 131, 141, 151];
+        original.observe(&frame1);
+        original.observe(&frame2);
+
+        let draft1 = original.draft();
+
+        // 1. Export to FttsDraft
+        let artifact = original.to_draft_artifact("base_model_sha256_hash_12345");
+        assert_eq!(artifact.header.drafter_name, "frankenmtp-v1-drafter");
+
+        // 2. Binary encode
+        let encoded_bytes = artifact.encode().expect("encode to binary");
+
+        // 3. Binary decode
+        let decoded_artifact = ftts_artifacts::fttsdraft::FttsDraft::decode(&encoded_bytes)
+            .expect("decode from binary");
+        decoded_artifact
+            .verify_compatibility("base_model_sha256_hash_12345", 1)
+            .expect("verify compatibility");
+
+        // 4. Reconstruct drafter
+        let reconstructed = FrankenMtpDrafter::from_draft_artifact(&decoded_artifact)
+            .expect("reconstruct from artifact");
+
+        // 5. Verify identical drafting behavior
+        let draft2 = reconstructed.draft();
+        assert_eq!(draft1, draft2, "draft predictions must be 100% identical after ABI roundtrip");
+        assert_eq!(original, reconstructed, "state must be identical");
     }
 }
