@@ -128,6 +128,11 @@ CARGO_MODE="local cargo"
 if [[ -n "${FTTS_CHECK_USE_RCH:-}" ]] && command -v rch >/dev/null 2>&1; then
     CARGO_RUNNER=(rch exec -- cargo)
     CARGO_MODE="rch exec (OPT-IN: worker resolves out-of-tree path deps against ITS OWN checkouts)"
+else
+    # The self-hosted CI runners can have an rch cargo shim installed even though this
+    # gate deliberately selected local execution. Make that selection operational instead
+    # of allowing the shim to auto-start rch and fail when the runner has no workers.
+    export RCH_CARGO_WRAPPER_BYPASS=1
 fi
 
 run_cargo() { "${CARGO_RUNNER[@]}" "$@"; }
