@@ -9,6 +9,7 @@
 
 pub mod admission;
 pub mod audio;
+pub mod batching;
 pub mod health;
 
 use std::{
