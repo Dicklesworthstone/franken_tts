@@ -884,6 +884,11 @@ impl<'a> QwenGenerator<'a> {
         &mut self.mtp_monitor
     }
 
+    /// Injects a deliberately broken drafter for AF-3 reliability monitor testing.
+    pub fn set_mtp_drafter_fault_injected(&mut self, fault: bool) {
+        self.mtp_drafter.set_fault_injected(fault);
+    }
+
     fn prompt_prefix_identity(&self) -> TalkerPromptPrefixIdentity {
         let first_q_weight = self
             .talker_weights
@@ -2209,6 +2214,7 @@ mod tests {
         generator_inst
             .begin_utterance(&prepared(&[1, 2]), UtteranceStart::Fresh)
             .expect("valid tiny prompt");
+        generator_inst.set_mtp_drafter_fault_injected(true);
 
         let mut frames = Vec::new();
         for _ in 0..10 {

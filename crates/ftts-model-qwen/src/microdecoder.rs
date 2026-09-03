@@ -1380,6 +1380,7 @@ impl TransitionBucket {
 pub struct FrankenMtpDrafter {
     previous_frame: Option<[usize; RESIDUAL_DEPTHS]>,
     transitions: [[TransitionBucket; TRANSITION_BUCKETS]; RESIDUAL_DEPTHS],
+    fault_injected: bool,
 }
 
 impl FrankenMtpDrafter {
@@ -1389,12 +1390,21 @@ impl FrankenMtpDrafter {
         Self {
             previous_frame: None,
             transitions: [[TransitionBucket::EMPTY; TRANSITION_BUCKETS]; RESIDUAL_DEPTHS],
+            fault_injected: false,
         }
+    }
+
+    /// Injects a deliberately broken drafter for AF-3 reliability monitor testing.
+    pub fn set_fault_injected(&mut self, fault: bool) {
+        self.fault_injected = fault;
     }
 
     /// Proposes one residual code at each of the fifteen depths without allocating.
     #[must_use]
     pub fn draft(&self) -> [usize; RESIDUAL_DEPTHS] {
+        if self.fault_injected {
+            return [RESIDUAL_VOCAB - 1; RESIDUAL_DEPTHS];
+        }
         let Some(previous) = self.previous_frame else {
             return [0; RESIDUAL_DEPTHS];
         };
