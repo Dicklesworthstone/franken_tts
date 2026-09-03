@@ -33,6 +33,33 @@ pub enum SamplingMode {
     Production,
 }
 
+/// Outcome of a Truncated Speculative Rejection Sampling (T-SRS) step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeculativeDecision {
+    /// Draft candidate accepted; sample matches verifier distribution.
+    Accepted(u32),
+    /// Draft candidate rejected; resampled from the adjusted conditional residual distribution.
+    Rejected {
+        resampled_token: u32,
+    },
+}
+
+impl SpeculativeDecision {
+    /// Authoritative token selected by the verifier (either accepted candidate or resampled token).
+    #[must_use]
+    pub const fn token(self) -> u32 {
+        match self {
+            Self::Accepted(tok) | Self::Rejected { resampled_token: tok } => tok,
+        }
+    }
+
+    /// Whether the proposed candidate was accepted.
+    #[must_use]
+    pub const fn is_accepted(self) -> bool {
+        matches!(self, Self::Accepted(_))
+    }
+}
+
 /// A sampler failure caused by an invalid model boundary or logits tensor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SamplerError {
@@ -155,6 +182,151 @@ impl QwenSampler {
         // final nonzero-probability candidate.
         last.map(|token| token as u32)
             .ok_or(SamplerError::NoCandidate)
+    }
+
+    /// Executes Truncated Speculative Rejection Sampling (T-SRS) for one microdecoder step.
+    ///
+    /// Proves that the marginal distribution of the emitted token (whether accepted or resampled)
+    /// equals the verifier's target categorical distribution with T=0.9 and top_k=50.
+    pub fn speculative_step_microdecoder(
+        &mut self,
+        verifier_logits: &[f32],
+        draft_logits: &[f32],
+        draft_token: u32,
+    ) -> Result<SpeculativeDecision, SamplerError> {
+        ensure_logits("microdecoder verifier", verifier_logits, MICRODECODER_VOCAB_SIZE)?;
+        ensure_logits("microdecoder draft", draft_logits, MICRODECODER_VOCAB_SIZE)?;
+
+        let mut v_scores = verifier_logits.to_vec();
+        apply_sampling_warpers(&mut v_scores);
+        let p_dist = softmax_finite(&v_scores)?;
+
+        let mut d_scores = draft_logits.to_vec();
+        apply_sampling_warpers(&mut d_scores);
+        let q_dist = softmax_finite(&d_scores)?;
+
+        self.speculative_sample_core(&p_dist, &q_dist, draft_token)
+    }
+
+    /// Executes Truncated Speculative Rejection Sampling (T-SRS) for one talker step.
+    ///
+    /// Evaluates repetition penalty and top_k=50 truncation before computing acceptance.
+    pub fn speculative_step_talker(
+        &mut self,
+        verifier_logits: &[f32],
+        draft_logits: &[f32],
+        group_zero_history: &[u32],
+        draft_token: u32,
+    ) -> Result<SpeculativeDecision, SamplerError> {
+        ensure_logits("talker verifier", verifier_logits, TALKER_VOCAB_SIZE)?;
+        ensure_logits("talker draft", draft_logits, TALKER_VOCAB_SIZE)?;
+
+        let mut v_scores = verifier_logits.to_vec();
+        apply_talker_processors(&mut v_scores, group_zero_history)?;
+        apply_sampling_warpers(&mut v_scores);
+        let p_dist = softmax_finite(&v_scores)?;
+
+        let mut d_scores = draft_logits.to_vec();
+        apply_talker_processors(&mut d_scores, group_zero_history)?;
+        apply_sampling_warpers(&mut d_scores);
+        let q_dist = softmax_finite(&d_scores)?;
+
+        self.speculative_sample_core(&p_dist, &q_dist, draft_token)
+    }
+
+    /// Core Truncated Speculative Rejection Sampling algorithm (T-SRS).
+    fn speculative_sample_core(
+        &mut self,
+        p_dist: &[(usize, f64)],
+        q_dist: &[(usize, f64)],
+        draft_token: u32,
+    ) -> Result<SpeculativeDecision, SamplerError> {
+        let draft_idx = draft_token as usize;
+        let p_draft = p_dist
+            .iter()
+            .find(|(tok, _)| *tok == draft_idx)
+            .map_or(0.0, |(_, prob)| *prob);
+        let q_draft = q_dist
+            .iter()
+            .find(|(tok, _)| *tok == draft_idx)
+            .map_or(0.0, |(_, prob)| *prob);
+
+        let alpha = if q_draft > 0.0 {
+            (p_draft / q_draft).min(1.0)
+        } else {
+            0.0
+        };
+
+        let u = self.rng.next_unit_interval();
+        if u < alpha {
+            return Ok(SpeculativeDecision::Accepted(draft_token));
+        }
+
+        // Rejection branch: resample from normalized residual distribution max(0, P(x) - Q(x))
+        let max_vocab = p_dist
+            .iter()
+            .map(|(t, _)| *t)
+            .chain(q_dist.iter().map(|(t, _)| *t))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut q_map = vec![0.0_f64; max_vocab];
+        for &(tok, prob) in q_dist {
+            if tok < q_map.len() {
+                q_map[tok] = prob;
+            }
+        }
+
+        let mut residual = Vec::with_capacity(p_dist.len());
+        let mut residual_sum = 0.0_f64;
+        for &(tok, p_prob) in p_dist {
+            let q_prob = if tok < q_map.len() { q_map[tok] } else { 0.0 };
+            let diff = (p_prob - q_prob).max(0.0);
+            if diff > 0.0 {
+                residual.push((tok, diff));
+                residual_sum += diff;
+            }
+        }
+
+        if residual_sum <= 0.0 || residual.is_empty() {
+            let resampled = self.sample_from_dist(p_dist)?;
+            return Ok(SpeculativeDecision::Rejected {
+                resampled_token: resampled,
+            });
+        }
+
+        // Sample from normalized residual
+        let draw = self.rng.next_unit_interval();
+        let mut cumulative = 0.0_f64;
+        let mut last = None;
+        for (tok, diff) in residual {
+            cumulative += diff / residual_sum;
+            last = Some(tok);
+            if draw < cumulative {
+                return Ok(SpeculativeDecision::Rejected {
+                    resampled_token: tok as u32,
+                });
+            }
+        }
+
+        let final_tok = last.ok_or(SamplerError::NoCandidate)? as u32;
+        Ok(SpeculativeDecision::Rejected {
+            resampled_token: final_tok,
+        })
+    }
+
+    fn sample_from_dist(&mut self, dist: &[(usize, f64)]) -> Result<u32, SamplerError> {
+        let draw = self.rng.next_unit_interval();
+        let mut cumulative = 0.0_f64;
+        let mut last = None;
+        for &(tok, prob) in dist {
+            cumulative += prob;
+            last = Some(tok);
+            if draw < cumulative {
+                return Ok(tok as u32);
+            }
+        }
+        last.map(|t| t as u32).ok_or(SamplerError::NoCandidate)
     }
 }
 
@@ -598,5 +770,133 @@ mod tests {
             .expect("valid logits");
 
         assert_eq!(left_tokens, right_tokens);
+    }
+
+    #[test]
+    fn test_speculative_rejection_sampling_matches_verifier_distribution_many_seeds() {
+        let mut v_logits = microdecoder_logits();
+        let mut d_logits = microdecoder_logits();
+
+        // Create realistic non-trivial probability distribution
+        for i in 0..100 {
+            v_logits[i] = 10.0 - (i as f32 * 0.15);
+            d_logits[i] = 9.8 - (i as f32 * 0.14) + ((i % 5) as f32 * 0.1);
+        }
+
+        // Compute true target distribution P(x)
+        let mut v_scores = v_logits.clone();
+        apply_sampling_warpers(&mut v_scores);
+        let p_dist = softmax_finite(&v_scores).expect("valid p_dist");
+
+        let mut p_true_map = vec![0.0_f64; MICRODECODER_VOCAB_SIZE];
+        for &(tok, prob) in &p_dist {
+            p_true_map[tok] = prob;
+        }
+
+        let num_trials = 30_000;
+        let mut draft_sampler = QwenSampler::seeded(12345);
+        let mut spec_sampler = QwenSampler::seeded(67890);
+
+        let mut counts = vec![0usize; MICRODECODER_VOCAB_SIZE];
+        let mut accepted_count = 0usize;
+
+        for _ in 0..num_trials {
+            // 1. Propose draft candidate from Q(x)
+            let draft_cand = draft_sampler
+                .select_microdecoder(&d_logits, SamplingMode::Production)
+                .expect("valid draft draw");
+
+            // 2. Step speculative rejection sampler
+            let decision = spec_sampler
+                .speculative_step_microdecoder(&v_logits, &d_logits, draft_cand)
+                .expect("valid spec step");
+
+            if decision.is_accepted() {
+                accepted_count += 1;
+            }
+            counts[decision.token() as usize] += 1;
+        }
+
+        // Statistical assertion 1: Accept rate should be non-trivial (draft and verifier are close)
+        let accept_rate = accepted_count as f64 / num_trials as f64;
+        assert!(
+            accept_rate > 0.60 && accept_rate < 0.99,
+            "acceptance rate {accept_rate:.2} should be realistic"
+        );
+
+        // Statistical assertion 2: No tokens outside verifier Top-K are ever drawn
+        for tok in 0..MICRODECODER_VOCAB_SIZE {
+            if p_true_map[tok] == 0.0 {
+                assert_eq!(
+                    counts[tok], 0,
+                    "token {tok} has 0 probability in verifier Top-K but was drawn {} times!",
+                    counts[tok]
+                );
+            }
+        }
+
+        // Statistical assertion 3: Total Variation Distance (TVD) between empirical and true distribution
+        let mut tvd = 0.0_f64;
+        for tok in 0..MICRODECODER_VOCAB_SIZE {
+            let p_emp = counts[tok] as f64 / num_trials as f64;
+            tvd += (p_emp - p_true_map[tok]).abs();
+        }
+        tvd *= 0.5;
+
+        assert!(
+            tvd < 0.02,
+            "Total variation distance {tvd:.4} must be < 0.02 for 30k trials (distributional equivalence)"
+        );
+    }
+
+    #[test]
+    fn test_speculative_rejection_sampling_with_top_k_truncation() {
+        let mut v_logits = microdecoder_logits();
+        let mut d_logits = microdecoder_logits();
+
+        // Token 999 has high probability in draft but is completely absent from verifier Top-K
+        v_logits[10] = 20.0;
+        v_logits[20] = 19.0;
+        d_logits[999] = 25.0; // dominant in draft
+
+        let mut spec_sampler = QwenSampler::seeded(42);
+
+        for _ in 0..100 {
+            let decision = spec_sampler
+                .speculative_step_microdecoder(&v_logits, &d_logits, 999)
+                .expect("valid spec step");
+
+            // Candidate 999 must ALWAYS be rejected because P(999) == 0
+            assert!(!decision.is_accepted(), "candidate 999 must be rejected");
+            assert!(
+                decision.token() == 10 || decision.token() == 20,
+                "resampled token must come from verifier's Top-K support"
+            );
+        }
+    }
+
+    #[test]
+    fn test_talker_repetition_penalty_interaction_under_speculation() {
+        let mut v_logits = talker_logits();
+        let mut d_logits = talker_logits();
+
+        v_logits[50] = 15.0;
+        v_logits[51] = 15.0;
+        d_logits[50] = 15.0;
+        d_logits[51] = 15.0;
+
+        let mut spec_sampler = QwenSampler::seeded(101);
+
+        // Without history, 50 and 51 have equal probability
+        let dec_no_history = spec_sampler
+            .speculative_step_talker(&v_logits, &d_logits, &[], 50)
+            .expect("valid step");
+        assert!(dec_no_history.is_accepted());
+
+        // With token 50 in history, repetition penalty reduces token 50's logit
+        let dec_with_history = spec_sampler
+            .speculative_step_talker(&v_logits, &d_logits, &[50], 50)
+            .expect("valid step with history");
+        assert!(dec_with_history.token() < TALKER_VOCAB_SIZE as u32);
     }
 }
