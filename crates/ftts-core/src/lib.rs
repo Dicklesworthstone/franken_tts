@@ -11,6 +11,7 @@ pub mod admission;
 pub mod audio;
 pub mod batching;
 pub mod health;
+pub mod numa;
 pub mod ragged;
 pub mod server_admission;
 
