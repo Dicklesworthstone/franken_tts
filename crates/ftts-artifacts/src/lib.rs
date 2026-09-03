@@ -6,6 +6,7 @@ pub mod awq;
 pub mod census;
 pub mod converter;
 pub mod enhance_loader;
+pub mod fttsdraft;
 pub mod fttspack;
 pub mod fttsq;
 pub mod safetensors;
