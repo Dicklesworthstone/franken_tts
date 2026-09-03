@@ -1,6 +1,14 @@
 import XCTest
 
 final class UtteranceEditorUITests: XCTestCase {
+    func testRecentVoicesIsDiscoverableFromTheMainHeader() throws {
+        let history = app.buttons["synthesis-history-button"]
+        XCTAssertTrue(history.waitForExistence(timeout: 4))
+        history.tap()
+        XCTAssertTrue(app.otherElements["synthesis-history-sheet"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.navigationBars["Recent voices"].exists)
+    }
+
     private var app: XCUIApplication!
 
     override func setUpWithError() throws {

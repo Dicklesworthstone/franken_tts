@@ -100,7 +100,8 @@ The first `ftts say` of a session pays the model load; when it finishes, the loa
 
 `ios/` holds a native SwiftUI version of the playground, built on the same Rust engine
 through a small C ABI (`crates/ftts-ffi`): on-device model download with pinned-digest
-verification, the seven preset voices, microphone enrollment, and on-device synthesis.
+verification, all eighteen built-in voices, microphone enrollment, private bounded result
+history, voice cards, and on-device synthesis.
 Design, phone-vs-Mac arithmetic, and memory strategy live in `docs/IOS_APP_PLAN.md`;
 build instructions in `ios/README.md`. No speed figure is claimed until one is measured
 on A18-class hardware.

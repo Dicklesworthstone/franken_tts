@@ -42,7 +42,7 @@ iPhone acceptance remain open and must not be inferred from this static state.
 - [ ] Build the Galvanic Voice Forge hero view with real frame and codec events.
 - [ ] Make the cute monster react causally to ready, cold, loading, running, success, cancellation, and error states.
 - [ ] Preserve enrollment consent, level meter, normalization, silence refusal, success selection, and haptics.
-- [ ] Add private local result history with retention, deletion, privacy redaction, and no-content diagnostics.
+- [x] Add private local result history with retention, deletion, privacy redaction, and no-content diagnostics.
 - [ ] Preserve automatic model warming and memory-pressure unloading; remove every unnecessary manual wake action.
 - [ ] Add responsive iPad sidebar/workspace/inspector layout.
 - [ ] Add Mac Catalyst support and Catalyst-compatible Rust library slice.

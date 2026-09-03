@@ -59,7 +59,7 @@ crates/ftts-ffi           staticlib crate, C ABI, thin over ftts-cli's synth mod
 CLI's `say` path calls — `ModelBundle::resolve`, `LoadedModel::load`,
 `synth::synthesize` — so there is exactly one native loading/synthesis implementation in
 the tree. Enrollment mirrors the wasm crate: mel features plus `SpeakerEncoder` (hydrated lazily
-on first enroll), fed raw f32 PCM at 24 kHz from the microphone. The seven presets embed via
+on first enroll), fed raw f32 PCM at 24 kHz from the microphone. The eighteen presets embed via
 `include_bytes!` from `crates/ftts-cli/presets/`, the same files every other surface uses.
 
 C ABI, deliberately small (all functions return 0/pointer on success, and
@@ -117,9 +117,10 @@ feel like siblings:
 3. **The Voice**: preset cards (name + one-line character), "your voice" card opening the
    enrollment sheet: shows the Stella+Rainbow script, records via `AVAudioEngine`
    (mono float, resampled to 24 kHz), names the clone, runs `ftts_enroll`.
-4. **The Utterance**: text editor (600 chars, counter), seed field with dice, Synthesize
+4. **The Utterance**: text editor (50,000 chars, counter), seed field with dice, Synthesize
    button with progress, waveform rendering of the result (SwiftUI `Canvas`), playback
-   via `AVAudioPlayer`, `ShareLink` on the WAV, Play Again.
+   via `AVAudioPlayer`, compact audio/video sharing, and a privacy-redacted recent-result
+   history retaining the newest 12 clips for up to seven days.
 5. Footer: version, link to the site.
 
 Theme: dark emerald (#020a06 background family, emerald accents), stitched-panel corners

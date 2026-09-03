@@ -372,6 +372,7 @@ final class LabModel {
     let presets = Engine.presets()
 
     let library = VoiceLibrary()
+    let history: SynthesisHistoryStore
 
     /// A preset name, or "voice:<uuid>" for an enrolled voice.
     var selectedVoice: String = "matt"
@@ -445,8 +446,12 @@ final class LabModel {
     private let activity = VoiceForgeActivityController.shared
     private var eta = TTSAdaptiveETA()
 
-    init(backgroundRetentionDuration: Duration = .seconds(20)) {
+    init(
+        backgroundRetentionDuration: Duration = .seconds(20),
+        history: SynthesisHistoryStore = SynthesisHistoryStore()
+    ) {
         self.backgroundRetentionDuration = backgroundRetentionDuration
+        self.history = history
     }
 
     func nextEngineLifecycleToken() -> UInt64 {
@@ -998,6 +1003,14 @@ final class LabModel {
         lastAudioVoiceLabel = voiceLabel
         player?.play()
         committed = true
+        // History is deliberately best-effort: a storage failure must never turn a
+        // completed, playable synthesis into a failed run. Its manifest contains no
+        // utterance text, seed, or speaker vector.
+        _ = try? history.record(
+            wavData: wav,
+            voiceLabel: voiceLabel,
+            durationSeconds: Double(pcm.count) / Double(WavWriter.sampleRate)
+        )
         // The share default is the small file; convert as soon as audio exists.
         Task {
             let converted = try? await MediaExporter.exportM4A(fromWav: url)
@@ -1468,6 +1481,7 @@ struct LabView: View {
     @State private var showEnrollment =
         ProcessInfo.processInfo.environment["FTTS_DEBUG_ENROLLMENT"] == "1"
     @State private var showGalaxy = false
+    @State private var showHistory = false
     @State private var showSpecimen = false
     @State private var showVoiceLab = ProcessInfo.processInfo.environment["FTTS_OPEN_VOICE_LIBRARY"] == "1"
     @State private var showVoiceComparison =
@@ -1672,6 +1686,9 @@ struct LabView: View {
         #endif
         .sheet(isPresented: $showGalaxy) {
             VoiceGalaxyView(presets: model.presets, enrolled: model.library.voices)
+        }
+        .sheet(isPresented: $showHistory) {
+            SynthesisHistorySheet(history: model.history)
         }
     }
 
@@ -1895,6 +1912,30 @@ struct LabView: View {
                     .foregroundStyle(Lab.emerald)
             }
             Spacer()
+            Button { showHistory = true } label: {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 16, weight: .bold))
+                        .frame(width: 28, height: 28)
+                    if !model.history.entries.isEmpty {
+                        Text("\(model.history.entries.count)")
+                            .font(.system(size: 8, weight: .black, design: .rounded))
+                            .foregroundStyle(Lab.onEmerald)
+                            .frame(minWidth: 15, minHeight: 15)
+                            .background(Lab.emerald, in: Circle())
+                            .offset(x: 5, y: -4)
+                    }
+                }
+            }
+            .buttonStyle(GhostButtonStyle(tint: Lab.cyan))
+            .accessibilityIdentifier("synthesis-history-button")
+            .accessibilityLabel("Recent voices")
+            .accessibilityValue(
+                model.history.entries.isEmpty
+                    ? "No saved results"
+                    : "\(model.history.entries.count) saved result\(model.history.entries.count == 1 ? "" : "s")"
+            )
+            .accessibilityHint("Opens private audio results saved for up to seven days")
             LabAppearanceButton(selection: $appearance)
         }
         .accessibilityElement(children: .contain)
