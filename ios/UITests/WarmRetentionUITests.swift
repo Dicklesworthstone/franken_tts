@@ -14,9 +14,13 @@ final class WarmRetentionUITests: XCTestCase {
             "the downloaded engine never reached its warm state"
         )
 
+        #if targetEnvironment(macCatalyst)
+        throw XCTSkip("physical-device lifecycle check is unavailable under Mac Catalyst")
+        #else
         XCUIDevice.shared.press(.home)
         sleep(3)
         app.activate()
+        #endif
 
         XCTAssertTrue(
             app.staticTexts["Voice core warm"].waitForExistence(timeout: 5),

@@ -49,6 +49,7 @@ private struct PhoneWorkspaceHeightKey: PreferenceKey {
 private struct NativeUtteranceEditor: UIViewRepresentable {
     @Binding var text: String
     @Binding var isFocused: Bool
+    let appearance: LabAppearance
     let maximumLength: Int
     let focusRequest: Int
     let selectAllRequest: Int
@@ -71,7 +72,7 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
         textView.smartDashesType = .yes
         textView.smartQuotesType = .yes
         textView.keyboardDismissMode = .interactive
-        textView.keyboardAppearance = .dark
+        textView.keyboardAppearance = appearance.keyboardAppearance
         textView.textContainerInset = UIEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
         textView.textContainer.lineFragmentPadding = 0
         textView.accessibilityIdentifier = "utteranceEditor"
@@ -81,6 +82,7 @@ private struct NativeUtteranceEditor: UIViewRepresentable {
 
     func updateUIView(_ textView: UITextView, context: Context) {
         context.coordinator.parent = self
+        textView.keyboardAppearance = appearance.keyboardAppearance
 
         // A delegate edit updates the binding before this method is called, so the
         // strings normally match. Explicit external actions carry a revision: they own
@@ -2555,6 +2557,7 @@ struct LabView: View {
                             set: { model.updateUtteranceFromEditor($0) }
                         ),
                         isFocused: $isUtteranceFocused,
+                        appearance: LabAppearance(rawValue: appearance) ?? .dark,
                         maximumLength: JokeLibrary.maximumUtteranceLength,
                         focusRequest: utteranceFocusRequest,
                         selectAllRequest: utteranceSelectAllRequest,

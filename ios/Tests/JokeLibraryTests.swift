@@ -1,7 +1,13 @@
 import XCTest
+import UIKit
 @testable import FrankenTTS
 
 final class JokeLibraryTests: XCTestCase {
+    func testKeyboardAppearanceMatchesSelectedTheme() {
+        XCTAssertEqual(LabAppearance.dark.keyboardAppearance, .dark)
+        XCTAssertEqual(LabAppearance.light.keyboardAppearance, .light)
+    }
+
     func testBundledJokeFileLoadsEveryBlankLineSeparatedEntry() {
         XCTAssertEqual(JokeLibrary.entries.count, 55)
         XCTAssertTrue(JokeLibrary.entries.allSatisfy { !$0.isEmpty })

@@ -9,6 +9,7 @@ enum LabAppearance: String {
     case dark
     case light
     var colorScheme: ColorScheme { self == .dark ? .dark : .light }
+    var keyboardAppearance: UIKeyboardAppearance { self == .dark ? .dark : .light }
 }
 
 enum Lab {
