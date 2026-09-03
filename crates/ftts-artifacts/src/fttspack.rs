@@ -193,6 +193,8 @@ pub enum TileLayout {
     Tile4x16Sdot,
     /// AVX-VNNI 4x32 block layout.
     Tile4x32Vnni,
+    /// Packed two-nibbles-per-byte Q4 layout (for mixed per-depth microdecoder packs).
+    TileQ4Packed,
 }
 
 impl TileLayout {
@@ -202,6 +204,7 @@ impl TileLayout {
             Self::RowMajor => "row_major",
             Self::Tile4x16Sdot => "tile_4x16_sdot",
             Self::Tile4x32Vnni => "tile_4x32_vnni",
+            Self::TileQ4Packed => "tile_q4_packed",
         }
     }
 
@@ -215,6 +218,7 @@ impl TileLayout {
             "row_major" => Ok(Self::RowMajor),
             "tile_4x16_sdot" => Ok(Self::Tile4x16Sdot),
             "tile_4x32_vnni" => Ok(Self::Tile4x32Vnni),
+            "tile_q4_packed" => Ok(Self::TileQ4Packed),
             other => Err(PackError::CorruptHeader(format!("unknown layout: {other}"))),
         }
     }
@@ -840,5 +844,12 @@ mod tests {
         assert!(matches!(err, PackError::KeyMismatch { .. }));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tile_layout_q4_packed_roundtrip() {
+        let layout = TileLayout::TileQ4Packed;
+        assert_eq!(layout.as_str(), "tile_q4_packed");
+        assert_eq!(TileLayout::parse_layout("tile_q4_packed").unwrap(), layout);
     }
 }
