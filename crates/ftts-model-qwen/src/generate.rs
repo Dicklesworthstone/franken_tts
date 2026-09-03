@@ -2326,6 +2326,132 @@ mod tests {
     }
 
     #[test]
+    fn batched_qwen_generator_matches_singleton_exact_tokens() {
+        use ftts_core::batching::{
+            BatchSchedulerConfig, BatchingPolicy, ContinuousBatchScheduler,
+        };
+
+        let weights = TinyWeights::new(0.0);
+        let micro_layers = vec![weights.micro_layer(); 2];
+        let micro_residual: Vec<&[f32]> = weights
+            .micro_residual_embeddings
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let micro_heads: Vec<&[f32]> = weights.micro_heads.iter().map(Vec::as_slice).collect();
+        let residual_feedback_a: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let residual_feedback_b: Vec<&[f32]> = weights
+            .residual_feedback
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+
+        // 1. Run Stream A solo
+        let mut solo_gen_a = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback_a.clone(),
+            1,
+            SamplingMode::CanonicalGreedy,
+        );
+        let prompt_a = prepared(&[1, 2]);
+        solo_gen_a
+            .begin_utterance(&prompt_a, UtteranceStart::Fresh)
+            .expect("valid prompt A");
+        let mut solo_frames_a = Vec::new();
+        for _ in 0..6 {
+            match solo_gen_a.next_frame().expect("next frame") {
+                FrameStep::Frame(f) => solo_frames_a.push(f),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("unexpected stall"),
+            }
+        }
+
+        // 2. Run Stream B solo
+        let mut solo_gen_b = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback_b.clone(),
+            2,
+            SamplingMode::CanonicalGreedy,
+        );
+        let prompt_b = prepared(&[2, 3]);
+        solo_gen_b
+            .begin_utterance(&prompt_b, UtteranceStart::Fresh)
+            .expect("valid prompt B");
+        let mut solo_frames_b = Vec::new();
+        for _ in 0..6 {
+            match solo_gen_b.next_frame().expect("next frame") {
+                FrameStep::Frame(f) => solo_frames_b.push(f),
+                FrameStep::Finished => break,
+                FrameStep::AwaitingText => panic!("unexpected stall"),
+            }
+        }
+
+        // 3. Run both streams together under ContinuousBatchScheduler
+        let batch_gen_a = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback_a,
+            1,
+            SamplingMode::CanonicalGreedy,
+        );
+        let batch_gen_b = generator(
+            &weights,
+            &micro_layers,
+            &micro_residual,
+            &micro_heads,
+            residual_feedback_b,
+            2,
+            SamplingMode::CanonicalGreedy,
+        );
+
+        let config = BatchSchedulerConfig {
+            policy: BatchingPolicy::Throughput {
+                max_batch_size: 4,
+                queue_delay: Duration::ZERO,
+            },
+            max_admitted_streams: 8,
+            quantum_slice: Duration::from_micros(10),
+        };
+        let mut scheduler = ContinuousBatchScheduler::new(config);
+
+        let id_a = scheduler
+            .admit(batch_gen_a, &prompt_a, UtteranceStart::Fresh)
+            .expect("admit stream A");
+        let id_b = scheduler
+            .admit(batch_gen_b, &prompt_b, UtteranceStart::Fresh)
+            .expect("admit stream B");
+
+        for _ in 0..6 {
+            scheduler.step_quantum().expect("step quantum");
+        }
+
+        let batched_frames_a = scheduler.take_frames(id_a).expect("frames A");
+        let batched_frames_b = scheduler.take_frames(id_b).expect("frames B");
+
+        // Assert exact token-for-token equality between batched and singleton executions
+        assert_eq!(
+            batched_frames_a, solo_frames_a,
+            "stream A in batch must match solo execution token-for-token"
+        );
+        assert_eq!(
+            batched_frames_b, solo_frames_b,
+            "stream B in batch must match solo execution token-for-token"
+        );
+    }
+
+    #[test]
     fn speaker_independent_prefix_reuse_is_bit_exact_across_voice_rows() {
         // Keep attention context-sensitive so a wrong split/cache cannot pass through an
         // identity transformer. In this tiny header the second non-BOS codec row stands in for

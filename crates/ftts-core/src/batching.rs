@@ -482,8 +482,7 @@ impl<G: FrameGenerator> ContinuousBatchScheduler<G> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::normalization::NormalizationMode;
-    use crate::tokenizer::NormalizationTrace;
+    use crate::{NormalizationMode, NormalizationTrace};
 
     /// Mock frame generator producing deterministic, distinct token streams per instance.
     struct MockGenerator {
@@ -667,15 +666,19 @@ mod tests {
             .admit(MockGenerator::new(2, 4), &text, UtteranceStart::Fresh)
             .unwrap();
 
-        // Next quantum steps both streams (cohort size = 2)
+        // Next quantum steps both streams (cohort size = 2):
+        // stream 1 emits its 3rd frame; stream 2 emits its 1st frame
         match scheduler.step_quantum().unwrap() {
             QuantumOutcome::Stepped { cohort_size, .. } => {
                 assert_eq!(cohort_size, 2, "cohort must batch streams 1 and 2 together");
             }
             QuantumOutcome::Idle => panic!("expected active quantum"),
         }
+        assert_eq!(scheduler.streams[&id1].frames_emitted(), 3);
+        assert_eq!(scheduler.streams[&id2].frames_emitted(), 1);
 
-        // Stream 1 has finished (3 frames emitted); stream 2 continues
+        // Next quantum: stream 1 reaches Finished, while stream 2 emits its 2nd frame
+        scheduler.step_quantum().unwrap();
         assert_eq!(scheduler.stream_status(id1), Some(StreamStatus::Finished));
         assert_eq!(scheduler.stream_status(id2), Some(StreamStatus::Active));
 
