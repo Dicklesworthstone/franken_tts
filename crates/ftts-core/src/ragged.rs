@@ -394,7 +394,8 @@ impl<G: SpeculativeFrameGenerator> RaggedBatchScheduler<G> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NormalizationMode, NormalizationTrace};
+    use std::time::Duration;
+    use crate::{FrameStep, NormalizationMode, NormalizationTrace};
 
     /// Synthetic generator with configurable speculative acceptance depth per frame.
     struct ConfigurableSpecGenerator {
