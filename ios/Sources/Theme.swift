@@ -97,6 +97,7 @@ enum Lab {
 
 struct LabAppearanceButton: View {
     @Binding var selection: String
+    var iconOnly = false
     private var appearance: LabAppearance { LabAppearance(rawValue: selection) ?? .dark }
     private var targetAppearance: LabAppearance { appearance == .dark ? .light : .dark }
     private var accent: Color { targetAppearance == .light ? Lab.amber : Lab.cyan }
@@ -110,13 +111,15 @@ struct LabAppearanceButton: View {
                     .font(.system(size: Lab.typeSize(12), weight: .bold))
                     .frame(width: 26, height: 26)
                     .background(accent.opacity(0.14), in: Circle())
-                Text(targetAppearance == .light ? "LIGHT" : "DARK")
-                    .font(.system(size: Lab.typeSize(8.5), weight: .black, design: .monospaced))
-                    .kerning(0.8)
+                if !iconOnly {
+                    Text(targetAppearance == .light ? "LIGHT" : "DARK")
+                        .font(.system(size: Lab.typeSize(8.5), weight: .black, design: .monospaced))
+                        .kerning(0.8)
+                }
             }
             .foregroundStyle(accent)
-            .padding(.leading, 5)
-            .padding(.trailing, 11)
+            .padding(.leading, iconOnly ? 9 : 5)
+            .padding(.trailing, iconOnly ? 9 : 11)
             .frame(minHeight: 44)
             .background(Lab.panel, in: Capsule())
             .overlay {

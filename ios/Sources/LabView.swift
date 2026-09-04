@@ -1542,7 +1542,7 @@ struct LabView: View {
                 if usesDashboardLayout, geometry.size.width >= 680 {
                     HStack(alignment: .top, spacing: 18) {
                         VStack(alignment: .leading, spacing: 12) {
-                            header
+                            header(compact: true)
                             modelEntryView
                             compactVoiceSelector(vertical: true)
                             Spacer(minLength: 4)
@@ -1610,7 +1610,7 @@ struct LabView: View {
 
     private func phoneWorkspace(compact: Bool) -> some View {
         VStack(alignment: .leading, spacing: compact ? 10 : 16) {
-            header
+            header(compact: false)
             modelEntryView
             compactVoiceSelector(vertical: false)
             utteranceCard(compact: compact)
@@ -1896,21 +1896,23 @@ struct LabView: View {
         consumeStagedText()
     }
 
-    private var header: some View {
-        HStack(spacing: 12) {
+    private func header(compact: Bool) -> some View {
+        HStack(spacing: compact ? 8 : 12) {
             MonsterStatusMark(mood: monsterMood, instrument: .voice)
-                .frame(width: 52, height: 52)
+                .frame(width: compact ? 46 : 52, height: compact ? 46 : 52)
             VStack(alignment: .leading, spacing: 2) {
                 FrankenWordmark(
                     productInitial: "TTS",
                     productRemainder: "",
-                    fullName: "FrankenTTS"
+                    fullName: "FrankenTTS",
+                    size: compact ? 18 : 22
                 )
                 Text("VOICE_ALIVE")
                     .font(.system(size: Lab.typeSize(8), weight: .black, design: .monospaced))
                     .kerning(2)
                     .foregroundStyle(Lab.emerald)
             }
+            .layoutPriority(1)
             Spacer()
             Button { showHistory = true } label: {
                 ZStack(alignment: .topTrailing) {
@@ -1936,7 +1938,7 @@ struct LabView: View {
                     : "\(model.history.entries.count) saved result\(model.history.entries.count == 1 ? "" : "s")"
             )
             .accessibilityHint("Opens private audio results saved for up to seven days")
-            LabAppearanceButton(selection: $appearance)
+            LabAppearanceButton(selection: $appearance, iconOnly: compact)
         }
         .accessibilityElement(children: .contain)
     }
