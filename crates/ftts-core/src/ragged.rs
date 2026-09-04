@@ -264,10 +264,10 @@ impl<G: SpeculativeFrameGenerator> RaggedBatchScheduler<G> {
             let Some(id) = self.ready_queue.pop_front() else {
                 break;
             };
-            if let Some(stream) = self.streams.get(&id) {
-                if stream.status == StreamStatus::Active {
-                    cohort.push(id);
-                }
+            if let Some(stream) = self.streams.get(&id)
+                && stream.status == StreamStatus::Active
+            {
+                cohort.push(id);
             }
         }
         cohort
@@ -665,9 +665,9 @@ mod tests {
         };
         let mut sched_a = RaggedBatchScheduler::new(config);
 
-        for s in 0..num_streams {
+        for (s, pattern) in spec_patterns.iter().enumerate().take(num_streams) {
             let generator_inst =
-                ConfigurableSpecGenerator::new(s, frames_per_stream, spec_patterns[s].clone());
+                ConfigurableSpecGenerator::new(s, frames_per_stream, pattern.clone());
             sched_a
                 .admit(generator_inst, &prep, UtteranceStart::Fresh, true)
                 .unwrap();
@@ -681,9 +681,9 @@ mod tests {
         // 2. Benchmark Condition B: Pure sequential batching (speculation disabled)
         let mut sched_b = RaggedBatchScheduler::new(config);
 
-        for s in 0..num_streams {
+        for (s, pattern) in spec_patterns.iter().enumerate().take(num_streams) {
             let generator_inst =
-                ConfigurableSpecGenerator::new(s, frames_per_stream, spec_patterns[s].clone());
+                ConfigurableSpecGenerator::new(s, frames_per_stream, pattern.clone());
             sched_b
                 .admit(generator_inst, &prep, UtteranceStart::Fresh, false)
                 .unwrap();

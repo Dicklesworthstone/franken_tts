@@ -1526,9 +1526,9 @@ impl FrankenMtpDrafter {
         let mut transitions = [[TransitionBucket::EMPTY; TRANSITION_BUCKETS]; RESIDUAL_DEPTHS];
         let bytes: Vec<u8> = tensor.data.iter().map(|&b| b as u8).collect();
 
-        for depth in 0..RESIDUAL_DEPTHS {
+        for (depth, depth_transitions) in transitions.iter_mut().enumerate() {
             let row_offset = depth * TRANSITION_BUCKETS * 8;
-            for bucket_idx in 0..TRANSITION_BUCKETS {
+            for (bucket_idx, bucket) in depth_transitions.iter_mut().enumerate() {
                 let offset = row_offset + bucket_idx * 8;
                 let source = u16::from_le_bytes(
                     bytes[offset..offset + 2]
@@ -1546,7 +1546,7 @@ impl FrankenMtpDrafter {
                         .map_err(|_| DraftError::CorruptHeader("invalid bucket count".into()))?,
                 );
 
-                transitions[depth][bucket_idx] = TransitionBucket {
+                *bucket = TransitionBucket {
                     source,
                     target,
                     count,
@@ -2380,9 +2380,11 @@ pub fn decode_frame_with_selector_q8(
     )
 }
 
-static SPEC_MTP_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+thread_local! {
+    static SPEC_MTP_OVERRIDE: std::cell::Cell<i8> = const { std::cell::Cell::new(-1) };
+}
 
-/// Overrides `spec_mtp_enabled` for tests in the current process.
+/// Overrides `spec_mtp_enabled` for tests on the current thread.
 /// Pass `Some(true)` or `Some(false)` to force an outcome; `None` to restore env resolution.
 pub fn set_spec_mtp_override(override_value: Option<bool>) {
     let val = match override_value {
@@ -2390,14 +2392,14 @@ pub fn set_spec_mtp_override(override_value: Option<bool>) {
         Some(false) => 0,
         None => -1,
     };
-    SPEC_MTP_OVERRIDE.store(val, std::sync::atomic::Ordering::Relaxed);
+    SPEC_MTP_OVERRIDE.set(val);
 }
 
 /// `FTTS_SPEC_MTP=1` arms greedy FrankenMTP speculative decode on the Base microdecoder.
 /// When unset or `0`, the microdecoder runs its authoritative sequential loop.
 #[must_use]
 pub fn spec_mtp_enabled() -> bool {
-    match SPEC_MTP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+    match SPEC_MTP_OVERRIDE.get() {
         1 => true,
         0 => false,
         _ => std::env::var("FTTS_SPEC_MTP").as_deref() == Ok("1"),

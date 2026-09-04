@@ -148,10 +148,10 @@ impl NumaTopology {
             let entry = entry?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with("node") {
-                if let Ok(idx) = name_str["node".len()..].parse::<usize>() {
-                    node_dirs.push((idx, entry.path()));
-                }
+            if let Some(suffix) = name_str.strip_prefix("node")
+                && let Ok(idx) = suffix.parse::<usize>()
+            {
+                node_dirs.push((idx, entry.path()));
             }
         }
 

@@ -126,11 +126,10 @@ impl ServerCapacityModel {
             .topology
             .dram_budget_bytes
             .saturating_sub(self.resident_weights_bytes);
-        let memory_stream_limit = if per_stream_budget_bytes > 0 {
-            (available_dram / per_stream_budget_bytes) as usize
-        } else {
-            usize::MAX
-        };
+        let memory_stream_limit = available_dram
+            .checked_div(per_stream_budget_bytes)
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(usize::MAX);
 
         // 2. Bandwidth bound: continuous batching reads weights once (~20.7 GB/s floor),
         // incremental streams consume base_bandwidth_per_stream_gbps.

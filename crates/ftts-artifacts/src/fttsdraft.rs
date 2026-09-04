@@ -619,7 +619,7 @@ mod tests {
     fn fuzz_decode_handles_arbitrary_garbage() {
         assert!(!fuzz_decode(&[]));
         assert!(!fuzz_decode(b"SHORT"));
-        assert!(!fuzz_decode(&vec![0u8; 100]));
+        assert!(!fuzz_decode(&[0u8; 100]));
         assert!(!fuzz_decode(b"FTTSDRFT12345678901234567890"));
     }
 }

@@ -315,8 +315,8 @@ mod tests {
 
         // Variances monotonically decrease from semantic depth 1 to acoustic depth 15
         let mut variances = vec![0.0_f32; 15];
-        for i in 0..15 {
-            variances[i] = 100.0 / ((i + 1) as f32).powi(2);
+        for (i, variance) in variances.iter_mut().enumerate() {
+            *variance = 100.0 / ((i + 1) as f32).powi(2);
         }
 
         let bits = allocator.allocate_depth_bits(&variances);

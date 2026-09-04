@@ -7,6 +7,7 @@ final class UtteranceEditorUITests: XCTestCase {
         history.tap()
         XCTAssertTrue(app.otherElements["synthesis-history-sheet"].waitForExistence(timeout: 3))
         XCTAssertTrue(app.navigationBars["Recent voices"].exists)
+        keepScreenshot(named: "recent-voices-history")
     }
 
     private var app: XCUIApplication!

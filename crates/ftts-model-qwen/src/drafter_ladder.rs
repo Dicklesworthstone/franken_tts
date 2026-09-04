@@ -90,18 +90,18 @@ impl SpeculativeDrafter for DistilledMicroDrafter {
         let mut proposals = [0usize; RESIDUAL_DEPTHS];
         let prev = previous_codes.or(self.last_frame.as_ref());
 
-        for depth in 0..RESIDUAL_DEPTHS {
+        for (depth, proposal) in proposals.iter_mut().enumerate() {
             let offset = depth * self.hidden_size;
             let mut dot = 0.0_f32;
             let limit = talker_hidden.len().min(self.hidden_size);
-            for i in 0..limit {
-                dot += talker_hidden[i] * self.projection_weights[offset + i];
+            for (i, hidden) in talker_hidden.iter().copied().enumerate().take(limit) {
+                dot += hidden * self.projection_weights[offset + i];
             }
 
             // Combine talker latent projection with previous frame history
             let prev_bonus = prev.map_or(0, |p| p[depth]);
             let candidate = ((dot.abs() * 1000.0) as usize + prev_bonus) % RESIDUAL_VOCAB;
-            proposals[depth] = candidate;
+            *proposal = candidate;
         }
 
         proposals
@@ -195,15 +195,15 @@ impl SpeculativeDrafter for ParallelHeadsDrafter {
         let limit = talker_hidden.len().min(self.hidden_size);
 
         // One-shot evaluation across all 15 heads
-        for depth in 0..RESIDUAL_DEPTHS {
+        for (depth, proposal) in proposals.iter_mut().enumerate() {
             let offset = depth * self.hidden_size;
             let mut logit = self.head_biases[depth];
-            for i in 0..limit {
-                logit += talker_hidden[i] * self.head_weights[offset + i];
+            for (i, hidden) in talker_hidden.iter().copied().enumerate().take(limit) {
+                logit += hidden * self.head_weights[offset + i];
             }
 
             let token = ((logit.abs() * 777.0) as usize) % RESIDUAL_VOCAB;
-            proposals[depth] = token;
+            *proposal = token;
         }
 
         proposals

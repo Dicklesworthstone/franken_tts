@@ -33,10 +33,10 @@
 //! When $\alpha \le 0$, speculation is disabled unconditionally (the deterministic fallback,
 //! wired first).
 
-use std::sync::atomic::{AtomicI8, Ordering};
-
-/// Override switch for testing AF-3 behavior without environment variable races.
-static AF3_MONITOR_OVERRIDE: AtomicI8 = AtomicI8::new(-1);
+thread_local! {
+    /// Per-thread override for testing AF-3 behavior without cross-test races.
+    static AF3_MONITOR_OVERRIDE: std::cell::Cell<i8> = const { std::cell::Cell::new(-1) };
+}
 
 /// Sets the test override for the AF-3 monitor:
 /// - `Some(true)`: forces monitor to remain healthy (alarm disabled)
@@ -48,7 +48,7 @@ pub fn set_af3_monitor_override(override_value: Option<bool>) {
         Some(false) => 0,
         None => -1,
     };
-    AF3_MONITOR_OVERRIDE.store(val, Ordering::Relaxed);
+    AF3_MONITOR_OVERRIDE.set(val);
 }
 
 /// Configuration parameters for the AF-3 e-process reliability monitor.
@@ -187,7 +187,7 @@ impl FrankenMtpEProcessMonitor {
     /// Whether speculation has been demoted (due to alarm or $\alpha \le 0$).
     #[must_use]
     pub fn is_demoted(&self) -> bool {
-        match AF3_MONITOR_OVERRIDE.load(Ordering::Relaxed) {
+        match AF3_MONITOR_OVERRIDE.get() {
             1 => false,
             0 => true,
             _ => self.alarmed || self.config.alpha <= 0.0,
@@ -225,7 +225,7 @@ impl FrankenMtpEProcessMonitor {
             return MonitorDecision::Disabled;
         }
 
-        if let Some(forced) = match AF3_MONITOR_OVERRIDE.load(Ordering::Relaxed) {
+        if let Some(forced) = match AF3_MONITOR_OVERRIDE.get() {
             1 => Some(MonitorDecision::Healthy {
                 e_value: self.e_value,
             }),

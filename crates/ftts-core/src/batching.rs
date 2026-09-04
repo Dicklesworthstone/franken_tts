@@ -355,12 +355,13 @@ impl<G: FrameGenerator> ContinuousBatchScheduler<G> {
 
     /// Cancels an active stream, terminating further generation.
     pub fn cancel(&mut self, id: StreamId) -> bool {
-        if let Some(stream) = self.streams.get_mut(&id) {
-            if stream.status != StreamStatus::Finished && stream.status != StreamStatus::Cancelled {
-                stream.status = StreamStatus::Cancelled;
-                stream.completion_time = Some(Instant::now());
-                return true;
-            }
+        if let Some(stream) = self.streams.get_mut(&id)
+            && stream.status != StreamStatus::Finished
+            && stream.status != StreamStatus::Cancelled
+        {
+            stream.status = StreamStatus::Cancelled;
+            stream.completion_time = Some(Instant::now());
+            return true;
         }
         false
     }
@@ -378,13 +379,13 @@ impl<G: FrameGenerator> ContinuousBatchScheduler<G> {
 
     /// Removes a finished or cancelled stream from the scheduler.
     pub fn retire(&mut self, id: StreamId) -> Option<BatchedStream<G>> {
-        if let Some(stream) = self.streams.get(&id) {
-            if matches!(
+        if let Some(stream) = self.streams.get(&id)
+            && matches!(
                 stream.status,
                 StreamStatus::Finished | StreamStatus::Cancelled
-            ) {
-                return self.streams.remove(&id);
-            }
+            )
+        {
+            return self.streams.remove(&id);
         }
         None
     }
@@ -403,10 +404,10 @@ impl<G: FrameGenerator> ContinuousBatchScheduler<G> {
                 break;
             };
 
-            if let Some(stream) = self.streams.get(&id) {
-                if stream.status == StreamStatus::Active {
-                    cohort.push(id);
-                }
+            if let Some(stream) = self.streams.get(&id)
+                && stream.status == StreamStatus::Active
+            {
+                cohort.push(id);
             }
         }
 
@@ -542,10 +543,11 @@ mod tests {
         }
 
         fn next_frame(&mut self) -> Result<FrameStep, GenerationError> {
-            if let Some(stall) = self.stall_at_frame {
-                if self.current_frame == stall && !self.is_finished_text {
-                    return Ok(FrameStep::AwaitingText);
-                }
+            if let Some(stall) = self.stall_at_frame
+                && self.current_frame == stall
+                && !self.is_finished_text
+            {
+                return Ok(FrameStep::AwaitingText);
             }
 
             if self.current_frame >= self.total_frames {
