@@ -2470,38 +2470,48 @@ struct LabView: View {
     }
 
     private var voiceFilterBar: some View {
-        ScrollViewReader { proxy in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(VoiceLibraryFilter.allCases) { filter in
-                        Button {
-                            withAnimation(.snappy) { voiceLibraryFilter = filter }
-                        } label: {
-                            Label(filter.rawValue, systemImage: filter.symbol)
-                                .font(.system(size: Lab.typeSize(11), weight: .bold))
-                                .foregroundStyle(voiceLibraryFilter == filter ? Lab.onEmerald : Lab.textPrimary)
-                                .padding(.horizontal, 13)
-                                .frame(height: 38)
-                                .background(
-                                    voiceLibraryFilter == filter ? Lab.emerald : Lab.panelSoft,
-                                    in: Capsule()
-                                )
-                                .overlay(Capsule().stroke(voiceLibraryFilter == filter ? .clear : Lab.stroke))
-                        }
-                        .buttonStyle(.plain)
-                        .id(filter)
-                    }
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                ForEach(VoiceLibraryFilter.allCases) { filter in
+                    voiceFilterButton(filter)
                 }
-                .padding(.vertical, 2)
             }
-            .scrollClipDisabled()
-            .onAppear {
-                proxy.scrollTo(voiceLibraryFilter, anchor: .trailing)
-            }
-            .onChange(of: voiceLibraryFilter) { _, filter in
-                withAnimation(.snappy) { proxy.scrollTo(filter, anchor: .center) }
+            .fixedSize(horizontal: true, vertical: false)
+
+            LazyVGrid(
+                columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible())],
+                spacing: 8
+            ) {
+                ForEach(VoiceLibraryFilter.allCases) { filter in
+                    voiceFilterButton(filter, fillsWidth: true)
+                }
             }
         }
+    }
+
+    private func voiceFilterButton(
+        _ filter: VoiceLibraryFilter,
+        fillsWidth: Bool = false
+    ) -> some View {
+        Button {
+            withAnimation(.snappy) { voiceLibraryFilter = filter }
+        } label: {
+            Label(filter.rawValue, systemImage: filter.symbol)
+                .font(.system(size: Lab.typeSize(11), weight: .bold))
+                .foregroundStyle(voiceLibraryFilter == filter ? Lab.onEmerald : Lab.textPrimary)
+                .padding(.horizontal, 13)
+                .frame(maxWidth: fillsWidth ? .infinity : nil)
+                .frame(height: 38)
+                .background(
+                    voiceLibraryFilter == filter ? Lab.emerald : Lab.panelSoft,
+                    in: Capsule()
+                )
+                .overlay(Capsule().stroke(voiceLibraryFilter == filter ? .clear : Lab.stroke))
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier(
+            "voice-filter-\(filter.rawValue.lowercased().replacingOccurrences(of: " ", with: "-"))"
+        )
     }
 
     private func voiceSectionHeader(_ title: String, detail: String) -> some View {

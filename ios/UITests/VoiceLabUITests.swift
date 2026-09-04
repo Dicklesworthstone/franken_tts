@@ -12,6 +12,32 @@ final class VoiceLabUITests: XCTestCase {
         app.launch()
     }
 
+    func testComparisonWorkspaceIsDiscoverableWithoutPlayingAudio() throws {
+        XCTAssertTrue(app.navigationBars["Voice Lab"].waitForExistence(timeout: 8))
+        XCTAssertTrue(app.descendants(matching: .any)["voice-lab-active-orb"].waitForExistence(timeout: 3))
+        keepScreenshot(named: "voice-lab-safe-overview")
+
+        app.swipeUp()
+        XCTAssertTrue(app.buttons["Play"].firstMatch.waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            app.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier BEGINSWITH 'voice-lab-signal-'"))
+                .firstMatch
+                .waitForExistence(timeout: 3)
+        )
+        XCTAssertTrue(app.staticTexts["0:00 / 0:05"].waitForExistence(timeout: 2))
+        keepScreenshot(named: "voice-lab-safe-results")
+
+        app.navigationBars["Voice Lab"].buttons["Done"].tap()
+        let alert = app.alerts["Voice Lab is still generating"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 2))
+        XCTAssertTrue(alert.buttons["Keep generating"].exists)
+        XCTAssertTrue(alert.buttons["Stop and leave"].exists)
+        keepScreenshot(named: "voice-lab-safe-leave-confirmation")
+        alert.buttons["Keep generating"].tap()
+        XCTAssertTrue(app.navigationBars["Voice Lab"].exists)
+    }
+
     func testMixedCardStatesStayStableAndLeavingRequiresConfirmation() throws {
         XCTAssertTrue(app.navigationBars["Voice Lab"].waitForExistence(timeout: 8))
         keepScreenshot(named: "voice-lab-mixed-states-top")
@@ -76,6 +102,26 @@ final class VoiceBrowserUITests: XCTestCase {
             NSPredicate(format: "label == %@", "Alexandria-Cassandra Nightingale")
         )
         XCTAssertTrue(names.firstMatch.waitForExistence(timeout: 3))
+        let appFrame = app.frame
+        for identifier in [
+            "voice-filter-all",
+            "voice-filter-feminine",
+            "voice-filter-masculine",
+            "voice-filter-my-voices",
+        ] {
+            let filter = app.buttons[identifier]
+            XCTAssertTrue(filter.exists, "Missing discoverable filter: \(identifier)")
+            XCTAssertGreaterThanOrEqual(
+                filter.frame.minX,
+                appFrame.minX,
+                "\(identifier) escaped the leading edge of the compact phone"
+            )
+            XCTAssertLessThanOrEqual(
+                filter.frame.maxX,
+                appFrame.maxX,
+                "\(identifier) escaped the trailing edge of the compact phone"
+            )
+        }
         let visibleNames = names.allElementsBoundByIndex.filter {
             $0.exists && !$0.frame.isEmpty
         }
