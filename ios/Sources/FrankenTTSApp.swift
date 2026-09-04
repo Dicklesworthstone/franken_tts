@@ -30,7 +30,10 @@ struct FrankenTTSApp: App {
         .defaultSize(width: 1180, height: 820)
         .windowResizability(.contentMinSize)
 #endif
-        .commands { VoiceForgeCommands() }
+        .commands {
+            VoiceForgeCommands()
+            LabTextSizeCommands()
+        }
     }
 }
 
@@ -103,6 +106,34 @@ private struct VoiceForgeCommands: Commands {
             Button("Stop Synthesis") { actions?.stop() }
                 .keyboardShortcut(.escape, modifiers: [])
                 .disabled(actions?.canStop != true)
+        }
+    }
+}
+
+private struct LabTextSizeCommands: Commands {
+    @AppStorage(Lab.textScaleStorageKey) private var textScale = Lab.defaultTextScale
+
+    var body: some Commands {
+        CommandMenu("Text Size") {
+            Button("Make Text Larger") {
+                textScale = Lab.steppedTextScale(textScale + Lab.textScaleStep)
+            }
+            .keyboardShortcut("+", modifiers: [.command])
+            .disabled(textScale >= Lab.maximumTextScale)
+
+            Button("Make Text Smaller") {
+                textScale = Lab.steppedTextScale(textScale - Lab.textScaleStep)
+            }
+            .keyboardShortcut("-", modifiers: [.command])
+            .disabled(textScale <= Lab.minimumTextScale)
+
+            Divider()
+
+            Button("Actual Size") {
+                textScale = Lab.defaultTextScale
+            }
+            .keyboardShortcut("0", modifiers: [.command])
+            .disabled(abs(textScale - Lab.defaultTextScale) < 0.001)
         }
     }
 }

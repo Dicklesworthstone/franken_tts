@@ -1473,6 +1473,7 @@ final class LabModel {
 
 struct LabView: View {
     @AppStorage(LabAppearance.storageKey) private var appearance = LabAppearance.dark.rawValue
+    @AppStorage(Lab.textScaleStorageKey) private var textScale = Lab.defaultTextScale
     private enum EditorFocus: Hashable {
         case seed
     }
@@ -1530,6 +1531,7 @@ struct LabView: View {
     }
 
     var body: some View {
+        let _ = textScale
         systemIntegrationView
     }
 

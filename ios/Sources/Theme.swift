@@ -13,6 +13,12 @@ enum LabAppearance: String {
 }
 
 enum Lab {
+    static let textScaleStorageKey = "frankentts.textScale"
+    static let defaultTextScale = 1.0
+    static let minimumTextScale = 0.8
+    static let maximumTextScale = 1.5
+    static let textScaleStep = 0.1
+
     static let background = adaptive(
         dark: UIColor(red: 0.008, green: 0.039, blue: 0.024, alpha: 1),
         light: UIColor(red: 0.965, green: 0.982, blue: 0.972, alpha: 1)
@@ -87,11 +93,20 @@ enum Lab {
     }
 
     static func typeSize(_ base: CGFloat) -> CGFloat {
+        let storedScale = UserDefaults.standard.object(forKey: textScaleStorageKey) == nil
+            ? defaultTextScale
+            : UserDefaults.standard.double(forKey: textScaleStorageKey)
+        let textScale = min(maximumTextScale, max(minimumTextScale, storedScale))
 #if targetEnvironment(macCatalyst)
-        base * 1.38
+        return base * 1.38 * textScale
 #else
-        UIFontMetrics(forTextStyle: .body).scaledValue(for: base)
+        return UIFontMetrics(forTextStyle: .body).scaledValue(for: base) * textScale
 #endif
+    }
+
+    static func steppedTextScale(_ value: Double) -> Double {
+        let stepped = (value / textScaleStep).rounded() * textScaleStep
+        return min(maximumTextScale, max(minimumTextScale, stepped))
     }
 }
 
