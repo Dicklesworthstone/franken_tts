@@ -166,7 +166,6 @@ struct LabAppearanceButton: View {
             .shadow(color: Lab.shadow, radius: 8, y: 4)
         }
         .buttonStyle(AppearanceTogglePressStyle())
-        .animation(.snappy(duration: 0.24), value: selection)
         .accessibilityIdentifier("appearance-toggle")
         .accessibilityLabel(appearance == .dark ? "Switch to light mode" : "Switch to dark mode")
         .accessibilityValue(appearance == .dark ? "Dark mode" : "Light mode")

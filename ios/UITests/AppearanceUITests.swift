@@ -23,7 +23,6 @@ final class FrankenTTSAppearanceUITests: XCTestCase {
 
         toggle.tap()
         XCTAssertEqual(toggle.label, "Switch to dark mode")
-        keepScreenshot(of: app, named: "Remembered light appearance")
 
         app.terminate()
         app.launch()
@@ -31,6 +30,7 @@ final class FrankenTTSAppearanceUITests: XCTestCase {
         let relaunchedToggle = app.buttons["appearance-toggle"]
         XCTAssertTrue(relaunchedToggle.waitForExistence(timeout: 12))
         XCTAssertEqual(relaunchedToggle.label, "Switch to dark mode")
+        keepScreenshot(of: app, named: "Remembered light appearance after relaunch")
     }
 
     private func keepScreenshot(of app: XCUIApplication, named name: String) {
