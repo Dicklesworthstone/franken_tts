@@ -8,6 +8,15 @@ final class JokeLibraryTests: XCTestCase {
         XCTAssertEqual(LabAppearance.light.keyboardAppearance, .light)
     }
 
+    func testInterfaceTextScaleStepsClampAndMapToDynamicType() {
+        XCTAssertEqual(Lab.steppedTextScale(0.1), Lab.minimumTextScale)
+        XCTAssertEqual(Lab.steppedTextScale(1.04), 1.0, accuracy: 0.001)
+        XCTAssertEqual(Lab.steppedTextScale(1.46), Lab.maximumTextScale)
+        XCTAssertEqual(Lab.steppedTextScale(9), Lab.maximumTextScale)
+        XCTAssertEqual(Lab.dynamicTypeSize(for: 1.0), .large)
+        XCTAssertEqual(Lab.dynamicTypeSize(for: Lab.maximumTextScale), .accessibility2)
+    }
+
     func testBundledJokeFileLoadsEveryBlankLineSeparatedEntry() {
         XCTAssertEqual(JokeLibrary.entries.count, 55)
         XCTAssertTrue(JokeLibrary.entries.allSatisfy { !$0.isEmpty })
