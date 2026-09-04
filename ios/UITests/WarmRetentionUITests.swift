@@ -20,11 +20,11 @@ final class WarmRetentionUITests: XCTestCase {
         XCUIDevice.shared.press(.home)
         sleep(3)
         app.activate()
-        #endif
 
         XCTAssertTrue(
             app.staticTexts["Voice core warm"].waitForExistence(timeout: 5),
             "a brief background interval discarded the warm engine"
         )
+        #endif
     }
 }
