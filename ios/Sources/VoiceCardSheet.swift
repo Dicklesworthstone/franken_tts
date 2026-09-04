@@ -88,7 +88,7 @@ struct VoiceCardSheet: View {
                         .accessibilityIdentifier("voice-card-preview")
                 } else if failed {
                     Text("Something went wrong making the card. Close this and try again.")
-                        .font(.system(size: 14))
+                        .font(.system(size: Lab.typeSize(14)))
                         .foregroundStyle(Lab.danger)
                 } else {
                     ProgressView()
@@ -98,10 +98,10 @@ struct VoiceCardSheet: View {
                 Text(
                     "The green mosaic is \(voice.name), written as thousands of tiny tiles. Send this picture to a friend; in their FrankenTTS app they tap \"Add a voice from a picture\", pick it, and the voice appears in their library. It survives screenshots and messaging apps, and it holds only the small voiceprint, never a recording of you."
                 )
-                .font(.system(size: 14))
+                .font(.system(size: Lab.typeSize(14)))
                 .foregroundStyle(Lab.textSecondary)
                 Text("Only share a voice that is yours to share.")
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(12), design: .monospaced))
                     .foregroundStyle(Lab.textSecondary)
                 if let cardUrl {
                     ShareLink(item: cardUrl) {
@@ -127,7 +127,7 @@ struct VoiceCardSheet: View {
                     .disabled(savedToPhotos)
                     if let saveError {
                         Text(saveError)
-                            .font(.system(size: 13))
+                            .font(.system(size: Lab.typeSize(13)))
                             .foregroundStyle(Lab.danger)
                     }
                 }

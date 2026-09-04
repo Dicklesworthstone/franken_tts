@@ -954,7 +954,7 @@ private struct VoiceLabPulse: View {
                         lineWidth: ring == 0 ? 3 : 1.5)
                 }
                 let bolt = Text(Image(systemName: "waveform.path.ecg"))
-                    .font(.system(size: 22, weight: .black))
+                    .font(.system(size: Lab.typeSize(22), weight: .black))
                     .foregroundColor(Lab.emerald)
                 context.draw(bolt, at: center)
             }

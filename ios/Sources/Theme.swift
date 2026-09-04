@@ -108,6 +108,19 @@ enum Lab {
         let stepped = (value / textScaleStep).rounded() * textScaleStep
         return min(maximumTextScale, max(minimumTextScale, stepped))
     }
+
+    static func dynamicTypeSize(for textScale: Double) -> DynamicTypeSize {
+        switch steppedTextScale(textScale) {
+        case ..<0.85: return .small
+        case ..<0.95: return .medium
+        case ..<1.05: return .large
+        case ..<1.15: return .xLarge
+        case ..<1.25: return .xxLarge
+        case ..<1.35: return .xxxLarge
+        case ..<1.45: return .accessibility1
+        default: return .accessibility2
+        }
+    }
 }
 
 struct LabAppearanceButton: View {

@@ -34,7 +34,7 @@ struct VoiceGalaxyView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         LabLabel(text: "The Voice Constellation")
                         Text("Nearby and alike means similar. Every shape is drawn from the voice's own 1,024 numbers.")
-                            .font(.system(size: 12))
+                            .font(.system(size: Lab.typeSize(12)))
                             .foregroundStyle(Lab.textSecondary)
                     }
                     Spacer()
@@ -70,7 +70,7 @@ struct VoiceGalaxyView: View {
                                     vector: entry.vector, context: contexts[entry.id])
                                     .frame(width: 74, height: 74)
                                 Text(entry.name)
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .font(.system(size: Lab.typeSize(11), weight: .bold, design: .monospaced))
                                     .foregroundStyle(
                                         entry.enrolled ? Lab.emerald : Lab.textPrimary)
                                     .lineLimit(1)
@@ -237,17 +237,17 @@ struct VoiceGalaxyView: View {
                         context: contexts[entries[index].id])
                         .frame(width: 40, height: 40)
                     Text(entries[index].name)
-                        .font(.system(size: 16, weight: .black))
+                        .font(.system(size: Lab.typeSize(16), weight: .black))
                         .foregroundStyle(Lab.textPrimary)
                 }
                 ForEach(Array(neighbors), id: \.self) { other in
                     HStack {
                         Text(entries[other].name)
-                            .font(.system(size: 13, design: .monospaced))
+                            .font(.system(size: Lab.typeSize(13), design: .monospaced))
                             .foregroundStyle(Lab.textSecondary)
                         Spacer()
                         Text("\(Int((similarity[index][other] * 100).rounded()))% similar")
-                            .font(.system(size: 12, design: .monospaced))
+                            .font(.system(size: Lab.typeSize(12), design: .monospaced))
                             .foregroundStyle(Lab.emerald)
                     }
                 }

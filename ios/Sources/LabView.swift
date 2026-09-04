@@ -1531,8 +1531,8 @@ struct LabView: View {
     }
 
     var body: some View {
-        let _ = textScale
         systemIntegrationView
+            .dynamicTypeSize(Lab.dynamicTypeSize(for: textScale))
     }
 
     private var workspaceView: some View {
@@ -1919,11 +1919,11 @@ struct LabView: View {
             Button { showHistory = true } label: {
                 ZStack(alignment: .topTrailing) {
                     Image(systemName: "clock.arrow.circlepath")
-                        .font(.system(size: 16, weight: .bold))
+                        .font(.system(size: Lab.typeSize(16), weight: .bold))
                         .frame(width: 28, height: 28)
                     if !model.history.entries.isEmpty {
                         Text("\(model.history.entries.count)")
-                            .font(.system(size: 8, weight: .black, design: .rounded))
+                            .font(.system(size: Lab.typeSize(8), weight: .black, design: .rounded))
                             .foregroundStyle(Lab.onEmerald)
                             .frame(minWidth: 15, minHeight: 15)
                             .background(Lab.emerald, in: Circle())
@@ -2319,7 +2319,7 @@ struct LabView: View {
                     ZStack {
                         RoundedRectangle(cornerRadius: 12).fill(Lab.cyan.opacity(0.12))
                         Image(systemName: "photo.badge.plus")
-                            .font(.system(size: 22, weight: .bold))
+                            .font(.system(size: Lab.typeSize(22), weight: .bold))
                             .foregroundStyle(Lab.cyan)
                     }
                     .frame(width: 46, height: 46)
@@ -2334,7 +2334,7 @@ struct LabView: View {
                     }
                     Spacer()
                     Image(systemName: "arrow.right.circle.fill")
-                        .font(.system(size: 22, weight: .bold))
+                        .font(.system(size: Lab.typeSize(22), weight: .bold))
                         .foregroundStyle(Lab.cyan)
                 }
                 .padding(14)
@@ -2514,7 +2514,7 @@ struct LabView: View {
         Button { openEnrollment(target: nil) } label: {
             HStack(spacing: 13) {
                 Image(systemName: "person.crop.circle.badge.plus")
-                    .font(.system(size: 28, weight: .bold))
+                    .font(.system(size: Lab.typeSize(28), weight: .bold))
                     .foregroundStyle(Lab.emerald)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("No personal voiceprints yet")
@@ -3234,7 +3234,7 @@ private struct VoiceOrb: View {
                 .fill(Color.black.opacity(0.62))
                 .padding(3)
             Text(String(name.prefix(1)).uppercased())
-                .font(.system(size: 14, weight: .black, design: .rounded))
+                .font(.system(size: Lab.typeSize(14), weight: .black, design: .rounded))
                 .foregroundStyle(selected ? Lab.emerald : Lab.textPrimary)
         }
         .frame(width: 40, height: 40)
@@ -3311,7 +3311,7 @@ struct VoiceTile: View {
                     }
                     Spacer()
                     Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: 19, weight: .bold))
+                        .font(.system(size: Lab.typeSize(19), weight: .bold))
                         .foregroundStyle(selected ? Lab.emerald : Lab.textSecondary.opacity(0.38))
                 }
                 Text(character)
@@ -3419,7 +3419,7 @@ struct EnrolledVoiceTile: View {
                     Button("Cancel", role: .cancel) {}
                 }
             }
-            .font(.system(size: 13))
+            .font(.system(size: Lab.typeSize(13)))
             .foregroundStyle(Lab.textSecondary)
         }
         .padding(13)
@@ -3470,11 +3470,11 @@ struct EnrollmentSheet: View {
                 Text(
                     "Read this aloud. The first few sentences are enough for a good clone; the whole script polishes it slightly. Background noise is removed automatically before your voice is learned."
                 )
-                .font(.system(size: 14))
+                .font(.system(size: Lab.typeSize(14)))
                 .foregroundStyle(Lab.textSecondary)
                 ScrollView {
                     Text(Self.script)
-                        .font(.system(size: 15))
+                        .font(.system(size: Lab.typeSize(15)))
                         .foregroundStyle(Lab.textPrimary)
                         .padding(12)
                 }
@@ -3508,19 +3508,19 @@ struct EnrollmentSheet: View {
                         }
                         .frame(height: 8)
                         Text("\(Int(model.recorder.seconds))s")
-                            .font(.system(size: 12, design: .monospaced))
+                            .font(.system(size: Lab.typeSize(12), design: .monospaced))
                             .foregroundStyle(Lab.textSecondary)
                     }
                     .accessibilityLabel("Recording level meter")
                     Text("Thirty seconds is plenty; recording stops itself at sixty.")
-                        .font(.system(size: 11))
+                        .font(.system(size: Lab.typeSize(11)))
                         .foregroundStyle(Lab.textSecondary)
                 }
                 if model.isEnrolling {
                     HStack(spacing: 10) {
                         ProgressView().tint(Lab.emerald)
                         Text("computing your voice vector…")
-                            .font(.system(size: 12, design: .monospaced))
+                            .font(.system(size: Lab.typeSize(12), design: .monospaced))
                             .foregroundStyle(Lab.textSecondary)
                     }
                 }
@@ -3562,7 +3562,7 @@ struct EnrollmentSheet: View {
                     .disabled(model.isEnrolling)
                 }
                 if let error = model.lastError, !model.recorder.isRecording, !model.isEnrolling {
-                    Text(error).font(.system(size: 13)).foregroundStyle(Lab.danger)
+                    Text(error).font(.system(size: Lab.typeSize(13))).foregroundStyle(Lab.danger)
                 }
             }
             .padding(18)
