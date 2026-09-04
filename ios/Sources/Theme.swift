@@ -109,17 +109,20 @@ enum Lab {
         return min(maximumTextScale, max(minimumTextScale, stepped))
     }
 
-    static func dynamicTypeSize(for textScale: Double) -> DynamicTypeSize {
-        switch steppedTextScale(textScale) {
-        case ..<0.85: return .small
-        case ..<0.95: return .medium
-        case ..<1.05: return .large
-        case ..<1.15: return .xLarge
-        case ..<1.25: return .xxLarge
-        case ..<1.35: return .xxxLarge
-        case ..<1.45: return .accessibility1
-        default: return .accessibility2
-        }
+    static func dynamicTypeSize(
+        from systemSize: DynamicTypeSize,
+        for textScale: Double
+    ) -> DynamicTypeSize {
+        let sizes: [DynamicTypeSize] = [
+            .xSmall, .small, .medium, .large, .xLarge, .xxLarge, .xxxLarge,
+            .accessibility1, .accessibility2, .accessibility3, .accessibility4,
+            .accessibility5,
+        ]
+        guard let systemIndex = sizes.firstIndex(of: systemSize) else { return systemSize }
+        let steps = Int(
+            ((steppedTextScale(textScale) - defaultTextScale) / textScaleStep).rounded()
+        )
+        return sizes[min(max(systemIndex + steps, 0), sizes.count - 1)]
     }
 }
 

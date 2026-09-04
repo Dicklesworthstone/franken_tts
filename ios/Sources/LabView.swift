@@ -1472,6 +1472,7 @@ final class LabModel {
 }
 
 struct LabView: View {
+    @Environment(\.dynamicTypeSize) private var systemDynamicTypeSize
     @AppStorage(LabAppearance.storageKey) private var appearance = LabAppearance.dark.rawValue
     @AppStorage(Lab.textScaleStorageKey) private var textScale = Lab.defaultTextScale
     private enum EditorFocus: Hashable {
@@ -1532,7 +1533,10 @@ struct LabView: View {
 
     var body: some View {
         systemIntegrationView
-            .dynamicTypeSize(Lab.dynamicTypeSize(for: textScale))
+            .environment(
+                \.dynamicTypeSize,
+                Lab.dynamicTypeSize(from: systemDynamicTypeSize, for: textScale)
+            )
     }
 
     private var workspaceView: some View {
