@@ -136,13 +136,15 @@ impl<G: FrameGenerator> BatchedStream<G> {
     /// Time elapsed from admission to first frame emission.
     #[must_use]
     pub fn time_to_first_frame(&self) -> Option<Duration> {
-        self.first_frame_time.map(|t| t.duration_since(self.arrival_time))
+        self.first_frame_time
+            .map(|t| t.duration_since(self.arrival_time))
     }
 
     /// Total wall-clock duration of the stream from admission to completion.
     #[must_use]
     pub fn total_duration(&self) -> Option<Duration> {
-        self.completion_time.map(|t| t.duration_since(self.arrival_time))
+        self.completion_time
+            .map(|t| t.duration_since(self.arrival_time))
     }
 }
 
@@ -200,11 +202,7 @@ impl BatchSchedulerMetrics {
     #[must_use]
     pub fn estimated_bandwidth_savings(&self) -> f64 {
         let mean = self.mean_batch_size();
-        if mean <= 1.0 {
-            0.0
-        } else {
-            1.0 - (1.0 / mean)
-        }
+        if mean <= 1.0 { 0.0 } else { 1.0 - (1.0 / mean) }
     }
 }
 
@@ -381,7 +379,10 @@ impl<G: FrameGenerator> ContinuousBatchScheduler<G> {
     /// Removes a finished or cancelled stream from the scheduler.
     pub fn retire(&mut self, id: StreamId) -> Option<BatchedStream<G>> {
         if let Some(stream) = self.streams.get(&id) {
-            if matches!(stream.status, StreamStatus::Finished | StreamStatus::Cancelled) {
+            if matches!(
+                stream.status,
+                StreamStatus::Finished | StreamStatus::Cancelled
+            ) {
                 return self.streams.remove(&id);
             }
         }
@@ -447,7 +448,11 @@ impl<G: FrameGenerator> ContinuousBatchScheduler<G> {
 
             self.metrics.total_stream_steps_evaluated += 1;
 
-            match stream.generator.next_frame().map_err(EngineError::Generation)? {
+            match stream
+                .generator
+                .next_frame()
+                .map_err(EngineError::Generation)?
+            {
                 FrameStep::Frame(frame) => {
                     if stream.first_frame_time.is_none() {
                         stream.first_frame_time = Some(Instant::now());
@@ -714,7 +719,10 @@ mod tests {
 
         // Step frame 2: encounters stall -> AwaitingText
         scheduler.step_quantum().unwrap();
-        assert_eq!(scheduler.stream_status(id), Some(StreamStatus::AwaitingText));
+        assert_eq!(
+            scheduler.stream_status(id),
+            Some(StreamStatus::AwaitingText)
+        );
         assert_eq!(scheduler.active_stream_count(), 0);
 
         // Idle step does nothing
@@ -783,7 +791,10 @@ mod tests {
         let outcome = scheduler.step_quantum().unwrap();
         match outcome {
             QuantumOutcome::Stepped { cohort_size, .. } => {
-                assert_eq!(cohort_size, 1, "Latency policy must strictly step 1 stream at a time");
+                assert_eq!(
+                    cohort_size, 1,
+                    "Latency policy must strictly step 1 stream at a time"
+                );
             }
             _ => panic!("expected stepped"),
         }

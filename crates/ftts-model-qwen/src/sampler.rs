@@ -39,9 +39,7 @@ pub enum SpeculativeDecision {
     /// Draft candidate accepted; sample matches verifier distribution.
     Accepted(u32),
     /// Draft candidate rejected; resampled from the adjusted conditional residual distribution.
-    Rejected {
-        resampled_token: u32,
-    },
+    Rejected { resampled_token: u32 },
 }
 
 impl SpeculativeDecision {
@@ -49,7 +47,10 @@ impl SpeculativeDecision {
     #[must_use]
     pub const fn token(self) -> u32 {
         match self {
-            Self::Accepted(tok) | Self::Rejected { resampled_token: tok } => tok,
+            Self::Accepted(tok)
+            | Self::Rejected {
+                resampled_token: tok,
+            } => tok,
         }
     }
 
@@ -194,7 +195,11 @@ impl QwenSampler {
         draft_logits: &[f32],
         draft_token: u32,
     ) -> Result<SpeculativeDecision, SamplerError> {
-        ensure_logits("microdecoder verifier", verifier_logits, MICRODECODER_VOCAB_SIZE)?;
+        ensure_logits(
+            "microdecoder verifier",
+            verifier_logits,
+            MICRODECODER_VOCAB_SIZE,
+        )?;
         ensure_logits("microdecoder draft", draft_logits, MICRODECODER_VOCAB_SIZE)?;
 
         let mut v_scores = verifier_logits.to_vec();

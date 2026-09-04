@@ -148,7 +148,10 @@ fn server_admission_burst_overload_gauntlet_and_certificate() {
 
     assert_eq!(admitted_tickets.len(), 4, "exact 4 admitted immediately");
     assert_eq!(queued_count, 4, "exact 4 placed in queue");
-    assert_eq!(rejected_count, 4, "exact 4 rejected immediately on overload");
+    assert_eq!(
+        rejected_count, 4,
+        "exact 4 rejected immediately on overload"
+    );
 
     // Admit the 4 active streams into scheduler
     for ticket in admitted_tickets {
@@ -210,7 +213,9 @@ fn server_admission_burst_overload_gauntlet_and_certificate() {
     assert!(json_output.contains("\"zero_silent_degradation\": true"));
 
     let markdown_output = cert.to_markdown();
-    assert!(markdown_output.contains("Capacity Certificate: AMD Ryzen Threadripper Pro 7985WX (64C)"));
+    assert!(
+        markdown_output.contains("Capacity Certificate: AMD Ryzen Threadripper Pro 7985WX (64C)")
+    );
     assert!(markdown_output.contains("Zero Silent Degradation: PASS"));
 }
 

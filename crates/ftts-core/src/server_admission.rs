@@ -28,7 +28,7 @@ use std::{
 };
 
 use crate::{
-    admission::{admit, AdmissionPlan, AdmissionPolicy, AdmissionRejection, AdmissionRequest},
+    admission::{AdmissionPlan, AdmissionPolicy, AdmissionRejection, AdmissionRequest, admit},
     batching::StreamId,
 };
 
@@ -69,13 +69,25 @@ impl SocketTopology {
     /// Pre-configured profile for high-end server (e.g. AMD EPYC 9654 96-core 12-channel DDR5).
     #[must_use]
     pub fn amd_epyc_9654() -> Self {
-        Self::new("AMD EPYC 9654 (96C)", 96, 460.8, 128 * 1024 * 1024 * 1024, 4)
+        Self::new(
+            "AMD EPYC 9654 (96C)",
+            96,
+            460.8,
+            128 * 1024 * 1024 * 1024,
+            4,
+        )
     }
 
     /// Pre-configured profile for workstation (e.g. AMD Threadripper Pro 7985WX 64-core 8-channel DDR5).
     #[must_use]
     pub fn threadripper_7985wx() -> Self {
-        Self::new("AMD Ryzen Threadripper Pro 7985WX (64C)", 64, 307.2, 64 * 1024 * 1024 * 1024, 2)
+        Self::new(
+            "AMD Ryzen Threadripper Pro 7985WX (64C)",
+            64,
+            307.2,
+            64 * 1024 * 1024 * 1024,
+            2,
+        )
     }
 
     /// Pre-configured profile for Apple Silicon (e.g. Apple M3 Max 16C unified memory).
@@ -102,7 +114,7 @@ impl ServerCapacityModel {
         Self {
             topology,
             resident_weights_bytes: 1_650_000_000, // ~1.65 GB Q8 weights
-            base_bandwidth_per_stream_gbps: 0.85,  // amortized incremental KV + activation bandwidth
+            base_bandwidth_per_stream_gbps: 0.85, // amortized incremental KV + activation bandwidth
         }
     }
 
@@ -128,7 +140,10 @@ impl ServerCapacityModel {
         // 3. Compute core bound: assume each physical core can sustain at least 0.5 - 1.0 streams
         let core_stream_limit = self.topology.physical_cores * 2;
 
-        memory_stream_limit.min(bw_stream_limit).min(core_stream_limit).max(1)
+        memory_stream_limit
+            .min(bw_stream_limit)
+            .min(core_stream_limit)
+            .max(1)
     }
 
     /// Estimates total energy consumption (Joules per generated minute) using the OQ-17 model.
@@ -341,9 +356,21 @@ impl CapacityCertificate {
             self.queueing_latency.p95_ms,
             self.queueing_latency.p99_ms,
             self.queueing_latency.max_ms,
-            if self.single_parallel_owner { "PASS" } else { "FAIL" },
-            if self.no_nested_runtimes { "PASS" } else { "FAIL" },
-            if self.zero_silent_degradation { "PASS" } else { "FAIL" }
+            if self.single_parallel_owner {
+                "PASS"
+            } else {
+                "FAIL"
+            },
+            if self.no_nested_runtimes {
+                "PASS"
+            } else {
+                "FAIL"
+            },
+            if self.zero_silent_degradation {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         )
     }
 }
@@ -423,10 +450,11 @@ impl ServerAdmissionController {
             kv_dtype: self.policy.kv_dtype,
             ring_buffer_bytes: self.policy.ring_buffer_bytes,
             weights_resident_bytes: self.policy.weights_resident_bytes,
-            budget_bytes: request.per_stream_budget_bytes.min(self.policy.budget_bytes),
+            budget_bytes: request
+                .per_stream_budget_bytes
+                .min(self.policy.budget_bytes),
         };
-        let plan = admit(&adm_req)
-            .map_err(ServerAdmissionRejection::PerRequestResourceRejected)?;
+        let plan = admit(&adm_req).map_err(ServerAdmissionRejection::PerRequestResourceRejected)?;
 
         // 2. Check if immediate capacity exists
         if self.admitted.len() < self.config.max_admitted_streams && self.queue.is_empty() {
@@ -546,7 +574,10 @@ impl ServerAdmissionController {
 
     /// Emits the verified Capacity Certificate for this controller and topology.
     #[must_use]
-    pub fn generate_capacity_certificate(&self, measured_aggregate_rtf: f64) -> CapacityCertificate {
+    pub fn generate_capacity_certificate(
+        &self,
+        measured_aggregate_rtf: f64,
+    ) -> CapacityCertificate {
         let latencies = self.latency_summary();
         let joules = self.capacity_model.estimate_joules_per_minute(
             measured_aggregate_rtf,
@@ -581,12 +612,21 @@ mod tests {
         let model = ServerCapacityModel::new(epyc);
         let stream_limit = model.max_admissible_streams(2 * 1024 * 1024 * 1024);
 
-        assert!(stream_limit >= 32, "96-core EPYC should support >=32 streams");
-        assert!(stream_limit <= 192, "stream limit must not exceed core capacity");
+        assert!(
+            stream_limit >= 32,
+            "96-core EPYC should support >=32 streams"
+        );
+        assert!(
+            stream_limit <= 192,
+            "stream limit must not exceed core capacity"
+        );
 
         let rtf = 48.0;
         let joules = model.estimate_joules_per_minute(rtf, 360.0);
-        assert!(joules > 0.0 && joules < 1000.0, "realistic joules per minute");
+        assert!(
+            joules > 0.0 && joules < 1000.0,
+            "realistic joules per minute"
+        );
     }
 
     #[test]

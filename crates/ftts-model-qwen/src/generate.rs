@@ -2327,9 +2327,7 @@ mod tests {
 
     #[test]
     fn batched_qwen_generator_matches_singleton_exact_tokens() {
-        use ftts_core::batching::{
-            BatchSchedulerConfig, BatchingPolicy, ContinuousBatchScheduler,
-        };
+        use ftts_core::batching::{BatchSchedulerConfig, BatchingPolicy, ContinuousBatchScheduler};
 
         let weights = TinyWeights::new(0.0);
         let micro_layers = vec![weights.micro_layer(); 2];

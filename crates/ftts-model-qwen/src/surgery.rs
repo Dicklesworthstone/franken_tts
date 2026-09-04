@@ -265,7 +265,10 @@ mod tests {
 
         // Low entropy, non-sibilance -> early exit allowed
         let depth = controller.decide_depth(1.2, false);
-        assert_eq!(depth, 10, "stable non-sibilance frame exits early at depth 10");
+        assert_eq!(
+            depth, 10,
+            "stable non-sibilance frame exits early at depth 10"
+        );
         assert!(depth < 15);
     }
 

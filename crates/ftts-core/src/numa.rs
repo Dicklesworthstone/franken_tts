@@ -213,11 +213,7 @@ impl NumaPoolMetrics {
         let hits = self.local_hits.load(Ordering::Relaxed) as f64;
         let misses = self.cross_node_fetches.load(Ordering::Relaxed) as f64;
         let total = hits + misses;
-        if total == 0.0 {
-            1.0
-        } else {
-            hits / total
-        }
+        if total == 0.0 { 1.0 } else { hits / total }
     }
 }
 
@@ -274,7 +270,9 @@ impl<T> NumaPackPool<T> {
             self.metrics
                 .cross_node_fetches
                 .fetch_add(1, Ordering::Relaxed);
-            self.packs.get(&NodeId(0)).expect("primary node pack exists")
+            self.packs
+                .get(&NodeId(0))
+                .expect("primary node pack exists")
         }
     }
 
@@ -335,21 +333,42 @@ mod tests {
         // Verify parsing logic and fallback when unset or unrecognized
         assert_eq!(NumaPolicy::parse_policy_str(None), NumaPolicy::Local);
         assert_eq!(NumaPolicy::parse_policy_str(Some("")), NumaPolicy::Local);
-        assert_eq!(NumaPolicy::parse_policy_str(Some("invalid")), NumaPolicy::Local);
-        assert_eq!(NumaPolicy::parse_policy_str(Some("local")), NumaPolicy::Local);
-        assert_eq!(NumaPolicy::parse_policy_str(Some("LOCAL")), NumaPolicy::Local);
-        assert_eq!(NumaPolicy::parse_policy_str(Some("replicate")), NumaPolicy::Replicate);
-        assert_eq!(NumaPolicy::parse_policy_str(Some("REPLICATE")), NumaPolicy::Replicate);
-        assert_eq!(NumaPolicy::parse_policy_str(Some("interleave")), NumaPolicy::Interleave);
-        assert_eq!(NumaPolicy::parse_policy_str(Some("INTERLEAVE")), NumaPolicy::Interleave);
+        assert_eq!(
+            NumaPolicy::parse_policy_str(Some("invalid")),
+            NumaPolicy::Local
+        );
+        assert_eq!(
+            NumaPolicy::parse_policy_str(Some("local")),
+            NumaPolicy::Local
+        );
+        assert_eq!(
+            NumaPolicy::parse_policy_str(Some("LOCAL")),
+            NumaPolicy::Local
+        );
+        assert_eq!(
+            NumaPolicy::parse_policy_str(Some("replicate")),
+            NumaPolicy::Replicate
+        );
+        assert_eq!(
+            NumaPolicy::parse_policy_str(Some("REPLICATE")),
+            NumaPolicy::Replicate
+        );
+        assert_eq!(
+            NumaPolicy::parse_policy_str(Some("interleave")),
+            NumaPolicy::Interleave
+        );
+        assert_eq!(
+            NumaPolicy::parse_policy_str(Some("INTERLEAVE")),
+            NumaPolicy::Interleave
+        );
     }
 
     #[test]
     fn numa_topology_detection_and_mapping() {
         let topo = NumaTopology::new(vec![
-            vec![0, 1, 2, 3],  // Node 0
-            vec![4, 5, 6, 7],  // Node 1
-            vec![8, 9, 10, 11], // Node 2
+            vec![0, 1, 2, 3],     // Node 0
+            vec![4, 5, 6, 7],     // Node 1
+            vec![8, 9, 10, 11],   // Node 2
             vec![12, 13, 14, 15], // Node 3
         ]);
 
@@ -392,10 +411,7 @@ mod tests {
 
     #[test]
     fn numa_pack_pool_local_tracks_cross_node_fetches() {
-        let topo = NumaTopology::new(vec![
-            vec![0, 1, 2, 3],
-            vec![4, 5, 6, 7],
-        ]);
+        let topo = NumaTopology::new(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
 
         // Policy: Local (only node 0 has pack)
         let pool = NumaPackPool::new(NumaPolicy::Local, &topo, |node| {

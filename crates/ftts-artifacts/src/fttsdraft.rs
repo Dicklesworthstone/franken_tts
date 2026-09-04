@@ -43,11 +43,23 @@ pub enum DraftError {
     BadMagic([u8; 8]),
     UnsupportedVersion(u32),
     CorruptHeader(String),
-    IncompatibleBaseModel { expected: String, actual: String },
-    IncompatibleAbiVersion { expected: u32, actual: u32 },
+    IncompatibleBaseModel {
+        expected: String,
+        actual: String,
+    },
+    IncompatibleAbiVersion {
+        expected: u32,
+        actual: u32,
+    },
     KillSwitched(String),
-    TruncatedPayload { expected_bytes: usize, actual_bytes: usize },
-    ChecksumMismatch { expected: String, actual: String },
+    TruncatedPayload {
+        expected_bytes: usize,
+        actual_bytes: usize,
+    },
+    ChecksumMismatch {
+        expected: String,
+        actual: String,
+    },
     Io(String),
 }
 
@@ -58,17 +70,32 @@ impl fmt::Display for DraftError {
             Self::UnsupportedVersion(v) => write!(f, "unsupported version: {v}"),
             Self::CorruptHeader(s) => write!(f, "corrupt header: {s}"),
             Self::IncompatibleBaseModel { expected, actual } => {
-                write!(f, "incompatible base model hash: expected {expected}, actual {actual}")
+                write!(
+                    f,
+                    "incompatible base model hash: expected {expected}, actual {actual}"
+                )
             }
             Self::IncompatibleAbiVersion { expected, actual } => {
-                write!(f, "incompatible engine ABI version: expected {expected}, actual {actual}")
+                write!(
+                    f,
+                    "incompatible engine ABI version: expected {expected}, actual {actual}"
+                )
             }
             Self::KillSwitched(name) => write!(f, "draft model is kill-switched: {name}"),
-            Self::TruncatedPayload { expected_bytes, actual_bytes } => {
-                write!(f, "truncated payload: expected {expected_bytes} bytes, found {actual_bytes}")
+            Self::TruncatedPayload {
+                expected_bytes,
+                actual_bytes,
+            } => {
+                write!(
+                    f,
+                    "truncated payload: expected {expected_bytes} bytes, found {actual_bytes}"
+                )
             }
             Self::ChecksumMismatch { expected, actual } => {
-                write!(f, "checksum mismatch: expected {expected}, calculated {actual}")
+                write!(
+                    f,
+                    "checksum mismatch: expected {expected}, calculated {actual}"
+                )
             }
             Self::Io(s) => write!(f, "I/O error: {s}"),
         }
@@ -175,7 +202,12 @@ impl DraftHeader {
         let target_layers = obj
             .get("target_layers")
             .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_u64).map(|v| v as u32).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_u64)
+                    .map(|v| v as u32)
+                    .collect()
+            })
             .unwrap_or_default();
 
         let metadata = obj
@@ -420,7 +452,12 @@ impl FttsDraft {
             return Err(DraftError::KillSwitched(self.header.drafter_name.clone()));
         }
 
-        if !self.header.base_model_hash.trim().eq_ignore_ascii_case(base_model_hash.trim()) {
+        if !self
+            .header
+            .base_model_hash
+            .trim()
+            .eq_ignore_ascii_case(base_model_hash.trim())
+        {
             return Err(DraftError::IncompatibleBaseModel {
                 expected: base_model_hash.to_string(),
                 actual: self.header.base_model_hash.clone(),
@@ -549,12 +586,16 @@ mod tests {
         assert!(matches!(err_base, DraftError::IncompatibleBaseModel { .. }));
 
         // Older engine ABI fails
-        let err_abi = draft.verify_compatibility("abcd1234ef567890", 0).unwrap_err();
+        let err_abi = draft
+            .verify_compatibility("abcd1234ef567890", 0)
+            .unwrap_err();
         assert!(matches!(err_abi, DraftError::IncompatibleAbiVersion { .. }));
 
         // Kill switch activation fails
         draft.header.is_kill_switched = true;
-        let err_kill = draft.verify_compatibility("abcd1234ef567890", 1).unwrap_err();
+        let err_kill = draft
+            .verify_compatibility("abcd1234ef567890", 1)
+            .unwrap_err();
         assert!(matches!(err_kill, DraftError::KillSwitched(_)));
     }
 

@@ -312,7 +312,11 @@ impl<G: SpeculativeFrameGenerator> RaggedBatchScheduler<G> {
                 continue;
             }
 
-            match stream.generator.step_speculative_block().map_err(EngineError::Generation)? {
+            match stream
+                .generator
+                .step_speculative_block()
+                .map_err(EngineError::Generation)?
+            {
                 SpeculativeStepOutcome::FullAccept(frame) => {
                     stream.code_frames.push(frame);
                     stream.full_accept_count += 1;
@@ -401,8 +405,8 @@ impl<G: SpeculativeFrameGenerator> RaggedBatchScheduler<G> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use crate::{FrameStep, NormalizationMode, NormalizationTrace};
+    use std::time::Duration;
 
     /// Synthetic generator with configurable speculative acceptance depth per frame.
     struct ConfigurableSpecGenerator {
@@ -662,8 +666,11 @@ mod tests {
         let mut sched_a = RaggedBatchScheduler::new(config);
 
         for s in 0..num_streams {
-            let generator_inst = ConfigurableSpecGenerator::new(s, frames_per_stream, spec_patterns[s].clone());
-            sched_a.admit(generator_inst, &prep, UtteranceStart::Fresh, true).unwrap();
+            let generator_inst =
+                ConfigurableSpecGenerator::new(s, frames_per_stream, spec_patterns[s].clone());
+            sched_a
+                .admit(generator_inst, &prep, UtteranceStart::Fresh, true)
+                .unwrap();
         }
 
         while sched_a.active_stream_count() > 0 {
@@ -675,8 +682,11 @@ mod tests {
         let mut sched_b = RaggedBatchScheduler::new(config);
 
         for s in 0..num_streams {
-            let generator_inst = ConfigurableSpecGenerator::new(s, frames_per_stream, spec_patterns[s].clone());
-            sched_b.admit(generator_inst, &prep, UtteranceStart::Fresh, false).unwrap();
+            let generator_inst =
+                ConfigurableSpecGenerator::new(s, frames_per_stream, spec_patterns[s].clone());
+            sched_b
+                .admit(generator_inst, &prep, UtteranceStart::Fresh, false)
+                .unwrap();
         }
 
         while sched_b.active_stream_count() > 0 {
@@ -685,18 +695,31 @@ mod tests {
         let metrics_b = *sched_b.metrics();
 
         // Total frames completed is equal across both conditions
-        assert_eq!(metrics_a.total_frames_completed, (num_streams * frames_per_stream) as u64);
-        assert_eq!(metrics_b.total_frames_completed, (num_streams * frames_per_stream) as u64);
+        assert_eq!(
+            metrics_a.total_frames_completed,
+            (num_streams * frames_per_stream) as u64
+        );
+        assert_eq!(
+            metrics_b.total_frames_completed,
+            (num_streams * frames_per_stream) as u64
+        );
 
         // Dual-Lane speculation resolves majority of frames in Lane 1
-        assert!(metrics_a.full_accept_rate() >= 0.50, "full accept rate should be >= 50%");
-        assert_eq!(metrics_b.lane1_full_accepts, 0, "Condition B has 0 speculation");
+        assert!(
+            metrics_a.full_accept_rate() >= 0.50,
+            "full accept rate should be >= 50%"
+        );
+        assert_eq!(
+            metrics_b.lane1_full_accepts, 0,
+            "Condition B has 0 speculation"
+        );
 
         // Dual-Lane achieves massive reduction in sequential repair steps:
         // Pure sequential evaluated 16 steps/frame * 80 frames = 1280 steps
         // Speculative dual-lane skips ~60% of steps completely
         assert!(metrics_a.total_repair_steps < metrics_b.total_repair_steps);
-        let step_reduction = 1.0 - (metrics_a.total_repair_steps as f64 / metrics_b.total_repair_steps as f64);
+        let step_reduction =
+            1.0 - (metrics_a.total_repair_steps as f64 / metrics_b.total_repair_steps as f64);
         assert!(
             step_reduction >= 0.50,
             "Dual-lane should eliminate at least 50% of sequential repair steps (got {:.1}%)",

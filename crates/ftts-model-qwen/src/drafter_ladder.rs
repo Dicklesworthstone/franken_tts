@@ -33,7 +33,11 @@ pub const RESIDUAL_VOCAB: usize = 2_048;
 /// Common trait implemented by all speculative draft engines in the ladder.
 pub trait SpeculativeDrafter {
     /// Generates proposal codes for all 15 residual depths.
-    fn draft(&mut self, talker_hidden: &[f32], previous_codes: Option<&[usize; RESIDUAL_DEPTHS]>) -> [usize; RESIDUAL_DEPTHS];
+    fn draft(
+        &mut self,
+        talker_hidden: &[f32],
+        previous_codes: Option<&[usize; RESIDUAL_DEPTHS]>,
+    ) -> [usize; RESIDUAL_DEPTHS];
 
     /// Observes authoritative teacher-verified or repaired codes from the verifier.
     fn observe(&mut self, verified_codes: &[usize; RESIDUAL_DEPTHS]);
@@ -78,7 +82,11 @@ impl DistilledMicroDrafter {
 }
 
 impl SpeculativeDrafter for DistilledMicroDrafter {
-    fn draft(&mut self, talker_hidden: &[f32], previous_codes: Option<&[usize; RESIDUAL_DEPTHS]>) -> [usize; RESIDUAL_DEPTHS] {
+    fn draft(
+        &mut self,
+        talker_hidden: &[f32],
+        previous_codes: Option<&[usize; RESIDUAL_DEPTHS]>,
+    ) -> [usize; RESIDUAL_DEPTHS] {
         let mut proposals = [0usize; RESIDUAL_DEPTHS];
         let prev = previous_codes.or(self.last_frame.as_ref());
 
@@ -178,7 +186,11 @@ impl ParallelHeadsDrafter {
 }
 
 impl SpeculativeDrafter for ParallelHeadsDrafter {
-    fn draft(&mut self, talker_hidden: &[f32], _previous_codes: Option<&[usize; RESIDUAL_DEPTHS]>) -> [usize; RESIDUAL_DEPTHS] {
+    fn draft(
+        &mut self,
+        talker_hidden: &[f32],
+        _previous_codes: Option<&[usize; RESIDUAL_DEPTHS]>,
+    ) -> [usize; RESIDUAL_DEPTHS] {
         let mut proposals = [0usize; RESIDUAL_DEPTHS];
         let limit = talker_hidden.len().min(self.hidden_size);
 

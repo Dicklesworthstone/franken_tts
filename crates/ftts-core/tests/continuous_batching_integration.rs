@@ -147,7 +147,8 @@ fn continuous_batching_throughput_scaling_and_metrics() {
     let solo_start = Instant::now();
     for s in 0..num_streams {
         let mut generator_inst = SyntheticWorkloadGenerator::new(s, frames_per_stream, work_cycles);
-        generator_inst.begin_utterance(&prepared, UtteranceStart::Fresh)
+        generator_inst
+            .begin_utterance(&prepared, UtteranceStart::Fresh)
             .unwrap();
         while let FrameStep::Frame(_) = generator_inst.next_frame().unwrap() {}
     }
@@ -179,7 +180,10 @@ fn continuous_batching_throughput_scaling_and_metrics() {
 
     let metrics = scheduler.metrics();
     assert_eq!(metrics.peak_batch_size, num_streams);
-    assert_eq!(metrics.total_frames_emitted, (num_streams * frames_per_stream) as u64);
+    assert_eq!(
+        metrics.total_frames_emitted,
+        (num_streams * frames_per_stream) as u64
+    );
     assert!(metrics.mean_batch_size() >= 1.0);
 
     let bandwidth_savings = metrics.estimated_bandwidth_savings();

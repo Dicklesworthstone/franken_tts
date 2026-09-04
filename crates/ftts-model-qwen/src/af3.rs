@@ -80,10 +80,7 @@ impl FrankenMtpEProcessConfig {
     /// Panics if $p_0 \le 0$, $p_0 \ge 1$, or $\lambda \le 0$ or $\lambda \ge 1/p_0$.
     #[must_use]
     pub fn new(p0: f64, lambda: f64, alpha: f64) -> Self {
-        assert!(
-            p0 > 0.0 && p0 < 1.0,
-            "p0 must be in (0, 1), got {p0}"
-        );
+        assert!(p0 > 0.0 && p0 < 1.0, "p0 must be in (0, 1), got {p0}");
         assert!(
             lambda > 0.0 && lambda < (1.0 / p0),
             "lambda must be in (0, 1/p0), got {lambda} with 1/p0={}",
@@ -229,7 +226,9 @@ impl FrankenMtpEProcessMonitor {
         }
 
         if let Some(forced) = match AF3_MONITOR_OVERRIDE.load(Ordering::Relaxed) {
-            1 => Some(MonitorDecision::Healthy { e_value: self.e_value }),
+            1 => Some(MonitorDecision::Healthy {
+                e_value: self.e_value,
+            }),
             0 => Some(MonitorDecision::Demoted),
             _ => None,
         } {
@@ -292,7 +291,10 @@ mod tests {
     fn deterministic_fallback_when_alpha_zero() {
         let config = FrankenMtpEProcessConfig::new(0.10, 2.0, 0.0);
         let mut monitor = FrankenMtpEProcessMonitor::new(config);
-        assert!(monitor.is_demoted(), "alpha <= 0 must immediately demote speculation");
+        assert!(
+            monitor.is_demoted(),
+            "alpha <= 0 must immediately demote speculation"
+        );
 
         let decision = monitor.observe(false);
         assert_eq!(decision, MonitorDecision::Disabled);
@@ -380,7 +382,9 @@ mod tests {
         // Simple LCG pseudo-random for deterministic reproducibility in unit test
         let mut lcg_state: u64 = 0xdeadbeef12345678;
         let mut next_u64 = || {
-            lcg_state = lcg_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            lcg_state = lcg_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             lcg_state
         };
 

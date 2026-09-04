@@ -41,7 +41,7 @@
 use ftts_kernels::int8::{QuantLinearMode, QuantizedMatrix, quant_linear};
 
 pub use crate::af3::{
-    set_af3_monitor_override, FrankenMtpEProcessConfig, FrankenMtpEProcessMonitor, MonitorDecision,
+    FrankenMtpEProcessConfig, FrankenMtpEProcessMonitor, MonitorDecision, set_af3_monitor_override,
 };
 
 /// Number of code groups per frame: one primary code plus 15 residuals.
@@ -1459,9 +1459,16 @@ impl FrankenMtpDrafter {
         use std::collections::BTreeMap;
 
         let mut metadata = BTreeMap::new();
-        metadata.insert("drafter_family".into(), "frankenmtp_v1_transition_sketch".into());
+        metadata.insert(
+            "drafter_family".into(),
+            "frankenmtp_v1_transition_sketch".into(),
+        );
         if let Some(prev) = self.previous_frame {
-            let prev_str = prev.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
+            let prev_str = prev
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             metadata.insert("previous_frame".into(), prev_str);
         }
 
@@ -1511,7 +1518,9 @@ impl FrankenMtpDrafter {
             .ok_or_else(|| DraftError::CorruptHeader("missing transition_buckets tensor".into()))?;
 
         if tensor.rows != RESIDUAL_DEPTHS || tensor.cols != TRANSITION_BUCKETS * 8 {
-            return Err(DraftError::CorruptHeader("invalid transition_buckets shape".into()));
+            return Err(DraftError::CorruptHeader(
+                "invalid transition_buckets shape".into(),
+            ));
         }
 
         let mut transitions = [[TransitionBucket::EMPTY; TRANSITION_BUCKETS]; RESIDUAL_DEPTHS];
@@ -1537,7 +1546,11 @@ impl FrankenMtpDrafter {
                         .map_err(|_| DraftError::CorruptHeader("invalid bucket count".into()))?,
                 );
 
-                transitions[depth][bucket_idx] = TransitionBucket { source, target, count };
+                transitions[depth][bucket_idx] = TransitionBucket {
+                    source,
+                    target,
+                    count,
+                };
             }
         }
 
@@ -4053,8 +4066,12 @@ mod tests {
     #[test]
     fn test_frankenmtp_drafter_roundtrip_through_fttsdraft_abi() {
         let mut original = FrankenMtpDrafter::new();
-        let frame1 = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150];
-        let frame2 = [11, 21, 31, 41, 51, 61, 71, 81, 91, 101, 111, 121, 131, 141, 151];
+        let frame1 = [
+            10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150,
+        ];
+        let frame2 = [
+            11, 21, 31, 41, 51, 61, 71, 81, 91, 101, 111, 121, 131, 141, 151,
+        ];
         original.observe(&frame1);
         original.observe(&frame2);
 
@@ -4080,7 +4097,10 @@ mod tests {
 
         // 5. Verify identical drafting behavior
         let draft2 = reconstructed.draft();
-        assert_eq!(draft1, draft2, "draft predictions must be 100% identical after ABI roundtrip");
+        assert_eq!(
+            draft1, draft2,
+            "draft predictions must be 100% identical after ABI roundtrip"
+        );
         assert_eq!(original, reconstructed, "state must be identical");
     }
 }
