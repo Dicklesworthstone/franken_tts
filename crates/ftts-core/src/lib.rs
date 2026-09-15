@@ -1947,6 +1947,93 @@ mod tests {
     }
 
     #[test]
+    fn runtime_context_owned_stage_preserves_caller_and_explicit_cancellation() {
+        use asupersync::{Budget, Cx, cx::cap, runtime::SpawnError};
+
+        // This exercises the real blocking pool used by the enrollment shell,
+        // not model inference or voice enrollment. The engine owns that pool;
+        // submitting a stage must not grant its caller any new Cx capability.
+        let engine = engine_with_budget(Duration::from_secs(5));
+        let caller = engine
+            .runtime
+            .request_cx_with_budget(Budget::INFINITE.with_cost_quota(23));
+        let _caller = Cx::set_current(Some(caller.clone()));
+        {
+            let _restriction = caller.restrict::<cap::None>().set_current_restricted();
+            let denied = Cx::current().expect("restricted caller installed");
+            assert!(denied.timer_driver().is_none());
+            assert!(!denied.capabilities().io);
+            assert!(matches!(
+                denied.spawn_blocking(|_| 42),
+                Err(SpawnError::RuntimeUnavailable)
+            ));
+            let cancellation = CancellationToken::new();
+            let observer = RecordingObserver::default();
+            let (value, worker) = engine
+                .run_stage(
+                    EngineStage::Enrollment,
+                    Duration::from_secs(5),
+                    &cancellation,
+                    &observer,
+                    |token| {
+                        token.checkpoint()?;
+                        Ok((42, thread::current().id()))
+                    },
+                )
+                .expect("the explicitly owned pool executes the stage");
+            assert_eq!(value, 42);
+            assert_ne!(
+                worker,
+                thread::current().id(),
+                "stage must leave the caller"
+            );
+            assert!(matches!(
+                observer.events().as_slice(),
+                [
+                    SynthesisEvent::StageStarted {
+                        stage: EngineStage::Enrollment
+                    },
+                    SynthesisEvent::StageFinished {
+                        stage: EngineStage::Enrollment,
+                        ..
+                    }
+                ]
+            ));
+
+            cancellation.cancel();
+            let entered = Arc::new(AtomicBool::new(false));
+            let entered_work = Arc::clone(&entered);
+            assert_eq!(
+                engine.run_stage(
+                    EngineStage::Enrollment,
+                    Duration::from_secs(5),
+                    &cancellation,
+                    &observer,
+                    move |_| {
+                        entered_work.store(true, Ordering::Release);
+                        Ok(())
+                    },
+                ),
+                Err(EngineError::Cancelled)
+            );
+            assert!(!entered.load(Ordering::Acquire));
+            assert_eq!(Cx::current().unwrap().task_id(), caller.task_id());
+            assert_eq!(Cx::current().unwrap().budget(), caller.budget());
+            assert_eq!(Cx::current().unwrap().capabilities(), denied.capabilities());
+            assert!(matches!(
+                Cx::current().unwrap().spawn_blocking(|_| 42),
+                Err(SpawnError::RuntimeUnavailable)
+            ));
+        }
+        assert_eq!(Cx::current().unwrap().task_id(), caller.task_id());
+        assert_eq!(Cx::current().unwrap().capabilities(), caller.capabilities());
+        assert!(
+            caller.checkpoint().is_ok(),
+            "engine cancellation stays explicit"
+        );
+    }
+
+    #[test]
     fn stage_budget_cancels_cooperative_cpu_work() {
         let engine = engine_with_budget(Duration::from_millis(5));
         let cancellation = CancellationToken::new();
