@@ -45,6 +45,10 @@ targets:
       - Sources
       - Shared
       - Assets.xcassets
+      # Reuse the original playground's tiny, seed-0 voice previews. They let
+      # someone audition every built-in voice before the 2 GB model exists.
+      - path: ../site/assets/audio/previews
+        buildPhase: resources
     dependencies:
       - framework: FttsCore.xcframework
         embed: false

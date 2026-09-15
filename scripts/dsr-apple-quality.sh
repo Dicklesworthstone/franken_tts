@@ -56,4 +56,5 @@ xcodebuild -project FrankenTTS.xcodeproj -scheme FrankenTTS \
   -only-testing:FrankenTTSUITests/UtteranceEditorUITests/testMultilineEmojiEditAndOutsideTapDismissesKeyboard \
   -only-testing:FrankenTTSUITests/VoiceCardUITests/testVoiceCardRendersAndSharesFromTheOwningLibraryCover \
   -only-testing:FrankenTTSUITests/VoiceLabUITests/testComparisonWorkspaceIsDiscoverableWithoutPlayingAudio \
+  -only-testing:FrankenTTSUITests/VoiceBrowserUITests/testBuiltInVoicePreviewsAreDiscoverableWithoutPlayingAudio \
   -only-testing:FrankenTTSUITests/VoiceBrowserUITests/testLongPersonalVoiceNameStaysOnOneLineOnCompactPhone

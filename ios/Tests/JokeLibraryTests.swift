@@ -40,6 +40,25 @@ final class JokeLibraryTests: XCTestCase {
         XCTAssertNotEqual(JokeLibrary.random(excluding: current), current)
     }
 
+    func testEveryBuiltInVoiceHasTheOriginalModelFreePreview() throws {
+        let presets = Engine.presets()
+
+        XCTAssertEqual(presets.count, 18)
+        XCTAssertEqual(
+            PresetPreviewLibrary.sentence,
+            "Now is the time for all good men to come to the aid of the agents."
+        )
+        for preset in presets {
+            let url = try XCTUnwrap(
+                PresetPreviewLibrary.url(for: preset.name),
+                "Missing model-free preview for \(preset.name)"
+            )
+            let bytes = try Data(contentsOf: url).count
+            XCTAssertGreaterThan(bytes, 0, "Empty preview for \(preset.name)")
+            XCTAssertLessThan(bytes, 60 * 1_024, "Preview for \(preset.name) is no longer tiny")
+        }
+    }
+
     func testLongUtterancesSplitAtReadableBoundariesWithinNativeBudget() {
         let paragraph = String(repeating: "A substantial spoken sentence. ", count: 180)
         let source = [paragraph, paragraph, paragraph].joined(separator: "\n\n")

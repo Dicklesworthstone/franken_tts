@@ -92,6 +92,22 @@ final class VoiceLabUITests: XCTestCase {
 }
 
 final class VoiceBrowserUITests: XCTestCase {
+    func testBuiltInVoicePreviewsAreDiscoverableWithoutPlayingAudio() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["FTTS_OPEN_VOICE_LIBRARY"] = "1"
+        app.launch()
+
+        XCTAssertTrue(app.navigationBars["Voice Library"].waitForExistence(timeout: 8))
+        let preview = app.buttons["preview-matt"]
+        XCTAssertTrue(preview.waitForExistence(timeout: 3))
+        XCTAssertEqual(preview.label, "Hear Matt preview")
+
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "voice-browser-model-free-preview"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     func testLongPersonalVoiceNameStaysOnOneLineOnCompactPhone() throws {
         let app = XCUIApplication()
         app.launchEnvironment["FTTS_DEBUG_LONG_VOICE_NAME"] = "1"

@@ -2,10 +2,78 @@
 
 import AVFoundation
 import CryptoKit
+import Observation
 import PhotosUI
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
+
+/// The original playground's instant, model-free built-in voice audition.
+///
+/// These are the exact small seed-0 clips used by the web voice cards and by
+/// `ftts voices --preview`. Xcode flattens the preview resource directory into
+/// the app bundle, just as it does for `norm_jokes.txt`.
+enum PresetPreviewLibrary {
+    static let sentence =
+        "Now is the time for all good men to come to the aid of the agents."
+
+    static func url(for voice: String, in bundle: Bundle = .main) -> URL? {
+        bundle.url(forResource: voice.lowercased(), withExtension: "mp3")
+    }
+}
+
+@MainActor
+@Observable
+private final class PresetPreviewPlayer {
+    private(set) var activeVoice: String?
+    private(set) var errorMessage: String?
+
+    private var player: AVAudioPlayer?
+    private var completionTask: Task<Void, Never>?
+
+    func toggle(_ voice: String) {
+        if activeVoice == voice, player?.isPlaying == true {
+            stop()
+            return
+        }
+
+        stop()
+        guard let url = PresetPreviewLibrary.url(for: voice) else {
+            errorMessage = "The \(voice.capitalized) preview is missing from this build."
+            return
+        }
+
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback)
+            let nextPlayer = try AVAudioPlayer(contentsOf: url)
+            nextPlayer.prepareToPlay()
+            guard nextPlayer.play() else {
+                errorMessage = "The \(voice.capitalized) preview could not start."
+                return
+            }
+            player = nextPlayer
+            activeVoice = voice
+            errorMessage = nil
+
+            let duration = max(0.1, nextPlayer.duration)
+            completionTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(duration + 0.1))
+                guard !Task.isCancelled, self?.activeVoice == voice else { return }
+                self?.stop()
+            }
+        } catch {
+            errorMessage = "The \(voice.capitalized) preview could not play."
+        }
+    }
+
+    func stop() {
+        completionTask?.cancel()
+        completionTask = nil
+        player?.stop()
+        player = nil
+        activeVoice = nil
+    }
+}
 
 private enum VoiceLibraryFilter: String, CaseIterable, Identifiable {
     case all = "All"
@@ -1480,6 +1548,7 @@ struct LabView: View {
     }
 
     @State private var model = LabModel()
+    @State private var presetPreviewPlayer = PresetPreviewPlayer()
     @State private var showEnrollment =
         ProcessInfo.processInfo.environment["FTTS_DEBUG_ENROLLMENT"] == "1"
     @State private var showGalaxy = false
@@ -1814,6 +1883,7 @@ struct LabView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background {
+                presetPreviewPlayer.stop()
                 model.prepareForBackground()
             } else if phase == .active {
                 model.prepareForForeground()
@@ -1825,6 +1895,20 @@ struct LabView: View {
             if phase == .ready, !automaticWarmSuppressed {
                 model.warmEngineIfPossible()
             }
+        }
+        .onChange(of: model.isSynthesizing) { _, isSynthesizing in
+            if isSynthesizing { presetPreviewPlayer.stop() }
+        }
+        .onChange(of: model.selectedVoice) { _, selectedVoice in
+            if presetPreviewPlayer.activeVoice != selectedVoice {
+                presetPreviewPlayer.stop()
+            }
+        }
+        .onChange(of: showVoiceLab) { _, isPresented in
+            if !isPresented { presetPreviewPlayer.stop() }
+        }
+        .onChange(of: showVoiceComparison) { _, isPresented in
+            if isPresented { presetPreviewPlayer.stop() }
         }
         .sensoryFeedback(.selection, trigger: model.selectedVoice)
         .sensoryFeedback(.success, trigger: model.lastAudio?.count)
@@ -1878,6 +1962,7 @@ struct LabView: View {
                 },
                 stop: { model.cancelSynthesis() },
                 togglePlayback: {
+                    presetPreviewPlayer.stop()
                     model.togglePlayback()
                     playbackTick += 1
                 },
@@ -2265,11 +2350,22 @@ struct LabView: View {
                         VoiceTile(
                             name: preset.name,
                             character: preset.character,
-                            selected: model.selectedVoice == preset.name
-                        ) {
-                            withAnimation(.snappy) { model.selectedVoice = preset.name }
-                        }
+                            selected: model.selectedVoice == preset.name,
+                            previewing: presetPreviewPlayer.activeVoice == preset.name,
+                            select: {
+                                withAnimation(.snappy) { model.selectedVoice = preset.name }
+                            },
+                            preview: {
+                                model.player?.pause()
+                                presetPreviewPlayer.toggle(preset.name)
+                            }
+                        )
                     }
+                }
+                if let previewError = presetPreviewPlayer.errorMessage {
+                    Label(previewError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: Lab.typeSize(11), weight: .medium))
+                        .foregroundStyle(Lab.danger)
                 }
             }
 
@@ -2806,6 +2902,7 @@ struct LabView: View {
     private var playbackExportControls: some View {
         HStack(spacing: 10) {
             Button {
+                presetPreviewPlayer.stop()
                 model.togglePlayback()
                 playbackTick += 1
             } label: {
@@ -3302,70 +3399,97 @@ struct VoiceTile: View {
     let name: String
     let character: String
     let selected: Bool
+    let previewing: Bool
     var accent = false
-    let action: () -> Void
+    let select: () -> Void
+    let preview: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 10) {
-                    VoiceOrb(name: name, selected: selected)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(name.capitalized)
-                            .font(.system(size: Lab.typeSize(16), weight: .black))
-                            .foregroundStyle(Lab.textPrimary)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.62)
-                            .allowsTightening(true)
-                            .layoutPriority(1)
-                        Text(character.localizedCaseInsensitiveContains("feminine") ? "FEMININE" : "MASCULINE")
-                            .font(.system(size: Lab.typeSize(7), weight: .black, design: .monospaced))
+        VStack(alignment: .leading, spacing: 10) {
+            Button(action: select) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 10) {
+                        VoiceOrb(name: name, selected: selected)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(name.capitalized)
+                                .font(.system(size: Lab.typeSize(16), weight: .black))
+                                .foregroundStyle(Lab.textPrimary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.62)
+                                .allowsTightening(true)
+                                .layoutPriority(1)
+                            Text(
+                                character.localizedCaseInsensitiveContains("feminine")
+                                    ? "FEMININE" : "MASCULINE"
+                            )
+                            .font(.system(
+                                size: Lab.typeSize(7), weight: .black, design: .monospaced
+                            ))
                             .kerning(1)
                             .foregroundStyle(selected ? Lab.emerald : Lab.textSecondary)
+                        }
+                        Spacer()
+                        Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: Lab.typeSize(19), weight: .bold))
+                            .foregroundStyle(
+                                selected ? Lab.emerald : Lab.textSecondary.opacity(0.38)
+                            )
                     }
-                    Spacer()
-                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: Lab.typeSize(19), weight: .bold))
-                        .foregroundStyle(selected ? Lab.emerald : Lab.textSecondary.opacity(0.38))
+                    Text(character)
+                        .font(.system(size: Lab.typeSize(11), weight: .medium))
+                        .foregroundStyle(Lab.textSecondary)
+                        .multilineTextAlignment(.leading)
+                        .frame(minHeight: 32, alignment: .top)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Text(selected ? "SELECTED" : "TAP TO SELECT")
+                            .font(.system(size: Lab.typeSize(8), weight: .black, design: .monospaced))
+                        Spacer()
+                        Image(systemName: selected ? "checkmark" : "arrow.right")
+                    }
+                    .foregroundStyle(selected ? Lab.emerald : Lab.textSecondary)
                 }
-                Text(character)
-                    .font(.system(size: Lab.typeSize(11), weight: .medium))
-                    .foregroundStyle(Lab.textSecondary)
-                    .multilineTextAlignment(.leading)
-                    .frame(minHeight: 32, alignment: .top)
-                    .fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Text(selected ? "SELECTED" : "TAP TO SELECT")
-                        .font(.system(size: Lab.typeSize(8), weight: .black, design: .monospaced))
-                    Spacer()
-                    Image(systemName: "waveform")
-                }
-                .foregroundStyle(selected ? Lab.emerald : Lab.textSecondary)
             }
-            .padding(14)
-            .frame(maxWidth: .infinity, minHeight: 154, alignment: .leading)
-            .background(
-                LinearGradient(
-                    colors: [
-                        selected ? Lab.emerald.opacity(0.13) : Lab.panelStrong,
-                        Lab.panel
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                ),
-                in: RoundedRectangle(cornerRadius: 17, style: .continuous)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 17)
-                    .stroke(
-                        selected
-                            ? Lab.emerald
-                            : (accent ? Lab.emerald.opacity(0.35) : Lab.stroke),
-                        lineWidth: selected ? 1.5 : 1)
+            .buttonStyle(.plain)
+            .accessibilityLabel("Select \(name): \(character)\(selected ? ", selected" : "")")
+
+            Button(action: preview) {
+                Label(
+                    previewing ? "Stop preview" : "Hear preview",
+                    systemImage: previewing ? "stop.fill" : "play.fill"
+                )
+                .font(.system(size: Lab.typeSize(10), weight: .black, design: .monospaced))
+                .frame(maxWidth: .infinity, minHeight: 34)
+            }
+            .buttonStyle(GhostButtonStyle(tint: previewing ? Lab.danger : Lab.cyan))
+            .accessibilityIdentifier("preview-\(name)")
+            .accessibilityLabel(
+                previewing
+                    ? "Stop \(name.capitalized) preview"
+                    : "Hear \(name.capitalized) preview"
             )
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("\(name): \(character)\(selected ? ", selected" : "")")
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 196, alignment: .leading)
+        .background(
+            LinearGradient(
+                colors: [
+                    selected ? Lab.emerald.opacity(0.13) : Lab.panelStrong,
+                    Lab.panel
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 17, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 17)
+                .stroke(
+                    selected
+                        ? Lab.emerald
+                        : (accent ? Lab.emerald.opacity(0.35) : Lab.stroke),
+                    lineWidth: selected ? 1.5 : 1)
+        )
     }
 }
 
