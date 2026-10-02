@@ -2209,10 +2209,14 @@ impl ResidualCodeScratch {
                 PositionRole::PrimaryCodeEmbedding { head }
                 | PositionRole::ResidualEmbedding { head, .. } => head,
             };
-            rms_norm_into(
+            // Match the allocating decoder's final-head normalization,
+            // including the opt-in canonical cross-target arithmetic.
+            ftts_kernels::f32ref::rms_norm(
                 &self.hidden_buf,
                 weights.final_norm,
                 config.rms_eps,
+                1,
+                self.hidden_buf.len(),
                 &mut self.normed_buf,
             );
             match quant.and_then(|route| route.heads.map(|heads| (heads, route.mode))) {
@@ -3957,6 +3961,12 @@ mod tests {
                 let primary = (seed as usize * 29) % TALKER_CODEC_VOCAB;
 
                 let mut reference_state = FrameState::new(&config);
+                let mut expected_logits = Vec::new();
+                let mut select_reference = |row: &[f32]| {
+                    expected_logits
+                        .push(row.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+                    argmax(row)
+                };
                 let expected = match route {
                     Some(route) => decode_frame_with_selector_q8(
                         &config,
@@ -3966,22 +3976,37 @@ mod tests {
                         &mut reference_state,
                         &talker_hidden,
                         primary,
-                        argmax,
+                        &mut select_reference,
                     ),
-                    None => decode_frame_greedy(
+                    None => decode_frame_with_selector(
                         &config,
                         &rope,
                         &weights,
                         &mut reference_state,
                         &talker_hidden,
                         primary,
+                        &mut select_reference,
                     ),
                 };
 
                 engine.reset_frame();
                 let mut codes = Vec::new();
-                engine.decode_frame_into(&talker_hidden, primary, argmax, &mut codes);
+                let mut actual_logits = Vec::new();
+                engine.decode_frame_into(
+                    &talker_hidden,
+                    primary,
+                    |row| {
+                        actual_logits
+                            .push(row.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+                        argmax(row)
+                    },
+                    &mut codes,
+                );
                 assert_eq!(codes, expected, "route {label} seed {seed}");
+                assert_eq!(
+                    actual_logits, expected_logits,
+                    "logits route {label} seed {seed}"
+                );
             }
         }
     }
