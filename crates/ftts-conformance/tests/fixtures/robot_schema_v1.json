@@ -916,6 +916,44 @@
       "name": "voice_inspect",
       "stream": "events",
       "summary": "answers `voice inspect`"
+    },
+    {
+      "fields": [
+        {
+          "name": "schema_version",
+          "required": true,
+          "summary": "contract version; pinned by the frozen fixture",
+          "type": "u8"
+        },
+        {
+          "name": "event",
+          "required": true,
+          "summary": "discriminator naming this object's type",
+          "type": "string"
+        },
+        {
+          "name": "voices",
+          "required": true,
+          "summary": "one {name, character, default} object per built-in voice",
+          "type": "array"
+        },
+        {
+          "name": "default_voice",
+          "required": true,
+          "summary": "the preset used when nothing else names a voice",
+          "type": "string"
+        },
+        {
+          "name": "preview_sentence",
+          "required": true,
+          "summary": "what `voices --preview NAME` (and the playground's ▶) says",
+          "type": "string"
+        }
+      ],
+      "kind": "reply",
+      "name": "preset_voices",
+      "stream": "events",
+      "summary": "answers `voices`: the built-in roster, in table order"
     }
   ],
   "exit_codes": {

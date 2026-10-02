@@ -4520,7 +4520,7 @@ mod tests {
     // updating this snapshot. The snapshot exists to make CLI-surface changes deliberate rather
     // than accidental, so it is re-baselined only alongside a real, intended command — never
     // widened to stop failing.
-    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,make-video,enroll,voice,card,convert,pull,talk,robot,doctor,resident-daemon\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check,robot,no-resident\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
+    const CLAP_SURFACE_SNAPSHOT: &str = "commands=say,make-video,enroll,voice,voices,card,convert,pull,talk,robot,doctor,resident-daemon\nrobot=schema,health,backends,selftest\nsay=file,model,voice,output,stream,check,robot,no-resident\npull=model,force\nglobal=profile,packet-frames,math-mode,voice-pack,normalize,trace,seed\n";
 
     #[test]
     fn clap_surface_matches_snapshot() {
