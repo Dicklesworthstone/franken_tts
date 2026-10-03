@@ -33,6 +33,11 @@ remain separate from this binary and crate release.
 
 ### Known open at release
 
+- The optional v0.1.11 site archive uses intermediate WASM binding filenames
+  ([#11](https://github.com/Dicklesworthstone/franken_tts/issues/11)). Serving
+  that archive requires byte-identical `ftts_wasm` filename aliases alongside
+  its raw bindings. Production deployment is qualified separately from this
+  retained archive; native binaries, installers and crates are unaffected.
 - File-mode SIGINT can exceed the existing two-second exit bound on CPU hosts
   ([#8](https://github.com/Dicklesworthstone/franken_tts/issues/8)). A same-host
   real-model comparison reproduced this in the published v0.1.10 binary
