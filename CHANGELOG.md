@@ -38,6 +38,10 @@ remain separate from this binary and crate release.
   that archive requires byte-identical `ftts_wasm` filename aliases alongside
   its raw bindings. Production deployment is qualified separately from this
   retained archive; native binaries, installers and crates are unaffected.
+- Fresh browser WASM reaches an unsupported standard-library clock in generator
+  attribution ([#12](https://github.com/Dicklesworthstone/franken_tts/issues/12)).
+  The same timing calls exist in v0.1.10. The working website remains in place;
+  the new archive has not been deployed.
 - File-mode SIGINT can exceed the existing two-second exit bound on CPU hosts
   ([#8](https://github.com/Dicklesworthstone/franken_tts/issues/8)). A same-host
   real-model comparison reproduced this in the published v0.1.10 binary
@@ -60,7 +64,12 @@ remain separate from this binary and crate release.
   Clippy passed with warnings denied. Canonical-logit and pinned-tokenizer
   regression checks passed.
 - Real Chromium canonical synthesis matched all 96,000 native golden samples
-  exactly. Threaded and serial WASM builds passed. WebKit model download failed
+  exactly using the repository's retained prebuilt bindings. The separate
+  threaded and serial WASM compilation gates passed, but their intermediate
+  output names meant this runtime proof did not qualify those new bindings.
+  The later actual-release Chromium gate hydrated successfully and failed
+  synthesis under #12. Fresh release WASM parity is not claimed.
+  WebKit model download failed
   before hydration with a writable-stream error
   ([#10](https://github.com/Dicklesworthstone/franken_tts/issues/10)); its loader,
   worker and proxy are unchanged from v0.1.10. WebKit audio parity and Apple
