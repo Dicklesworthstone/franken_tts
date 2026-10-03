@@ -16,10 +16,10 @@ ultra-tests = ["ftts-cli/ultra-tests"]
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-ftts-cli = { path = "../ftts-cli", version = "0.1.10" }
-ftts-core = { path = "../ftts-core", version = "0.1.10" }
-ftts-model-qwen = { path = "../ftts-model-qwen", version = "0.1.10" }
-ftts-video = { path = "../ftts-video", version = "0.1.10" }
+ftts-cli = { path = "../ftts-cli", version = "0.1.11" }
+ftts-core = { path = "../ftts-core", version = "0.1.11" }
+ftts-model-qwen = { path = "../ftts-model-qwen", version = "0.1.11" }
+ftts-video = { path = "../ftts-video", version = "0.1.11" }
 serde_json = "1.0"
 
 # NOT `workspace = true`: the workspace forbids `unsafe_code`, and a C ABI is definitionally

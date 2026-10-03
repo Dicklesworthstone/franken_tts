@@ -1,5 +1,78 @@
 # Changelog
 
+## [0.1.11] - 2026-10-02
+
+This CLI and Rust crate release covers 133 commits after v0.1.10 before the
+release metadata commit. Apple application versioning and device qualification
+remain separate from this binary and crate release.
+
+### Added
+
+- `ftts voices` and instant preset previews in the playground share the
+  eighteen built-in voice profiles.
+- Streaming progress and multi-voice batching surfaces in the engine and FFI,
+  with callback ordering, terminal-event and lifetime coverage.
+- Opt-in model conformance gates and experimental speculative decoding,
+  scheduling, admission and drafter artifact tooling. Experimental drafter
+  files are not used by default synthesis.
+
+### Changed
+
+- Streaming cancellation preserves every accepted generator frame through
+  codec delivery and partial-packet flushing.
+- Dependencies use asupersync 0.5.0 from crates.io, fmd-font 0.3.2,
+  fancy-regex 0.19.2 and clap 4.6.7.
+- Frozen CLI and robot contracts now include the voices command and
+  `preset_voices` event.
+
+### Fixed
+
+- The scratch microdecoder again applies the canonical final-head
+  normalization when canonical math is requested. Its layer-local Q8 behavior
+  is unchanged; regression coverage compares every output logit bit.
+
+### Known open at release
+
+- File-mode SIGINT can exceed the existing two-second exit bound on CPU hosts
+  ([#8](https://github.com/Dicklesworthstone/franken_tts/issues/8)). A same-host
+  real-model comparison reproduced this in the published v0.1.10 binary
+  (2.70 seconds) and the candidate (2.83 seconds). Both exited 6 with valid
+  partial WAVs whose bytes matched the event accounting. The bound is retained
+  and the failure is not reported as a passing gate.
+- The existing browser harness can accept empty or truncated PCM and does not
+  fail every synthesis error
+  ([#7](https://github.com/Dicklesworthstone/franken_tts/issues/7)). Release QA
+  uses an isolated driver requiring fresh finite PCM, complete native/WASM
+  parity, successful completion and no browser or worker exceptions.
+- Experimental `.fttsdraft` shape and offset parsing needs further hardening
+  for malformed inputs
+  ([#6](https://github.com/Dicklesworthstone/franken_tts/issues/6)). The default
+  synthesis path does not load these artifacts.
+
+### Qualification
+
+- Default workspace tests: 672 passed, two ignored across 75 suites; all-target
+  Clippy passed with warnings denied. Canonical-logit and pinned-tokenizer
+  regression checks passed.
+- Real Chromium canonical synthesis matched all 96,000 native golden samples
+  exactly. Threaded and serial WASM builds passed. WebKit model download failed
+  before hydration with a writable-stream error
+  ([#10](https://github.com/Dicklesworthstone/franken_tts/issues/10)); its loader,
+  worker and proxy are unchanged from v0.1.10. WebKit audio parity and Apple
+  device qualification are not claimed.
+- Optimized cancellation tests: five passed; the file-mode timing failure is
+  retained under #8. Accepted-frame and partial-WAV accounting checks passed.
+- Linux release-profile CPU-fp32 oracle qualification remains incomplete:
+  codec seam divergence measurements and the talker layer's exact differing-
+  element count do not match their pinned ratchets
+  ([#9](https://github.com/Dicklesworthstone/franken_tts/issues/9)). Ten tests
+  passed and two failed; streaming/offline codec equality passed. These
+  reference-route results do not establish a default optimized synthesis
+  regression; same-host prior-release comparison remains outstanding.
+- Full ultra certification is not claimed. The original debug run lost its
+  active compiled target directory and later test executables never ran
+  ([RCH #85](https://github.com/Dicklesworthstone/remote_compilation_helper/issues/85)).
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
@@ -15,7 +88,8 @@ individual commits are intentionally not cited.
 
 | Version | Date | Status | Summary |
 |---------|------|--------|---------|
-| 0.1.10 | 2026-08-29 | current | 18 built-in voices across all platforms; Accelerate SGEMM kernels; AWQ/GPTQ microdecoder int4; iOS benchmark suite & LabView callouts |
+| 0.1.11 | 2026-10-02 | current | Streaming frame conservation, CLI voices contracts, canonical final-head normalization fix, dependency refresh, documented qualification limits |
+| 0.1.10 | 2026-08-29 | superseded | 18 built-in voices across all platforms; Accelerate SGEMM kernels; AWQ/GPTQ microdecoder int4; iOS benchmark suite & LabView callouts |
 | 0.1.9 | 2026-08-25 | superseded | the voice compiler: ICL QUALITY packs end to end; enrollment diagnostics; Ctrl-C contract everywhere; micro-q8 artifacts |
 | 0.1.8 | 2026-08-12 | superseded | model downloads survive GitHub throttling: Hugging Face is the primary mirror everywhere |
 | 0.1.7 | 2026-08-12 | superseded | browser memory diet (no double-resident model), native↔browser parity harness, w8a16 multicore |

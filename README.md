@@ -6,7 +6,7 @@
 
 [![License: MIT + rider](https://img.shields.io/badge/license-MIT%20%2B%20rider-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-0.1.9-green.svg)](https://github.com/Dicklesworthstone/franken_tts/releases)
+[![Version](https://img.shields.io/badge/version-0.1.11-green.svg)](https://github.com/Dicklesworthstone/franken_tts/releases)
 
 ```bash
 # macOS / Linux
