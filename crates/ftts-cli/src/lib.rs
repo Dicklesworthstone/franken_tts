@@ -3260,7 +3260,7 @@ fn run_enroll(
             "{} · {} · quality · {} codec frames · consent {} · {elapsed_ms} ms",
             pack.profile.as_str(),
             style::detail("ICL"),
-            codes.len(),
+            codes.len() / ftts_model_qwen::codec::CODEC_GROUPS,
             if pack.consent.attested {
                 "attested"
             } else {
@@ -4123,7 +4123,10 @@ fn run_voice_inspect(path: &Path, stdout: &mut dyn Write) -> Result<(), FttsErro
                     "no"
                 },
                 match pack.codec_codes.as_deref() {
-                    Some(codes) => format!("{} frames", codes.len()),
+                    Some(codes) => format!(
+                        "{} frames",
+                        codes.len() / ftts_model_qwen::codec::CODEC_GROUPS
+                    ),
                     None => "none".to_owned(),
                 },
                 if pack.reference_audio.is_some() {

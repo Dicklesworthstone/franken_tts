@@ -1852,6 +1852,54 @@ impl SynthesisProfile {
     };
 }
 
+impl SynthesisProfile {
+    /// One-line JSON (milliseconds) — the `FTTS_SYNTH_PROFILE=<path>` report line.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let ms = |duration: Duration| duration.as_secs_f64() * 1e3;
+        serde_json::json!({
+            "event": "synthesis_profile",
+            "call_ms": ms(self.call),
+            "generation_ms": ms(self.generation),
+            "prefill_ms": ms(self.prefill),
+            "talker_ms": ms(self.talker),
+            "microdecoder_ms": ms(self.microdecoder),
+            "feedback_ms": ms(self.feedback),
+            "codec_active_ms": ms(self.codec_active),
+            "codec_backpressure_ms": ms(self.codec_backpressure),
+            "codec_tail_ms": ms(self.codec_tail),
+            "frames": self.frames,
+            "team_partitions": self.team_partitions,
+            "codec_partitions": ftts_kernels::team::codec_partitions(),
+        })
+        .to_string()
+    }
+}
+
+/// `FTTS_SYNTH_PROFILE=<path>` appends each synthesis's [`SynthesisProfile`] to `path` as one
+/// JSON line — the per-stage attribution the perf work sizes the generator/codec core split from.
+///
+/// A file, not stderr, deliberately: this runs on the synthesis thread, and the CLI's main thread
+/// can hold the stderr lock while it waits on that thread (an `eprintln!` here deadlocked a run),
+/// and under `--stream raw` stderr carries the robot events. Best effort: an unwritable path never
+/// fails synthesis. Read once.
+fn append_synth_profile_report(profile: &SynthesisProfile) {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| {
+        std::env::var_os("FTTS_SYNTH_PROFILE")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    }) else {
+        return;
+    };
+    let line = format!("{}\n", profile.to_json());
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
+}
+
 thread_local! {
     static LAST_SYNTHESIS_PROFILE: Cell<SynthesisProfile> =
         const { Cell::new(SynthesisProfile::EMPTY) };
@@ -2270,9 +2318,9 @@ fn synthesize_inner(
             let worker = scope.spawn(move || -> Result<DecodedAudio, FttsError> {
                 let codec_user_initiated_qos = codec_user_initiated_qos
                     && ftts_kernels::team::request_user_initiated_qos_for_current_thread();
-                // Overlap for real: this thread's int8 ops run serially on a spare core
-                // instead of contending for the generator's worker team.
-                ftts_kernels::team::bypass_team_on_this_thread();
+                // Overlap for real: this thread never contends for the generator's engine team;
+                // it fans out on its own codec team where spare cores exist (serially otherwise).
+                ftts_kernels::team::use_codec_team_on_this_thread();
                 let mut state = codec.stream_state();
                 let mut pcm = Vec::new();
                 // `stream_push` REPLACES its output buffer with one packet's samples (see the
@@ -2434,22 +2482,22 @@ fn synthesize_inner(
     }
 
     let timings = generator.timings();
-    LAST_SYNTHESIS_PROFILE.with(|slot| {
-        slot.set(SynthesisProfile {
-            call: call_started.elapsed(),
-            generation,
-            prefill: timings.prefill,
-            microdecoder: timings.microdecoder,
-            feedback: timings.feedback,
-            talker: timings.talker,
-            codec_active: decoded.codec_active,
-            codec_backpressure,
-            codec_tail,
-            codec_user_initiated_qos: decoded.codec_user_initiated_qos,
-            frames: timings.frames,
-            team_partitions: ftts_kernels::team::partitions(),
-        });
-    });
+    let profile = SynthesisProfile {
+        call: call_started.elapsed(),
+        generation,
+        prefill: timings.prefill,
+        microdecoder: timings.microdecoder,
+        feedback: timings.feedback,
+        talker: timings.talker,
+        codec_active: decoded.codec_active,
+        codec_backpressure,
+        codec_tail,
+        codec_user_initiated_qos: decoded.codec_user_initiated_qos,
+        frames: timings.frames,
+        team_partitions: ftts_kernels::team::partitions(),
+    };
+    LAST_SYNTHESIS_PROFILE.with(|slot| slot.set(profile));
+    append_synth_profile_report(&profile);
 
     Ok(SynthesizedAudio {
         frames: result.generated_frames,
@@ -2483,28 +2531,37 @@ fn codec_packet_code_capacity(packet_frames: usize) -> Result<usize, FttsError> 
     Ok(packet_frames * 16)
 }
 
-/// Opt-in frame queue between generation and the concurrent codec worker.
+/// Frame queue between generation and the concurrent codec worker: one codec packet by default.
 ///
-/// Zero preserves the audited rendezvous/cancellation behavior. A candidate may request a small
-/// absolute frame count with `FTTS_CODEC_QUEUE_FRAMES`; the hard cap of two codec packets bounds
-/// post-cancel drain work regardless of external input. Invalid values fail closed to zero.
+/// With a rendezvous (zero) the two stages serialize whenever the codec is the slower one: during
+/// a packet's decode the generator can hand over a single frame and then blocks, and the codec
+/// then idles while the rest of the next packet is generated. On a 4-vCPU x86 host (codec ~145
+/// ms/frame, generator ~126) that cost ~45% of wall time (54.6 s → 36.8 s for a 17.4 s paragraph
+/// with a one-packet queue; output byte-identical — the queue moves no bits). A one-packet queue
+/// lets the generator fill the next packet during the current decode. The price is bounded: on
+/// cancel, generation still stops at the next frame boundary, and at most one more packet of
+/// already-accepted frames is drained. `FTTS_CODEC_QUEUE_FRAMES` overrides with an absolute frame
+/// count (`0` restores the rendezvous); the hard cap of two codec packets bounds post-cancel drain
+/// work regardless of external input. Unparseable values fall back to the default.
 fn codec_queue_capacity(packet_frames: usize) -> usize {
-    static REQUESTED_FRAMES: OnceLock<usize> = OnceLock::new();
+    static REQUESTED_FRAMES: OnceLock<Option<usize>> = OnceLock::new();
     let requested = *REQUESTED_FRAMES.get_or_init(|| {
         codec_queue_requested_frames(std::env::var("FTTS_CODEC_QUEUE_FRAMES").ok().as_deref())
     });
-    requested.min(packet_frames.saturating_mul(2))
+    requested
+        .unwrap_or(packet_frames)
+        .min(packet_frames.saturating_mul(2))
 }
 
-fn codec_queue_requested_frames(value: Option<&str>) -> usize {
-    value
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+fn codec_queue_requested_frames(value: Option<&str>) -> Option<usize> {
+    value.and_then(|value| value.trim().parse::<usize>().ok())
 }
 
 #[cfg(test)]
 fn codec_queue_capacity_from_value(value: Option<&str>, packet_frames: usize) -> usize {
-    codec_queue_requested_frames(value).min(packet_frames.saturating_mul(2))
+    codec_queue_requested_frames(value)
+        .unwrap_or(packet_frames)
+        .min(packet_frames.saturating_mul(2))
 }
 
 fn codec_user_initiated_qos_enabled() -> bool {
@@ -2626,9 +2683,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codec_queue_candidate_fails_closed_and_stays_bounded() {
-        assert_eq!(codec_queue_capacity_from_value(None, 4), 0);
-        assert_eq!(codec_queue_capacity_from_value(Some("not-a-number"), 4), 0);
+    fn codec_queue_defaults_to_one_packet_and_stays_bounded() {
+        assert_eq!(codec_queue_capacity_from_value(None, 4), 4);
+        assert_eq!(codec_queue_capacity_from_value(Some("not-a-number"), 4), 4);
+        assert_eq!(codec_queue_capacity_from_value(Some("0"), 4), 0);
+        assert_eq!(codec_queue_capacity_from_value(None, 1), 1);
         assert_eq!(codec_queue_capacity_from_value(Some(" 4 "), 4), 4);
         assert_eq!(codec_queue_capacity_from_value(Some("999"), 4), 8);
         assert_eq!(codec_queue_capacity_from_value(Some("1"), 0), 0);

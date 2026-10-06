@@ -1089,25 +1089,12 @@ fn score_head_refined_with_scratch(
     resize_filled(&mut scratch.coarse, vocab);
     quant_linear(mode, normed, head_q8, None, 1, &mut scratch.coarse);
 
-    // Top-M indices by coarse logit: selection sort over a running boundary is O(vocab * M)
-    // with M=96 — cheaper and simpler than sorting 2,048 floats, and allocation-light.
-    scratch.candidates.clear();
-    scratch.candidates.reserve(HEAD_REFINE_CANDIDATES);
-    scratch.kept.clear();
-    scratch.kept.resize(vocab, false);
-    for _ in 0..HEAD_REFINE_CANDIDATES.min(vocab) {
-        let mut best: Option<usize> = None;
-        for token in 0..vocab {
-            if !scratch.kept[token]
-                && best.is_none_or(|current| scratch.coarse[token] > scratch.coarse[current])
-            {
-                best = Some(token);
-            }
-        }
-        let token = best.expect("vocab is non-empty");
-        scratch.kept[token] = true;
-        scratch.candidates.push(token);
-    }
+    select_refine_candidates(
+        &scratch.coarse,
+        HEAD_REFINE_CANDIDATES.min(vocab),
+        &mut scratch.candidates,
+        &mut scratch.kept,
+    );
 
     logits.fill(f32::NEG_INFINITY);
     for &token in &scratch.candidates {
@@ -1136,6 +1123,63 @@ fn score_head_refined_with_scratch(
             sum += row[index] * normed[index];
         }
         logits[token] = sum;
+    }
+}
+
+/// The `wanted` highest coarse logits' indices — the refine candidate SET (its order is unused:
+/// each candidate's logit is recomputed independently).
+///
+/// The set is exactly what a repeated "take the highest remaining, lowest index on a tie" scan
+/// picks, i.e. the first `wanted` indices under the total order (logit descending, index
+/// ascending). A partial selection under that comparator finds the same set in O(vocab) instead
+/// of the scan's O(vocab × wanted) — 96 full passes over 2,048 logits at each of 15 depths per
+/// frame, on the generator thread while the team idles. NaN has no place in that order, so a row
+/// carrying one keeps the scan itself (its exact first-non-kept-wins behavior), never a guess.
+fn select_refine_candidates(
+    coarse: &[f32],
+    wanted: usize,
+    candidates: &mut Vec<usize>,
+    kept: &mut Vec<bool>,
+) {
+    candidates.clear();
+    if wanted == 0 {
+        return;
+    }
+    if coarse.iter().any(|value| value.is_nan()) {
+        select_refine_candidates_by_scan(coarse, wanted, candidates, kept);
+        return;
+    }
+    candidates.extend(0..coarse.len());
+    candidates.select_nth_unstable_by(wanted - 1, |&a, &b| {
+        coarse[b]
+            .partial_cmp(&coarse[a])
+            .expect("NaN rows take the scan")
+            .then(a.cmp(&b))
+    });
+    candidates.truncate(wanted);
+}
+
+/// The repeated-scan selection: highest remaining coarse logit, lowest index on a tie.
+fn select_refine_candidates_by_scan(
+    coarse: &[f32],
+    wanted: usize,
+    candidates: &mut Vec<usize>,
+    kept: &mut Vec<bool>,
+) {
+    candidates.clear();
+    candidates.reserve(wanted);
+    kept.clear();
+    kept.resize(coarse.len(), false);
+    for _ in 0..wanted {
+        let mut best: Option<usize> = None;
+        for token in 0..coarse.len() {
+            if !kept[token] && best.is_none_or(|current| coarse[token] > coarse[current]) {
+                best = Some(token);
+            }
+        }
+        let token = best.expect("vocab is non-empty");
+        kept[token] = true;
+        candidates.push(token);
     }
 }
 
@@ -2560,6 +2604,44 @@ fn decode_frame_with_selector_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_selection_picks_exactly_the_scan_s_candidate_set() {
+        // Heavy ties (coarse logits are dequantized i32 sums, so duplicates are real), signed
+        // zeros, infinities, a NaN row (which must take the scan), and widths around the
+        // 96-candidate boundary.
+        let mut state = 0xC0A5_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+        for case in 0..60 {
+            let vocab = [2048_usize, 3072, 96, 97, 5, 1][case % 6];
+            let levels = [3_u32, 40, 1000][case % 3];
+            let mut coarse: Vec<f32> = (0..vocab)
+                .map(|_| (next() % levels) as f32 * 0.25 - 4.0)
+                .collect();
+            if case % 7 == 0 && vocab > 3 {
+                coarse[1] = -0.0;
+                coarse[2] = 0.0;
+                coarse[0] = f32::INFINITY;
+                coarse[vocab - 1] = f32::NEG_INFINITY;
+            }
+            if case % 11 == 0 {
+                coarse[vocab / 2] = f32::NAN;
+            }
+            let wanted = HEAD_REFINE_CANDIDATES.min(vocab);
+            let (mut fast, mut fast_kept) = (Vec::new(), Vec::new());
+            select_refine_candidates(&coarse, wanted, &mut fast, &mut fast_kept);
+            let (mut scan, mut scan_kept) = (Vec::new(), Vec::new());
+            select_refine_candidates_by_scan(&coarse, wanted, &mut scan, &mut scan_kept);
+            fast.sort_unstable();
+            scan.sort_unstable();
+            assert_eq!(fast, scan, "case {case}: vocab {vocab}, levels {levels}");
+        }
+    }
     use ftts_kernels::int8::KernelPlanV0;
 
     fn weights_of(len: usize, seed: u32) -> Vec<f32> {

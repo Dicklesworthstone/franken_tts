@@ -12,13 +12,25 @@
 //! A [`Job`] carries raw pointers into the caller's slices. Three facts make that sound:
 //!
 //! 1. **Lifetime**: [`Team::linear_q8`] does not return until every worker has decremented
-//!    `remaining` to zero, so the pointers outlive every access.
+//!    `pending` to zero, so the pointers outlive every access.
 //! 2. **Aliasing**: workers write only `out[row * n + col]` for `col` inside their own disjoint
 //!    column range; reads (`x_q`, scales, weights, bias) are shared and immutable for the whole
 //!    dispatch because the caller holds the only `&mut` (to `out`) and blocks.
-//! 3. **One parallel owner**: `dispatch_gate` serializes whole dispatches, so a second engine
-//!    thread cannot overwrite the job while workers are mid-partition, and workers themselves
-//!    never dispatch (their compute is a leaf loop).
+//! 3. **One parallel owner per team**: `dispatch_gate` serializes whole dispatches, so a second
+//!    thread cannot overwrite a team's job while its workers are mid-partition, and workers
+//!    themselves never dispatch (their compute is a leaf loop).
+//!
+//! ## Two disjoint teams: engine and codec
+//!
+//! The codec decodes concurrently with generation on its own worker thread. Off Apple platforms
+//! (where Accelerate does not absorb its GEMMs) the codec is compute-bound — about 2.5 GMAC per
+//! 80 ms frame — and on small machines one serial codec thread is the whole pipeline's ceiling.
+//! So the codec worker may own a second, fully separate team ([`use_codec_team_on_this_thread`]):
+//! its own control block, workers, and dispatch gate. The engine-team invariants above hold for
+//! each team independently; no worker of either team ever dispatches, so nothing nests; and the
+//! default sizes keep `engine + codec <= cores`, so the two never oversubscribe the machine
+//! (a preempted worker stalls its whole barrier). Partitioning never changes a bit in either
+//! team, so both sizes are pure speed knobs.
 //!
 //! A stress test drives thousands of mixed-shape dispatches and a watchdog test bounds wall
 //! time, per the `many_utterances_without_deadlock` policy.
@@ -26,12 +38,15 @@
 //! ## Relation to the plan's "sense-reversing barrier"
 //!
 //! The doctrine text describes the steady-state rendezvous as a sense-reversing atomic
-//! barrier. What ships here is a mutex/condvar **generation-counter** barrier: same protocol
-//! shape (a monotone epoch replaces the flipped sense; workers wait for the epoch to advance,
-//! the dispatcher waits for `remaining` to reach zero), but the ordering guarantees come from
-//! the mutex, not from raw atomics — so an audit of this module should trace the lock, not
-//! look for `AtomicBool` sense flags. The atomic flavor remains a candidate once dispatch
-//! overhead itself shows up on a profile.
+//! barrier. What ships here is a **generation-counter** barrier with a spin-then-park fast path:
+//! the dispatcher publishes the job under the mutex, mirrors the generation into an atomic
+//! `epoch` (Release), and sets an atomic `pending` count first; workers spin briefly on `epoch`
+//! and the dispatcher on `pending` (see `spin_window`), falling back to the condvars, which are
+//! notified only when someone is actually parked (`sleepers` for `go`; the last worker always
+//! takes the lock before notifying `done`, after the dispatcher's under-lock check, so no wake
+//! is lost). Jobs are still read under the lock they were written under. Dispatch overhead did
+//! show up on a profile — ~430 dispatches per frame at a measured 26–62 µs park/wake round trip
+//! on a 4-vCPU Linux host — which is what promoted the atomic fast path.
 
 use crate::int8::{Int8Tier, QuantizedMatrix, dot_w8a16};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -160,7 +175,8 @@ unsafe impl Sync for Job {}
 struct Control {
     generation: u64,
     job: Option<Job>,
-    remaining: usize,
+    /// Workers currently parked on `go`; the dispatcher notifies only when this is non-zero.
+    sleepers: usize,
     /// Set when any partition panicked during the current dispatch, so the caller can
     /// propagate a loud failure instead of hanging on a worker that will never report done.
     panicked: bool,
@@ -170,10 +186,104 @@ struct Shared {
     control: Mutex<Control>,
     go: Condvar,
     done: Condvar,
+    /// Mirror of `control.generation`, published (Release) after the job is in place, so a
+    /// spinning worker can see a new dispatch without taking the lock.
+    epoch: std::sync::atomic::AtomicU64,
+    /// Worker partitions of the current dispatch that have not reported done. Set before the
+    /// epoch is published; the last decrement wakes a parked dispatcher.
+    pending: std::sync::atomic::AtomicUsize,
+    /// Whether this team's threads may spin before parking. Only a team that leaves the machine
+    /// undersubscribed spins: on a fully subscribed machine a spinning worker steals the core of
+    /// the very thread it is waiting for (measured: a 4-way team on 4 vCPUs went from ~40 µs to
+    /// ~96 µs per dispatch with spinning on).
+    spin: bool,
 }
 
-/// The process-wide team. Armed by default at min(6, cores) partitions on native
-/// (`FTTS_INT8_THREADS` overrides; 1 disarms), and explicitly by the host on wasm.
+impl Shared {
+    fn new(spin: bool) -> Self {
+        Self {
+            control: Mutex::new(Control {
+                generation: 0,
+                job: None,
+                sleepers: 0,
+                panicked: false,
+            }),
+            go: Condvar::new(),
+            done: Condvar::new(),
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            spin,
+        }
+    }
+}
+
+/// How long a worker (between dispatches) or the dispatcher (awaiting its workers) spins on an
+/// atomic before parking on a condvar.
+///
+/// The decode loop issues ~430 small dispatches per 80 ms frame (four per layer step: 28 talker
+/// layers, 15 × 5 microdecoder steps), separated by short serial stretches (norms, attention,
+/// sampling). A park/wake round trip measured ~26–62 µs on a 4-vCPU Linux host — tens of
+/// milliseconds per frame of pure handshake — while the work itself is often under 100 µs.
+/// Spinning briefly turns most of those into an atomic load. The window is bounded so an idle
+/// team (between utterances, or while the generator samples) still parks and costs nothing.
+/// Apple platforms keep the measured park-immediately behavior (battery, and their dispatch
+/// overhead was never shown to matter); `FTTS_TEAM_SPIN_US` overrides everywhere. Timing only:
+/// which thread computes which partition is unchanged, so no output bit can move.
+#[cfg(not(target_arch = "wasm32"))]
+fn spin_window() -> std::time::Duration {
+    static WINDOW: OnceLock<std::time::Duration> = OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let default_us = if cfg!(target_vendor = "apple") { 0 } else { 50 };
+        let micros = std::env::var("FTTS_TEAM_SPIN_US")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(default_us)
+            .min(10_000);
+        std::time::Duration::from_micros(micros)
+    })
+}
+
+/// Spins until `ready()` or the spin window elapses; returns whether `ready()` became true.
+///
+/// Never spins for a team built without `spin` (see [`Shared`]). wasm never spins: it has no
+/// monotonic clock to bound the window (`Instant::now` traps), and its Workers already park
+/// cheaply on `atomic.wait`.
+fn spin_until(shared: &Shared, ready: impl Fn() -> bool) -> bool {
+    if ready() {
+        return true;
+    }
+    if !shared.spin {
+        return false;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let window = spin_window();
+        if window.is_zero() {
+            return false;
+        }
+        let start = std::time::Instant::now();
+        loop {
+            for _ in 0..32 {
+                std::hint::spin_loop();
+                if ready() {
+                    return true;
+                }
+            }
+            if start.elapsed() >= window {
+                return ready();
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
+/// A kernel team. The engine team is armed by default at min(6, cores) partitions on Apple and
+/// min(6, cores - 1) elsewhere (`FTTS_INT8_THREADS` overrides; 1 disarms), and explicitly by the
+/// host on wasm; the codec team takes the remaining cores up to four off Apple
+/// (`FTTS_CODEC_THREADS` overrides; 1 disarms). See the module docs.
 pub struct Team {
     shared: &'static Shared,
     /// Total partitions per dispatch: spawned workers + the calling thread.
@@ -183,6 +293,8 @@ pub struct Team {
 
 thread_local! {
     static TEAM_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set on the codec worker: [`armed`] resolves to the codec team instead of the engine team.
+    static CODEC_TEAM_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct TeamBypassReset(bool);
@@ -211,6 +323,34 @@ pub fn bypass_team_on_this_thread() {
     TEAM_BYPASS.with(|cell| cell.set(true));
 }
 
+/// Makes THIS thread dispatch to the codec team (module docs) instead of the engine team.
+///
+/// For the codec pipeline worker: it overlaps the generator's engine-team dispatches, so it must
+/// never contend for that team's gate — but where spare cores exist it can still fan its own
+/// GEMMs out. When the codec team is disarmed (sized to one partition, or on wasm) this thread
+/// runs serially, exactly like [`bypass_team_on_this_thread`].
+pub fn use_codec_team_on_this_thread() {
+    CODEC_TEAM_THREAD.with(|cell| cell.set(true));
+}
+
+/// Partitions of the codec team, or 1 while it is disarmed or not yet armed by a codec thread.
+///
+/// Does not arm the team as a side effect, so reporting it costs no threads.
+#[must_use]
+pub fn codec_partitions() -> usize {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        CODEC_TEAM
+            .get()
+            .and_then(Option::as_ref)
+            .map_or(1, |team| team.partitions)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+}
+
 /// Runs `body` with team dispatch bypassed on this thread, restoring the previous state after.
 ///
 /// For callers that need the SERIAL kernel for a bounded stretch — the int8 autotuner probes
@@ -233,23 +373,34 @@ pub fn thread_bypassed() -> bool {
     TEAM_BYPASS.with(std::cell::Cell::get)
 }
 
-/// The team for this process, if parallel execution is enabled.
+/// The team this thread dispatches to, if parallel execution is enabled for it: the codec team on
+/// a thread that called [`use_codec_team_on_this_thread`], else the engine team.
 ///
-/// `FTTS_INT8_THREADS` sets the total partition count (caller included); `1` or unset means
-/// serial (no threads spawned, no team). Values are clamped to the machine's available
-/// parallelism. Read once.
+/// `FTTS_INT8_THREADS` / `FTTS_CODEC_THREADS` set each team's total partition count (caller
+/// included); `1` means serial (no threads spawned, no team). Values are clamped to the machine's
+/// available parallelism. Read once per team.
 pub fn armed() -> Option<&'static Team> {
     // wasm32 cannot spawn its own threads: `wasm32-unknown-unknown` has no `std::thread::spawn`,
     // because only the host can create the Workers that share this module's linear memory. So the
     // team is *installed* from JS once its Workers are up (see `install_wasm_team`) instead of
     // being created on first use, and stays `None` until then — which is also the correct answer
     // for any browser without `SharedArrayBuffer`.
+    let codec_thread = CODEC_TEAM_THREAD.with(std::cell::Cell::get);
     #[cfg(target_arch = "wasm32")]
     {
-        WASM_TEAM.get().and_then(Option::as_ref)
+        // The browser has one host-installed team; a codec thread keeps its serial behavior.
+        if codec_thread {
+            None
+        } else {
+            WASM_TEAM.get().and_then(Option::as_ref)
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
-    armed_native()
+    if codec_thread {
+        codec_team_native()
+    } else {
+        armed_native()
+    }
 }
 
 /// The team installed by the host, once its Workers exist.
@@ -275,25 +426,14 @@ static WASM_SHARED: OnceLock<&'static Shared> = OnceLock::new();
 /// would not merely be slow, it would abort.
 #[cfg(target_arch = "wasm32")]
 pub fn publish_wasm_block() {
-    let _ = WASM_SHARED.get_or_init(|| {
-        Box::leak(Box::new(Shared {
-            control: Mutex::new(Control {
-                generation: 0,
-                job: None,
-                remaining: 0,
-                panicked: false,
-            }),
-            go: Condvar::new(),
-            done: Condvar::new(),
-        }))
-    });
+    let _ = WASM_SHARED.get_or_init(|| Box::leak(Box::new(Shared::new(false))));
 }
 
 /// Arms a `partitions`-way team over the already-published control block.
 ///
 /// Call this only after `partitions - 1` Workers have confirmed they are parked in
 /// [`wasm_worker_loop`]. Sizing the team before they report would be a deadlock waiting to
-/// happen: the dispatcher decrements `remaining` down from `partitions - 1` and blocks until it
+/// happen: the dispatcher waits for `pending` to count down from `partitions - 1` and blocks until it
 /// reaches zero, so a partition that never started is a partition that never reports done.
 ///
 /// `partitions <= 1` arms nothing, which is the serial fallback a browser without
@@ -328,72 +468,151 @@ pub fn wasm_worker_loop(worker: usize) {
     worker_loop(shared, worker)
 }
 
+/// The engine team's default partition count on a machine with `ceiling` hardware threads.
+///
+/// Six ways is the measured knee on M4 Pro (memory-bound beyond it). Off Apple platforms one
+/// hardware thread is left to the codec worker, which decodes concurrently and is compute-bound
+/// there: measured on a 4-vCPU x86 host, a 4-way engine team plus the codec thread (five busy
+/// threads on four cores) was ~10% slower end to end than a 3-way team, because the barrier waits
+/// for whichever worker the scheduler preempted. Apple keeps the measured six — its codec GEMMs go
+/// through Accelerate and it has efficiency cores to spare.
+fn engine_partitions_default(ceiling: usize) -> usize {
+    if cfg!(target_vendor = "apple") {
+        6.min(ceiling)
+    } else {
+        6.min(ceiling.saturating_sub(1)).max(1)
+    }
+}
+
+/// The codec team's default partition count: the hardware threads the engine team leaves free,
+/// at most four (the codec's GEMMs are short; wider stripes buy little), and serial on Apple
+/// platforms, whose codec GEMMs go through Accelerate rather than this team.
+fn codec_partitions_default(ceiling: usize, engine: usize) -> usize {
+    if cfg!(target_vendor = "apple") {
+        1
+    } else {
+        ceiling.saturating_sub(engine).clamp(1, 4)
+    }
+}
+
+/// Reads a partition-count override, clamped to `ceiling`.
+#[cfg(not(target_arch = "wasm32"))]
+fn partitions_from_env(name: &str, default: usize, ceiling: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+        .min(ceiling)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn hardware_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn engine_partitions() -> usize {
+    let ceiling = hardware_threads();
+    // Partitioning never changes output bits, so the default applies everywhere, reference
+    // route included.
+    partitions_from_env(
+        "FTTS_INT8_THREADS",
+        engine_partitions_default(ceiling),
+        ceiling,
+    )
+}
+
+/// The codec team's configured width (`1` = serial), whether or not a codec thread armed it.
+#[cfg(not(target_arch = "wasm32"))]
+fn codec_partitions_configured() -> usize {
+    let ceiling = hardware_threads();
+    partitions_from_env(
+        "FTTS_CODEC_THREADS",
+        codec_partitions_default(ceiling, engine_partitions()),
+        ceiling,
+    )
+}
+
+/// Whether both teams together — the codec worker counting as one thread even when serial —
+/// fit the machine's hardware threads, the precondition for spinning (see [`Shared`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn teams_undersubscribe() -> bool {
+    engine_partitions() + codec_partitions_configured() <= hardware_threads()
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn armed_native() -> Option<&'static Team> {
     static TEAM: OnceLock<Option<Team>> = OnceLock::new();
-    TEAM.get_or_init(|| {
-        let ceiling = std::thread::available_parallelism().map_or(1, usize::from);
-        // Default six ways: the measured knee on M4 Pro (memory-bound beyond it). Partitioning
-        // never changes output bits, so the default applies everywhere, reference route included.
-        let requested: usize = std::env::var("FTTS_INT8_THREADS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(6);
-        let partitions = requested.min(ceiling);
-        if partitions <= 1 {
-            return None;
-        }
-        let shared: &'static Shared = Box::leak(Box::new(Shared {
-            control: Mutex::new(Control {
-                generation: 0,
-                job: None,
-                remaining: 0,
-                panicked: false,
-            }),
-            go: Condvar::new(),
-            done: Condvar::new(),
-        }));
-        // Workers 1..partitions; the caller is partition 0. Threads live for the process and
-        // park on the condvar between dispatches, so leaking their handles is deliberate.
-        for worker in 1..partitions {
-            std::thread::Builder::new()
-                .name(format!("ftts-int8-{worker}"))
-                // Debug builds inline the kernel dispatch chains deeply enough to
-                // overflow the 2 MiB default worker stack non-deterministically (the
-                // startup autotuner picks tiers under memory pressure), which surfaced
-                // as spontaneous aborts in the metamorphic invariants. Release builds
-                // have headroom either way; 16 MiB is cheap for long-lived parked
-                // threads and removes the entire failure class.
-                .stack_size(16 * 1024 * 1024)
-                .spawn(move || {
-                    // On Apple platforms a thread without an elevated QoS class is fair
-                    // game for the efficiency cores. The team barrier waits for its
-                    // slowest member, so one demoted worker sets the pace of every
-                    // dispatch; ask for the same class the caller's UI work runs at.
-                    let _ = request_user_initiated_qos_for_current_thread();
-                    worker_loop(shared, worker)
-                })
-                .expect("spawn int8 worker");
-        }
-        Some(Team {
-            shared,
-            partitions,
-            dispatch_gate: Mutex::new(()),
-        })
+    TEAM.get_or_init(|| spawn_native_team(engine_partitions(), "ftts-int8"))
+        .as_ref()
+}
+
+/// The codec team, armed on first use by a codec thread.
+#[cfg(not(target_arch = "wasm32"))]
+static CODEC_TEAM: OnceLock<Option<Team>> = OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+fn codec_team_native() -> Option<&'static Team> {
+    CODEC_TEAM
+        .get_or_init(|| spawn_native_team(codec_partitions_configured(), "ftts-codec"))
+        .as_ref()
+}
+
+/// Spawns a `partitions`-way team (`partitions - 1` workers; the dispatcher is partition 0), or
+/// `None` for a serial one.
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_native_team(partitions: usize, name: &str) -> Option<Team> {
+    if partitions <= 1 {
+        return None;
+    }
+    let shared: &'static Shared = Box::leak(Box::new(Shared::new(teams_undersubscribe())));
+    // Workers 1..partitions; the caller is partition 0. Threads live for the process and
+    // park on the condvar between dispatches, so leaking their handles is deliberate.
+    for worker in 1..partitions {
+        std::thread::Builder::new()
+            .name(format!("{name}-{worker}"))
+            // Debug builds inline the kernel dispatch chains deeply enough to
+            // overflow the 2 MiB default worker stack non-deterministically (the
+            // startup autotuner picks tiers under memory pressure), which surfaced
+            // as spontaneous aborts in the metamorphic invariants. Release builds
+            // have headroom either way; 16 MiB is cheap for long-lived parked
+            // threads and removes the entire failure class.
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                // On Apple platforms a thread without an elevated QoS class is fair
+                // game for the efficiency cores. The team barrier waits for its
+                // slowest member, so one demoted worker sets the pace of every
+                // dispatch; ask for the same class the caller's UI work runs at.
+                let _ = request_user_initiated_qos_for_current_thread();
+                worker_loop(shared, worker)
+            })
+            .expect("spawn kernel-team worker");
+    }
+    Some(Team {
+        shared,
+        partitions,
+        dispatch_gate: Mutex::new(()),
     })
-    .as_ref()
 }
 
 fn worker_loop(shared: &'static Shared, worker: usize) {
+    use std::sync::atomic::Ordering;
     let mut seen = 0_u64;
     loop {
+        // Spin briefly on the published epoch before parking (see `spin_window`); either way the
+        // job is read under the lock, which the dispatcher wrote it under.
+        let _ = spin_until(shared, || shared.epoch.load(Ordering::Acquire) != seen);
         let job = {
             let mut control = lock_control(shared);
-            while control.generation == seen {
-                control = shared
-                    .go
-                    .wait(control)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if control.generation == seen {
+                control.sleepers += 1;
+                while control.generation == seen {
+                    control = shared
+                        .go
+                        .wait(control)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                control.sleepers -= 1;
             }
             seen = control.generation;
             control.job.expect("generation bumped without a job")
@@ -411,19 +630,20 @@ fn worker_loop(shared: &'static Shared, worker: usize) {
             }
             run_partition(&job, worker)
         });
-        let mut control = lock_control(shared);
         if outcome.is_err() {
-            control.panicked = true;
+            lock_control(shared).panicked = true;
         }
-        control.remaining -= 1;
-        if control.remaining == 0 {
+        if shared.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Last one out wakes the dispatcher if it parked. Taking the lock orders this notify
+            // after the dispatcher's own under-lock check of `pending`, so the wake cannot be lost.
+            let _control = lock_control(shared);
             shared.done.notify_all();
         }
     }
 }
 
 /// Locks team control, tolerating poison: every dispatch re-establishes the full invariant
-/// (job, generation, remaining) from scratch, so a lock poisoned by an earlier panic carries
+/// (job, generation, pending) from scratch, so a lock poisoned by an earlier panic carries
 /// no state that could mislead the next dispatch.
 fn lock_control(shared: &Shared) -> std::sync::MutexGuard<'_, Control> {
     shared
@@ -772,6 +992,7 @@ impl Team {
 
     /// The shared dispatch/work/join cycle (module-docs facts 1-3).
     fn dispatch(&self, job: Job) {
+        use std::sync::atomic::Ordering;
         // One dispatch at a time, held through the join (module-docs fact 3). Poison
         // tolerance: a prior caller's panic leaves no dispatch state behind — everything is
         // re-established below.
@@ -782,10 +1003,19 @@ impl Team {
         {
             let mut control = lock_control(self.shared);
             control.job = Some(job);
-            control.generation += 1;
-            control.remaining = self.partitions - 1;
             control.panicked = false;
-            self.shared.go.notify_all();
+            // `pending` is in place before the epoch publishes the job, so no worker can report
+            // done against a stale count.
+            self.shared
+                .pending
+                .store(self.partitions - 1, Ordering::Relaxed);
+            control.generation += 1;
+            self.shared
+                .epoch
+                .store(control.generation, Ordering::Release);
+            if control.sleepers > 0 {
+                self.shared.go.notify_all();
+            }
         }
 
         // The caller is partition 0: it works instead of idling. Its own panic must still
@@ -795,14 +1025,20 @@ impl Team {
             run_partition(&job, 0);
         }));
 
-        let mut control = lock_control(self.shared);
-        while control.remaining > 0 {
-            control = self
-                .shared
-                .done
-                .wait(control)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
+        let workers_done = || self.shared.pending.load(Ordering::Acquire) == 0;
+        let mut control = if spin_until(self.shared, workers_done) {
+            lock_control(self.shared)
+        } else {
+            let mut control = lock_control(self.shared);
+            while !workers_done() {
+                control = self
+                    .shared
+                    .done
+                    .wait(control)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            control
+        };
         control.job = None;
         let worker_panicked = control.panicked;
         drop(control);
@@ -884,16 +1120,7 @@ mod tests {
     /// A directly constructed team, so the test controls the partition count regardless of the
     /// process environment.
     fn test_team(partitions: usize) -> Team {
-        let shared: &'static Shared = Box::leak(Box::new(Shared {
-            control: Mutex::new(Control {
-                generation: 0,
-                job: None,
-                remaining: 0,
-                panicked: false,
-            }),
-            go: Condvar::new(),
-            done: Condvar::new(),
-        }));
+        let shared: &'static Shared = Box::leak(Box::new(Shared::new(true)));
         for worker in 1..partitions {
             std::thread::spawn(move || worker_loop(shared, worker));
         }
@@ -902,6 +1129,79 @@ mod tests {
             partitions,
             dispatch_gate: Mutex::new(()),
         }
+    }
+
+    #[test]
+    fn default_team_sizes_never_oversubscribe_the_machine() {
+        // Off Apple the engine leaves the codec a hardware thread and the codec takes only what
+        // is left (capped at four); a serial team is one thread either way. Apple keeps the
+        // measured six-way engine and a serial codec.
+        for ceiling in 1..=64 {
+            let engine = engine_partitions_default(ceiling);
+            let codec = codec_partitions_default(ceiling, engine);
+            assert!(engine >= 1 && codec >= 1, "ceiling {ceiling}");
+            assert!(engine <= 6 && codec <= 4, "ceiling {ceiling}");
+            if cfg!(target_vendor = "apple") {
+                assert_eq!(codec, 1);
+            } else {
+                assert!(
+                    engine + codec <= ceiling.max(2),
+                    "ceiling {ceiling}: engine {engine} + codec {codec}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_codec_thread_never_resolves_to_the_engine_team() {
+        let engine = armed().map(std::ptr::from_ref);
+        let codec = std::thread::spawn(|| {
+            use_codec_team_on_this_thread();
+            armed().map(|team| std::ptr::from_ref(team) as usize)
+        })
+        .join()
+        .expect("codec probe thread");
+        if let (Some(engine), Some(codec)) = (engine, codec) {
+            assert_ne!(engine as usize, codec, "codec thread got the engine team");
+        }
+        // Reporting agrees with what the codec thread's armed() built: its width when armed,
+        // one when the codec team is serial.
+        match codec {
+            Some(_) => assert!(codec_partitions() > 1),
+            None => assert_eq!(codec_partitions(), 1),
+        }
+    }
+
+    #[test]
+    fn two_disjoint_teams_dispatching_concurrently_stay_bit_identical_to_serial() {
+        // The engine/codec split's whole safety claim: two teams with their own gates and
+        // workers run f32 GEMMs at the same time without disturbing each other's bits.
+        let (m, k, n) = (24, 384, 160);
+        let x = values_of(m * k, 11);
+        let weight = values_of(n * k, 12);
+        let bias = values_of(n, 13);
+        let mut serial = vec![0.0_f32; m * n];
+        crate::packed_gemm::linear_packed(&x, &weight, Some(&bias), m, k, n, &mut serial);
+        let teams: Vec<&'static Team> = (0..2)
+            .map(|_| &*Box::leak(Box::new(test_team(2))))
+            .collect();
+        std::thread::scope(|scope| {
+            for team in teams {
+                let (x, weight, bias, serial) = (&x, &weight, &bias, &serial);
+                scope.spawn(move || {
+                    for _ in 0..200 {
+                        let mut out = vec![0.0_f32; m * n];
+                        team.linear_f32(x, weight, Some(bias), m, k, n, &mut out);
+                        assert!(
+                            out.iter()
+                                .zip(serial)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "a concurrent team's GEMM diverged from serial"
+                        );
+                    }
+                });
+            }
+        });
     }
 
     #[test]
