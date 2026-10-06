@@ -571,10 +571,13 @@ fn run_w8a16_linear_partition(job: &W8A16LinearJob, worker: usize) {
 
 /// Computes this worker's column stripe of an f32 dense linear.
 fn run_f32_linear_partition(job: &F32LinearJob, worker: usize) {
-    // Stripes are NR-aligned so every partition stays on the packed register-tiled path; a ragged
-    // boundary would push one partition onto the scalar remainder loop for no reason.
-    const NR: usize = 8;
-    let chunk = job.n.div_ceil(job.partitions).next_multiple_of(NR);
+    // Stripes are tile-aligned (for every dispatched ISA level) so every partition stays on the
+    // packed register-tiled path; a ragged boundary would push one partition onto the scalar
+    // remainder loop for no reason.
+    let chunk = job
+        .n
+        .div_ceil(job.partitions)
+        .next_multiple_of(crate::packed_gemm::STRIPE_COLUMNS);
     let start = (worker * chunk).min(job.n);
     let end = ((worker + 1) * chunk).min(job.n);
     if start >= end {

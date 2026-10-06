@@ -960,13 +960,9 @@ fn snake_beta_fast(values: &mut [f32], frames: usize, alpha_log: &[f32], beta_lo
             (beta + 1e-9).recip()
         })
         .collect();
-    for frame in 0..frames {
-        let row = &mut values[frame * channels..(frame + 1) * channels];
-        for ((value, &a), &s) in row.iter_mut().zip(&alpha).zip(&scale) {
-            let sine = ftts_kernels::sleef::sinf_u10(*value * a);
-            *value += s * (sine * sine);
-        }
-    }
+    // The per-element `value += s * sinf_u10(value * a)²` walk, compiled with hardware FMA where
+    // the CPU has it (bit-identical; see the kernel's docs).
+    ftts_kernels::sleef::snake_beta_frame_major(&mut values[..frames * channels], &alpha, &scale);
 }
 
 // NEGATIVE EVIDENCE — the platform-BLAS reduction does NOT generalize from the convolutions to the

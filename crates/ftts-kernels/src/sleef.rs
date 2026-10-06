@@ -29,8 +29,9 @@
 //! [`sinf_u10`] falls back to a correctly-rounded f64 evaluation above that threshold and
 //! [`sinf_u10_in_fast_range`] lets a caller assert it never got there.
 //!
-//! Nothing in this module is on the production path. It is selected only by the parity harness,
-//! through [`crate::f32ref::F32Transcendental`].
+//! [`sinf_u10`] is also the default route's SnakeBeta sine (`FTTS_FAST_SNAKE`, via
+//! [`snake_beta_frame_major`]); the parity harness selects these routines through
+//! [`crate::f32ref::F32Transcendental`].
 
 /// `1 / π`, rounded once to f32 — SLEEF's `M_1_PIf`.
 const M_1_PI_F: f32 = 0.318_309_886_183_790_671_537_767_526_745_028_724_f32;
@@ -59,6 +60,7 @@ struct Df {
 }
 
 /// `dfadd2_vf2_vf_vf` — Knuth's two-sum, which needs no ordering assumption.
+#[inline(always)]
 fn df_two_sum(x: f32, y: f32) -> Df {
     let high = x + y;
     let v = high - x;
@@ -67,6 +69,7 @@ fn df_two_sum(x: f32, y: f32) -> Df {
 }
 
 /// `dfadd_vf2_vf_vf` — Dekker's fast two-sum, valid only because `|x| >= |y|`.
+#[inline(always)]
 fn df_fast_two_sum(x: f32, y: f32) -> Df {
     let high = x + y;
     Df {
@@ -76,6 +79,7 @@ fn df_fast_two_sum(x: f32, y: f32) -> Df {
 }
 
 /// `dfadd_vf2_vf2_vf` — fast two-sum of a double-float and a float.
+#[inline(always)]
 fn df_add_f32(x: Df, y: f32) -> Df {
     let high = x.high + y;
     Df {
@@ -85,6 +89,7 @@ fn df_add_f32(x: Df, y: f32) -> Df {
 }
 
 /// `dfadd_vf2_vf_vf2` — fast two-sum of a float and a double-float.
+#[inline(always)]
 fn df_add_to_f32(x: f32, y: Df) -> Df {
     let high = x + y.high;
     Df {
@@ -94,6 +99,7 @@ fn df_add_to_f32(x: f32, y: Df) -> Df {
 }
 
 /// `dfsqu_vf2_vf2` — the square of a double-float, FMA form.
+#[inline(always)]
 fn df_square(x: Df) -> Df {
     let high = x.high * x.high;
     Df {
@@ -103,6 +109,7 @@ fn df_square(x: Df) -> Df {
 }
 
 /// `dfmul_vf2_vf2_vf2` — the product of two double-floats, FMA form.
+#[inline(always)]
 fn df_mul(x: Df, y: Df) -> Df {
     let high = x.high * y.high;
     let mut low = x.high.mul_add(y.high, -high);
@@ -112,6 +119,7 @@ fn df_mul(x: Df, y: Df) -> Df {
 }
 
 /// `dfmul_vf_vf2_vf2` — the same product, rounded down to a single f32, FMA form.
+#[inline(always)]
 fn df_mul_to_f32(x: Df, y: Df) -> f32 {
     x.high
         .mul_add(y.high, x.low.mul_add(y.high, x.high * y.low))
@@ -132,7 +140,16 @@ pub fn sinf_u10(d: f32) -> f32 {
     if !sinf_u10_in_fast_range(d) {
         return f64::from(d).sin() as f32;
     }
+    sinf_u10_fast_range(d)
+}
 
+/// [`sinf_u10`]'s Cody–Waite branch alone: equal to it for every `d` with
+/// [`sinf_u10_in_fast_range`], meaningless (but defined) outside that range.
+///
+/// Branch-free apart from selects, so a loop over it vectorizes; `#[inline(always)]` so every
+/// `mul_add` lands inside the caller's target features (one `vfmadd`, not a libm `fmaf` call).
+#[inline(always)]
+fn sinf_u10_fast_range(d: f32) -> f32 {
     let scaled = (d * M_1_PI_F).round_ties_even();
     let quadrant = scaled as i32;
 
@@ -163,6 +180,98 @@ pub fn sinf_u10(d: f32) -> f32 {
         return d;
     }
     if quadrant & 1 == 0 { result } else { -result }
+}
+
+/// SnakeBeta over frame-major data with [`sinf_u10`] as the sine:
+/// `values[f * C + c] += scale[c] * sin(values[f * C + c] * alpha[c])²` for `C = alpha.len()`.
+///
+/// `alpha` and `scale` are the per-channel constants (`exp(alpha_log)` and
+/// `1 / (exp(beta_log) + 1e-9)`), precomputed by the caller. The expression and its rounding
+/// order are exactly the per-element form the codec's fast SnakeBeta always used; this function
+/// only decides how it is compiled. Rows whose arguments are all in [`sinf_u10_in_fast_range`]
+/// (all of them, in practice) run the branch-free loop; any other row takes the per-element
+/// [`sinf_u10`] walk — the same value either way.
+///
+/// Why it is here and dispatched: on x86-64 the release binaries target baseline SSE2, where every
+/// `f32::mul_add` in the polynomial lowers to a call into libm's `fmaf` — about eleven calls per
+/// element — and the loop cannot vectorize. The `avx2,fma` / `avx512f` instantiations compile the
+/// same body with hardware FMA. `mul_add` is a single correctly rounded fused operation on every
+/// path (libm `fmaf` and `vfmadd` agree exactly), and lanes are independent, so all
+/// instantiations are **bit-identical** (pinned by `snake_kernel_levels_are_bit_identical`).
+///
+/// # Panics
+///
+/// If `scale.len() != alpha.len()` or `values.len()` is not a multiple of `alpha.len()`.
+pub fn snake_beta_frame_major(values: &mut [f32], alpha: &[f32], scale: &[f32]) {
+    assert_eq!(scale.len(), alpha.len(), "SnakeBeta scale width");
+    let channels = alpha.len();
+    if channels == 0 {
+        assert!(values.is_empty(), "SnakeBeta values without channels");
+        return;
+    }
+    assert!(
+        values.len().is_multiple_of(channels),
+        "SnakeBeta values shape"
+    );
+    #[cfg(all(target_arch = "x86_64", feature = "x86-f32"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            // SAFETY: AVX-512F confirmed on this CPU just above (it implies FMA).
+            unsafe { x86_snake::avx512(values, alpha, scale) };
+            return;
+        }
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: AVX2 and FMA confirmed on this CPU just above.
+            unsafe { x86_snake::avx2_fma(values, alpha, scale) };
+            return;
+        }
+    }
+    snake_beta_rows(values, alpha, scale);
+}
+
+/// The shared SnakeBeta body; see [`snake_beta_frame_major`].
+#[inline(always)]
+fn snake_beta_rows(values: &mut [f32], alpha: &[f32], scale: &[f32]) {
+    for row in values.chunks_exact_mut(alpha.len()) {
+        let in_range = row
+            .iter()
+            .zip(alpha)
+            .all(|(&value, &a)| sinf_u10_in_fast_range(value * a));
+        if in_range {
+            for ((value, &a), &s) in row.iter_mut().zip(alpha).zip(scale) {
+                let sine = sinf_u10_fast_range(*value * a);
+                *value += s * (sine * sine);
+            }
+        } else {
+            for ((value, &a), &s) in row.iter_mut().zip(alpha).zip(scale) {
+                let sine = sinf_u10(*value * a);
+                *value += s * (sine * sine);
+            }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "x86-f32"))]
+mod x86_snake {
+    //! Target-feature instantiations of [`super::snake_beta_rows`]. No intrinsics; bit-identity is
+    //! argued on [`super::snake_beta_frame_major`].
+
+    /// # Safety
+    ///
+    /// The CPU must support AVX2 and FMA.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn avx2_fma(values: &mut [f32], alpha: &[f32], scale: &[f32]) {
+        super::snake_beta_rows(values, alpha, scale);
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must support AVX-512F (and FMA, which every AVX-512F part has).
+    #[target_feature(enable = "avx512f,fma")]
+    pub(super) unsafe fn avx512(values: &mut [f32], alpha: &[f32], scale: &[f32]) {
+        super::snake_beta_rows(values, alpha, scale);
+    }
 }
 
 /// `Sleef_expf_u10` — `exp(d)` to within 1 ulp. SLEEF ships no lower-accuracy `expf`.
@@ -273,6 +382,38 @@ mod tests {
         assert_eq!(expf_u10(0.0), 1.0);
         assert_eq!(expf_u10(-200.0), 0.0);
         assert_eq!(expf_u10(200.0), f32::INFINITY);
+    }
+
+    #[test]
+    fn snake_kernel_levels_are_bit_identical() {
+        // The dispatched kernel (whatever this CPU selects) and the portable body must agree with
+        // the plain per-element `sinf_u10` form to the bit: in-range rows, a row with one
+        // Payne–Hanek-range argument (the per-element fallback), signed zeros, and a NaN.
+        let channels = 96;
+        let alpha: Vec<f32> = (0..channels).map(|c| 0.5 + c as f32 * 0.07).collect();
+        let scale: Vec<f32> = (0..channels)
+            .map(|c| 1.0 / (0.3 + c as f32 * 0.01))
+            .collect();
+        let mut values: Vec<f32> = sweep(9.0, 40 * channels as u32).collect();
+        values[3 * channels + 5] = 400.0; // out of the Cody–Waite range after scaling
+        values[7 * channels] = -0.0;
+        values[7 * channels + 1] = 0.0;
+        values[11 * channels + 2] = f32::NAN;
+        let mut expected = values.clone();
+        for row in expected.chunks_exact_mut(channels) {
+            for ((value, &a), &s) in row.iter_mut().zip(&alpha).zip(&scale) {
+                let sine = sinf_u10(*value * a);
+                *value += s * (sine * sine);
+            }
+        }
+        let mut portable = values.clone();
+        snake_beta_rows(&mut portable, &alpha, &scale);
+        let mut dispatched = values;
+        snake_beta_frame_major(&mut dispatched, &alpha, &scale);
+        for (index, ((e, p), d)) in expected.iter().zip(&portable).zip(&dispatched).enumerate() {
+            assert_eq!(e.to_bits(), p.to_bits(), "portable differs at {index}");
+            assert_eq!(e.to_bits(), d.to_bits(), "dispatched differs at {index}");
+        }
     }
 
     #[test]

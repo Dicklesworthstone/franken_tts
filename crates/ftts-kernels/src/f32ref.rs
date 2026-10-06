@@ -297,6 +297,11 @@ pub fn linear_with_accumulation(
             team.linear_f32(x, weight, bias, m, k, n, out);
             return;
         }
+        // Without a team (the codec worker bypasses it by design), the per-column dot below is
+        // one dependent add chain per output — latency-bound at ~one add per four cycles, which
+        // made the codec transformer's single-position projections a quarter of codec time.
+        gemv_interleaved(x, weight, bias, k, n, out);
+        return;
     }
 
     for row in 0..m {
@@ -306,6 +311,47 @@ pub fn linear_with_accumulation(
             let sum = dot_with_accumulation(x_row, w_row, accumulation);
             out[row * n + col] = bias.map_or(sum, |b| sum + b[col]);
         }
+    }
+}
+
+/// Single-row `out[n] = x[k] @ weight[n, k]^T + bias[n]`, sixteen output columns interleaved.
+///
+/// Each output still accumulates `x[d] * w[d]` over ascending `d` from `0.0` with one IEEE
+/// multiply and one IEEE add per step, then adds its bias once — exactly the packed kernel's
+/// per-element arithmetic, which `packed_matches_scalar_bit_for_bit` pins equal to the scalar
+/// dot. Interleaving only gives the out-of-order core sixteen independent chains to overlap
+/// instead of one, and reads each weight row exactly once (no packing pass for a lone row).
+fn gemv_interleaved(
+    x: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) {
+    const COLUMNS: usize = 16;
+    let mut col = 0;
+    while col + COLUMNS <= n {
+        let rows: [&[f32]; COLUMNS] =
+            std::array::from_fn(|lane| &weight[(col + lane) * k..(col + lane + 1) * k]);
+        let mut acc = [0.0_f32; COLUMNS];
+        for (depth, &value) in x.iter().enumerate() {
+            for (slot, row) in acc.iter_mut().zip(&rows) {
+                *slot += value * row[depth];
+            }
+        }
+        for (lane, &sum) in acc.iter().enumerate() {
+            out[col + lane] = bias.map_or(0.0, |b| b[col + lane]) + sum;
+        }
+        col += COLUMNS;
+    }
+    for column in col..n {
+        let row = &weight[column * k..(column + 1) * k];
+        let mut sum = 0.0_f32;
+        for (&value, &w) in x.iter().zip(row) {
+            sum += value * w;
+        }
+        out[column] = bias.map_or(0.0, |b| b[column]) + sum;
     }
 }
 
@@ -1921,6 +1967,52 @@ pub fn apply_rope_in_place(row: &mut [f32], cos: &[f32], sin: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interleaved_gemv_is_bit_identical_to_the_per_column_scalar_dot() {
+        // The m = 1 no-team route must reproduce the per-column scalar chain it replaced, for
+        // every column remainder and with or without a bias, at real codec transformer widths.
+        let mut state = 0x6E3F_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        };
+        for &(k, n) in &[
+            (512_usize, 1024_usize),
+            (1024, 512),
+            (7, 17),
+            (33, 15),
+            (1, 1),
+            (64, 31),
+        ] {
+            let x: Vec<f32> = (0..k).map(|_| next()).collect();
+            let weight: Vec<f32> = (0..n * k).map(|_| next()).collect();
+            let bias: Vec<f32> = (0..n).map(|_| next()).collect();
+            for carry_bias in [None, Some(&bias[..])] {
+                let mut expected = vec![0.0_f32; n];
+                for (column, slot) in expected.iter_mut().enumerate() {
+                    let sum = dot_with_accumulation(
+                        &x,
+                        &weight[column * k..(column + 1) * k],
+                        F32LinearAccumulation::Scalar,
+                    );
+                    *slot = carry_bias.map_or(sum, |b| sum + b[column]);
+                }
+                let mut actual = vec![0.0_f32; n];
+                gemv_interleaved(&x, &weight, carry_bias, k, n, &mut actual);
+                for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        e.to_bits(),
+                        "k={k} n={n} bias={} column {index}",
+                        carry_bias.is_some()
+                    );
+                }
+            }
+        }
+    }
 
     /// The whole point of the fixed-point variant: the accumulated integer is order-free, so
     /// any permutation of the input yields the identical scale — the property wasm-vs-native
