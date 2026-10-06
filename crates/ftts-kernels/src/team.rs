@@ -33,7 +33,7 @@
 //! look for `AtomicBool` sense flags. The atomic flavor remains a candidate once dispatch
 //! overhead itself shows up on a profile.
 
-use crate::int8::{Int8Tier, QuantizedMatrix, dot_i32, dot_w8a16};
+use crate::int8::{Int8Tier, QuantizedMatrix, dot_w8a16};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 /// Ask Apple to schedule the current worker at the user-initiated QoS class.
@@ -511,20 +511,23 @@ fn run_linear_partition(job: &LinearJob, worker: usize) {
             (!job.bias.is_null()).then(|| std::slice::from_raw_parts(job.bias, job.n)),
         )
     };
-    for col in start..end {
-        let w_row = &w_data[col * job.k..(col + 1) * job.k];
-        let w_scale = w_scales[col];
-        let bias_term = bias.map(|b| b[col]);
-        for row in 0..job.m {
-            let x_row = &x_q[row * job.k..(row + 1) * job.k];
-            let acc = dot_i32(x_row, w_row, job.tier);
-            let value = acc as f32 * (x_scales[row] * w_scale);
-            // SAFETY: `col` is inside this partition's exclusive range and `row < m`, so this
-            // address is written by no other partition for the duration of the dispatch.
-            unsafe {
-                *job.out.add(row * job.n + col) = bias_term.map_or(value, |b| value + b);
-            }
-        }
+    // SAFETY: `out` spans the full [m, n] output for this dispatch, and `start..end` is this
+    // partition's exclusive column range, so no other partition writes these cells. The loop nest
+    // is the serial kernel's own (`linear_q8_columns`), which is what keeps the two bit-identical.
+    unsafe {
+        crate::int8::linear_q8_columns(
+            x_q,
+            x_scales,
+            w_data,
+            w_scales,
+            bias,
+            job.m,
+            job.n,
+            job.k,
+            job.tier,
+            start..end,
+            job.out,
+        );
     }
 }
 

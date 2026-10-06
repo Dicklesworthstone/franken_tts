@@ -10,7 +10,7 @@ keywords = ["tts", "speech", "qwen", "voice", "audio"]
 categories = ["multimedia::audio"]
 
 [features]
-default = ["native-mmap", "accelerate-sgemm", "neon-dotprod"]
+default = ["native-mmap", "accelerate-sgemm", "neon-dotprod", "x86-int8"]
 # The only audited OS-memory interface in this crate. Disabling it preserves correctness through
 # the owned-byte fallback, which is useful for targets without a supported mmap implementation.
 native-mmap = []
@@ -21,6 +21,11 @@ accelerate-sgemm = []
 # where the CPU reports FEAT_DotProd at runtime, and keeps a bit-identical portable fallback in
 # the same module. Disabling it removes the island entirely; the scalar/autovec routes remain.
 neon-dotprod = []
+# The audited x86-64 int8 islands in `int8.rs` (AVX2, AVX-VNNI, AVX-512 VNNI). Compile only on
+# x86_64 targets, dispatch only where the CPU reports the feature at runtime (the release binaries
+# target baseline x86-64, so nothing here raises the minimum CPU), and keep the bit-identical
+# portable fallback in the same module. Disabling it removes the islands entirely.
+x86-int8 = []
 
 [dependencies]
 # Pure-Rust libm: the canonical-mode transcendentals (erf for the codec ConvNeXt

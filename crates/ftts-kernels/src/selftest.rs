@@ -39,6 +39,15 @@ pub enum KernelTier {
     NeonSdot,
     /// The wasm32 SIMD128 island (`simd128` target feature).
     WasmSimd128,
+    /// The x86-64 AVX2 island (`x86-int8` feature + runtime AVX2).
+    X86Avx2,
+    /// The x86-64 AVX-VNNI island (`x86-int8` feature + runtime AVX2/AVX-VNNI). Its S8S8 rows
+    /// run the +128 fold internally, so the all-extreme `+127` activation becomes the biased
+    /// byte 255 — the U8S8 envelope executed through the real `vpdpbusd`, not just modelled.
+    X86AvxVnni,
+    /// The x86-64 AVX-512 VNNI island (`x86-int8` feature + runtime AVX-512F/BW/VNNI), proven
+    /// through the same folded U8S8 path as [`Self::X86AvxVnni`].
+    X86Avx512Vnni,
 }
 
 impl KernelTier {
@@ -50,6 +59,9 @@ impl KernelTier {
             Self::Autovec => "autovec",
             Self::NeonSdot => "neon-sdot",
             Self::WasmSimd128 => "wasm-simd128",
+            Self::X86Avx2 => "x86-avx2",
+            Self::X86AvxVnni => "x86-avx-vnni",
+            Self::X86Avx512Vnni => "x86-avx512-vnni",
         }
     }
 
@@ -59,6 +71,9 @@ impl KernelTier {
             crate::int8::Int8Tier::Autovec => Self::Autovec,
             crate::int8::Int8Tier::NeonSdot => Self::NeonSdot,
             crate::int8::Int8Tier::WasmSimd128 => Self::WasmSimd128,
+            crate::int8::Int8Tier::X86Avx2 => Self::X86Avx2,
+            crate::int8::Int8Tier::X86AvxVnni => Self::X86AvxVnni,
+            crate::int8::Int8Tier::X86Avx512Vnni => Self::X86Avx512Vnni,
         }
     }
 }
@@ -364,6 +379,36 @@ mod tests {
                 }),
                 "FEAT_DotProd reported but no SDOT proof row executed"
             );
+        }
+    }
+
+    #[test]
+    fn the_x86_islands_are_proven_on_this_silicon_when_present() {
+        // Same vacuous-truth guard as the SDOT test: every x86 island the CPU reports must have
+        // executed its S8S8 proof rows (for the VNNI tiers, through the folded U8S8 path).
+        let report = run_selftest();
+        for (available, tier) in [
+            (crate::int8::x86_avx2_available(), KernelTier::X86Avx2),
+            (
+                crate::int8::x86_avx_vnni_available(),
+                KernelTier::X86AvxVnni,
+            ),
+            (
+                crate::int8::x86_avx512_vnni_available(),
+                KernelTier::X86Avx512Vnni,
+            ),
+        ] {
+            if available {
+                assert!(
+                    report.checks.iter().any(|check| {
+                        check.tier == tier
+                            && check.contract == DotContract::S8S8Kernel
+                            && check.passed
+                    }),
+                    "{} reported but no proof row executed",
+                    tier.as_str()
+                );
+            }
         }
     }
 

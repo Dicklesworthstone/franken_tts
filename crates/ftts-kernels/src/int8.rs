@@ -158,6 +158,18 @@ pub enum Int8Tier {
     /// the autovectorizer to find, so without this tier a browser runs the byte-at-a-time
     /// `Scalar` loop.
     WasmSimd128,
+    /// Hand AVX2 island (x86-64 + runtime AVX2): exact i8→i16 widening + `vpmaddwd`.
+    ///
+    /// The x86 release binaries target the baseline x86-64 ISA (SSE2), so without a runtime-
+    /// dispatched island the `Scalar` loop vectorizes 16 bytes at a time with no int8 multiply
+    /// at all. This is the floor every AVX2-era x86 CPU (Haswell+, Zen 1+) gets.
+    X86Avx2,
+    /// Hand AVX-VNNI island (x86-64 + runtime AVX-VNNI): VEX `vpdpbusd` on 256-bit registers in
+    /// the U8S8 +128-fold form (plan §7.3). Alder Lake+ client parts and Zen 5.
+    X86AvxVnni,
+    /// Hand AVX-512 VNNI island (x86-64 + runtime AVX-512F/BW/VNNI): EVEX `vpdpbusd` on 512-bit
+    /// registers in the same +128-fold form. Ice Lake+ / Sapphire Rapids servers and Zen 4+.
+    X86Avx512Vnni,
 }
 
 impl Int8Tier {
@@ -169,7 +181,29 @@ impl Int8Tier {
             Self::Autovec => "autovec",
             Self::NeonSdot => "neon-sdot",
             Self::WasmSimd128 => "wasm-simd128",
+            Self::X86Avx2 => "x86-avx2",
+            Self::X86AvxVnni => "x86-avx-vnni",
+            Self::X86Avx512Vnni => "x86-avx512-vnni",
         }
+    }
+
+    /// Parses a stable route name back into a tier this build can execute right now.
+    ///
+    /// `None` for an unknown name *and* for a known tier the running CPU cannot execute, so a
+    /// persisted plan or an `FTTS_INT8_TIER` override can never select an undispatchable island.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::available()
+            .into_iter()
+            .find(|tier| tier.as_str() == name)
+    }
+
+    /// Whether this tier carries the four-column register-blocked GEMV kernel.
+    ///
+    /// Blocking only changes which dot runs when — every element is still one exact i32 dot —
+    /// so blocked and per-column loops are bit-identical; this is a speed property only.
+    const fn has_blocked_kernel(self) -> bool {
+        matches!(self, Self::X86Avx2 | Self::X86AvxVnni | Self::X86Avx512Vnni)
     }
 
     /// Every tier this build can execute on the running silicon, scalar first.
@@ -182,18 +216,30 @@ impl Int8Tier {
         if wasm_simd128_available() {
             tiers.push(Self::WasmSimd128);
         }
+        if x86_avx2_available() {
+            tiers.push(Self::X86Avx2);
+        }
+        if x86_avx_vnni_available() {
+            tiers.push(Self::X86AvxVnni);
+        }
+        if x86_avx512_vnni_available() {
+            tiers.push(Self::X86Avx512Vnni);
+        }
         tiers
     }
 
     /// The route the int8 path dispatches by default, honoring the `FTTS_INT8_TIER` override.
     ///
-    /// The override exists for interleaved A/B measurement (`scalar` / `autovec` / `neon-sdot`);
-    /// an unavailable or unrecognized override falls back to the measured default rather than
-    /// panicking mid-synthesis. Until a per-shape KernelPlan lands, the default is `NeonSdot`
-    /// where FEAT_DotProd exists, else `Scalar`. Measured on M4 Pro (2026-08-08, shape bench,
-    /// noisy shared host, indicative): plain `Scalar` autovectorizes to ~50 GB/s and ties SDOT
-    /// at m=1 — NE-INH-003 reconfirmed — while the hand-shaped `Autovec` lane loop defeats the
-    /// vectorizer and loses ~15x; it stays only as an A/B datapoint.
+    /// The override exists for interleaved A/B measurement (any [`Self::as_str`] name); an
+    /// unavailable or unrecognized override falls back to the capability default rather than
+    /// panicking mid-synthesis. The capability default is the native island where one exists
+    /// (`NeonSdot` with FEAT_DotProd; on x86-64 the widest of AVX-512 VNNI, AVX-VNNI, AVX2),
+    /// else `Scalar` — the measured per-regime choice is [`autotuned_plan`]'s job, not this
+    /// function's. Measured on M4 Pro (2026-08-08, shape bench, noisy shared host, indicative):
+    /// plain `Scalar` autovectorizes to ~50 GB/s and ties SDOT at m=1 — NE-INH-003 reconfirmed —
+    /// while the hand-shaped `Autovec` lane loop defeats the vectorizer and loses ~15x; it stays
+    /// only as an A/B datapoint. That aarch64 result does not transfer to x86-64, whose baseline
+    /// target has no int8 multiply for the vectorizer to reach (see [`Self::X86Avx2`]).
     #[must_use]
     pub fn dispatch() -> Self {
         // wasm32 first and without consulting the environment: there are no environment variables
@@ -202,12 +248,26 @@ impl Int8Tier {
         if wasm_simd128_available() {
             return Self::WasmSimd128;
         }
-        match std::env::var("FTTS_INT8_TIER").as_deref() {
-            Ok("scalar") => Self::Scalar,
-            Ok("autovec") => Self::Autovec,
-            Ok("neon-sdot") if neon_sdot_available() => Self::NeonSdot,
-            _ if neon_sdot_available() => Self::NeonSdot,
-            _ => Self::Scalar,
+        if let Ok(name) = std::env::var("FTTS_INT8_TIER")
+            && let Some(tier) = Self::from_name(&name)
+        {
+            return tier;
+        }
+        Self::capability_default()
+    }
+
+    /// The widest native island the running CPU can execute, else `Scalar`.
+    fn capability_default() -> Self {
+        if neon_sdot_available() {
+            Self::NeonSdot
+        } else if x86_avx512_vnni_available() {
+            Self::X86Avx512Vnni
+        } else if x86_avx_vnni_available() {
+            Self::X86AvxVnni
+        } else if x86_avx2_available() {
+            Self::X86Avx2
+        } else {
+            Self::Scalar
         }
     }
 }
@@ -484,15 +544,9 @@ fn load_persisted_plan() -> Option<KernelPlanV0> {
     if lines.next()? != plan_cache_key() {
         return None;
     }
-    let parse = |line: &str| match line {
-        "scalar" => Some(Int8Tier::Scalar),
-        "autovec" => Some(Int8Tier::Autovec),
-        "neon-sdot" if neon_sdot_available() => Some(Int8Tier::NeonSdot),
-        _ => None,
-    };
     Some(KernelPlanV0 {
-        decode_gemv: parse(lines.next()?)?,
-        batch_gemm: parse(lines.next()?)?,
+        decode_gemv: Int8Tier::from_name(lines.next()?)?,
+        batch_gemm: Int8Tier::from_name(lines.next()?)?,
     })
 }
 
@@ -588,6 +642,45 @@ pub fn wasm_simd128_available() -> bool {
     cfg!(all(target_arch = "wasm32", target_feature = "simd128"))
 }
 
+/// Whether the x86-64 AVX2 island is compiled in and the CPU reports AVX2.
+#[must_use]
+pub fn x86_avx2_available() -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "x86-int8"))]
+    {
+        x86_int8::avx2_available()
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "x86-int8")))]
+    {
+        false
+    }
+}
+
+/// Whether the x86-64 AVX-VNNI island is compiled in and the CPU reports AVX2 + AVX-VNNI.
+#[must_use]
+pub fn x86_avx_vnni_available() -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "x86-int8"))]
+    {
+        x86_int8::avx_vnni_available()
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "x86-int8")))]
+    {
+        false
+    }
+}
+
+/// Whether the x86-64 AVX-512 VNNI island is compiled in and the CPU reports AVX-512F/BW/VNNI.
+#[must_use]
+pub fn x86_avx512_vnni_available() -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "x86-int8"))]
+    {
+        x86_int8::avx512_vnni_available()
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "x86-int8")))]
+    {
+        false
+    }
+}
+
 /// Exact i32 dot product of two Q8 rows over the selected route.
 ///
 /// # Panics
@@ -601,6 +694,91 @@ pub fn dot_i32(a: &[i8], b: &[i8], tier: Int8Tier) -> i32 {
         Int8Tier::Autovec => dot_i32_autovec(a, b),
         Int8Tier::NeonSdot => dot_i32_neon_or_panic(a, b),
         Int8Tier::WasmSimd128 => dot_i32_wasm_or_panic(a, b),
+        Int8Tier::X86Avx2 | Int8Tier::X86AvxVnni | Int8Tier::X86Avx512Vnni => {
+            dot_i32_x86_or_panic(a, b, tier)
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "x86-int8"))]
+fn dot_i32_x86_or_panic(a: &[i8], b: &[i8], tier: Int8Tier) -> i32 {
+    x86_int8::dot_i32(a, b, tier)
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "x86-int8")))]
+fn dot_i32_x86_or_panic(_a: &[i8], _b: &[i8], tier: Int8Tier) -> i32 {
+    panic!("{} route selected on a non-x86-64 build", tier.as_str());
+}
+
+/// Exact i32 dots of one activation row against four consecutive weight rows.
+///
+/// `weights` holds the four rows back to back (`4 * k` bytes). Every lane equals
+/// `dot_i32(x, row_lane, Scalar)` exactly; only tiers with [`Int8Tier::has_blocked_kernel`]
+/// may be passed.
+fn dot4_i32(x: &[i8], weights: &[i8], tier: Int8Tier) -> [i32; 4] {
+    #[cfg(all(target_arch = "x86_64", feature = "x86-int8"))]
+    {
+        x86_int8::dot4_i32(x, weights, tier)
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "x86-int8")))]
+    {
+        let _ = (x, weights);
+        panic!("{} has no blocked kernel on this build", tier.as_str());
+    }
+}
+
+/// Computes output columns `start..end` of a W8A8 linear, writing through `out`.
+///
+/// The single loop nest the serial [`linear_q8`] and the team's column partitions share, so the
+/// two paths cannot drift apart: tiers with a blocked kernel take four weight rows per pass
+/// (each streamed once and reused across all `m` activation rows — weight-stationary), the rest
+/// one row per pass, and every output element is one exact i32 dot either way, dequantized as
+/// `acc as f32 * (x_scale * w_scale)` (+ bias) in that order.
+///
+/// # Safety
+///
+/// `out` must be valid for writes of `m * n` f32 elements for the duration of the call, and no
+/// other live reference may alias the `[row * n + col]` cells for `col` in `start..end`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn linear_q8_columns(
+    x_q: &[i8],
+    x_scales: &[f32],
+    w_data: &[i8],
+    w_scales: &[f32],
+    bias: Option<&[f32]>,
+    m: usize,
+    n: usize,
+    k: usize,
+    tier: Int8Tier,
+    columns: std::ops::Range<usize>,
+    out: *mut f32,
+) {
+    let write = |row: usize, col: usize, acc: i32| {
+        let value = acc as f32 * (x_scales[row] * w_scales[col]);
+        let value = bias.map_or(value, |b| value + b[col]);
+        // SAFETY: the caller guarantees `out` spans `m * n` writable elements and that this
+        // column range is exclusively ours; `row < m` and `col < n` hold at every call site.
+        unsafe { *out.add(row * n + col) = value };
+    };
+    let mut col = columns.start;
+    if tier.has_blocked_kernel() {
+        while col + 4 <= columns.end {
+            let block = &w_data[col * k..(col + 4) * k];
+            for row in 0..m {
+                let acc = dot4_i32(&x_q[row * k..(row + 1) * k], block, tier);
+                for (lane, &value) in acc.iter().enumerate() {
+                    write(row, col + lane, value);
+                }
+            }
+            col += 4;
+        }
+    }
+    while col < columns.end {
+        let w_row = &w_data[col * k..(col + 1) * k];
+        for row in 0..m {
+            write(row, col, dot_i32(&x_q[row * k..(row + 1) * k], w_row, tier));
+        }
+        col += 1;
     }
 }
 
@@ -937,6 +1115,415 @@ mod wasm_simd128 {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", feature = "x86-int8"))]
+mod x86_int8 {
+    //! The audited x86-64 int8 islands — the x86 counterparts of the SDOT island.
+    //!
+    //! Why these exist: the x86-64 release binaries target the baseline ISA (SSE2), so the
+    //! `Scalar` loop that NE-INH-003 found "vectorizes to memory bandwidth" on aarch64 has no
+    //! int8 multiply to vectorize into on x86 — it widens and multiplies sixteen bytes at a time
+    //! in SSE2. Runtime detection lets one binary keep the baseline minimum CPU and still reach
+    //! each machine's native int8 instruction.
+    //!
+    //! Exactness, per tier — each is *equal* to `Scalar` in i32 on every input, `-128` included:
+    //!
+    //! - **AVX2**: `vpmovsxbw` widens both operands to i16, `vpmaddwd` multiplies and sums
+    //!   adjacent pairs into i32. Every i8×i8 product fits i16×i16→i32 and every pairwise sum
+    //!   fits i32, so nothing saturates or rounds.
+    //! - **AVX-VNNI / AVX-512 VNNI**: `vpdpbusd` multiplies *unsigned* by signed bytes, so the
+    //!   signed activation is biased into u8 (`a ^ 0x80 == a + 128`) and the bias is folded back
+    //!   out: `Σ a·b = Σ (a+128)·b − 128·Σ b` (plan §7.3, "U8S8 +128 fold"). `Σ b` comes from a
+    //!   second `vpdpbusd` against all-ones, so no per-matrix precomputation or artifact change is
+    //!   needed. `vpdpbusd` is the non-saturating form; partial sums wrap in i32 and wrapping
+    //!   addition is exact modulo 2³², so the final value is exact whenever the true dot fits
+    //!   i32 — which the shipped selftest proves at every census K (the U8S8 envelope
+    //!   `255 × 127 × K` is precisely this fold's operand range). The sign-transfer alternative
+    //!   (`|a|` × `sign(a)·b`) was rejected: it mis-computes `(-128)·(-128)`, and a corrupt
+    //!   artifact can carry that byte.
+    //!
+    //! Every load below is bounded by the loop structure against the slice lengths the callers
+    //! assert; AVX-512 tails use masked loads, which touch only enabled lanes.
+
+    use super::Int8Tier;
+    use core::arch::x86_64::{
+        __m256i, __m512i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_shuffle_epi32,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16, _mm256_dpbusd_avx_epi32,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_xor_si256, _mm512_dpbusd_epi32, _mm512_loadu_si512,
+        _mm512_maskz_loadu_epi8, _mm512_reduce_add_epi32, _mm512_set1_epi8, _mm512_setzero_si512,
+        _mm512_xor_si512,
+    };
+
+    /// Whether the CPU reports AVX2.
+    #[must_use]
+    pub fn avx2_available() -> bool {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+
+    /// Whether the CPU reports AVX2 and AVX-VNNI (VEX-encoded `vpdpbusd`).
+    #[must_use]
+    pub fn avx_vnni_available() -> bool {
+        avx2_available() && std::arch::is_x86_feature_detected!("avxvnni")
+    }
+
+    /// Whether the CPU reports AVX-512F, AVX-512BW and AVX-512 VNNI.
+    #[must_use]
+    pub fn avx512_vnni_available() -> bool {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+    }
+
+    fn assert_executable(tier: Int8Tier) {
+        let executable = match tier {
+            Int8Tier::X86Avx2 => avx2_available(),
+            Int8Tier::X86AvxVnni => avx_vnni_available(),
+            Int8Tier::X86Avx512Vnni => avx512_vnni_available(),
+            _ => false,
+        };
+        assert!(
+            executable,
+            "{} route selected without its CPU feature",
+            tier.as_str()
+        );
+    }
+
+    /// Exact i32 dot product over the selected x86 island.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tier` is not an x86 tier or the CPU lacks its feature; lengths are asserted
+    /// equal by [`super::dot_i32`].
+    #[must_use]
+    pub fn dot_i32(a: &[i8], b: &[i8], tier: Int8Tier) -> i32 {
+        assert_executable(tier);
+        // SAFETY (all three arms): `assert_executable` just confirmed this CPU reports every
+        // target feature the callee enables, and `super::dot_i32` asserted equal lengths, which
+        // is the callee's only other precondition.
+        match tier {
+            Int8Tier::X86Avx2 => unsafe { dot_avx2(a, b) },
+            Int8Tier::X86AvxVnni => unsafe { dot_avx_vnni(a, b) },
+            _ => unsafe { dot_avx512_vnni(a, b) },
+        }
+    }
+
+    /// Exact i32 dots of `x` against four consecutive `x.len()`-byte rows of `weights`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `weights.len() != 4 * x.len()`, `tier` is not an x86 tier, or the CPU lacks
+    /// its feature.
+    #[must_use]
+    pub fn dot4_i32(x: &[i8], weights: &[i8], tier: Int8Tier) -> [i32; 4] {
+        assert_eq!(
+            weights.len(),
+            4 * x.len(),
+            "dot4 needs four whole weight rows"
+        );
+        assert_executable(tier);
+        // SAFETY (all three arms): `assert_executable` confirmed the callee's target features on
+        // this CPU, and the length assertion above is the callee's only other precondition.
+        match tier {
+            Int8Tier::X86Avx2 => unsafe { dot4_avx2(x, weights) },
+            Int8Tier::X86AvxVnni => unsafe { dot4_avx_vnni(x, weights) },
+            _ => unsafe { dot4_avx512_vnni(x, weights) },
+        }
+    }
+
+    /// Horizontal i32 sum of eight lanes (wrapping, hence exact modulo 2³²).
+    #[target_feature(enable = "avx2")]
+    fn hsum_256(v: __m256i) -> i32 {
+        let s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b0100_1110>(s));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b1011_0001>(s));
+        _mm_cvtsi128_si32(s)
+    }
+
+    /// Exact scalar dot over `from..len`, for the tails of the 256-bit islands.
+    fn scalar_tail(a: &[i8], b: &[i8], from: usize) -> i32 {
+        a[from..]
+            .iter()
+            .zip(&b[from..])
+            .map(|(&x, &y)| i32::from(x) * i32::from(y))
+            .fold(0_i32, i32::wrapping_add)
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must support AVX2 and `a.len() == b.len()`.
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_avx2(a: &[i8], b: &[i8]) -> i32 {
+        let len = a.len();
+        let (a_ptr, b_ptr) = (a.as_ptr(), b.as_ptr());
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut index = 0_usize;
+        while index + 32 <= len {
+            // SAFETY: `index + 32 <= len` bounds both 16-byte loads of each operand inside its
+            // slice (equal lengths per the contract); unaligned loads need byte alignment only.
+            let (a0, b0, a1, b1) = unsafe {
+                (
+                    _mm_loadu_si128(a_ptr.add(index).cast()),
+                    _mm_loadu_si128(b_ptr.add(index).cast()),
+                    _mm_loadu_si128(a_ptr.add(index + 16).cast()),
+                    _mm_loadu_si128(b_ptr.add(index + 16).cast()),
+                )
+            };
+            acc0 = _mm256_add_epi32(
+                acc0,
+                _mm256_madd_epi16(_mm256_cvtepi8_epi16(a0), _mm256_cvtepi8_epi16(b0)),
+            );
+            acc1 = _mm256_add_epi32(
+                acc1,
+                _mm256_madd_epi16(_mm256_cvtepi8_epi16(a1), _mm256_cvtepi8_epi16(b1)),
+            );
+            index += 32;
+        }
+        if index + 16 <= len {
+            // SAFETY: `index + 16 <= len` bounds both 16-byte loads inside their slices.
+            let (a0, b0) = unsafe {
+                (
+                    _mm_loadu_si128(a_ptr.add(index).cast()),
+                    _mm_loadu_si128(b_ptr.add(index).cast()),
+                )
+            };
+            acc0 = _mm256_add_epi32(
+                acc0,
+                _mm256_madd_epi16(_mm256_cvtepi8_epi16(a0), _mm256_cvtepi8_epi16(b0)),
+            );
+            index += 16;
+        }
+        hsum_256(_mm256_add_epi32(acc0, acc1)).wrapping_add(scalar_tail(a, b, index))
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must support AVX2 and `weights.len() == 4 * x.len()`.
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot4_avx2(x: &[i8], weights: &[i8]) -> [i32; 4] {
+        let k = x.len();
+        let (x_ptr, w_ptr) = (x.as_ptr(), weights.as_ptr());
+        let mut acc = [_mm256_setzero_si256(); 4];
+        let mut index = 0_usize;
+        while index + 16 <= k {
+            // SAFETY: `index + 16 <= k` bounds the 16-byte activation load inside `x`.
+            let widened = _mm256_cvtepi8_epi16(unsafe { _mm_loadu_si128(x_ptr.add(index).cast()) });
+            for (lane, accumulator) in acc.iter_mut().enumerate() {
+                // SAFETY: row `lane` occupies `lane * k .. (lane + 1) * k` of the `4 * k`-byte
+                // `weights`, and `index + 16 <= k` keeps this load inside that row.
+                let w = unsafe { _mm_loadu_si128(w_ptr.add(lane * k + index).cast()) };
+                *accumulator = _mm256_add_epi32(
+                    *accumulator,
+                    _mm256_madd_epi16(widened, _mm256_cvtepi8_epi16(w)),
+                );
+            }
+            index += 16;
+        }
+        let mut sums = [0_i32; 4];
+        for (lane, sum) in sums.iter_mut().enumerate() {
+            let row = &weights[lane * k..(lane + 1) * k];
+            *sum = hsum_256(acc[lane]).wrapping_add(scalar_tail(x, row, index));
+        }
+        sums
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must support AVX2 + AVX-VNNI and `a.len() == b.len()`.
+    #[target_feature(enable = "avx2,avxvnni")]
+    unsafe fn dot_avx_vnni(a: &[i8], b: &[i8]) -> i32 {
+        let len = a.len();
+        let (a_ptr, b_ptr) = (a.as_ptr(), b.as_ptr());
+        let flip = _mm256_set1_epi8(i8::MIN);
+        let ones = _mm256_set1_epi8(1);
+        let (mut folded0, mut folded1) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+        let (mut sum0, mut sum1) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+        let mut index = 0_usize;
+        while index + 64 <= len {
+            // SAFETY: `index + 64 <= len` bounds both 32-byte loads of each operand inside its
+            // slice (equal lengths per the contract).
+            let (a0, b0, a1, b1) = unsafe {
+                (
+                    _mm256_loadu_si256(a_ptr.add(index).cast()),
+                    _mm256_loadu_si256(b_ptr.add(index).cast()),
+                    _mm256_loadu_si256(a_ptr.add(index + 32).cast()),
+                    _mm256_loadu_si256(b_ptr.add(index + 32).cast()),
+                )
+            };
+            folded0 = _mm256_dpbusd_avx_epi32(folded0, _mm256_xor_si256(a0, flip), b0);
+            sum0 = _mm256_dpbusd_avx_epi32(sum0, ones, b0);
+            folded1 = _mm256_dpbusd_avx_epi32(folded1, _mm256_xor_si256(a1, flip), b1);
+            sum1 = _mm256_dpbusd_avx_epi32(sum1, ones, b1);
+            index += 64;
+        }
+        if index + 32 <= len {
+            // SAFETY: `index + 32 <= len` bounds both 32-byte loads inside their slices.
+            let (a0, b0) = unsafe {
+                (
+                    _mm256_loadu_si256(a_ptr.add(index).cast()),
+                    _mm256_loadu_si256(b_ptr.add(index).cast()),
+                )
+            };
+            folded0 = _mm256_dpbusd_avx_epi32(folded0, _mm256_xor_si256(a0, flip), b0);
+            sum0 = _mm256_dpbusd_avx_epi32(sum0, ones, b0);
+            index += 32;
+        }
+        let folded = hsum_256(_mm256_add_epi32(folded0, folded1));
+        let weight_sum = hsum_256(_mm256_add_epi32(sum0, sum1));
+        folded
+            .wrapping_sub(weight_sum.wrapping_mul(128))
+            .wrapping_add(scalar_tail(a, b, index))
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must support AVX2 + AVX-VNNI and `weights.len() == 4 * x.len()`.
+    #[target_feature(enable = "avx2,avxvnni")]
+    unsafe fn dot4_avx_vnni(x: &[i8], weights: &[i8]) -> [i32; 4] {
+        let k = x.len();
+        let (x_ptr, w_ptr) = (x.as_ptr(), weights.as_ptr());
+        let flip = _mm256_set1_epi8(i8::MIN);
+        let ones = _mm256_set1_epi8(1);
+        let mut folded = [_mm256_setzero_si256(); 4];
+        let mut sums = [_mm256_setzero_si256(); 4];
+        let mut index = 0_usize;
+        while index + 32 <= k {
+            // SAFETY: `index + 32 <= k` bounds the 32-byte activation load inside `x`.
+            let biased =
+                _mm256_xor_si256(unsafe { _mm256_loadu_si256(x_ptr.add(index).cast()) }, flip);
+            for lane in 0..4 {
+                // SAFETY: row `lane` occupies `lane * k .. (lane + 1) * k` of the `4 * k`-byte
+                // `weights`, and `index + 32 <= k` keeps this load inside that row.
+                let w = unsafe { _mm256_loadu_si256(w_ptr.add(lane * k + index).cast()) };
+                folded[lane] = _mm256_dpbusd_avx_epi32(folded[lane], biased, w);
+                sums[lane] = _mm256_dpbusd_avx_epi32(sums[lane], ones, w);
+            }
+            index += 32;
+        }
+        let mut out = [0_i32; 4];
+        for (lane, value) in out.iter_mut().enumerate() {
+            let row = &weights[lane * k..(lane + 1) * k];
+            *value = hsum_256(folded[lane])
+                .wrapping_sub(hsum_256(sums[lane]).wrapping_mul(128))
+                .wrapping_add(scalar_tail(x, row, index));
+        }
+        out
+    }
+
+    /// One 64-byte block (or a masked shorter tail) of the folded AVX-512 VNNI dot.
+    ///
+    /// Masked-off lanes load as zero: their biased activation is 128 but their weight is 0, so
+    /// they add nothing to either accumulator.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    fn vnni512_step(folded: __m512i, sum: __m512i, a: __m512i, b: __m512i) -> (__m512i, __m512i) {
+        let biased = _mm512_xor_si512(a, _mm512_set1_epi8(i8::MIN));
+        (
+            _mm512_dpbusd_epi32(folded, biased, b),
+            _mm512_dpbusd_epi32(sum, _mm512_set1_epi8(1), b),
+        )
+    }
+
+    /// Lane mask enabling the first `remaining` bytes (`remaining < 64`).
+    fn tail_mask(remaining: usize) -> u64 {
+        debug_assert!(remaining < 64);
+        (1_u64 << remaining) - 1
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must support AVX-512F/BW/VNNI and `a.len() == b.len()`.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    unsafe fn dot_avx512_vnni(a: &[i8], b: &[i8]) -> i32 {
+        let len = a.len();
+        let (a_ptr, b_ptr) = (a.as_ptr(), b.as_ptr());
+        let (mut folded0, mut sum0) = (_mm512_setzero_si512(), _mm512_setzero_si512());
+        let (mut folded1, mut sum1) = (_mm512_setzero_si512(), _mm512_setzero_si512());
+        let mut index = 0_usize;
+        while index + 128 <= len {
+            // SAFETY: `index + 128 <= len` bounds both 64-byte loads of each operand inside its
+            // slice (equal lengths per the contract).
+            let (a0, b0, a1, b1) = unsafe {
+                (
+                    _mm512_loadu_si512(a_ptr.add(index).cast()),
+                    _mm512_loadu_si512(b_ptr.add(index).cast()),
+                    _mm512_loadu_si512(a_ptr.add(index + 64).cast()),
+                    _mm512_loadu_si512(b_ptr.add(index + 64).cast()),
+                )
+            };
+            (folded0, sum0) = vnni512_step(folded0, sum0, a0, b0);
+            (folded1, sum1) = vnni512_step(folded1, sum1, a1, b1);
+            index += 128;
+        }
+        if index + 64 <= len {
+            // SAFETY: `index + 64 <= len` bounds both 64-byte loads inside their slices.
+            let (a0, b0) = unsafe {
+                (
+                    _mm512_loadu_si512(a_ptr.add(index).cast()),
+                    _mm512_loadu_si512(b_ptr.add(index).cast()),
+                )
+            };
+            (folded0, sum0) = vnni512_step(folded0, sum0, a0, b0);
+            index += 64;
+        }
+        if index < len {
+            let mask = tail_mask(len - index);
+            // SAFETY: `index < len`, so both pointers stay inside their slices, and the masked
+            // load reads only the `len - index` enabled bytes, all of which are in bounds.
+            let (a0, b0) = unsafe {
+                (
+                    _mm512_maskz_loadu_epi8(mask, a_ptr.add(index)),
+                    _mm512_maskz_loadu_epi8(mask, b_ptr.add(index)),
+                )
+            };
+            (folded1, sum1) = vnni512_step(folded1, sum1, a0, b0);
+        }
+        let folded =
+            _mm512_reduce_add_epi32(folded0).wrapping_add(_mm512_reduce_add_epi32(folded1));
+        let weight_sum = _mm512_reduce_add_epi32(sum0).wrapping_add(_mm512_reduce_add_epi32(sum1));
+        folded.wrapping_sub(weight_sum.wrapping_mul(128))
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must support AVX-512F/BW/VNNI and `weights.len() == 4 * x.len()`.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    unsafe fn dot4_avx512_vnni(x: &[i8], weights: &[i8]) -> [i32; 4] {
+        let k = x.len();
+        let (x_ptr, w_ptr) = (x.as_ptr(), weights.as_ptr());
+        let mut folded = [_mm512_setzero_si512(); 4];
+        let mut sums = [_mm512_setzero_si512(); 4];
+        let mut index = 0_usize;
+        while index + 64 <= k {
+            // SAFETY: `index + 64 <= k` bounds the 64-byte activation load inside `x`.
+            let a = unsafe { _mm512_loadu_si512(x_ptr.add(index).cast()) };
+            for lane in 0..4 {
+                // SAFETY: row `lane` occupies `lane * k .. (lane + 1) * k` of the `4 * k`-byte
+                // `weights`, and `index + 64 <= k` keeps this load inside that row.
+                let w = unsafe { _mm512_loadu_si512(w_ptr.add(lane * k + index).cast()) };
+                (folded[lane], sums[lane]) = vnni512_step(folded[lane], sums[lane], a, w);
+            }
+            index += 64;
+        }
+        if index < k {
+            let mask = tail_mask(k - index);
+            // SAFETY: `index < k` keeps the pointer inside `x`; the masked load reads only the
+            // `k - index` enabled bytes, all in bounds.
+            let a = unsafe { _mm512_maskz_loadu_epi8(mask, x_ptr.add(index)) };
+            for lane in 0..4 {
+                // SAFETY: same bound inside row `lane` of the `4 * k`-byte `weights`.
+                let w = unsafe { _mm512_maskz_loadu_epi8(mask, w_ptr.add(lane * k + index)) };
+                (folded[lane], sums[lane]) = vnni512_step(folded[lane], sums[lane], a, w);
+            }
+        }
+        let mut out = [0_i32; 4];
+        for (lane, value) in out.iter_mut().enumerate() {
+            *value = _mm512_reduce_add_epi32(folded[lane])
+                .wrapping_sub(_mm512_reduce_add_epi32(sums[lane]).wrapping_mul(128));
+        }
+        out
+    }
+}
+
 /// W8A8 linear: quantized activations `[m, k]` times a [`QuantizedMatrix`] `[n, k]`, producing
 /// f32 `[m, n]`.
 ///
@@ -992,16 +1579,22 @@ pub fn linear_q8(
         return;
     }
 
-    for col in 0..n {
-        let w_row = &weight.data[col * k..(col + 1) * k];
-        let w_scale = weight.scales[col];
-        let bias_term = bias.map(|b| b[col]);
-        for row in 0..m {
-            let x_row = &x_q[row * k..(row + 1) * k];
-            let acc = dot_i32(x_row, w_row, tier);
-            let value = acc as f32 * (x_scales[row] * w_scale);
-            out[row * n + col] = bias_term.map_or(value, |b| value + b);
-        }
+    // SAFETY: `out` is a `&mut [f32]` of exactly `m * n` (asserted above) and the full column
+    // range is requested, so every write lands inside it; the borrow checker rules out aliases.
+    unsafe {
+        linear_q8_columns(
+            x_q,
+            x_scales,
+            &weight.data,
+            &weight.scales,
+            bias,
+            m,
+            n,
+            k,
+            tier,
+            0..n,
+            out.as_mut_ptr(),
+        );
     }
 }
 
@@ -1145,6 +1738,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_tier_stays_exact_on_minus_128_bytes_the_canonical_recipe_never_emits() {
+        // The tier law is "equal to Scalar on EVERY input", not just canonical ones: a corrupt
+        // or foreign artifact can carry -128, and the x86 +128 fold must not mis-compute
+        // (-128)·(-128) the way a sign-transfer form would.
+        for len in [64_usize, 100, 1024, 3072] {
+            let minus = vec![i8::MIN; len];
+            let mixed: Vec<i8> = (0..len)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        i8::MIN
+                    } else {
+                        (127 - (i % 255) as i32) as i8
+                    }
+                })
+                .collect();
+            for (a, b) in [(&minus, &minus), (&minus, &mixed), (&mixed, &minus)] {
+                let reference = dot_i32(a, b, Int8Tier::Scalar);
+                for tier in Int8Tier::available() {
+                    assert_eq!(
+                        dot_i32(a, b, tier),
+                        reference,
+                        "len={len} {}",
+                        tier.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_tiers_equal_the_scalar_linear_at_ragged_shapes() {
+        // Four-column blocking leaves column remainders (n % 4) and, at odd k, intra-row tails
+        // for every vector width; serial and team paths share this loop nest.
+        for &(m, n, k) in &[
+            (1_usize, 7_usize, 1024_usize),
+            (3, 10, 100),
+            (2, 4, 17),
+            (16, 9, 3072),
+            (1, 1, 63),
+        ] {
+            let x_q = pseudo_random_q8(m * k, 0xb10c ^ k as u64);
+            let x_scales: Vec<f32> = (0..m).map(|r| 0.01 + r as f32 * 0.003).collect();
+            let weight = QuantizedMatrix {
+                data: pseudo_random_q8(n * k, 0xb10d ^ n as u64),
+                scales: (0..n).map(|c| 0.02 + c as f32 * 0.001).collect(),
+                n,
+                k,
+            };
+            let bias: Vec<f32> = (0..n).map(|c| c as f32 * 0.5 - 1.0).collect();
+            let mut reference = vec![0.0_f32; m * n];
+            crate::team::with_team_bypassed(|| {
+                linear_q8(
+                    &x_q,
+                    &x_scales,
+                    &weight,
+                    Some(&bias),
+                    m,
+                    &mut reference,
+                    Int8Tier::Scalar,
+                );
+            });
+            for tier in Int8Tier::available() {
+                let mut out = vec![0.0_f32; m * n];
+                crate::team::with_team_bypassed(|| {
+                    linear_q8(&x_q, &x_scales, &weight, Some(&bias), m, &mut out, tier);
+                });
+                for (index, (a, b)) in reference.iter().zip(&out).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{} m={m} n={n} k={k} element {index}",
+                        tier.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn route_names_round_trip_for_every_executable_tier() {
+        for tier in Int8Tier::available() {
+            assert_eq!(Int8Tier::from_name(tier.as_str()), Some(tier));
+        }
+        assert_eq!(Int8Tier::from_name("not-a-tier"), None);
     }
 
     #[test]
