@@ -129,6 +129,7 @@ Since v0.1.3 the quantized stack is the library-wide default (`ftts_kernels::rou
 - **W8A8 int8 talker + microdecoder** (symmetric per-channel weights, dynamic per-row activations, exact i32 accumulation), fanned across a six-thread persistent worker team whose partitioning is bit-identical to serial execution at every thread count.
 - **A BLAS-form f32 codec** that runs the reference's own reduction order through Accelerate: measured faster than the int8 codec arm while tracking the oracle more closely, so the codec stays full-precision by default and the int8 codec arms (`FTTS_INT8_CODEC=convnext|all`) remain opt-in A/B routes. Codec decode is pipelined with generation, and streamed output is bit-identical to offline decode.
 - **SLEEF SnakeBeta** (129.6 dB SNR against libm — inaudible by a wide margin) and a startup autotuner that picks the fastest proven kernel tier per regime, cached in `~/.cache/franken_tts/`.
+- **Native x86-64 kernels, dispatched at runtime** (the x86 binaries still run on any x86-64 CPU): AVX2, AVX-VNNI, and AVX-512 VNNI int8 dot products (exactly equal to the scalar route in i32, proven by `ftts robot selftest`), explicit AVX2/AVX-512 micro-kernels for the codec's f32 GEMMs, and an FMA-compiled SnakeBeta — all bit-identical to what ran before, so output does not change. Off Apple the codec gets its own core (and its own small worker team when cores are spare), the generator→codec handoff carries one packet of queue, and the worker team spins briefly before sleeping between its ~430 dispatches per frame. On a 4-vCPU Emerald Rapids cloud VM a 17.4 s paragraph went from 165 s to 33 s (0.11× → 0.52× real time; byte-identical WAV) — a self-comparison on a noisy shared host, not a certified ledger row. Real time on x86 needs more cores than that VM has.
 - Every int8 kernel tier is proven exactly equal to the scalar reference in i32 by `ftts robot selftest`, on your machine, at this model's real reduction lengths.
 
 What the default route does not promise yet: sampled outputs are *different valid renditions*, not the f32 waveform — with sixteen sampled draws per frame, any lossy weight change alters the token stream within a frame or two (measured). Objective spectral checks pass for the codec and SnakeBeta pieces; a listening-based evaluation of the full sampled path against the reference is still open (`docs/DISCREPANCIES.md`, DISC-003), which is why the reference route stays one environment variable away.
@@ -211,7 +212,14 @@ Any natural speech works, but a phonetically rich passage measurably beats casua
 >
 > When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow. The rainbow is a division of white light into many beautiful colors.
 
-Keep a note of exactly what you read: the upcoming higher-quality ICL cloning mode conditions on the reference audio *plus its verbatim transcript*, so a recording of a known passage is already future-proof.
+Keep a note of exactly what you read: the higher-quality ICL cloning mode conditions on the reference audio *plus its verbatim transcript*:
+
+```bash
+ftts enroll my_recording.m4a --mode quality --transcript-file passage.txt -o me.ftvoice
+ftts say --voice me.ftvoice "Hello from the in-context cloning path" hello.m4a
+```
+
+A quality pack carries the reference's codec tokens and transcript, and synthesis continues from them the way the upstream model does — including priming the codec with the reference audio, so the voice's acoustic context carries into every utterance. That priming decodes the whole reference once per voice (seconds on Apple Silicon, tens of seconds on a small x86 VM); the result is cached under `~/.cache/franken_tts/voice-cache/` and reused bit-identically afterwards (`FTTS_VOICE_CACHE=0` turns the cache off). ICL voices are synthesized in-process rather than through the resident engine. A listening-based comparison of ICL against x-vector cloning is still open.
 
 ## Robot mode
 
@@ -243,7 +251,7 @@ Workspace crates: `ftts-core` (engine), `ftts-model-qwen` (model graph), `ftts-k
 
 ## Known limitations
 
-- **Real time is load-dependent.** The default optimized route runs faster than real time on an unloaded Mac Mini M4 Pro; on the same machine saturated with concurrent build jobs it measured 0.66–1.05× real time. The f32 reference route (`FTTS_INT8=0`) runs 6–7× slower than real time by design.
+- **Real time is load- and machine-dependent.** The default optimized route runs faster than real time on an unloaded Mac Mini M4 Pro; on the same machine saturated with concurrent build jobs it measured 0.66–1.05× real time. On x86 the codec is the bottleneck on small machines: a 4-vCPU cloud VM measured 0.52× real time. The f32 reference route (`FTTS_INT8=0`) runs 6–7× slower than real time by design.
 - **The optimized default trades exactness for speed.** Kernel integer math is exactly proven, and the codec and SnakeBeta pieces pass objective spectral gates, but listening-based evaluation of the full sampled path is still open (DISC-003); `FTTS_INT8=0` restores the reference route.
 - **Model load costs ~4 s before the first sample.** `ftts pull` ships pre-quantized weights as of v0.1.2, so this is artifact load rather than a quantization pass, but it is still paid once per process — short one-shot utterances are dominated by it.
 - **The two biggest optimizations are not built yet.** The microdecoder's 5-layer body is re-read 15× per frame (~1.18 GB of the ~1.65 GB per-frame weight traffic), and neither planned fix has landed: the cache-resident MTP hot pack is designed but unimplemented, and FrankenMTP's drafter and block-verification primitives are in-tree without being wired into the generation path, so decode still runs all 15 steps sequentially.

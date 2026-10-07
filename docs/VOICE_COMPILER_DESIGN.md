@@ -38,6 +38,30 @@ Decisions worth remembering:
 - **x-vector profiles get NO prefix-KV section** — the maximal target-independent prefix there is
   the 7–9-position header; the embedding is the reusable artifact (OQ-10 §5.1 verdict).
 
+## ICL synthesis primes the codec with the reference (codec spec §5.3)
+
+Upstream ICL decodes `reference ++ generated` codes as one sequence and cuts the reference's
+samples, so generated audio inherits a codec state conditioned on the reference voice (the codec
+transformer's information horizon is 568 frames). `ftts say --voice quality.ftvoice` reproduces
+that exactly: the codec worker primes its streaming state with the pack's codec codes
+(`CodecStreamingState::prime_reference`) before decoding generated frames — on this strictly causal
+decoder, priming then pushing equals the concatenated decode's tail bit for bit
+(`ftts-conformance/tests/icl_prefix_decode.rs`). Priming runs on the codec worker, overlapping the
+talker prefill.
+
+Priming decodes the whole reference — the dominant ICL time-to-first-audio term on hosts where the
+codec is slow (≈37 s for a 17 s reference on a 4-vCPU x86 VM). It depends only on the reference
+codes, the codec weights, and the codec's numerics route, so the primed state is kept as a
+`.ftvoice-cache` blob, `codec_primed_state` (`CodecStreamingState::save`/`restore`: every retained
+history, the transformer KV windows, the frame counter, f32 as exact bits), under
+`~/.cache/franken_tts/voice-cache/<cache_key>.ftvoice-cache`, written atomically with owner-only
+permissions. The key digests the reference codes, a **numerics fingerprint** (the PCM of a fixed
+one-frame probe decoded from a fresh state, which moves with the weights and with every route, env,
+and platform choice that affects codec arithmetic), the engine version, and a state-format ABI. A
+restore is bit-identical to fresh priming (pinned at unit level and on real weights), so the cache
+changes time, never audio; any miss, mismatch, or refused blob falls back to priming. Measured on
+that VM: TTFA 40.3 s cold → 7.2 s warm, WAV byte-identical. `FTTS_VOICE_CACHE=0` disables it.
+
 ## Enrollment modes (bead `frankentts-p4-enrollment-en6`)
 
 QUALITY / QUICK / AUTO are never presented as interchangeable equals:

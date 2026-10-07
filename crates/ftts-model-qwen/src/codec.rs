@@ -110,6 +110,76 @@ pub enum CodecError {
     CodeLayout,
     /// A requested U8S8 reduction cannot safely accumulate in i32.
     I32AccumulatorOverflow { reduction_k: usize },
+    /// A saved streaming-state blob does not fit this decoder (truncated, foreign version, or a
+    /// buffer whose length this geometry could never hold).
+    StateBlob { reason: &'static str },
+}
+
+/// Little-endian writer/reader for [`CodecStreamingState::save`] / `restore` blobs.
+///
+/// f32 values travel as their exact bits, so a restored state is bit-identical to the saved one.
+mod state_blob {
+    use super::CodecError;
+
+    pub(super) const MAGIC: &[u8; 8] = b"FTCSTATE";
+    pub(super) const VERSION: u32 = 1;
+
+    pub(super) fn put_usize(out: &mut Vec<u8>, value: usize) {
+        out.extend_from_slice(&(value as u64).to_le_bytes());
+    }
+
+    pub(super) fn put_f32s(out: &mut Vec<u8>, values: &[f32]) {
+        put_usize(out, values.len());
+        for value in values {
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+    }
+
+    pub(super) fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8], CodecError> {
+        if input.len() < len {
+            return Err(CodecError::StateBlob {
+                reason: "truncated",
+            });
+        }
+        let (head, rest) = input.split_at(len);
+        *input = rest;
+        Ok(head)
+    }
+
+    pub(super) fn get_usize(input: &mut &[u8]) -> Result<usize, CodecError> {
+        let bytes = take(input, 8)?;
+        usize::try_from(u64::from_le_bytes(bytes.try_into().expect("8 bytes"))).map_err(|_| {
+            CodecError::StateBlob {
+                reason: "count exceeds usize",
+            }
+        })
+    }
+
+    /// Reads a float buffer whose length must be a multiple of `stride` and at most `max`.
+    pub(super) fn get_f32s(
+        input: &mut &[u8],
+        stride: usize,
+        max: usize,
+    ) -> Result<Vec<f32>, CodecError> {
+        let len = get_usize(input)?;
+        if len > max || (stride > 0 && !len.is_multiple_of(stride)) {
+            return Err(CodecError::StateBlob {
+                reason: "buffer length outside this decoder's geometry",
+            });
+        }
+        let bytes = take(
+            input,
+            len.checked_mul(4).ok_or(CodecError::StateBlob {
+                reason: "buffer length overflow",
+            })?,
+        )?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|quad| f32::from_bits(u32::from_le_bytes(*quad)))
+            .collect())
+    }
 }
 
 /// A high-precision codebook materialised from upstream's unnormalised storage.
@@ -383,6 +453,31 @@ impl CodecKvCache {
         self.keys.clear();
         self.values.clear();
         self.positions = 0;
+    }
+
+    fn save(&self, out: &mut Vec<u8>) {
+        state_blob::put_usize(out, self.positions);
+        state_blob::put_f32s(out, &self.keys);
+        state_blob::put_f32s(out, &self.values);
+    }
+
+    fn restore(&mut self, input: &mut &[u8]) -> Result<(), CodecError> {
+        let positions = state_blob::get_usize(input)?;
+        let max = self.capacity * self.width;
+        let keys = state_blob::get_f32s(input, self.width, max)?;
+        let values = state_blob::get_f32s(input, self.width, max)?;
+        if positions > self.capacity
+            || keys.len() != positions * self.width
+            || values.len() != keys.len()
+        {
+            return Err(CodecError::StateBlob {
+                reason: "KV cache positions disagree with its buffers",
+            });
+        }
+        self.positions = positions;
+        self.keys = keys;
+        self.values = values;
+        Ok(())
     }
 
     fn push(&mut self, key: &[f32], value: &[f32]) {
@@ -1303,6 +1398,16 @@ impl CausalConvStream {
     pub fn clear(&mut self) {
         self.history.clear();
     }
+
+    fn save(&self, out: &mut Vec<u8>) {
+        state_blob::put_f32s(out, &self.history);
+    }
+
+    fn restore(&mut self, input: &mut &[u8]) -> Result<(), CodecError> {
+        let max = (self.kernel - 1) * self.dilation * self.input_channels;
+        self.history = state_blob::get_f32s(input, self.input_channels, max)?;
+        Ok(())
+    }
 }
 
 /// Persistent causal right-trimmed ConvTranspose1d state.
@@ -1362,6 +1467,17 @@ impl CausalTransposeConvStream {
     pub fn clear(&mut self) {
         self.history.clear();
         self.columns.clear();
+    }
+
+    /// Saved state excludes `columns`: it is a weight permutation, rebuilt on first use.
+    fn save(&self, out: &mut Vec<u8>) {
+        state_blob::put_f32s(out, &self.history);
+    }
+
+    fn restore(&mut self, input: &mut &[u8]) -> Result<(), CodecError> {
+        let max = ((self.kernel - 1) / self.stride) * self.input_channels;
+        self.history = state_blob::get_f32s(input, self.input_channels, max)?;
+        Ok(())
     }
 
     /// Process a packet and write its finalized output frames to `output`.
@@ -1466,6 +1582,16 @@ impl CausalDepthwiseConvStream {
 
     fn clear(&mut self) {
         self.history.clear();
+    }
+
+    fn save(&self, out: &mut Vec<u8>) {
+        state_blob::put_f32s(out, &self.history);
+    }
+
+    fn restore(&mut self, input: &mut &[u8]) -> Result<(), CodecError> {
+        let max = (self.kernel - 1) * self.channels;
+        self.history = state_blob::get_f32s(input, self.channels, max)?;
+        Ok(())
     }
 
     fn push(
@@ -1884,6 +2010,14 @@ impl CodecConvNextStream {
         self.depthwise.clear();
     }
 
+    fn save(&self, out: &mut Vec<u8>) {
+        self.depthwise.save(out);
+    }
+
+    fn restore(&mut self, input: &mut &[u8]) -> Result<(), CodecError> {
+        self.depthwise.restore(input)
+    }
+
     fn push(
         &mut self,
         input: &[f32],
@@ -1989,6 +2123,16 @@ impl CodecResidualUnitStream {
         self.second_conv.clear();
     }
 
+    fn save(&self, out: &mut Vec<u8>) {
+        self.first_conv.save(out);
+        self.second_conv.save(out);
+    }
+
+    fn restore(&mut self, input: &mut &[u8]) -> Result<(), CodecError> {
+        self.first_conv.restore(input)?;
+        self.second_conv.restore(input)
+    }
+
     fn push(
         &mut self,
         input: &[f32],
@@ -2062,6 +2206,21 @@ impl CodecDecoderBlockStream {
         }
     }
 
+    fn save(&self, out: &mut Vec<u8>) {
+        self.transposed.save(out);
+        for unit in &self.residual_units {
+            unit.save(out);
+        }
+    }
+
+    fn restore(&mut self, input: &mut &[u8]) -> Result<(), CodecError> {
+        self.transposed.restore(input)?;
+        for unit in &mut self.residual_units {
+            unit.restore(input)?;
+        }
+        Ok(())
+    }
+
     fn push(
         &mut self,
         input: &[f32],
@@ -2112,6 +2271,16 @@ impl CodecUpsampleStageStream {
     fn clear(&mut self) {
         self.transposed.clear();
         self.convnext.clear();
+    }
+
+    fn save(&self, out: &mut Vec<u8>) {
+        self.transposed.save(out);
+        self.convnext.save(out);
+    }
+
+    fn restore(&mut self, input: &mut &[u8]) -> Result<(), CodecError> {
+        self.transposed.restore(input)?;
+        self.convnext.restore(input)
     }
 
     fn push(
@@ -2194,6 +2363,97 @@ impl CodecStreamingState {
                 weights.final_conv.dilation,
             ),
         }
+    }
+
+    /// Serializes the decoder's live streaming state — every retained history, the transformer
+    /// KV windows, and the frame counter — as a versioned little-endian blob.
+    ///
+    /// This is the `.ftvoice-cache` payload for an ICL voice's primed codec context: priming
+    /// decodes the whole reference (codec spec §5.3), which costs seconds, and depends only on
+    /// the reference codes, the weights, and the codec route — so it is computed once per voice.
+    /// f32 values are stored as exact bits; [`Self::restore`] reproduces this state bit for bit,
+    /// so decoding after a restore is identical to decoding after the original priming.
+    #[must_use]
+    pub fn save(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(state_blob::MAGIC);
+        out.extend_from_slice(&state_blob::VERSION.to_le_bytes());
+        state_blob::put_usize(&mut out, self.frames_seen);
+        self.pre_conv.save(&mut out);
+        state_blob::put_usize(&mut out, self.transformer_caches.len());
+        for cache in &self.transformer_caches {
+            cache.save(&mut out);
+        }
+        for stage in &self.latent_upsample {
+            stage.save(&mut out);
+        }
+        self.decoder_input.save(&mut out);
+        for block in &self.decoder_blocks {
+            block.save(&mut out);
+        }
+        self.final_conv.save(&mut out);
+        out
+    }
+
+    /// Replaces this state's live contents with a [`Self::save`] blob.
+    ///
+    /// `self` must be a state built for the same decoder ([`Self::new`] / `stream_state`): its
+    /// geometry bounds every buffer the blob may carry. The blob is treated as untrusted — a
+    /// truncated, trailing, foreign-version, or wrongly sized blob is refused, and on refusal the
+    /// state is left cleared rather than half-restored.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::StateBlob`] naming the first violation.
+    pub fn restore(&mut self, blob: &[u8]) -> Result<(), CodecError> {
+        let outcome = self.restore_inner(blob);
+        if outcome.is_err() {
+            self.clear();
+        }
+        outcome
+    }
+
+    fn restore_inner(&mut self, blob: &[u8]) -> Result<(), CodecError> {
+        let mut input = blob;
+        if state_blob::take(&mut input, 8)? != state_blob::MAGIC {
+            return Err(CodecError::StateBlob {
+                reason: "not a codec state blob",
+            });
+        }
+        let version = u32::from_le_bytes(
+            state_blob::take(&mut input, 4)?
+                .try_into()
+                .expect("4 bytes"),
+        );
+        if version != state_blob::VERSION {
+            return Err(CodecError::StateBlob {
+                reason: "unsupported codec state version",
+            });
+        }
+        self.frames_seen = state_blob::get_usize(&mut input)?;
+        self.pre_conv.restore(&mut input)?;
+        if state_blob::get_usize(&mut input)? != self.transformer_caches.len() {
+            return Err(CodecError::StateBlob {
+                reason: "transformer layer count differs",
+            });
+        }
+        for cache in &mut self.transformer_caches {
+            cache.restore(&mut input)?;
+        }
+        for stage in &mut self.latent_upsample {
+            stage.restore(&mut input)?;
+        }
+        self.decoder_input.restore(&mut input)?;
+        for block in &mut self.decoder_blocks {
+            block.restore(&mut input)?;
+        }
+        self.final_conv.restore(&mut input)?;
+        if !input.is_empty() {
+            return Err(CodecError::StateBlob {
+                reason: "trailing bytes",
+            });
+        }
+        Ok(())
     }
 
     /// Reset this state for a fresh utterance without releasing its retained allocations.
@@ -2873,6 +3133,70 @@ mod tests {
             .push(quantizer, &weights, &codes, 2, &mut packet)
             .expect("reset codec stream");
         assert_eq!(packet, waveform);
+
+        // Save/restore (the `.ftvoice-cache` primed-state payload): a state restored from a
+        // saved blob continues bit-identically to the state it was saved from.
+        stream.clear();
+        stream
+            .push(quantizer, &weights, &codes[..2], 1, &mut packet)
+            .expect("priming packet");
+        let blob = stream.save();
+        let mut restored = CodecStreamingState::new(config, &weights);
+        restored
+            .restore(&blob)
+            .expect("a state accepts its own blob");
+        assert_eq!(
+            restored.save(),
+            blob,
+            "restore must reproduce the saved state exactly"
+        );
+        let (mut continued, mut resumed) = (Vec::new(), Vec::new());
+        stream
+            .push(quantizer, &weights, &codes[2..], 1, &mut continued)
+            .expect("continuation");
+        restored
+            .push(quantizer, &weights, &codes[2..], 1, &mut resumed)
+            .expect("restored continuation");
+        assert_eq!(
+            continued.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            resumed.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(continued, waveform[1_920..]);
+
+        // Untrusted blobs: truncation, trailing bytes, a foreign magic, and an impossible buffer
+        // length are refused, and a refused restore leaves the state cleared, not half-written.
+        let mut trailing = blob.clone();
+        trailing.push(0);
+        let mut foreign = blob.clone();
+        foreign[0] ^= 0xff;
+        let mut oversized = blob.clone();
+        // frames_seen (8) + pre_conv history length lives right after magic (8) + version (4).
+        oversized[20..28].copy_from_slice(&u64::MAX.to_le_bytes());
+        for hostile in [
+            &blob[..blob.len() - 1],
+            &trailing[..],
+            &foreign[..],
+            &oversized[..],
+        ] {
+            let mut target = CodecStreamingState::new(config, &weights);
+            target.restore(&blob).expect("valid blob");
+            assert!(matches!(
+                target.restore(hostile),
+                Err(CodecError::StateBlob { .. })
+            ));
+            let mut fresh = CodecStreamingState::new(config, &weights);
+            let (mut from_target, mut from_fresh) = (Vec::new(), Vec::new());
+            target
+                .push(quantizer, &weights, &codes[..2], 1, &mut from_target)
+                .expect("cleared state decodes");
+            fresh
+                .push(quantizer, &weights, &codes[..2], 1, &mut from_fresh)
+                .expect("fresh state decodes");
+            assert_eq!(
+                from_target, from_fresh,
+                "a refused restore must leave a clear state"
+            );
+        }
     }
 
     #[test]

@@ -2298,6 +2298,19 @@ fn synthesize_inner(
     // unbounded audio tail, and every accepted frame is still drained exactly once.
     let preparer = PreparedPassThrough { prepared };
     let frame_queue_capacity = codec_queue_capacity(packet_frames);
+    // Codec spec §5.3: the reference's ICL decode runs the codec over `reference ++ generated`
+    // codes and cuts the reference's samples, so generated audio is decoded from a codec state
+    // conditioned on the reference (its transformer's information horizon is 568 frames).
+    // Priming the streaming state with the reference codes IS that decode on this causal
+    // decoder — bit-exact, pinned by the `icl_prefix_decode` conformance gate — and without it
+    // every ICL utterance started from a cold codec instead of the reference voice's state.
+    let icl_reference: Option<(Vec<i32>, usize)> = match voice {
+        VoiceConditioning::Icl { codec_codes, .. } => Some((
+            codec_codes.iter().map(|&code| i32::from(code)).collect(),
+            codec_codes.len() / ftts_model_qwen::codec::CODEC_GROUPS,
+        )),
+        VoiceConditioning::XVector(_) => None,
+    };
     let codec_user_initiated_qos = codec_user_initiated_qos_enabled();
     let (frame_tx, frame_rx) =
         std::sync::mpsc::sync_channel::<ftts_core::CodeFrame>(frame_queue_capacity);
@@ -2322,6 +2335,14 @@ fn synthesize_inner(
                 // it fans out on its own codec team where spare cores exist (serially otherwise).
                 ftts_kernels::team::use_codec_team_on_this_thread();
                 let mut state = codec.stream_state();
+                let mut codec_active = Duration::ZERO;
+                // Primed here, on the codec worker, so the reference decode overlaps the
+                // generator's prefill instead of delaying it.
+                if let Some((codes, frames)) = icl_reference.as_ref().filter(|(_, n)| *n > 0) {
+                    let priming_started = Instant::now();
+                    prime_icl_codec_state(codec, &mut state, codes, *frames)?;
+                    codec_active += priming_started.elapsed();
+                }
                 let mut pcm = Vec::new();
                 // `stream_push` REPLACES its output buffer with one packet's samples (see the
                 // streaming==offline test), so packets decode into a scratch and append here.
@@ -2330,7 +2351,6 @@ fn synthesize_inner(
                 let mut buffered_frames = 0_usize;
                 let mut first_audio_at: Option<std::time::Duration> = None;
                 let mut first_audible_at: Option<std::time::Duration> = None;
-                let mut codec_active = Duration::ZERO;
                 // One decoded packet leaves the worker: live delivery first (a blocking or
                 // failing sink is the flow-control/abort contract on `PcmPacketSink`), then
                 // the whole-utterance buffer, then the TTFA marks — so with a sink attached
@@ -2529,6 +2549,162 @@ fn codec_packet_code_capacity(packet_frames: usize) -> Result<usize, FttsError> 
     }
     // Safe because the accepted bound is far below usize::MAX / 16 on every target.
     Ok(packet_frames * 16)
+}
+
+/// The codec stream-state ABI this build writes into `.ftvoice-cache` primed-state blobs. Bump it
+/// whenever streaming-state semantics change in a way the numerics probe could miss.
+const ICL_CODEC_STATE_ABI: u32 = 1;
+
+/// The `.ftvoice-cache` blob holding an ICL voice's primed codec state.
+const ICL_CODEC_STATE_BLOB: &str = "codec_primed_state";
+
+/// Primes `state` with an ICL reference (codec spec §5.3), from the per-voice cache when valid.
+///
+/// Priming decodes the entire reference — seconds of codec work (≈37 s for a 17 s reference on a
+/// 4-vCPU x86 host; the dominant ICL time-to-first-audio term). Its result depends only on the
+/// reference codes, the codec weights, and the codec's numerics route, so it is computed once per
+/// voice and kept as a derived `.ftvoice-cache` under `~/.cache/franken_tts/voice-cache/`, keyed
+/// by: the reference codes' digest, a numerics fingerprint (the PCM of a fixed one-frame probe
+/// decoded from a fresh state — it moves with the weights and with every route, env, and platform
+/// choice that affects codec arithmetic), this build's version, and [`ICL_CODEC_STATE_ABI`]. A
+/// restored state is bit-identical to a freshly primed one (`CodecStreamingState::restore`), so
+/// the cache changes time, never audio. Any miss, mismatch, or I/O failure falls back to priming;
+/// writes are atomic and best-effort. `FTTS_VOICE_CACHE=0` disables both reading and writing.
+fn prime_icl_codec_state(
+    codec: &CodecCheckpoint,
+    state: &mut ftts_model_qwen::codec::CodecStreamingState,
+    codes: &[i32],
+    frames: usize,
+) -> Result<(), FttsError> {
+    let cache = icl_codec_cache_path(codec, codes)?;
+    if let Some((path, key)) = &cache
+        && restore_icl_codec_state(path, key, state)
+    {
+        return Ok(());
+    }
+    codec
+        .stream_prime_reference(state, codes, frames)
+        .map_err(checkpoint_error)?;
+    if let Some((path, key)) = cache {
+        store_icl_codec_state(&path, &key, state);
+    }
+    Ok(())
+}
+
+/// The cache file and key for one reference on this codec, or `None` when caching is disabled
+/// or there is no cache directory.
+fn icl_codec_cache_path(
+    codec: &CodecCheckpoint,
+    codes: &[i32],
+) -> Result<Option<(PathBuf, ftts_artifacts::voice::FtVoiceCacheKey)>, FttsError> {
+    use ftts_artifacts::sha256::{digest, hex_digest};
+    if matches!(
+        std::env::var("FTTS_VOICE_CACHE").as_deref(),
+        Ok("0" | "off" | "false")
+    ) {
+        return Ok(None);
+    }
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return Ok(None);
+    };
+    // Numerics fingerprint: one all-zero frame through a fresh state.
+    let mut probe = codec.stream_state();
+    let mut pcm = Vec::new();
+    codec
+        .stream_push(
+            &mut probe,
+            &[0; ftts_model_qwen::codec::CODEC_GROUPS],
+            1,
+            &mut pcm,
+        )
+        .map_err(checkpoint_error)?;
+    let pcm_bytes: Vec<u8> = pcm.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+    let code_bytes: Vec<u8> = codes.iter().flat_map(|c| c.to_le_bytes()).collect();
+    let codes_sha256 = hex_digest(&digest(&code_bytes));
+    let key = ftts_artifacts::voice::FtVoiceCacheKey {
+        voice_recipe_hash: codes_sha256.clone(),
+        model_hash: hex_digest(&digest(&pcm_bytes)),
+        prompt_builder_version: 0,
+        streaming_mode: "streaming".to_owned(),
+        quant_recipe: format!("codec-primed-state/ftts-{}", env!("CARGO_PKG_VERSION")),
+        math_mode: if ftts_kernels::f32ref::canonical_norm_requested() {
+            "canonical".to_owned()
+        } else {
+            "default".to_owned()
+        },
+        engine_abi: ICL_CODEC_STATE_ABI,
+        language_id: String::new(),
+        speaker_embed_sha256: String::new(),
+        ref_transcript_tokens_sha256: None,
+        ref_codec_codes_sha256: Some(codes_sha256),
+    };
+    let path = PathBuf::from(home)
+        .join(".cache/franken_tts/voice-cache")
+        .join(format!("{}.ftvoice-cache", key.cache_key()));
+    Ok(Some((path, key)))
+}
+
+/// Restores a cached primed state; `false` (state untouched or cleared) on any mismatch.
+fn restore_icl_codec_state(
+    path: &Path,
+    key: &ftts_artifacts::voice::FtVoiceCacheKey,
+    state: &mut ftts_model_qwen::codec::CodecStreamingState,
+) -> bool {
+    // A primed state is a few MB; anything far larger at this path is not ours.
+    const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() > MAX_CACHE_BYTES {
+        return false;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(cache) = ftts_artifacts::voice::parse_ftvoice_cache(&bytes) else {
+        return false;
+    };
+    if cache.key != *key {
+        return false;
+    }
+    let Some(blob) = cache.blobs.get(ICL_CODEC_STATE_BLOB) else {
+        return false;
+    };
+    state.restore(blob).is_ok()
+}
+
+/// Writes the primed state atomically (temp file + rename), owner-only; failures are ignored.
+fn store_icl_codec_state(
+    path: &Path,
+    key: &ftts_artifacts::voice::FtVoiceCacheKey,
+    state: &ftts_model_qwen::codec::CodecStreamingState,
+) {
+    let mut blobs = std::collections::BTreeMap::new();
+    blobs.insert(ICL_CODEC_STATE_BLOB.to_owned(), state.save());
+    let Ok(bytes) = ftts_artifacts::voice::serialize_ftvoice_cache(key, &blobs) else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let staging = path.with_extension(format!("tmp{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Derived from the reference recording: as private as the voice pack itself.
+        options.mode(0o600);
+    }
+    let written = options
+        .open(&staging)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes));
+    if written.is_err() || fs::rename(&staging, path).is_err() {
+        let _ = fs::remove_file(&staging);
+    }
 }
 
 /// Frame queue between generation and the concurrent codec worker: one codec packet by default.

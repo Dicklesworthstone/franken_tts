@@ -176,3 +176,56 @@ fn a_cloned_primed_state_serves_repeated_utterances_identically() {
          \"outcome\":\"passed\",\"utterances\":2}}"
     );
 }
+
+#[test]
+fn a_saved_and_restored_primed_state_decodes_bit_identically() {
+    let Some(path) = checkpoint_path() else {
+        eprintln!(
+            "receipt: {{\"test\":\"icl_prefix_decode\",\"outcome\":\"skipped\",\
+             \"reason\":\"speech_tokenizer checkpoint unavailable\"}}"
+        );
+        return;
+    };
+    let checkpoint = CodecCheckpoint::load(&path).expect("codec checkpoint loads");
+
+    // The on-disk `.ftvoice-cache` form of the snapshot above: `say` persists the primed state
+    // with `save()` and later runs `restore()` it into a fresh state instead of re-decoding the
+    // reference. The restored decode must equal the primed one to the bit.
+    let reference = synthetic_codes(REFERENCE_FRAMES, 0x0BAD_C0DE_D00D_FEED);
+    let mut primed = checkpoint.stream_state();
+    checkpoint
+        .stream_prime_reference(&mut primed, &reference, REFERENCE_FRAMES)
+        .expect("prime");
+    let blob = primed.save();
+
+    let mut restored = checkpoint.stream_state();
+    restored
+        .restore(&blob)
+        .expect("a fresh state accepts the primed blob");
+    assert_eq!(restored.save(), blob, "restore reproduces the saved state");
+
+    let generated = synthetic_codes(GENERATED_FRAMES, 0x9999_AAAA_BBBB_CCCC);
+    let (mut primed_pcm, mut restored_pcm) = (Vec::new(), Vec::new());
+    checkpoint
+        .stream_push(&mut primed, &generated, GENERATED_FRAMES, &mut primed_pcm)
+        .expect("push from primed");
+    checkpoint
+        .stream_push(
+            &mut restored,
+            &generated,
+            GENERATED_FRAMES,
+            &mut restored_pcm,
+        )
+        .expect("push from restored");
+    assert_eq!(primed_pcm.len(), restored_pcm.len(), "sample counts");
+    let divergence = first_divergence(&primed_pcm, &restored_pcm);
+    assert_eq!(
+        divergence, None,
+        "restored decode diverged at {divergence:?}"
+    );
+    eprintln!(
+        "receipt: {{\"test\":\"icl_prefix_decode\",\"case\":\"save_restore\",\
+         \"outcome\":\"passed\",\"blob_bytes\":{}}}",
+        blob.len()
+    );
+}
