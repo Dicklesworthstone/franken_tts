@@ -93,6 +93,8 @@ cargo fuzz run safetensors_parser -- -max_total_time=300
 cargo fuzz run fttsq_parser -- -max_total_time=300
 cargo fuzz run tokenizer_metadata -- -max_total_time=300
 cargo fuzz run tokenizer_text -- -max_total_time=300
+cargo fuzz run ftvoice_parser -- -max_total_time=300
+cargo fuzz run ftvoice_cache_parser -- -max_total_time=300
 ```
 
 Run those commands from `fuzz/`; a crash artifact is retained under `fuzz/artifacts/` (ignored

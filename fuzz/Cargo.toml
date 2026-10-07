@@ -40,5 +40,19 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ftvoice_parser"
+path = "fuzz_targets/ftvoice_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ftvoice_cache_parser"
+path = "fuzz_targets/ftvoice_cache_parser.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
