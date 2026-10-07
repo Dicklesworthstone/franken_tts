@@ -727,6 +727,45 @@ fn dot4_i32(x: &[i8], weights: &[i8], tier: Int8Tier) -> [i32; 4] {
     }
 }
 
+/// Rows per register-blocked batch tile for `tier`, or `None` where the four-column GEMV kernel
+/// runs per row instead.
+fn batch_tile_rows(tier: Int8Tier) -> Option<usize> {
+    #[cfg(all(target_arch = "x86_64", feature = "x86-int8"))]
+    {
+        x86_int8::batch_tile_rows(tier)
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "x86-int8")))]
+    {
+        let _ = tier;
+        None
+    }
+}
+
+/// Exact `Σ w` of each of four consecutive `k`-byte weight rows (the U8S8 fold's correction).
+fn weight_sums4(weights: &[i8], k: usize) -> [i32; 4] {
+    std::array::from_fn(|lane| {
+        weights[lane * k..(lane + 1) * k]
+            .iter()
+            .map(|&w| i32::from(w))
+            .sum()
+    })
+}
+
+/// Exact i32 dots of `rows` activation rows (`x_rows`, `rows * k` bytes) against four weight rows,
+/// for a tier with [`batch_tile_rows`]; entries past `rows` are zero. `sums` must be
+/// [`weight_sums4`] of `weights`.
+fn dot_tile_i32(x_rows: &[i8], weights: &[i8], sums: [i32; 4], tier: Int8Tier) -> [[i32; 4]; 4] {
+    #[cfg(all(target_arch = "x86_64", feature = "x86-int8"))]
+    {
+        x86_int8::dot_tile_i32(x_rows, weights, sums, tier)
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "x86-int8")))]
+    {
+        let _ = (x_rows, weights, sums);
+        panic!("{} has no batch tile on this build", tier.as_str());
+    }
+}
+
 /// Computes output columns `start..end` of a W8A8 linear, writing through `out`.
 ///
 /// The single loop nest the serial [`linear_q8`] and the team's column partitions share, so the
@@ -764,9 +803,26 @@ pub(crate) unsafe fn linear_q8_columns(
     };
     let mut col = columns.start;
     if tier.has_blocked_kernel() {
+        let tile_rows = batch_tile_rows(tier).filter(|&rows| m >= rows);
         while col + 4 <= columns.end {
             let block = &w_data[col * k..(col + 4) * k];
-            for row in 0..m {
+            let mut row = 0;
+            // Batched calls (prefill) take the register-blocked row×4 tile: each weight byte loaded
+            // once per tile of rows instead of once per row, and the U8S8 fold's weight sums
+            // computed once per column block instead of once per row.
+            if let Some(rows) = tile_rows {
+                let sums = weight_sums4(block, k);
+                while row + rows <= m {
+                    let tile = dot_tile_i32(&x_q[row * k..(row + rows) * k], block, sums, tier);
+                    for (offset, acc) in tile.iter().take(rows).enumerate() {
+                        for (lane, &value) in acc.iter().enumerate() {
+                            write(row + offset, col + lane, value);
+                        }
+                    }
+                    row += rows;
+                }
+            }
+            for row in row..m {
                 let acc = dot4_i32(&x_q[row * k..(row + 1) * k], block, tier);
                 for (lane, &value) in acc.iter().enumerate() {
                     write(row, col + lane, value);
@@ -1237,6 +1293,41 @@ mod x86_int8 {
         }
     }
 
+    /// Rows per batch tile: four on AVX-512 VNNI (16 zmm accumulators). AVX-VNNI and AVX2 keep
+    /// the four-column kernel per row: a 256-bit tile was not executed on any host available when
+    /// this landed, and an unexercised kernel does not ship.
+    pub fn batch_tile_rows(tier: Int8Tier) -> Option<usize> {
+        match tier {
+            Int8Tier::X86Avx512Vnni => Some(4),
+            _ => None,
+        }
+    }
+
+    /// Exact i32 dots of `R` activation rows against four weight rows, `R` from
+    /// [`batch_tile_rows`]; `sums[c]` is `Σ w` of weight row `c` over all `k` bytes. Rows past `R`
+    /// stay zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tier has no batch tile, the CPU lacks its feature, or the slice lengths
+    /// disagree with `R * k` / `4 * k`.
+    #[must_use]
+    pub fn dot_tile_i32(
+        x_rows: &[i8],
+        weights: &[i8],
+        sums: [i32; 4],
+        tier: Int8Tier,
+    ) -> [[i32; 4]; 4] {
+        let rows = batch_tile_rows(tier).expect("tier has a batch tile");
+        assert_eq!(weights.len() % 4, 0, "four whole weight rows");
+        let k = weights.len() / 4;
+        assert_eq!(x_rows.len(), rows * k, "activation tile shape");
+        assert_executable(tier);
+        // SAFETY: the only tier with a batch tile is AVX-512 VNNI, whose features were confirmed
+        // just above; shapes asserted above.
+        unsafe { tile4x4_avx512_vnni(x_rows, weights, k, sums) }
+    }
+
     /// Horizontal i32 sum of eight lanes (wrapping, hence exact modulo 2³²).
     #[target_feature(enable = "avx2")]
     fn hsum_256(v: __m256i) -> i32 {
@@ -1417,6 +1508,72 @@ mod x86_int8 {
             *value = hsum_256(folded[lane])
                 .wrapping_sub(hsum_256(sums[lane]).wrapping_mul(128))
                 .wrapping_add(scalar_tail(x, row, index));
+        }
+        out
+    }
+
+    /// The 4×4 AVX-512 VNNI batch tile: sixteen zmm accumulators of `Σ (x+128)·w`, masked tail,
+    /// then `− 128·Σw` with the precomputed full-row sums (masked-off lanes load zero weights and
+    /// so add nothing).
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX-512F/BW/VNNI, `x_rows.len() == 4 * k`, `weights.len() == 4 * k`.
+    // SAFETY: the sole caller is `dot_tile_i32` (feature and shapes asserted there).
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    unsafe fn tile4x4_avx512_vnni(
+        x_rows: &[i8],
+        weights: &[i8],
+        k: usize,
+        sums: [i32; 4],
+    ) -> [[i32; 4]; 4] {
+        let (x_ptr, w_ptr) = (x_rows.as_ptr(), weights.as_ptr());
+        let flip = _mm512_set1_epi8(i8::MIN);
+        let mut acc = [[_mm512_setzero_si512(); 4]; 4];
+        let mut index = 0_usize;
+        while index < k {
+            let remaining = k - index;
+            let (w, x): ([__m512i; 4], [__m512i; 4]) = if remaining >= 64 {
+                // SAFETY: `index + 64 <= k` keeps every load inside its `k`-byte row.
+                unsafe {
+                    (
+                        std::array::from_fn(|lane| {
+                            _mm512_loadu_si512(w_ptr.add(lane * k + index).cast())
+                        }),
+                        std::array::from_fn(|row| {
+                            _mm512_loadu_si512(x_ptr.add(row * k + index).cast())
+                        }),
+                    )
+                }
+            } else {
+                let mask = tail_mask(remaining);
+                // SAFETY: `index < k`, and the masked loads read only the `remaining` enabled
+                // bytes of each row, all in bounds.
+                unsafe {
+                    (
+                        std::array::from_fn(|lane| {
+                            _mm512_maskz_loadu_epi8(mask, w_ptr.add(lane * k + index))
+                        }),
+                        std::array::from_fn(|row| {
+                            _mm512_maskz_loadu_epi8(mask, x_ptr.add(row * k + index))
+                        }),
+                    )
+                }
+            };
+            for (row, row_acc) in acc.iter_mut().enumerate() {
+                let biased = _mm512_xor_si512(x[row], flip);
+                for (lane, slot) in row_acc.iter_mut().enumerate() {
+                    *slot = _mm512_dpbusd_epi32(*slot, biased, w[lane]);
+                }
+            }
+            index += remaining.min(64);
+        }
+        let mut out = [[0_i32; 4]; 4];
+        for (row, row_out) in out.iter_mut().enumerate() {
+            for (lane, value) in row_out.iter_mut().enumerate() {
+                *value = _mm512_reduce_add_epi32(acc[row][lane])
+                    .wrapping_sub(sums[lane].wrapping_mul(128));
+            }
         }
         out
     }
@@ -1793,6 +1950,10 @@ mod tests {
             (2, 4, 17),
             (16, 9, 3072),
             (1, 1, 63),
+            // Batch tiles with row remainders (m % 4, m % 2) and k tails past the last vector.
+            (7, 8, 200),
+            (9, 12, 77),
+            (290, 8, 1024),
         ] {
             let x_q = pseudo_random_q8(m * k, 0xb10c ^ k as u64);
             let x_scales: Vec<f32> = (0..m).map(|r| 0.01 + r as f32 * 0.003).collect();

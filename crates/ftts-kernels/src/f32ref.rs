@@ -1706,11 +1706,17 @@ pub(crate) unsafe fn gqa_attention_head_range_into(
                 let kv_head = q_head / kv_group;
                 let query_base = (query_position * q_heads + q_head) * head_dim;
                 let query = &queries[query_base..query_base + head_dim];
-                for (key_position, score) in scores.iter_mut().enumerate() {
-                    let key_base = (key_position * kv_heads + kv_head) * head_dim;
-                    let key = &keys[key_base..key_base + head_dim];
-                    let dot = dot_with_accumulation(query, key, accumulation);
-                    *score = dot * scale + mask[key_position];
+                if scalar_order(accumulation) {
+                    attention_scores_interleaved(
+                        query, keys, kv_head, kv_heads, head_dim, scale, mask, scores,
+                    );
+                } else {
+                    for (key_position, score) in scores.iter_mut().enumerate() {
+                        let key_base = (key_position * kv_heads + kv_head) * head_dim;
+                        let key = &keys[key_base..key_base + head_dim];
+                        let dot = dot_with_accumulation(query, key, accumulation);
+                        *score = dot * scale + mask[key_position];
+                    }
                 }
                 softmax_rows_with_arithmetic(scores, 1, key_positions, softmax_arithmetic);
 
@@ -1846,7 +1852,117 @@ fn accelerate_gqa_attention(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Whether `accumulation` reduces in the plain left-to-right scalar order (the `Accelerate*`
+/// requests degrade to it off Apple, and on Apple only the dense routes reach BLAS).
+fn scalar_order(accumulation: F32LinearAccumulation) -> bool {
+    matches!(
+        accumulation,
+        F32LinearAccumulation::Scalar
+            | F32LinearAccumulation::Accelerate
+            | F32LinearAccumulation::AccelerateRowInvariant
+            | F32LinearAccumulation::AccelerateBiasSeeded
+            | F32LinearAccumulation::AccelerateBiasSeededRowInvariant
+    )
+}
+
+/// One query head's scores against every key, sixteen keys at a time:
+/// `scores[j] = (Σ_i q[i]·key_j[i]) * scale + mask[j]`, each dot summed over ascending `i` from
+/// `0.0` — exactly [`dot_with_accumulation`]'s scalar order. Interleaving keys gives the core
+/// sixteen independent add chains instead of one: the per-key dot is a 128-term dependent chain,
+/// and running them one after another was latency-bound (prefill attention dominated ICL
+/// time-to-first-audio). Every score's operation sequence is unchanged, so this is bit-identical.
+#[allow(clippy::too_many_arguments)]
+fn attention_scores_interleaved(
+    query: &[f32],
+    keys: &[f32],
+    kv_head: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    mask: &[f32],
+    scores: &mut [f32],
+) {
+    const BLOCK: usize = 16;
+    let key_row = |position: usize| {
+        let base = (position * kv_heads + kv_head) * head_dim;
+        &keys[base..base + head_dim]
+    };
+    let mut start = 0;
+    while start + BLOCK <= scores.len() {
+        let rows: [&[f32]; BLOCK] = std::array::from_fn(|lane| key_row(start + lane));
+        let mut acc = [0.0_f32; BLOCK];
+        for (index, &q) in query.iter().enumerate() {
+            for (slot, row) in acc.iter_mut().zip(&rows) {
+                *slot += q * row[index];
+            }
+        }
+        for (lane, &dot) in acc.iter().enumerate() {
+            scores[start + lane] = dot * scale + mask[start + lane];
+        }
+        start += BLOCK;
+    }
+    for position in start..scores.len() {
+        let mut dot = 0.0_f32;
+        for (&q, &k) in query.iter().zip(key_row(position)) {
+            dot += q * k;
+        }
+        scores[position] = dot * scale + mask[position];
+    }
+}
+
 fn attention_weighted_sum(
+    scores: &[f32],
+    values: &[f32],
+    kv_head: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    accumulation: F32LinearAccumulation,
+    out: &mut [f32],
+) {
+    if scalar_order(accumulation) {
+        // Key-outer, lane-inner: each lane still accumulates `weight * value` over ascending
+        // keys from `0.0` (then `0.0 + acc`, as the lane-outer form ends) — the same sequence per
+        // output element — but the head_dim lanes advance together over one contiguous value
+        // row, instead of one latency-bound chain per lane walking a strided column.
+        let mut acc = [0.0_f32; 256];
+        let lanes = if head_dim <= acc.len() {
+            &mut acc[..head_dim]
+        } else {
+            return attention_weighted_sum_lane_major(
+                scores,
+                values,
+                kv_head,
+                kv_heads,
+                head_dim,
+                accumulation,
+                out,
+            );
+        };
+        for (key_position, &weight) in scores.iter().enumerate() {
+            let base = (key_position * kv_heads + kv_head) * head_dim;
+            for (slot, &value) in lanes.iter_mut().zip(&values[base..base + head_dim]) {
+                *slot += weight * value;
+            }
+        }
+        for (slot, &sum) in out.iter_mut().zip(lanes.iter()) {
+            *slot = 0.0 + sum;
+        }
+        return;
+    }
+    attention_weighted_sum_lane_major(
+        scores,
+        values,
+        kv_head,
+        kv_heads,
+        head_dim,
+        accumulation,
+        out,
+    );
+}
+
+/// The lane-outer weighted sum: the forensic reduction orders, and any head wider than the
+/// key-outer form's stack accumulator.
+fn attention_weighted_sum_lane_major(
     scores: &[f32],
     values: &[f32],
     kv_head: usize,
@@ -1967,6 +2083,105 @@ pub fn apply_rope_in_place(row: &mut [f32], cos: &[f32], sin: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interleaved_attention_is_bit_identical_to_the_per_key_scalar_order() {
+        // The pre-interleave arithmetic, spelled out: one scalar dot per key, then the softmax,
+        // then the lane-outer weighted sum. The shipped kernel must reproduce it to the bit at
+        // talker GQA geometry (16 Q / 8 KV / 128), under a causal mask with -inf, across key
+        // counts that leave every 16-key block remainder, prefill and decode shapes alike.
+        let mut state = 0xA77E_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        };
+        let (q_heads, kv_heads, head_dim) = (16, 8, 128);
+        for &(query_positions, key_positions) in
+            &[(1_usize, 1_usize), (1, 37), (5, 5), (17, 33), (3, 300)]
+        {
+            let queries: Vec<f32> = (0..query_positions * q_heads * head_dim)
+                .map(|_| next())
+                .collect();
+            let keys: Vec<f32> = (0..key_positions * kv_heads * head_dim)
+                .map(|_| next())
+                .collect();
+            let values: Vec<f32> = (0..key_positions * kv_heads * head_dim)
+                .map(|_| next())
+                .collect();
+            let past = key_positions - query_positions;
+            let mask: Vec<f32> = (0..query_positions * key_positions)
+                .map(|i| {
+                    let (query, key) = (i / key_positions, i % key_positions);
+                    if key <= past + query {
+                        0.0
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+                .collect();
+            for softmax in [
+                F32SoftmaxArithmetic::ReciprocalMultiply,
+                F32SoftmaxArithmetic::Canonical,
+            ] {
+                let mut expected = vec![0.0_f32; query_positions * q_heads * head_dim];
+                let scale = (head_dim as f32).sqrt().recip();
+                let mut scores = vec![0.0_f32; key_positions];
+                for query_position in 0..query_positions {
+                    let row_mask =
+                        &mask[query_position * key_positions..(query_position + 1) * key_positions];
+                    for q_head in 0..q_heads {
+                        let kv_head = q_head / (q_heads / kv_heads);
+                        let base = (query_position * q_heads + q_head) * head_dim;
+                        let query = &queries[base..base + head_dim];
+                        for (key_position, score) in scores.iter_mut().enumerate() {
+                            let key_base = (key_position * kv_heads + kv_head) * head_dim;
+                            let dot = dot_with_accumulation(
+                                query,
+                                &keys[key_base..key_base + head_dim],
+                                F32LinearAccumulation::Scalar,
+                            );
+                            *score = dot * scale + row_mask[key_position];
+                        }
+                        softmax_rows_with_arithmetic(&mut scores, 1, key_positions, softmax);
+                        attention_weighted_sum_lane_major(
+                            &scores,
+                            &values,
+                            kv_head,
+                            kv_heads,
+                            head_dim,
+                            F32LinearAccumulation::Scalar,
+                            &mut expected[base..base + head_dim],
+                        );
+                    }
+                }
+                let mut actual = vec![0.0_f32; query_positions * q_heads * head_dim];
+                gqa_attention_head_range_with_arithmetic(
+                    &queries,
+                    &keys,
+                    &values,
+                    &mask,
+                    query_positions,
+                    key_positions,
+                    q_heads,
+                    kv_heads,
+                    head_dim,
+                    softmax,
+                    F32LinearAccumulation::Scalar,
+                    0..q_heads,
+                    &mut actual,
+                );
+                for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        e.to_bits(),
+                        "q={query_positions} k={key_positions} {softmax:?} element {index}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn interleaved_gemv_is_bit_identical_to_the_per_column_scalar_dot() {
