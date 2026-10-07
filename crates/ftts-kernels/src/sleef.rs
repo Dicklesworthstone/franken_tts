@@ -260,6 +260,7 @@ mod x86_snake {
     /// # Safety
     ///
     /// The CPU must support AVX2 and FMA.
+    // SAFETY: the sole caller, `snake_beta_frame_major`, detects AVX2 and FMA first.
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn avx2_fma(values: &mut [f32], alpha: &[f32], scale: &[f32]) {
         super::snake_beta_rows(values, alpha, scale);
@@ -268,6 +269,7 @@ mod x86_snake {
     /// # Safety
     ///
     /// The CPU must support AVX-512F (and FMA, which every AVX-512F part has).
+    // SAFETY: the sole caller, `snake_beta_frame_major`, detects AVX-512F first.
     #[target_feature(enable = "avx512f,fma")]
     pub(super) unsafe fn avx512(values: &mut [f32], alpha: &[f32], scale: &[f32]) {
         super::snake_beta_rows(values, alpha, scale);

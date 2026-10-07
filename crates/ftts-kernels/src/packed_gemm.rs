@@ -303,6 +303,7 @@ trait Tile {
     // The GEMM tile contract itself (operands, tile origin and height, shape); see
     // `linear_packed_range` for why it is not bundled into a struct.
     #[allow(clippy::too_many_arguments)]
+    // SAFETY: a trait declaration; `range_impl`, the only caller, discharges the contract above.
     unsafe fn accumulate(
         x: &[f32],
         panel: &[f32],
@@ -322,6 +323,7 @@ impl Tile for PortableTile {
     const ROWS: usize = MR;
     const COLS: usize = NR;
 
+    // SAFETY: plain Rust under the trait contract; there is no CPU-feature precondition.
     unsafe fn accumulate(
         x: &[f32],
         panel: &[f32],
@@ -332,11 +334,12 @@ impl Tile for PortableTile {
         k: usize,
         n: usize,
     ) {
-        // SAFETY (both arms): the trait contract covers exactly these rows and columns.
         if rows == MR {
+            // SAFETY: the trait contract covers exactly these rows and columns.
             unsafe { accumulate_tile::<MR, NR>(x, panel, out, i0, j0, k, n) };
         } else {
             for row in i0..i0 + rows {
+                // SAFETY: `row` is one of the `rows` the trait contract covers.
                 unsafe { accumulate_tile::<1, NR>(x, panel, out, row, j0, k, n) };
             }
         }
@@ -377,6 +380,7 @@ mod x86 {
         const ROWS: usize = 8;
         const COLS: usize = 32;
 
+        // SAFETY: the trait contract, including AVX-512F, holds on entry (see `range_impl`).
         unsafe fn accumulate(
             x: &[f32],
             panel: &[f32],
@@ -387,7 +391,8 @@ mod x86 {
             k: usize,
             n: usize,
         ) {
-            // SAFETY (every arm): the trait contract — rows/columns in bounds, AVX-512F present.
+            // SAFETY: every arm runs under the trait contract — rows/columns in bounds, AVX-512F
+            // present — with `ROWS` equal to the requested height.
             unsafe {
                 match rows {
                     8 => tile_avx512::<8>(x, panel, out, i0, j0, k, n),
@@ -410,6 +415,7 @@ mod x86 {
         const ROWS: usize = 6;
         const COLS: usize = 16;
 
+        // SAFETY: the trait contract, including AVX2, holds on entry (see `range_impl`).
         unsafe fn accumulate(
             x: &[f32],
             panel: &[f32],
@@ -420,7 +426,8 @@ mod x86 {
             k: usize,
             n: usize,
         ) {
-            // SAFETY (every arm): the trait contract — rows/columns in bounds, AVX2 present.
+            // SAFETY: every arm runs under the trait contract — rows/columns in bounds, AVX2
+            // present — with `ROWS` equal to the requested height.
             unsafe {
                 match rows {
                     6 => tile_avx2::<6>(x, panel, out, i0, j0, k, n),
@@ -438,6 +445,7 @@ mod x86 {
     ///
     /// AVX-512F must be present; `panel.len() >= k * 32`; `x` holds rows `i0..i0 + ROWS` of
     /// length `k`; `out` is writable over those rows and columns `j0..j0 + 32` of `[m, n]`.
+    // SAFETY: called only from `Avx512Tile::accumulate`, under its trait contract.
     #[target_feature(enable = "avx512f")]
     unsafe fn tile_avx512<const ROWS: usize>(
         x: &[f32],
@@ -486,6 +494,7 @@ mod x86 {
     ///
     /// AVX2 must be present; `panel.len() >= k * 16`; `x` holds rows `i0..i0 + ROWS` of length
     /// `k`; `out` is writable over those rows and columns `j0..j0 + 16` of `[m, n]`.
+    // SAFETY: called only from `Avx2Tile::accumulate`, under its trait contract.
     #[target_feature(enable = "avx2")]
     unsafe fn tile_avx2<const ROWS: usize>(
         x: &[f32],
@@ -549,6 +558,8 @@ thread_local! {
 ///
 /// The [`linear_packed_range`] buffer contract, plus `T`'s CPU-feature precondition.
 #[allow(clippy::too_many_arguments)]
+// SAFETY: called only from `linear_packed_range_at`, which forwards its own buffer contract and
+// selects `T` only after confirming that tile's CPU features.
 unsafe fn range_impl<T: Tile>(
     x: &[f32],
     weight: &[f32],

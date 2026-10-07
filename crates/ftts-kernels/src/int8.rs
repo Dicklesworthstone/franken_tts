@@ -740,6 +740,8 @@ fn dot4_i32(x: &[i8], weights: &[i8], tier: Int8Tier) -> [i32; 4] {
 /// `out` must be valid for writes of `m * n` f32 elements for the duration of the call, and no
 /// other live reference may alias the `[row * n + col]` cells for `col` in `start..end`.
 #[allow(clippy::too_many_arguments)]
+// SAFETY: both callers discharge the contract above — `linear_q8` passes its exclusively borrowed
+// `m * n` output with the full column range, the team passes one worker's disjoint stripe.
 pub(crate) unsafe fn linear_q8_columns(
     x_q: &[i8],
     x_scales: &[f32],
@@ -1197,12 +1199,14 @@ mod x86_int8 {
     #[must_use]
     pub fn dot_i32(a: &[i8], b: &[i8], tier: Int8Tier) -> i32 {
         assert_executable(tier);
-        // SAFETY (all three arms): `assert_executable` just confirmed this CPU reports every
-        // target feature the callee enables, and `super::dot_i32` asserted equal lengths, which
-        // is the callee's only other precondition.
+        // Each arm: `assert_executable` just confirmed this CPU reports every target feature the
+        // callee enables, and `super::dot_i32` asserted equal lengths, the only other precondition.
         match tier {
+            // SAFETY: AVX2 confirmed above; lengths asserted equal by the caller.
             Int8Tier::X86Avx2 => unsafe { dot_avx2(a, b) },
+            // SAFETY: AVX2 + AVX-VNNI confirmed above; lengths asserted equal by the caller.
             Int8Tier::X86AvxVnni => unsafe { dot_avx_vnni(a, b) },
+            // SAFETY: AVX-512F/BW/VNNI confirmed above; lengths asserted equal by the caller.
             _ => unsafe { dot_avx512_vnni(a, b) },
         }
     }
@@ -1221,11 +1225,14 @@ mod x86_int8 {
             "dot4 needs four whole weight rows"
         );
         assert_executable(tier);
-        // SAFETY (all three arms): `assert_executable` confirmed the callee's target features on
-        // this CPU, and the length assertion above is the callee's only other precondition.
+        // Each arm: `assert_executable` confirmed the callee's target features on this CPU, and
+        // the length assertion above is the callee's only other precondition.
         match tier {
+            // SAFETY: AVX2 confirmed above; `weights.len() == 4 * x.len()` asserted above.
             Int8Tier::X86Avx2 => unsafe { dot4_avx2(x, weights) },
+            // SAFETY: AVX2 + AVX-VNNI confirmed above; weight length asserted above.
             Int8Tier::X86AvxVnni => unsafe { dot4_avx_vnni(x, weights) },
+            // SAFETY: AVX-512F/BW/VNNI confirmed above; weight length asserted above.
             _ => unsafe { dot4_avx512_vnni(x, weights) },
         }
     }
@@ -1251,6 +1258,7 @@ mod x86_int8 {
     /// # Safety
     ///
     /// The CPU must support AVX2 and `a.len() == b.len()`.
+    // SAFETY: the sole caller is `dot_i32` (feature asserted, lengths asserted equal by `super::dot_i32`), so both # Safety conditions hold on entry.
     #[target_feature(enable = "avx2")]
     unsafe fn dot_avx2(a: &[i8], b: &[i8]) -> i32 {
         let len = a.len();
@@ -1299,6 +1307,7 @@ mod x86_int8 {
     /// # Safety
     ///
     /// The CPU must support AVX2 and `weights.len() == 4 * x.len()`.
+    // SAFETY: the sole caller is `dot4_i32` (feature asserted, weight length asserted), so both # Safety conditions hold on entry.
     #[target_feature(enable = "avx2")]
     unsafe fn dot4_avx2(x: &[i8], weights: &[i8]) -> [i32; 4] {
         let k = x.len();
@@ -1330,6 +1339,7 @@ mod x86_int8 {
     /// # Safety
     ///
     /// The CPU must support AVX2 + AVX-VNNI and `a.len() == b.len()`.
+    // SAFETY: the sole caller is `dot_i32` (feature asserted, lengths asserted equal by `super::dot_i32`), so both # Safety conditions hold on entry.
     #[target_feature(enable = "avx2,avxvnni")]
     unsafe fn dot_avx_vnni(a: &[i8], b: &[i8]) -> i32 {
         let len = a.len();
@@ -1378,6 +1388,7 @@ mod x86_int8 {
     /// # Safety
     ///
     /// The CPU must support AVX2 + AVX-VNNI and `weights.len() == 4 * x.len()`.
+    // SAFETY: the sole caller is `dot4_i32` (feature asserted, weight length asserted), so both # Safety conditions hold on entry.
     #[target_feature(enable = "avx2,avxvnni")]
     unsafe fn dot4_avx_vnni(x: &[i8], weights: &[i8]) -> [i32; 4] {
         let k = x.len();
@@ -1432,6 +1443,7 @@ mod x86_int8 {
     /// # Safety
     ///
     /// The CPU must support AVX-512F/BW/VNNI and `a.len() == b.len()`.
+    // SAFETY: the sole caller is `dot_i32` (feature asserted, lengths asserted equal by `super::dot_i32`), so both # Safety conditions hold on entry.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     unsafe fn dot_avx512_vnni(a: &[i8], b: &[i8]) -> i32 {
         let len = a.len();
@@ -1486,6 +1498,7 @@ mod x86_int8 {
     /// # Safety
     ///
     /// The CPU must support AVX-512F/BW/VNNI and `weights.len() == 4 * x.len()`.
+    // SAFETY: the sole caller is `dot4_i32` (feature asserted, weight length asserted), so both # Safety conditions hold on entry.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     unsafe fn dot4_avx512_vnni(x: &[i8], weights: &[i8]) -> [i32; 4] {
         let k = x.len();
