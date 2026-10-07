@@ -182,6 +182,44 @@ mod state_blob {
     }
 }
 
+/// Per-thread scratch buffers for the codec's large per-packet temporaries.
+///
+/// The im2col columns alone reach ~20 MB per call at `decoder.4` with a four-frame packet
+/// (7,680 positions × 672 reductions). Allocating, zero-filling, and freeing that every call made
+/// ~14% of codec time kernel page-fault handling (≈595K minor faults per 48 decoded frames on an
+/// x86 host). Reusing one buffer per role per thread removes it, and keeps steady-state decode free
+/// of allocator activity as the doctrine asks. Contents never leak between calls: every user
+/// writes each element it later reads.
+mod scratch {
+    use std::cell::RefCell;
+    use std::thread::LocalKey;
+
+    thread_local! {
+        pub(super) static IM2COL: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+        pub(super) static TCONV_COLUMNS: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+        pub(super) static STREAM_JOINED: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+        pub(super) static STREAM_OUTPUT: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Lends `slot`'s buffer, sized to `len`, to `body`. The buffer is taken out of the slot for
+    /// the duration (and put back after), so a nested use of the same role simply allocates
+    /// instead of panicking on a double borrow. Stale contents may remain: `body` must write every
+    /// element it reads.
+    pub(super) fn with<R>(
+        slot: &'static LocalKey<RefCell<Vec<f32>>>,
+        len: usize,
+        body: impl FnOnce(&mut [f32]) -> R,
+    ) -> R {
+        let mut buffer = slot.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        if buffer.len() < len {
+            buffer.resize(len, 0.0);
+        }
+        let result = body(&mut buffer[..len]);
+        slot.with(|cell| *cell.borrow_mut() = buffer);
+        result
+    }
+}
+
 /// A high-precision codebook materialised from upstream's unnormalised storage.
 ///
 /// The checkpoint stores `embedding_sum` rather than lookup-ready vectors. Materialising the
@@ -1150,24 +1188,51 @@ pub fn causal_conv1d(
     // exact. See `ftts-conformance/tests/codec_gemm_bisect.rs`, which is the probe that measured
     // this.
     let reduction = input_channels * kernel;
-    let mut columns = vec![0.0f32; frames * reduction];
-    for frame in 0..frames {
-        for tap in 0..kernel {
-            let past = (kernel - 1 - tap) * dilation;
-            let Some(source_frame) = frame.checked_sub(past) else {
-                // Left padding. The zero column must be materialized, not skipped: the reference's
-                // GEMM reduces over the full `K`, and a shortened reduction blocks differently.
-                continue;
-            };
-            let source = &input[source_frame * input_channels..][..input_channels];
+    scratch::with(&scratch::IM2COL, frames * reduction, |columns| {
+        for frame in 0..frames {
             let target = &mut columns[frame * reduction..][..reduction];
-            for (input_channel, &value) in source.iter().enumerate() {
-                target[input_channel * kernel + tap] = value;
+            for tap in 0..kernel {
+                let past = (kernel - 1 - tap) * dilation;
+                let Some(source_frame) = frame.checked_sub(past) else {
+                    // Left padding. The zero column must be materialized, not skipped: the
+                    // reference's GEMM reduces over the full `K`, and a shortened reduction blocks
+                    // differently. Written explicitly because the scratch buffer is reused.
+                    for input_channel in 0..input_channels {
+                        target[input_channel * kernel + tap] = 0.0;
+                    }
+                    continue;
+                };
+                let source = &input[source_frame * input_channels..][..input_channels];
+                for (input_channel, &value) in source.iter().enumerate() {
+                    target[input_channel * kernel + tap] = value;
+                }
             }
         }
-    }
+        causal_conv1d_gemm(
+            columns,
+            frames,
+            reduction,
+            weight,
+            bias,
+            output_channels,
+            output,
+        );
+    });
+}
+
+/// The GEMM half of [`causal_conv1d`] over already-unfolded `columns`.
+#[allow(clippy::too_many_arguments)]
+fn causal_conv1d_gemm(
+    columns: &[f32],
+    frames: usize,
+    reduction: usize,
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    output_channels: usize,
+    output: &mut [f32],
+) {
     f32ref::linear_with_accumulation(
-        &columns,
+        columns,
         weight,
         bias,
         frames,
@@ -1288,45 +1353,47 @@ pub fn causal_transpose_conv1d_columns(
     output: &mut [f32],
 ) {
     let column_width = output_channels * kernel;
-    let mut columns = vec![0.0f32; frames * column_width];
-    f32ref::linear_with_accumulation(
-        input,
-        column_weight,
-        None,
-        frames,
-        input_channels,
-        column_width,
-        if ftts_kernels::f32ref::canonical_norm_requested() {
-            f32ref::F32LinearAccumulation::Scalar
-        } else {
-            f32ref::F32LinearAccumulation::AccelerateRowInvariant
-        },
-        &mut columns,
-    );
+    // The GEMM below writes every element of `columns`, so the reused scratch needs no clearing.
+    scratch::with(&scratch::TCONV_COLUMNS, frames * column_width, |columns| {
+        f32ref::linear_with_accumulation(
+            input,
+            column_weight,
+            None,
+            frames,
+            input_channels,
+            column_width,
+            if ftts_kernels::f32ref::canonical_norm_requested() {
+                f32ref::F32LinearAccumulation::Scalar
+            } else {
+                f32ref::F32LinearAccumulation::AccelerateRowInvariant
+            },
+            columns,
+        );
 
-    // `col2im`: sum each input frame's column into the output samples its taps land on, ascending.
-    let kept_frames = frames * stride;
-    for output_frame in 0..kept_frames {
-        for output_channel in 0..output_channels {
-            let mut total = 0.0f32;
-            for tap in 0..kernel {
-                // The input frame whose `tap` lands on this output sample, when one exists.
-                let Some(shifted) = output_frame.checked_sub(tap) else {
-                    continue;
-                };
-                if !shifted.is_multiple_of(stride) {
-                    continue;
+        // `col2im`: sum each input frame's column into the output samples its taps land on, ascending.
+        let kept_frames = frames * stride;
+        for output_frame in 0..kept_frames {
+            for output_channel in 0..output_channels {
+                let mut total = 0.0f32;
+                for tap in 0..kernel {
+                    // The input frame whose `tap` lands on this output sample, when one exists.
+                    let Some(shifted) = output_frame.checked_sub(tap) else {
+                        continue;
+                    };
+                    if !shifted.is_multiple_of(stride) {
+                        continue;
+                    }
+                    let frame = shifted / stride;
+                    if frame >= frames {
+                        continue;
+                    }
+                    total += columns[frame * column_width + output_channel * kernel + tap];
                 }
-                let frame = shifted / stride;
-                if frame >= frames {
-                    continue;
-                }
-                total += columns[frame * column_width + output_channel * kernel + tap];
+                output[output_frame * output_channels + output_channel] =
+                    bias.map_or(total, |values| total + values[output_channel]);
             }
-            output[output_frame * output_channels + output_channel] =
-                bias.map_or(total, |values| total + values[output_channel]);
         }
-    }
+    });
 }
 
 /// Persistent left context for one causal Conv1d stage.
@@ -1370,28 +1437,41 @@ impl CausalConvStream {
             "causal stream input shape"
         );
         let history_frames = self.history.len() / self.input_channels;
-        let mut joined = Vec::with_capacity(self.history.len() + input.len());
-        joined.extend_from_slice(&self.history);
-        joined.extend_from_slice(input);
         let joined_frames = history_frames + frames;
-        let mut all = vec![0.0f32; joined_frames * output_channels];
-        causal_conv1d(
-            &joined,
-            joined_frames,
-            self.input_channels,
-            weight,
-            bias,
-            output_channels,
-            self.kernel,
-            self.dilation,
-            &mut all,
+        let history_len = self.history.len();
+        // Both scratch buffers are fully written before they are read: `joined` by the two
+        // copies, `all` by the convolution's GEMM.
+        scratch::with(
+            &scratch::STREAM_JOINED,
+            history_len + input.len(),
+            |joined| {
+                joined[..history_len].copy_from_slice(&self.history);
+                joined[history_len..].copy_from_slice(input);
+                scratch::with(
+                    &scratch::STREAM_OUTPUT,
+                    joined_frames * output_channels,
+                    |all| {
+                        causal_conv1d(
+                            joined,
+                            joined_frames,
+                            self.input_channels,
+                            weight,
+                            bias,
+                            output_channels,
+                            self.kernel,
+                            self.dilation,
+                            all,
+                        );
+                        output.clear();
+                        output.extend_from_slice(&all[history_frames * output_channels..]);
+                    },
+                );
+                let retain = ((self.kernel - 1) * self.dilation).min(joined_frames);
+                self.history.clear();
+                self.history
+                    .extend_from_slice(&joined[(joined_frames - retain) * self.input_channels..]);
+            },
         );
-        output.clear();
-        output.extend_from_slice(&all[history_frames * output_channels..]);
-        let retain = ((self.kernel - 1) * self.dilation).min(joined_frames);
-        self.history.clear();
-        self.history
-            .extend_from_slice(&joined[(joined_frames - retain) * self.input_channels..]);
     }
 
     /// Discard retained left context without releasing its allocation.
