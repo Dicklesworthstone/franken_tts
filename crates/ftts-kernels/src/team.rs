@@ -476,6 +476,7 @@ pub fn wasm_worker_loop(worker: usize) {
 /// threads on four cores) was ~10% slower end to end than a 3-way team, because the barrier waits
 /// for whichever worker the scheduler preempted. Apple keeps the measured six — its codec GEMMs go
 /// through Accelerate and it has efficiency cores to spare.
+#[cfg(any(not(target_arch = "wasm32"), test))]
 fn engine_partitions_default(ceiling: usize) -> usize {
     if cfg!(target_vendor = "apple") {
         6.min(ceiling)
@@ -487,6 +488,7 @@ fn engine_partitions_default(ceiling: usize) -> usize {
 /// The codec team's default partition count: the hardware threads the engine team leaves free,
 /// at most four (the codec's GEMMs are short; wider stripes buy little), and serial on Apple
 /// platforms, whose codec GEMMs go through Accelerate rather than this team.
+#[cfg(any(not(target_arch = "wasm32"), test))]
 fn codec_partitions_default(ceiling: usize, engine: usize) -> usize {
     if cfg!(target_vendor = "apple") {
         1

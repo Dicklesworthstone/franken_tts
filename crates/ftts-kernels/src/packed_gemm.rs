@@ -91,17 +91,21 @@ impl F32GemmLevel {
     /// Every level this build can execute on the running CPU, portable first.
     #[must_use]
     pub fn available() -> Vec<Self> {
-        let mut levels = vec![Self::Portable];
         #[cfg(all(target_arch = "x86_64", feature = "x86-f32"))]
         {
+            let mut levels = vec![Self::Portable];
             if std::arch::is_x86_feature_detected!("avx2") {
                 levels.push(Self::X86Avx2);
             }
             if std::arch::is_x86_feature_detected!("avx512f") {
                 levels.push(Self::X86Avx512);
             }
+            levels
         }
-        levels
+        #[cfg(not(all(target_arch = "x86_64", feature = "x86-f32")))]
+        {
+            vec![Self::Portable]
+        }
     }
 
     /// The level dispatched by default: the widest available, unless `FTTS_F32_GEMM` names
