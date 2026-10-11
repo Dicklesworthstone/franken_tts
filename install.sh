@@ -175,7 +175,7 @@ draw_box() {
     esc=$(printf '\033')
     local strip_ansi_sed="s/${esc}\\[[0-9;]*m//g"
 
-    for line in "${lines[@]}"; do
+    for line in ${lines[@]+"${lines[@]}"}; do
         stripped=$(printf '%b' "$line" | LC_ALL=C sed "$strip_ansi_sed")
         len=${#stripped}
         [ "$len" -gt "$max_width" ] && max_width=$len
@@ -186,7 +186,7 @@ draw_box() {
     for ((i=0; i<inner_width; i++)); do border+="═"; done
 
     printf "\033[%sm╔%s╗\033[0m\n" "$color" "$border"
-    for line in "${lines[@]}"; do
+    for line in ${lines[@]+"${lines[@]}"}; do
         stripped=$(printf '%b' "$line" | LC_ALL=C sed "$strip_ansi_sed")
         len=${#stripped}
         local padding=$((max_width - len)) pad_str=""
@@ -509,7 +509,7 @@ resolve_version() {
     while [ $attempts -lt $MAX_RETRIES ] && [ -z "$tag" ]; do
         attempts=$((attempts + 1))
         if command -v curl &>/dev/null; then
-            tag=$(curl -fsSL "${PROXY_ARGS[@]}" \
+            tag=$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
                 --connect-timeout 10 --max-time 30 \
                 -H "Accept: application/vnd.github.v3+json" \
                 "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
@@ -529,7 +529,7 @@ resolve_version() {
     log_step "Trying redirect-based version resolution..."
     local redirect_url="https://github.com/${OWNER}/${REPO}/releases/latest"
     if command -v curl &>/dev/null; then
-        tag=$(curl -fsSL "${PROXY_ARGS[@]}" -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||' || echo "")
+        tag=$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||' || echo "")
     fi
 
     if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]] && [[ "$tag" != *"/"* ]]; then
@@ -658,7 +658,7 @@ check_network() {
     [ -n "$OFFLINE_TARBALL" ] && return 0
     [ "$FROM_SOURCE" -eq 1 ] && return 0
     command -v curl >/dev/null 2>&1 || { log_warn "curl not found; skipping network check"; return 0; }
-    if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 3 --max-time 5 -o /dev/null "https://github.com" 2>/dev/null; then
+    if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 3 --max-time 5 -o /dev/null "https://github.com" 2>/dev/null; then
         log_warn "Could not reach github.com; download may fail"
     fi
 }
@@ -762,7 +762,7 @@ download_file() {
         attempt=$((attempt + 1))
         log_debug "Download attempt $attempt for $url"
         if command -v curl &>/dev/null; then
-            if curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 30 --max-time "$DOWNLOAD_TIMEOUT" \
+            if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 30 --max-time "$DOWNLOAD_TIMEOUT" \
                 --retry 2 -o "$partial" "$url"; then
                 mv -f "$partial" "$dest"; return 0
             fi
@@ -996,7 +996,7 @@ ensure_rust_nightly() {
         log_warn "abort and install Rust yourself if you prefer."
         # The grace period only makes sense when the warning was visible.
         [ "$QUIET" -eq 1 ] || sleep 3
-        curl -fsSL "${PROXY_ARGS[@]}" https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
+        curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
         export PATH="$HOME/.cargo/bin:$PATH"
         # shellcheck disable=SC1091  # rustup-generated env file not present at lint time
         [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
@@ -1026,7 +1026,7 @@ build_from_source() {
 
     log_step "Running cargo +nightly install (this may take several minutes)..."
     if ! cargo +nightly install ftts-cli --locked \
-        "${version_args[@]}" \
+        ${version_args[@]+"${version_args[@]}"} \
         --root "$cargo_root" \
         --bins; then
         log_error "Source build failed (cargo's own error above is authoritative —"
