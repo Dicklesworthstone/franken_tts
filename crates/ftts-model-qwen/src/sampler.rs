@@ -20,8 +20,10 @@ pub const TALKER_MAX_NEW_TOKENS: usize = 8_192;
 /// The residual decoder emits exactly this many non-primary codes per frame.
 pub const MICRODECODER_MAX_NEW_TOKENS: usize = 15;
 
-const REPETITION_PENALTY: f32 = 1.05;
-const TEMPERATURE: f32 = 0.9;
+/// Production talker history penalty, exposed for generation provenance.
+pub const REPETITION_PENALTY: f32 = 1.05;
+/// Production temperature, shared by the talker and microdecoder.
+pub const TEMPERATURE: f32 = 0.9;
 pub const TOP_K: usize = 50;
 
 /// Selects either the Contract-A canonical decoder or the production distribution.

@@ -5,6 +5,7 @@
 pub(crate) mod card;
 pub mod diagnostics;
 mod error;
+mod provenance;
 pub mod resident;
 pub mod robot;
 pub mod session_protocol;
@@ -318,11 +319,11 @@ struct Cli {
     #[arg(long, global = true, value_enum)]
     normalize: Option<NormalizeMode>,
 
-    /// Request a structured trace from synthesis without default-persisting sensitive text.
+    /// Write a versioned, text-free generation receipt for say in DIR (forces inline synthesis).
     #[arg(long, global = true, value_name = "DIR")]
     trace: Option<PathBuf>,
 
-    /// Reproducibility seed for a future sampler.
+    /// Production sampling seed (default 0); replay requires the same build, ISA and sampler.
     #[arg(long, global = true)]
     seed: Option<u64>,
 
@@ -1495,7 +1496,7 @@ struct CancelState {
     /// Signal strikes seen so far: first vs force-exit.
     signals: std::sync::atomic::AtomicU32,
     /// Set by the first signal; polled where the token cannot reach — the resident
-    /// daemon round-trip, whose v1 wire protocol has no cancel operation.
+    /// daemon round-trip, whose wire protocol has no cancel operation.
     tripped: std::sync::atomic::AtomicBool,
     /// Tripped by the first signal; aborts the in-process engine loop.
     token: ftts_core::CancellationToken,
@@ -2164,21 +2165,39 @@ fn run_say_events(
         &voice_path,
         (denoise_ephemeral).then_some(&mut say_denoise_report),
     )?;
+    let generation_trace = cli
+        .trace
+        .as_deref()
+        .map(|directory| {
+            provenance::GenerationTrace::prepare(
+                directory,
+                run.run_id(),
+                cli.seed,
+                &bundle,
+                &voice_path,
+                &voice_conditioning,
+            )
+        })
+        .transpose()?;
     // With the resident engine (the default), the model stays loaded in a background
     // process and this invocation skips its own hydration; the daemon's load happens
     // inside the synthesis stage on its first request. Any resident-path unavailability
     // falls back to the classic in-process load below, never to a failure.
     //
-    // `--stream raw` BYPASSES the resident: the daemon's frozen v1 wire protocol delivers
+    // `--stream raw` BYPASSES the resident: the daemon wire protocol delivers
     // one whole PCM blob after complete synthesis (resident.rs), so a resident-served run
     // can never stream live — and a warm run silently regressing to buffered delivery
     // while the cold run streams would be worse than either behavior alone. Raw streaming
     // therefore pays the in-process load; the warm+streaming surface is the talk session.
-    // ICL conditioning cannot ride the resident wire protocol (v1 carries vectors only);
+    // ICL conditioning cannot ride the resident wire protocol (it carries vectors only);
     // serving it through the daemon would silently strip the transcript+tokens quality
     // path, so those runs pay the in-process load instead.
-    let use_resident =
-        resident::enabled(args.no_resident) && !raw_stream && voice_conditioning.is_xvector();
+    // A trace describes artifacts loaded here, not older in-memory resident weights.
+    // Opt-in trace therefore pays the inline load and never starts a daemon.
+    let use_resident = resident::enabled(args.no_resident)
+        && !raw_stream
+        && voice_conditioning.is_xvector()
+        && generation_trace.is_none();
     let load_inline = || {
         if output.human_progress && !args.robot && !raw_stream {
             synth::LoadedModel::load_with_human_progress(&bundle)
@@ -2194,13 +2213,12 @@ fn run_say_events(
     emit_stage(run, emit, "load", "end", &mut seq)?;
 
     // --- synthesis -------------------------------------------------------------------------
-    // Canonical greedy consumes no RNG state, so an absent `--seed` changes nothing today;
-    // 0 is the documented default rather than a value picked per run, which would make a
-    // future switch to the production sampler silently irreproducible.
+    // Production sampling consumes the seed today. An omitted seed resolves to zero;
+    // reproducibility remains scoped to build + ISA + sampler version + seed.
     let seed = cli.seed.unwrap_or(0);
 
     // The signal bridge goes up before anything slow: a SIGINT during the resident
-    // round-trip must land somewhere even though the v1 wire protocol cannot cancel
+    // round-trip must land somewhere even though the wire protocol cannot cancel
     // the daemon. Inline synthesis shares this token, so one handler serves both
     // paths (bead frankentts-astz).
     let cancel = std::sync::Arc::new(CancelState::new());
@@ -2222,7 +2240,7 @@ fn run_say_events(
             // whenever the whole utterance happens to finish (g4zq).
             &|| cancel.was_tripped(),
         )?;
-        // The daemon finished anyway — v1 has no cancel op — but honoring the request
+        // The daemon finished anyway — the wire has no cancel op — but honoring the request
         // means discarding the reply, not shipping audio the user asked us to stop
         // making. Same terminal shape as an inline cancel: run_error, exit 6.
         if audio.is_some() && cancel.was_tripped() {
@@ -2253,7 +2271,7 @@ fn run_say_events(
         emit_stage(run, emit, &format!("resident-{state}"), "end", &mut seq)?;
     }
     // Whether the in-process live path already wrote PCM and emitted `audio_chunk` events
-    // during synthesis. The resident path cannot (its v1 wire reply is one whole blob), so
+    // during synthesis. The resident path cannot (its wire reply is one whole blob), so
     // it keeps the post-synthesis packetization below.
     let mut live_output_began = false;
     let audio_result = match resident_audio {
@@ -2461,6 +2479,24 @@ fn run_say_events(
         plan.finalize()?;
     }
     emit_stage(run, emit, "output", "end", &mut seq)?;
+
+    if let Some(trace) = generation_trace {
+        trace.finish(&audio_result, samples)?;
+    }
+    if !audio_result.stop_reason.is_clean_completion() {
+        // Partial output is finalized and preserved. Keep the closed robot v1 schema:
+        // terminal run_error (exit 5), never a successful run_complete on a capped take.
+        return Err(FttsError::BudgetTimeout(format!(
+            "{} after {} frames (limit {}); partial audio preserved; {}",
+            audio_result.stop_reason,
+            audio_result.frames,
+            audio_result.frame_limit,
+            audio_result
+                .stop_reason
+                .remedy()
+                .unwrap_or("inspect the generation receipt"),
+        )));
+    }
 
     let mut complete = run.event(robot::EventType::RunComplete);
     complete.insert("exit_code".to_owned(), json!(FttsExitCode::Success.as_u8()));
@@ -4477,6 +4513,14 @@ fn output_error(error: io::Error) -> FttsError {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn seed_help_describes_the_active_sampler_and_unsupported_flags_still_fail() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("Production sampling seed (default 0)"));
+        assert!(!help.contains("future sampler"));
+        assert!(Cli::try_parse_from(["ftts", "say", "--temperature", "0.5", "hello"]).is_err());
+    }
 
     #[test]
     fn preset_voices_are_valid_speaker_vectors() {

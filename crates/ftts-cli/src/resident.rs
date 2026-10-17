@@ -69,7 +69,19 @@ fn spawn_wait() -> Duration {
         .map_or(DEFAULT_SPAWN_WAIT, Duration::from_secs)
 }
 
-const PROTOCOL: u64 = 1;
+// v2 requires termination evidence; a v1 daemon must fall back inline, never certify a cap.
+const PROTOCOL: u64 = 2;
+
+fn termination_from_reply(reply: &Value) -> Option<(ftts_core::admission::StopReason, u64)> {
+    use ftts_core::admission::StopReason;
+    let reason = match reply.get("stop_reason")?.as_str()? {
+        "end_of_speech" => StopReason::EndOfSpeech,
+        "frame_cap_reached" => StopReason::FrameCapReached,
+        _ => return None,
+    };
+    let limit = reply.get("frame_limit")?.as_u64()?;
+    (limit > 0).then_some((reason, limit))
+}
 
 /// One synthesis request as it crosses the wire. Everything the daemon needs to rebuild
 /// the exact [`SynthesisRequest`] the client would have run inline.
@@ -242,7 +254,7 @@ pub fn try_synthesize(
     try_synthesize_interruptible(bundle, request, &|| false)
 }
 
-/// [`try_synthesize`], but the reply wait honors `tripped`: the v1 wire has no
+/// [`try_synthesize`], but the reply wait honors `tripped`: the wire has no
 /// cancel op, so the daemon finishes and discards server-side by its own contract —
 /// the CLIENT must not sit deaf on a blocking read while a SIGINT has already been
 /// consumed (bead frankentts-say-sigint-latency-resident-g4zq). The reply-phase read
@@ -434,6 +446,9 @@ fn roundtrip(
         return Ok(None);
     };
     if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        let Some((stop_reason, frame_limit)) = termination_from_reply(&reply) else {
+            return Ok(None);
+        };
         // The sample count is wire data. Bound it before it sizes an allocation: at 24 kHz
         // this cap is over two hours of audio, far past anything the engine can produce,
         // and a corrupt or mismatched daemon claiming more falls back inline instead of
@@ -455,6 +470,13 @@ fn roundtrip(
             .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         return Ok(Some(SynthesizedAudio {
+            stop_reason,
+            frame_limit,
+            // The resident handles whole one-shot requests only, with no text feed.
+            utterance_start: ftts_core::UtteranceStart::Fresh,
+            normalization: None,
+            seed: request.seed,
+            sampling_mode: ftts_model_qwen::sampler::SamplingMode::Production,
             pcm,
             frames: reply.get("frames").and_then(Value::as_u64).unwrap_or(0),
             prepared_token_count: reply
@@ -465,7 +487,7 @@ fn roundtrip(
                 .get("ttfa_ms")
                 .and_then(Value::as_u64)
                 .map(Duration::from_millis),
-            // The v1 wire reply carries one whole buffer after synthesis; an audible
+            // The wire reply carries one whole buffer after synthesis; an audible
             // mark measured daemon-side would not be a client delivery time. Absent
             // here, `run_complete.ttfa_ms` falls back to the raw mark above.
             ttfa_audible: None,
@@ -816,12 +838,12 @@ fn handle_connection(
         loaded,
         engine,
         &synthesis_request,
-        // v1 wire carries vectors only; the daemon is x-vector by construction.
+        // The wire carries vectors only; the daemon is x-vector by construction.
         &crate::synth::VoiceConditioning::XVector(speaker),
         seed,
         &cancellation,
         &observer,
-        // The v1 wire protocol has no per-request profile and replies with one whole
+        // The wire protocol has no per-request profile and replies with one whole
         // buffer, so packet size is invisible to clients; 4 preserves the daemon's
         // historical decode cadence.
         4,
@@ -833,6 +855,8 @@ fn handle_connection(
                 "ok": true,
                 "samples": audio.pcm.len(),
                 "frames": audio.frames,
+                "stop_reason": audio.stop_reason.as_str(),
+                "frame_limit": audio.frame_limit,
                 "prepared_token_count": audio.prepared_token_count,
                 "ttfa_ms": audio.ttfa.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
             });
@@ -861,6 +885,18 @@ fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_or_unknown_termination_is_not_clean_completion() {
+        assert!(termination_from_reply(&json!({"ok": true, "frames": 4})).is_none());
+        assert!(
+            termination_from_reply(&json!({"stop_reason": "unknown", "frame_limit": 5})).is_none()
+        );
+        assert_eq!(
+            termination_from_reply(&json!({"stop_reason": "frame_cap_reached", "frame_limit": 5})),
+            Some((ftts_core::admission::StopReason::FrameCapReached, 5))
+        );
+    }
 
     #[test]
     fn normalize_labels_round_trip() {

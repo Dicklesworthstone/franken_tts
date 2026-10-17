@@ -223,6 +223,21 @@ A quality pack carries the reference's codec tokens and transcript, and synthesi
 
 ## Robot mode
 
+`ftts say --trace DIR` writes a separate `ftts.generation` schema-v1 receipt named
+`RUN_ID.generation.json`. It records requested versus effective seed, production
+sampling settings, loaded artifact and conditioning hashes, normalization summary,
+fresh/continuation mode, frame ceiling and observed stop reason. It omits text,
+reference transcripts and filesystem paths. This opt-in mode hashes the assets and
+runs inline so a warm resident cannot hide older in-memory weights. The existing
+robot NDJSON schema stays at v1. Failed preparation/cancellation does not produce a
+completed receipt; use the terminal `run_error` event for those failures.
+
+A frame ceiling is not end of speech. `say` preserves capped audio but exits 5 with
+`run_error`; only an observed model EOS produces `run_complete`. EOS still does not
+certify that every word was spoken correctly or that the voice is acceptable.
+`--seed` controls production sampling now (default 0); reproducibility is scoped to
+the same build, ISA, sampler version and seed.
+
 `franken_tts` is built agent-first. `ftts robot schema` prints the NDJSON event schema; synthesis runs emit machine-readable events and exit with stable, documented codes, so orchestrators and coding agents can drive it without scraping human-facing text. Two subcommands report the kernel state of the machine they run on: `ftts robot selftest` executes the integer-overflow proof rows through every dispatchable kernel tier and reports per-row verdicts, and `ftts robot backends` lists available tiers, the dispatched route, detected ISA features, and the autotuned kernel plan.
 
 ## Architecture

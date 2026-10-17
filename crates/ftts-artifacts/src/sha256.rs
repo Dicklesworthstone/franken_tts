@@ -257,10 +257,12 @@ impl Sha256 {
 ///
 /// Propagates the underlying [`std::io::Error`] from opening or reading the file.
 pub fn hex_digest_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::Digest as _;
     use std::io::Read as _;
 
     let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
+    // Match digest()'s hardware-backed path without allocating the whole model file.
+    let mut hasher = sha2::Sha256::new();
     // 1 MiB: large enough that syscall overhead is negligible, small enough to stay cache-polite.
     let mut buffer = vec![0_u8; 1 << 20];
     loop {
@@ -271,7 +273,7 @@ pub fn hex_digest_file(path: &std::path::Path) -> std::io::Result<String> {
             Err(error) => return Err(error),
         }
     }
-    Ok(to_hex(&hasher.finish()))
+    Ok(to_hex(&hasher.finalize().into()))
 }
 
 /// Digests a byte slice, returning lowercase hex.

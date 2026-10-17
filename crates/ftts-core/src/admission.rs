@@ -485,7 +485,7 @@ impl StopReason {
             Self::EndOfSpeech | Self::Cancelled => None,
             Self::FrameCapReached => Some(
                 "the utterance hit the frame cap before the model finished speaking; raise \
-                 --max-frames or split the text into shorter chunks",
+                 FTTS_MAX_FRAMES or split the text into shorter chunks",
             ),
             Self::DurationLimitReached => Some(
                 "the utterance hit the hard duration limit; raise it or split the text into \

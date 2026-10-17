@@ -1774,6 +1774,13 @@ impl LoadedModel {
 
 /// A completed synthesis: the codes the talker produced and the audio they decode to.
 pub struct SynthesizedAudio {
+    /// Observed model termination and effective admission ceiling.
+    pub stop_reason: ftts_core::admission::StopReason,
+    pub frame_limit: u64,
+    pub utterance_start: ftts_core::UtteranceStart,
+    pub normalization: Option<ftts_core::NormalizationTraceSummary>,
+    pub seed: u64,
+    pub sampling_mode: SamplingMode,
     /// Codec frames generated before the stop.
     pub frames: u64,
     /// Token ids that entered the model path, including the assistant wrapper.
@@ -2243,6 +2250,7 @@ fn synthesize_inner(
     // new_with_artifact would rebuild identical tables per call from the same weights and
     // artifact; lending the prepared ones changes no bytes — the route is built from exactly
     // the config below, and assemble() is shared by both constructors.
+    let sampling_mode = SamplingMode::Production;
     let generator_config = QwenGeneratorConfig {
         talker_config: TalkerConfig::default(),
         talker_weights: model.talker.talker_weights(&talker_layers),
@@ -2267,7 +2275,7 @@ fn synthesize_inner(
         // subtalker sampling per depth the engine's utterance envelope matches the reference's
         // sampled runs (peak frame RMS 0.086 with trailing silence). Determinism scope: build +
         // ISA + sampler version + seed, 16 draws per frame.
-        sampling_mode: SamplingMode::Production,
+        sampling_mode,
         seed,
     };
     let int8 = model.int8_route.get_or_init(|| {
@@ -2520,6 +2528,12 @@ fn synthesize_inner(
     append_synth_profile_report(&profile);
 
     Ok(SynthesizedAudio {
+        stop_reason: result.stop_reason,
+        frame_limit: result.frame_limit,
+        utterance_start: result.utterance_start,
+        normalization: Some(result.normalization),
+        seed,
+        sampling_mode,
         frames: result.generated_frames,
         prepared_token_count: result.prepared_token_count,
         pcm: decoded.pcm,

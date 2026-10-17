@@ -720,6 +720,14 @@ pub struct EnrollmentRequest {
 /// A completed synthesis result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SynthesisResult {
+    /// Observed termination, never inferred from the amount of audio produced.
+    pub stop_reason: admission::StopReason,
+    /// Effective final admission ceiling (including any continuation re-admission).
+    pub frame_limit: u64,
+    /// The mode actually passed to the generator for this utterance.
+    pub utterance_start: UtteranceStart,
+    /// Privacy-safe summary of the initial text preparation, never the input text.
+    pub normalization: NormalizationTraceSummary,
     /// Number of generated codec frames.
     pub generated_frames: u64,
     /// Every generated 16-code frame, in emission order, for the codec stage.
@@ -1031,6 +1039,7 @@ impl TtsEngine {
         // stall cap — so end-of-text is applied exactly once.
         let mut text_done = false;
         let mut feed_closed = text_feed.is_none();
+        let mut stop_reason = admission::StopReason::FrameCapReached;
         while (code_frames.len() as u64) < plan.predicted_max_frames {
             cancellation.checkpoint().inspect_err(|_| {
                 observer.on_event(SynthesisEvent::Health {
@@ -1097,7 +1106,10 @@ impl TtsEngine {
                     });
                     code_frames.push(frame);
                 }
-                FrameStep::Finished => break,
+                FrameStep::Finished => {
+                    stop_reason = admission::StopReason::EndOfSpeech;
+                    break;
+                }
                 FrameStep::AwaitingText => {
                     let stall_started = Instant::now();
                     let resumed = 'stall: {
@@ -1161,6 +1173,10 @@ impl TtsEngine {
             elapsed: started.elapsed(),
         });
         Ok(SynthesisResult {
+            stop_reason,
+            frame_limit: plan.predicted_max_frames,
+            utterance_start: mode,
+            normalization: prepared.normalization_trace.summary(),
             generated_frames: code_frames.len() as u64,
             code_frames,
             prepared_token_count: usize::try_from(total_prompt_tokens)
@@ -1705,6 +1721,9 @@ mod tests {
             "ceiling {ceiling} must exceed the 3 emitted frames, or the stop is ambiguous"
         );
         assert_eq!(result.generated_frames, 3, "EOS bounds the utterance");
+        assert_eq!(result.stop_reason, admission::StopReason::EndOfSpeech);
+        assert_eq!(result.frame_limit, ceiling);
+        assert_eq!(result.utterance_start, UtteranceStart::Fresh);
         assert_eq!(result.code_frames.len(), 3);
         assert_eq!(
             generator.polls, 4,
@@ -1743,13 +1762,15 @@ mod tests {
             "an endless generator must be cut at the ceiling, not one frame either side"
         );
         assert_eq!(result.code_frames.len() as u64, ceiling);
+        assert_eq!(result.stop_reason, admission::StopReason::FrameCapReached);
+        assert_eq!(result.frame_limit, ceiling);
         assert_eq!(
             generator.polls as u64, ceiling,
             "once the ceiling is reached the loop must stop asking, not poll a discarded frame"
         );
     }
 
-    /// The boundary: EOS arriving exactly at the ceiling is still a clean stop, not an overrun.
+    /// At the ceiling EOS has NOT been observed: do not promote a plausible ending to proof.
     #[test]
     fn eos_landing_exactly_on_the_ceiling_yields_the_ceiling_frames() {
         let engine = engine_with_frame_ceiling(4);
@@ -1769,6 +1790,7 @@ mod tests {
 
         assert_eq!(admitted_ceiling(&observer), 4);
         assert_eq!(result.generated_frames, 4);
+        assert_eq!(result.stop_reason, admission::StopReason::FrameCapReached);
         assert_eq!(
             generator.polls, 4,
             "the ceiling is reached first, so the generator is never asked for a fifth frame"
@@ -2404,6 +2426,8 @@ mod tests {
 
         // 2 initial + 3 appended + 1 tail frame after finish.
         assert_eq!(result.generated_frames, 6);
+        assert_eq!(result.utterance_start, UtteranceStart::Continuation);
+        assert_eq!(result.stop_reason, admission::StopReason::EndOfSpeech);
         assert_eq!(generator.appends, 1);
         assert!(
             !observer
