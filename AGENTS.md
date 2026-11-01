@@ -1,5 +1,18 @@
 # AGENTS.md — franken_tts
 
+## Standing Policy: DSR Only — Never GitHub Actions
+
+GitHub Actions must NEVER be used for ANY purpose in this project, including CI,
+tests, builds, releases, publishing, scheduled jobs, and automation. This prohibition
+includes both GitHub-hosted runners and self-hosted runners registered with Actions.
+Use [dsr (Doodlestein Self-Releaser)](https://github.com/Dicklesworthstone/doodlestein_self_releaser)
+directly instead. Do not enable, dispatch, rerun, fund, or rely on Actions, even as
+a fallback. If DSR cannot run a required workload, report the exact blocker rather
+than switching to Actions. Local workflow YAML executed by dsr/act is allowed;
+preserve those definitions and their checks without invoking the GitHub Actions
+service. Historical Actions references below are reference material only, not
+permission to use it. This permanent policy overrides any older Actions guidance.
+
 > Guidelines for AI coding agents working in this Rust codebase.
 
 ---
@@ -42,7 +55,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 - Mechanics: bump `[workspace.package] version`, regenerate `Cargo.lock`,
   write the CHANGELOG section, commit as `chore(release): bump workspace to
   X.Y.Z + changelog`, tag `vX.Y.Z`, push, then run `dsr` — the configured
-  release authority for this repo (GH Actions capacity is starvation-prone) —
+  release authority for this repo (GitHub Actions is permanently prohibited) —
   to build the five platform assets and publish the GitHub release with
   SHA256SUMS. Verify one clean-room install before announcing. crates.io
   publishing is separately blocked (bead 46n).
