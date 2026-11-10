@@ -11,9 +11,31 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 import os from "node:os";
 import { serve } from "./serve.mjs";
+import { sweepStaleWebKitOrigins, WEBKIT_HARNESS_PORT } from "./webkit_storage.mjs";
 
 const siteDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const { server, port } = await serve({ siteDir, modelFiles: {} });
+// Same pinned port as browser.mjs --webkit. Port 0 would leave another OPFS
+// origin in ~/Library/WebKit after this process deletes only its temp profile.
+let served;
+try {
+  served = await serve({ siteDir, modelFiles: {}, port: WEBKIT_HARNESS_PORT });
+} catch (error) {
+  if (error?.code === "EADDRINUSE") {
+    console.error(
+      `WebKit harness port ${WEBKIT_HARNESS_PORT} is already in use. ` +
+        "Not falling back to a random port: each port keeps another OPFS copy in ~/Library/WebKit.",
+    );
+    process.exit(1);
+  }
+  throw error;
+}
+const { server, port } = served;
+const swept = await sweepStaleWebKitOrigins({ keepPort: port });
+if (swept.removed) {
+  console.log(
+    `removed ${swept.removed} stale WebKit loopback origin(s), ${(swept.bytes / 1024 ** 3).toFixed(2)} GB`,
+  );
+}
 
 for (const [name, engine] of [
   ["chromium", chromium],

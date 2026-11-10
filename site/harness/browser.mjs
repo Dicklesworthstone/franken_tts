@@ -24,6 +24,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { serve } from "./serve.mjs";
+import { sweepStaleWebKitOrigins, WEBKIT_HARNESS_PORT } from "./webkit_storage.mjs";
 
 const siteDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const modelDir = path.join(process.env.HOME, ".cache/franken_tts/model");
@@ -74,7 +75,37 @@ const modelFiles = {
   "tokenizer_config.json": path.join(modelDir, "tokenizer_config.json"),
 };
 
-const { server, port, headers } = await serve({ siteDir, modelFiles });
+// WebKit OPFS is per origin, and the origin includes the port. A random port
+// stored another tokenizer under ~/Library/WebKit on every run; the temp
+// profile removed below does not contain that directory. Pin the port and
+// drop every other loopback origin before launch.
+const webkitRun = ENGINE_NAME === "webkit";
+let served;
+try {
+  served = await serve({
+    siteDir,
+    modelFiles,
+    port: webkitRun ? WEBKIT_HARNESS_PORT : 0,
+  });
+} catch (error) {
+  if (webkitRun && error?.code === "EADDRINUSE") {
+    console.error(
+      `WebKit harness port ${WEBKIT_HARNESS_PORT} is already in use. ` +
+        "Not falling back to a random port: each port keeps another OPFS copy in ~/Library/WebKit.",
+    );
+    process.exit(1);
+  }
+  throw error;
+}
+const { server, port, headers } = served;
+if (webkitRun) {
+  const swept = await sweepStaleWebKitOrigins({ keepPort: port });
+  if (swept.removed) {
+    console.log(
+      `removed ${swept.removed} stale WebKit loopback origin(s), ${(swept.bytes / 1024 ** 3).toFixed(2)} GB`,
+    );
+  }
+}
 console.log(`serving ${siteDir} on :${port}`);
 console.log(`  COOP=${headers["Cross-Origin-Opener-Policy"]} COEP=${headers["Cross-Origin-Embedder-Policy"]}`);
 

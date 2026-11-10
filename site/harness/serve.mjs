@@ -98,9 +98,12 @@ export function serve({ siteDir, modelFiles, port = 0 }) {
       fs.readFileSync(file),
     );
   });
-  return new Promise((resolve) => {
-    server.listen(port, "127.0.0.1", () =>
-      resolve({ server, port: server.address().port, headers: base }),
-    );
+  return new Promise((resolve, reject) => {
+    const fail = (error) => reject(error);
+    server.once("error", fail);
+    server.listen(port, "127.0.0.1", () => {
+      server.off("error", fail);
+      resolve({ server, port: server.address().port, headers: base });
+    });
   });
 }
