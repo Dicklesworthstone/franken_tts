@@ -10,7 +10,7 @@ keywords = ["tts", "speech", "qwen", "voice", "audio"]
 categories = ["multimedia::audio"]
 
 [dependencies]
-fancy-regex = "0.19"
+fancy-regex = "0.20"
 ftts-artifacts = { path = "../ftts-artifacts", version = "0.1.11" }
 ftts-core = { path = "../ftts-core", version = "0.1.11" }
 ftts-kernels = { path = "../ftts-kernels", version = "0.1.11" }

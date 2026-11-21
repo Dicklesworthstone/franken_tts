@@ -24,7 +24,7 @@ repository = "https://github.com/Dicklesworthstone/franken_tts"
 # Pinned to crates.io, NOT the sibling checkout: the sibling's main
 # is mid-development and its transient states (deny-lint failures, API churn) were
 # breaking every downstream cold build. Owner directive 2026-08-22. Bump deliberately.
-asupersync = { version = "0.5.0", default-features = false }
+asupersync = { version = "0.7.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
