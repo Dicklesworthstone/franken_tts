@@ -194,31 +194,51 @@ impl DraftHeader {
 
         let drafter_type = DrafterType::parse(&get_str("drafter_type")?);
         let drafter_name = get_str("drafter_name")?;
-        let is_kill_switched = obj
-            .get("is_kill_switched")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let is_kill_switched = match obj.get("is_kill_switched") {
+            None => false,
+            Some(v) => v.as_bool().ok_or_else(|| {
+                DraftError::CorruptHeader("is_kill_switched must be a boolean".into())
+            })?,
+        };
 
-        let target_layers = obj
-            .get("target_layers")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_u64)
-                    .map(|v| v as u32)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let target_layers = match obj.get("target_layers") {
+            None => Vec::new(),
+            Some(v) => {
+                let arr = v.as_array().ok_or_else(|| {
+                    DraftError::CorruptHeader("target_layers must be an array".into())
+                })?;
+                let mut layers = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let raw = item.as_u64().ok_or_else(|| {
+                        DraftError::CorruptHeader(
+                            "target_layers entries must be unsigned integers".into(),
+                        )
+                    })?;
+                    let layer = u32::try_from(raw).map_err(|_| {
+                        DraftError::CorruptHeader("target_layers entry overflows u32".into())
+                    })?;
+                    layers.push(layer);
+                }
+                layers
+            }
+        };
 
-        let metadata = obj
-            .get("metadata")
-            .and_then(Value::as_object)
-            .map(|map| {
-                map.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let metadata = match obj.get("metadata") {
+            None => BTreeMap::new(),
+            Some(v) => {
+                let map = v.as_object().ok_or_else(|| {
+                    DraftError::CorruptHeader("metadata must be an object".into())
+                })?;
+                let mut entries = BTreeMap::new();
+                for (k, val) in map {
+                    let s = val.as_str().ok_or_else(|| {
+                        DraftError::CorruptHeader(format!("metadata entry {k} must be a string"))
+                    })?;
+                    entries.insert(k.clone(), s.to_string());
+                }
+                entries
+            }
+        };
 
         Ok(Self {
             base_model_hash,
@@ -266,42 +286,73 @@ impl DraftTensor {
             .ok_or_else(|| DraftError::CorruptHeader("missing name".into()))?
             .to_string();
 
-        let rows = obj
+        let rows_u64 = obj
             .get("rows")
             .and_then(Value::as_u64)
-            .ok_or_else(|| DraftError::CorruptHeader("missing rows".into()))?
-            as usize;
+            .ok_or_else(|| DraftError::CorruptHeader("missing rows".into()))?;
+        let rows = usize::try_from(rows_u64)
+            .map_err(|_| DraftError::CorruptHeader("rows exceeds platform usize".into()))?;
 
-        let cols = obj
+        let cols_u64 = obj
             .get("cols")
             .and_then(Value::as_u64)
-            .ok_or_else(|| DraftError::CorruptHeader("missing cols".into()))?
-            as usize;
+            .ok_or_else(|| DraftError::CorruptHeader("missing cols".into()))?;
+        let cols = usize::try_from(cols_u64)
+            .map_err(|_| DraftError::CorruptHeader("cols exceeds platform usize".into()))?;
 
-        let scales: Vec<f32> = obj
+        let expected_elems = rows.checked_mul(cols).ok_or_else(|| {
+            DraftError::CorruptHeader(format!(
+                "tensor {name} dimension overflow: {rows} * {cols}"
+            ))
+        })?;
+
+        let scales_arr = obj
             .get("scales")
             .and_then(Value::as_array)
-            .ok_or_else(|| DraftError::CorruptHeader("missing scales".into()))?
-            .iter()
-            .filter_map(Value::as_f64)
-            .map(|f| f as f32)
-            .collect();
+            .ok_or_else(|| DraftError::CorruptHeader("missing scales".into()))?;
+        if scales_arr.len() != rows {
+            return Err(DraftError::CorruptHeader(format!(
+                "tensor {name} scale count mismatch: expected {rows} row scales, got {}",
+                scales_arr.len()
+            )));
+        }
+        let mut scales = Vec::with_capacity(scales_arr.len());
+        for item in scales_arr {
+            let raw = item.as_f64().ok_or_else(|| {
+                DraftError::CorruptHeader(format!("tensor {name} contains non-numeric scale"))
+            })?;
+            let scale = raw as f32;
+            if !scale.is_finite() {
+                return Err(DraftError::CorruptHeader(format!(
+                    "tensor {name} contains non-finite scale"
+                )));
+            }
+            scales.push(scale);
+        }
 
-        let data: Vec<i8> = obj
+        let data_arr = obj
             .get("data")
             .and_then(Value::as_array)
-            .ok_or_else(|| DraftError::CorruptHeader("missing data".into()))?
-            .iter()
-            .filter_map(Value::as_i64)
-            .map(|i| i as i8)
-            .collect();
-
-        if data.len() != rows * cols {
+            .ok_or_else(|| DraftError::CorruptHeader("missing data".into()))?;
+        if data_arr.len() != expected_elems {
             return Err(DraftError::CorruptHeader(format!(
-                "tensor {name} length mismatch: expected {} elements, got {}",
-                rows * cols,
-                data.len()
+                "tensor {name} length mismatch: expected {expected_elems} elements, got {}",
+                data_arr.len()
             )));
+        }
+        let mut data = Vec::with_capacity(data_arr.len());
+        for item in data_arr {
+            let raw = item.as_i64().ok_or_else(|| {
+                DraftError::CorruptHeader(format!(
+                    "tensor {name} contains non-integer data entry"
+                ))
+            })?;
+            let byte = i8::try_from(raw).map_err(|_| {
+                DraftError::CorruptHeader(format!(
+                    "tensor {name} data entry {raw} out of i8 range"
+                ))
+            })?;
+            data.push(byte);
         }
 
         Ok(Self {
@@ -355,6 +406,12 @@ impl FttsDraft {
         let mut tensors = BTreeMap::new();
         for t_val in tensors_arr {
             let tensor = DraftTensor::from_json(t_val)?;
+            if tensors.contains_key(&tensor.name) {
+                return Err(DraftError::CorruptHeader(format!(
+                    "duplicate tensor name: {}",
+                    tensor.name
+                )));
+            }
             tensors.insert(tensor.name.clone(), tensor);
         }
 
@@ -621,5 +678,174 @@ mod tests {
         assert!(!fuzz_decode(b"SHORT"));
         assert!(!fuzz_decode(&[0u8; 100]));
         assert!(!fuzz_decode(b"FTTSDRFT12345678901234567890"));
+    }
+
+    fn encode_raw_json_envelope(json_val: &Value) -> Vec<u8> {
+        let json_bytes = serde_json::to_vec(json_val).expect("serialize test json");
+        let json_len = json_bytes.len() as u64;
+        let checksum = hex_digest(&json_bytes);
+        let mut out = Vec::with_capacity(84 + json_bytes.len());
+        out.extend_from_slice(DRAFT_MAGIC);
+        out.extend_from_slice(&DRAFT_FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&json_len.to_le_bytes());
+        out.extend_from_slice(checksum.as_bytes());
+        out.extend_from_slice(&json_bytes);
+        out
+    }
+
+    fn valid_header_json() -> Value {
+        sample_draft().header.to_json()
+    }
+
+    #[test]
+    fn draft_rejects_overflowing_tensor_dimensions() {
+        let hostile = json!({
+            "header": valid_header_json(),
+            "tensors": [{
+                "name": "overflow",
+                "rows": 9_223_372_036_854_775_808_u64,
+                "cols": 2_u64,
+                "scales": [],
+                "data": []
+            }]
+        });
+        let bytes = encode_raw_json_envelope(&hostile);
+        let err = FttsDraft::decode(&bytes).expect_err("must reject overflowing rows * cols");
+        assert!(matches!(err, DraftError::CorruptHeader(_)));
+        assert!(!fuzz_decode(&bytes));
+
+        let max_dim = json!({
+            "header": valid_header_json(),
+            "tensors": [{
+                "name": "u64max",
+                "rows": u64::MAX,
+                "cols": u64::MAX,
+                "scales": [],
+                "data": []
+            }]
+        });
+        let max_bytes = encode_raw_json_envelope(&max_dim);
+        let err2 = FttsDraft::decode(&max_bytes).expect_err("must reject u64::MAX dims");
+        assert!(matches!(err2, DraftError::CorruptHeader(_)));
+        assert!(!fuzz_decode(&max_bytes));
+    }
+
+    #[test]
+    fn draft_rejects_malformed_numeric_arrays_and_scale_mismatch() {
+        let cases = [
+            json!({
+                "name": "bad_scale_type",
+                "rows": 1,
+                "cols": 2,
+                "scales": ["not-a-number"],
+                "data": [1, 2]
+            }),
+            json!({
+                "name": "inf_scale",
+                "rows": 1,
+                "cols": 2,
+                "scales": [1.0e300_f64],
+                "data": [1, 2]
+            }),
+            json!({
+                "name": "scale_count_mismatch",
+                "rows": 2,
+                "cols": 2,
+                "scales": [0.5],
+                "data": [1, 2, 3, 4]
+            }),
+            json!({
+                "name": "bad_data_type",
+                "rows": 1,
+                "cols": 2,
+                "scales": [0.5],
+                "data": [1, "bad"]
+            }),
+            json!({
+                "name": "i8_overflow_pos",
+                "rows": 1,
+                "cols": 2,
+                "scales": [0.5],
+                "data": [1, 128]
+            }),
+            json!({
+                "name": "i8_overflow_neg",
+                "rows": 1,
+                "cols": 2,
+                "scales": [0.5],
+                "data": [-129, 0]
+            }),
+            json!({
+                "name": "float_data",
+                "rows": 1,
+                "cols": 1,
+                "scales": [0.5],
+                "data": [1.5]
+            }),
+        ];
+
+        for tensor in cases {
+            let doc = json!({
+                "header": valid_header_json(),
+                "tensors": [tensor]
+            });
+            let bytes = encode_raw_json_envelope(&doc);
+            let err = FttsDraft::decode(&bytes).expect_err("must reject malformed tensor");
+            assert!(matches!(err, DraftError::CorruptHeader(_)));
+            assert!(!fuzz_decode(&bytes));
+        }
+    }
+
+    #[test]
+    fn draft_rejects_duplicate_tensors_and_malformed_header_fields() {
+        let valid_tensor = json!({
+            "name": "dup.proj",
+            "rows": 1,
+            "cols": 2,
+            "scales": [0.5],
+            "data": [1, -1]
+        });
+        let dup_doc = json!({
+            "header": valid_header_json(),
+            "tensors": [valid_tensor.clone(), valid_tensor]
+        });
+        let dup_bytes = encode_raw_json_envelope(&dup_doc);
+        assert!(matches!(
+            FttsDraft::decode(&dup_bytes),
+            Err(DraftError::CorruptHeader(_))
+        ));
+
+        let mut bad_layers = valid_header_json();
+        bad_layers["target_layers"] = json!([1, 4_294_967_296_u64]);
+        let bad_layers_bytes = encode_raw_json_envelope(&json!({
+            "header": bad_layers,
+            "tensors": []
+        }));
+        assert!(matches!(
+            FttsDraft::decode(&bad_layers_bytes),
+            Err(DraftError::CorruptHeader(_))
+        ));
+
+        let mut bad_kill = valid_header_json();
+        bad_kill["is_kill_switched"] = json!("true");
+        let bad_kill_bytes = encode_raw_json_envelope(&json!({
+            "header": bad_kill,
+            "tensors": []
+        }));
+        assert!(matches!(
+            FttsDraft::decode(&bad_kill_bytes),
+            Err(DraftError::CorruptHeader(_))
+        ));
+
+        let mut bad_meta = valid_header_json();
+        bad_meta["metadata"] = json!({"epochs": 10});
+        let bad_meta_bytes = encode_raw_json_envelope(&json!({
+            "header": bad_meta,
+            "tensors": []
+        }));
+        assert!(matches!(
+            FttsDraft::decode(&bad_meta_bytes),
+            Err(DraftError::CorruptHeader(_))
+        ));
     }
 }
