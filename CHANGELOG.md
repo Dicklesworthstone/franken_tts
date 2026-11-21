@@ -1,5 +1,67 @@
 # Changelog
 
+## [0.1.12] - 2026-11-21
+
+This CLI, Rust crate, and optional site archive release covers 25 commits after
+v0.1.11 before the release metadata commit. Apple application versioning and
+device qualification remain separate from this release.
+
+### Added
+
+- Runtime-dispatched x86-64 int8 kernel islands (`AVX2`, `AVX-VNNI`,
+  `AVX-512 VNNI`) and AVX-512 VNNI prefill batch tiles, bit-identical to the
+  portable scalar route with no minimum-CPU raise.
+- Runtime-dispatched x86-64 f32 packed-GEMM micro-kernels, FMA SnakeBeta,
+  interleaved GEMV, dedicated codec worker team, spin-then-park barrier,
+  one-packet codec queue, and per-thread im2col/stream scratch reuse.
+- Reference-audio codec priming for ICL mode with per-voice `.ftvoice-cache`
+  persistence.
+- Text-free `ftts say --trace DIR` generation receipts (`RUN_ID.generation.json`),
+  deterministic default sampler seeding (`--seed` defaults to `0`), frame-ceiling
+  exit code 5 with `run_error`, and resident wire protocol v2 (with v1 inline
+  fallback).
+- Fuzz parser targets for `.ftvoice` and `.ftvoice-cache`.
+
+### Changed
+
+- Dependencies updated to `asupersync` 0.7.0, `fmd-font` 0.5.0,
+  `fancy-regex` 0.20.2, `clap` 4.6.9, `ctrlc` 3.5.3, `serde_json` 1.0.154,
+  `wasm-bindgen` 0.2.130, and refreshed transitive crates clearing all
+  `cargo-audit` findings (0 vulnerabilities, 0 unsound, 0 yanked).
+- `[profile.release]` explicitly declares `opt-level = 3` alongside
+  `lto = "fat"`, `codegen-units = 1`, and `panic = "abort"`.
+
+### Fixed
+
+- Hardened experimental `.fttsdraft` decoding against overflowing tensor
+  dimensions, non-numeric or non-finite scales, per-row scale-count mismatches,
+  non-integer or out-of-range `i8` data entries, duplicate tensor names, and
+  malformed header fields ([#6](https://github.com/Dicklesworthstone/franken_tts/issues/6)).
+- Removed unconditional `std::time::Instant::now` calls from `QwenGenerator` on
+  `wasm32` targets so browser WASM avoids the unsupported std clock trap while
+  preserving native monotonic timings ([#12](https://github.com/Dicklesworthstone/franken_tts/issues/12)).
+- Hardened `site/harness/browser.mjs` to enforce non-swallowed synthesis waits,
+  fresh non-empty finite 24 kHz PCM, full-length mono 16-bit WAV parity, zero
+  error banners or uncaught exceptions, and clean resource shutdown ([#7](https://github.com/Dicklesworthstone/franken_tts/issues/7));
+  pinned the WebKit loopback port with stale OPFS origin cleanup.
+- Updated `site/build.sh` to emit explicit `--out-name ftts_wasm` bindings and
+  verify all four worker JS/WASM targets ([#11](https://github.com/Dicklesworthstone/franken_tts/issues/11)).
+- Fixed `install.sh` compatibility with stock macOS Bash 3.2 (empty array
+  guards) and minified GitHub API JSON tag parsing.
+- Resolved `aarch64`/`wasm32` warnings and nightly Clippy `needless_range_loop`
+  lints.
+
+### Known open at release
+
+- File-mode SIGINT CPU timing bound ([#8](https://github.com/Dicklesworthstone/franken_tts/issues/8)),
+  non-default Linux scalar CPU-fp32 oracle ratchets ([#9](https://github.com/Dicklesworthstone/franken_tts/issues/9)),
+  and WebKit OPFS writable-stream download failure ([#10](https://github.com/Dicklesworthstone/franken_tts/issues/10))
+  remain open.
+- Real-browser 2 GB model Chromium/WebKit hydration and synthesis parity runs
+  for [#7](https://github.com/Dicklesworthstone/franken_tts/issues/7) and
+  [#12](https://github.com/Dicklesworthstone/franken_tts/issues/12) remain
+  qualified separately from this native binary, crate, and site archive release.
+
 ## [0.1.11] - 2026-10-02
 
 This CLI and Rust crate release covers 133 commits after v0.1.10 before the
@@ -102,7 +164,8 @@ individual commits are intentionally not cited.
 
 | Version | Date | Status | Summary |
 |---------|------|--------|---------|
-| 0.1.11 | 2026-10-02 | current | Streaming frame conservation, CLI voices contracts, canonical final-head normalization fix, dependency refresh, documented qualification limits |
+| 0.1.12 | 2026-11-21 | current | Native x86-64 AVX2/AVX-512 VNNI & packed-GEMM kernels, ICL codec priming cache, generation receipts, `.fttsdraft`/WASM clock/harness fixes, dependency refresh |
+| 0.1.11 | 2026-10-02 | superseded | Streaming frame conservation, CLI voices contracts, canonical final-head normalization fix, dependency refresh, documented qualification limits |
 | 0.1.10 | 2026-08-29 | superseded | 18 built-in voices across all platforms; Accelerate SGEMM kernels; AWQ/GPTQ microdecoder int4; iOS benchmark suite & LabView callouts |
 | 0.1.9 | 2026-08-25 | superseded | the voice compiler: ICL QUALITY packs end to end; enrollment diagnostics; Ctrl-C contract everywhere; micro-q8 artifacts |
 | 0.1.8 | 2026-08-12 | superseded | model downloads survive GitHub throttling: Hugging Face is the primary mirror everywhere |
