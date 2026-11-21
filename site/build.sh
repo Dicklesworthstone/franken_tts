@@ -49,7 +49,7 @@ RUSTFLAGS="-C target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals \
     -Z build-std=std,panic_abort
 
 wasm-bindgen "$TARGET_DIR/wasm32-unknown-unknown/release/ftts_wasm.wasm" \
-  --out-dir site/pkg --typescript --target web
+  --out-dir site/pkg --out-name ftts_wasm --typescript --target web
 
 # ── the SERIAL build, and why two builds are now mandatory ──────────────────────────────────────
 #
@@ -77,7 +77,7 @@ RUSTFLAGS="-C target-feature=+simd128 \
   cargo build -p ftts-wasm --target wasm32-unknown-unknown --release
 
 wasm-bindgen "$TARGET_DIR/wasm32-unknown-unknown/release/ftts_wasm.wasm" \
-  --out-dir site/pkg-serial --typescript --target web
+  --out-dir site/pkg-serial --out-name ftts_wasm --typescript --target web
 rm -f site/pkg-serial/.gitignore
 
 # wasm-pack writes a .gitignore that would hide the artifacts from Pages' upload.
@@ -99,5 +99,15 @@ if command -v wasm-opt >/dev/null 2>&1; then
 else
   echo "WARNING: wasm-opt not found (brew install binaryen) — shipping wasm-pack's output as-is"
 fi
+for required in \
+  site/pkg/ftts_wasm.js \
+  site/pkg/ftts_wasm_bg.wasm \
+  site/pkg-serial/ftts_wasm.js \
+  site/pkg-serial/ftts_wasm_bg.wasm; do
+  if [[ ! -s "$required" ]]; then
+    echo "ERROR: missing required WASM runtime asset: $required" >&2
+    exit 1
+  fi
+done
 echo "site/ ready — serve locally with: python3 -m http.server -d site 8788"
 echo "(the /model proxy only exists on Pages; for local runs, point loader.js at a local copy)"

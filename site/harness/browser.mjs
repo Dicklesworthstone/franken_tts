@@ -25,6 +25,13 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { serve } from "./serve.mjs";
 import { sweepStaleWebKitOrigins, WEBKIT_HARNESS_PORT } from "./webkit_storage.mjs";
+import {
+  EXPECTED_SAMPLE_RATE,
+  wav16,
+  readWav16,
+  validateBrowserPcm,
+  compareBrowserToGolden,
+} from "./parity.mjs";
 
 const siteDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const modelDir = path.join(process.env.HOME, ".cache/franken_tts/model");
@@ -98,87 +105,11 @@ try {
   throw error;
 }
 const { server, port, headers } = served;
-if (webkitRun) {
-  const swept = await sweepStaleWebKitOrigins({ keepPort: port });
-  if (swept.removed) {
-    console.log(
-      `removed ${swept.removed} stale WebKit loopback origin(s), ${(swept.bytes / 1024 ** 3).toFixed(2)} GB`,
-    );
-  }
-}
-console.log(`serving ${siteDir} on :${port}`);
-console.log(`  COOP=${headers["Cross-Origin-Opener-Policy"]} COEP=${headers["Cross-Origin-Embedder-Policy"]}`);
-
-console.log(`browser engine: ${ENGINE_NAME}`);
-// PERSISTENT profile, and it is not optional. WebKit's OPFS needs a real storage directory: in an
-// ephemeral context the first `getFileHandle` fails with "operation failed for an unknown transient
-// reason", the download never starts, and the run looks like a site bug. Chromium tolerates the
-// ephemeral case, so testing only Chromium hides the difference — which is exactly how a WebKit
-// "stall" got mistaken for a real defect once already.
-const profile = await fs.mkdtemp(path.join(os.tmpdir(), `ftts-harness-${ENGINE_NAME}-`));
-const browser = await ENGINE.launchPersistentContext(profile, { headless: !HEADED });
-const page = browser.pages()[0] ?? (await browser.newPage());
-
 const transcript = [];
-page.on("console", (message) => {
-  const text = message.text();
-  transcript.push(`[${message.type()}] ${text}`);
-  // The engine's own stage timing goes to the worker console, which never reaches the page.
-  // Surfacing it here is how the codec-vs-talker split becomes visible.
-  if (text.includes("ftts-wasm timing")) console.log(`\n      ${text}`);
-});
-page.on("pageerror", (error) => transcript.push(`[pageerror] ${error.message}`));
-// Worker consoles and errors do NOT surface on the page by default, which is exactly how a fatal
-// error inside engine-worker.js looked like an innocent stall. Attach to every worker, including
-// the kernel workers it spawns.
-page.on("worker", (worker) => {
-  transcript.push(`[worker started] ${worker.url()}`);
-  worker.on("close", () => transcript.push(`[worker CLOSED] ${worker.url()}`));
-});
-browser.on("weberror", (error) => transcript.push(`[weberror] ${error.error().message}`));
-page.on("requestfailed", (request) =>
-  transcript.push(`[requestfailed] ${request.url()} ${request.failure()?.errorText}`),
-);
-
-
-/// Minimal 16-bit mono WAV writer/reader, so a parity run needs no audio dependency.
-function wav16(samples, rate) {
-  const data = Buffer.alloc(samples.length * 2);
-  for (let i = 0; i < samples.length; i += 1) {
-    data.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32767))), i * 2);
-  }
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + data.length, 4);
-  header.write("WAVEfmt ", 8);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(1, 22);
-  header.writeUInt32LE(rate, 24);
-  header.writeUInt32LE(rate * 2, 28);
-  header.writeUInt16LE(2, 32);
-  header.writeUInt16LE(16, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(data.length, 40);
-  return Buffer.concat([header, data]);
-}
-
-/// Walk the chunk list rather than assuming a 44-byte header: the CLI's writer is free to emit
-/// LIST/fact chunks, and a fixed offset would silently read metadata as audio.
-function readWav16(buffer) {
-  let offset = 12;
-  while (offset + 8 <= buffer.length) {
-    const id = buffer.toString("ascii", offset, offset + 4);
-    const size = buffer.readUInt32LE(offset + 4);
-    if (id === "data") {
-      const out = new Array(size / 2);
-      for (let i = 0; i < out.length; i += 1) out[i] = buffer.readInt16LE(offset + 8 + i * 2);
-      return out;
-    }
-    offset += 8 + size + (size % 2);
-  }
-  throw new Error("no data chunk in WAV");
-}
+const pageErrors = [];
+const webErrors = [];
+let profile = null;
+let browser = null;
 
 let failures = 0;
 const check = (label, ok, detail = "") => {
@@ -188,6 +119,53 @@ const check = (label, ok, detail = "") => {
 };
 
 try {
+  if (webkitRun) {
+    const swept = await sweepStaleWebKitOrigins({ keepPort: port });
+    if (swept.removed) {
+      console.log(
+        `removed ${swept.removed} stale WebKit loopback origin(s), ${(swept.bytes / 1024 ** 3).toFixed(2)} GB`,
+      );
+    }
+  }
+  console.log(`serving ${siteDir} on :${port}`);
+  console.log(`  COOP=${headers["Cross-Origin-Opener-Policy"]} COEP=${headers["Cross-Origin-Embedder-Policy"]}`);
+
+  console.log(`browser engine: ${ENGINE_NAME}`);
+  // PERSISTENT profile, and it is not optional. WebKit's OPFS needs a real storage directory: in an
+  // ephemeral context the first `getFileHandle` fails with "operation failed for an unknown transient
+  // reason", the download never starts, and the run looks like a site bug. Chromium tolerates the
+  // ephemeral case, so testing only Chromium hides the difference — which is exactly how a WebKit
+  // "stall" got mistaken for a real defect once already.
+  profile = await fs.mkdtemp(path.join(os.tmpdir(), `ftts-harness-${ENGINE_NAME}-`));
+  browser = await ENGINE.launchPersistentContext(profile, { headless: !HEADED });
+  const page = browser.pages()[0] ?? (await browser.newPage());
+
+  page.on("console", (message) => {
+    const text = message.text();
+    transcript.push(`[${message.type()}] ${text}`);
+    // The engine's own stage timing goes to the worker console, which never reaches the page.
+    // Surfacing it here is how the codec-vs-talker split becomes visible.
+    if (text.includes("ftts-wasm timing")) console.log(`\n      ${text}`);
+  });
+  page.on("pageerror", (error) => {
+    pageErrors.push(error.message);
+    transcript.push(`[pageerror] ${error.message}`);
+  });
+  // Worker consoles and errors do NOT surface on the page by default, which is exactly how a fatal
+  // error inside engine-worker.js looked like an innocent stall. Attach to every worker, including
+  // the kernel workers it spawns.
+  page.on("worker", (worker) => {
+    transcript.push(`[worker started] ${worker.url()}`);
+    worker.on("close", () => transcript.push(`[worker CLOSED] ${worker.url()}`));
+  });
+  browser.on("weberror", (error) => {
+    const msg = error.error().message;
+    webErrors.push(msg);
+    transcript.push(`[weberror] ${msg}`);
+  });
+  page.on("requestfailed", (request) =>
+    transcript.push(`[requestfailed] ${request.url()} ${request.failure()?.errorText}`),
+  );
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "domcontentloaded" });
 
   const isolated = await page.evaluate(() => self.crossOriginIsolated);
@@ -260,6 +238,7 @@ try {
     () => document.getElementById("error")?.textContent?.trim() ?? "",
   );
   if (pageError) console.log(`\nPAGE ERROR: ${pageError}`);
+  check("no hydration error banner", pageError.length === 0, pageError);
 
   // The number that actually matters. Everything above only proves the page loads; this measures
   // whether the kernel work bought anything, in the browser, on the real model.
@@ -302,19 +281,41 @@ try {
       inputs.text === CONFORMANCE_TEXT && inputs.seed === "0" && inputs.voice === "matt",
       `voice=${inputs.voice} seed=${inputs.seed}`,
     );
+    await page.evaluate(() => {
+      globalThis.__fttsLastPcm = null;
+      globalThis.__fttsLastSampleRate = null;
+    });
     const started = Date.now();
     await page.click("#speak");
     // Wait for the control to go DOWN before waiting for it to come back up. Checking only for
     // "enabled" races the click handler: the button is still enabled for the instant between the
     // click and the handler disabling it, so the wait returned immediately, reported 0.0 s, and
     // the run exited while synthesis was still going — a pass that measured nothing.
-    await page
-      .waitForFunction(() => document.getElementById("speak").disabled, null, { timeout: 30_000 })
-      .catch(() => {});
+    let synthStarted = true;
+    try {
+      await page.waitForFunction(() => document.getElementById("speak")?.disabled === true, null, {
+        timeout: 30_000,
+      });
+    } catch (error) {
+      synthStarted = false;
+      check("synthesis started (speak button disabled)", false, error.message);
+    }
+    if (synthStarted) {
+      check("synthesis started (speak button disabled)", true);
+    }
     // Synthesis is minutes at wasm speed; now wait for it to re-enable.
-    await page
-      .waitForFunction(() => !document.getElementById("speak").disabled, null, { timeout: 900_000 })
-      .catch(() => {});
+    let synthCompleted = true;
+    try {
+      await page.waitForFunction(() => document.getElementById("speak")?.disabled === false, null, {
+        timeout: 900_000,
+      });
+    } catch (error) {
+      synthCompleted = false;
+      check("synthesis completed within timeout", false, error.message);
+    }
+    if (synthCompleted) {
+      check("synthesis completed within timeout", true);
+    }
     const seconds = (Date.now() - started) / 1000;
     const status = await page.evaluate(
       () => document.getElementById("synth-status")?.textContent?.trim() ?? "",
@@ -327,70 +328,43 @@ try {
       () => document.getElementById("error")?.textContent?.trim() ?? "",
     );
     if (synthError) console.log(`SYNTH ERROR: ${synthError}`);
+    check("no synthesis error banner", synthError.length === 0, synthError);
+    check(
+      "no uncaught page or worker exceptions",
+      pageErrors.length === 0 && webErrors.length === 0,
+      [...pageErrors, ...webErrors].join("; "),
+    );
 
-    // ── conformance: the browser's samples against the CLI's ────────────────────────────────
+    // ── conformance: require fresh finite 24 kHz PCM and full-length CLI parity ─────────────
     const pcm = await page.evaluate(() =>
       globalThis.__fttsLastPcm ? Array.from(globalThis.__fttsLastPcm) : null,
     );
-    const rate = await page.evaluate(() => globalThis.__fttsLastSampleRate ?? 24000);
-    if (pcm && (PCM_OUT || CLI_GOLDEN)) {
-      if (PCM_OUT) {
-        await fs.writeFile(PCM_OUT, wav16(pcm, rate));
-        console.log(`wrote ${PCM_OUT} (${pcm.length} samples @ ${rate} Hz)`);
-      }
-      if (CLI_GOLDEN) {
-        const golden = readWav16(await fs.readFile(CLI_GOLDEN));
-        const n = Math.min(golden.length, pcm.length);
-        // The browser holds f32 in [-1,1]; the CLI's WAV is i16. Quantize ours the same way
-        // before comparing, so the comparison measures the ENGINE and not the WAV encoder.
-        // Quantize with round-half-away-from-zero to match the CLI's
-        // `sample_to_i16` (ftts_core::audio): JS Math.round breaks ties toward
-        // +infinity, which disagrees with Rust's f32::round on negative halves
-        // and manufactured phantom 1-LSB diffs at exact .5 boundaries.
-        const ours = pcm.slice(0, n).map((v) => {
-          // Math.fround replicates the CLI's f32 arithmetic: sample_to_i16
-          // computes v * 32767.0 in f32 (the product rounds to f32 BEFORE the
-          // integer rounding), so the f64 product here must be f32-rounded
-          // first or exact-half products disagree by 1 LSB
-          // (ftts_core::audio::sample_to_i16; frankentts-uuac).
-          const scaled = Math.fround(v * 32767);
-          const rounded = Math.sign(scaled) * Math.round(Math.abs(scaled));
-          return Math.max(-32768, Math.min(32767, rounded));
-        });
-        const theirs = golden.slice(0, n);
-        let identical = 0;
-        let maxDiff = 0;
-        let sumSq = 0;
-        let refSq = 0;
-        for (let i = 0; i < n; i += 1) {
-          const d = ours[i] - theirs[i];
-          if (d === 0) identical += 1;
-          maxDiff = Math.max(maxDiff, Math.abs(d));
-          sumSq += d * d;
-          refSq += theirs[i] * theirs[i];
-        }
-        const snr = 10 * Math.log10((refSq || 1) / (sumSq || 1e-20));
-        // Sub-LSB diagnostics: for every differing sample, report the raw f32
-        // delta (in LSB units) BEFORE quantization — distinguishes i16
-        // tie-straddles (delta ~ 0.5 LSB) from genuine engine ULP noise
-        // (delta ~ 1e-4 LSB) (frankentts-uuac).
-        const rawDiffs = [];
-        for (let i = 0; i < n; i += 1) {
-          if (ours[i] !== theirs[i]) {
-            rawDiffs.push({ i, f32: pcm[i], deltaLsb: Math.abs(pcm[i] * 32767 - theirs[i]) });
-          }
-        }
-        console.log(`      raw f32 deltas at differing samples: ${JSON.stringify(rawDiffs.slice(0, 8))}`);
+    const rate = await page.evaluate(() => globalThis.__fttsLastSampleRate ?? null);
+    const pcmCheck = validateBrowserPcm(pcm, rate, EXPECTED_SAMPLE_RATE);
+    check(
+      "browser produced fresh non-empty finite 24 kHz PCM",
+      pcmCheck.ok,
+      pcmCheck.ok ? `${pcmCheck.samples} samples @ ${pcmCheck.rate} Hz` : pcmCheck.reason,
+    );
+    if (pcmCheck.ok && PCM_OUT) {
+      await fs.writeFile(PCM_OUT, wav16(pcm, rate));
+      console.log(`wrote ${PCM_OUT} (${pcm.length} samples @ ${rate} Hz)`);
+    }
+    if (CLI_GOLDEN) {
+      if (pcmCheck.ok) {
+        const goldenWav = readWav16(await fs.readFile(CLI_GOLDEN), EXPECTED_SAMPLE_RATE);
+        const cmp = compareBrowserToGolden(pcm, rate, goldenWav.samples, EXPECTED_SAMPLE_RATE);
+        console.log(`      raw f32 deltas at differing samples: ${JSON.stringify(cmp.rawDiffs)}`);
         console.log(`\n--- CLI PARITY (${CONFORMANCE_TEXT.slice(0, 32)}…, voice matt, seed 0) ---`);
-        console.log(`      lengths: browser ${pcm.length}, cli ${golden.length}, compared ${n}`);
-        console.log(`      identical samples: ${identical}/${n} (${((100 * identical) / n).toFixed(2)}%)`);
-        console.log(`      max |diff|: ${maxDiff} LSB of 32767`);
-        console.log(`      SNR of the difference: ${snr.toFixed(1)} dB`);
-        check("browser output matches the CLI sample-for-sample", identical === n,
-          identical === n ? "" : `${n - identical} samples differ, max ${maxDiff} LSB, SNR ${snr.toFixed(1)} dB`);
+        console.log(`      lengths: browser ${cmp.browserLen}, cli ${cmp.goldenLen}, compared ${cmp.compared}`);
+        const pct = cmp.compared ? ((100 * cmp.identical) / cmp.compared).toFixed(2) : "0.00";
+        console.log(`      identical samples: ${cmp.identical}/${cmp.compared} (${pct}%)`);
+        console.log(`      max |diff|: ${cmp.maxDiff} LSB of 32767`);
+        console.log(`      SNR of the difference: ${cmp.snr.toFixed(1)} dB`);
+        check("browser output matches the CLI sample-for-sample (full length)", cmp.ok, cmp.reason);
+      } else {
+        check("browser output matches the CLI sample-for-sample (full length)", false, pcmCheck.reason);
       }
-    } else if (CLI_GOLDEN) {
-      check("browser produced PCM to compare", false, "no __fttsLastPcm (synthesis failed?)");
     }
     // Stages recorded DURING synthesis. The history dump above happens at "ready", so anything
     // synthesis reports — including how much linear memory it claims, which is now the number
@@ -402,23 +376,31 @@ try {
   console.log("\n--- browser transcript ---");
   for (const line of transcript.slice(-60)) console.log(line);
   if (TRANSCRIPT_OUT) {
-    await fs.writeFile(TRANSCRIPT_OUT, transcript.join("\n"));
+    await fs.writeFile(TRANSCRIPT_OUT, transcript.join("\n")).catch((error) => {
+      console.error(`warning: could not write transcript ${TRANSCRIPT_OUT}: ${error.message}`);
+      failures += 1;
+    });
     console.log(`full transcript: ${TRANSCRIPT_OUT} (${transcript.length} lines)`);
   }
-  if (!KEEP) {
-    await browser.close();
-    server.close();
-    // The persistent profile above is a full browser profile (~1.7 GB for
-    // Chromium). Nothing removed it, so every run left one in TMPDIR: 54 of
-    // them, 91 GB, by 2026-08-28. Remove it only AFTER the browser closes,
-    // or its still-open files reappear under the directory we just deleted.
-    // KEEP leaves the browser up for debugging, so it keeps the profile too.
-    // A cleanup failure must not mask the run's real result from this finally.
-    await fs.rm(profile, { recursive: true, force: true }).catch((error) => {
-      console.log(`warning: could not remove profile ${profile}: ${error.message}`);
+  if (browser) {
+    await browser.close().catch((error) => {
+      console.error(`warning: could not close browser context: ${error.message}`);
     });
+  }
+  if (server) {
+    await new Promise((resolve) => server.close(() => resolve()));
+  }
+  if (profile) {
+    if (KEEP) {
+      console.log(`retained browser profile: ${profile}`);
+    } else {
+      // Remove persistent profile only AFTER browser closure.
+      await fs.rm(profile, { recursive: true, force: true }).catch((error) => {
+        console.log(`warning: could not remove profile ${profile}: ${error.message}`);
+      });
+    }
   }
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
-process.exit(failures ? 1 : 0);
+process.exitCode = failures ? 1 : 0;
