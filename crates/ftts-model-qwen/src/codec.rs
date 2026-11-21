@@ -2004,9 +2004,9 @@ pub fn forward_convnext(
     );
     let mut output = input.to_vec();
     for frame in 0..frames {
-        for channel in 0..channels {
+        for (channel, &gamma) in weights.gamma.iter().enumerate().take(channels) {
             let index = frame * channels + channel;
-            output[index] += weights.gamma[channel] * hidden[index];
+            output[index] += gamma * hidden[index];
         }
     }
     output

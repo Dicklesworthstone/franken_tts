@@ -1527,8 +1527,8 @@ impl FrankenMtpDrafter {
         };
 
         let mut data = Vec::with_capacity(RESIDUAL_DEPTHS * TRANSITION_BUCKETS * 8);
-        for depth in 0..RESIDUAL_DEPTHS {
-            for bucket in &self.transitions[depth] {
+        for depth_transitions in &self.transitions {
+            for bucket in depth_transitions {
                 data.extend_from_slice(&bucket.source.to_le_bytes());
                 data.extend_from_slice(&bucket.target.to_le_bytes());
                 data.extend_from_slice(&bucket.count.to_le_bytes());
