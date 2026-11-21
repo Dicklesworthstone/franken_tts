@@ -29,7 +29,44 @@ use crate::talker::{
 use ftts_artifacts::fttsq::{MappedFttsq, StoredDtype};
 use ftts_kernels::int8::{QuantLinearMode, QuantizedMatrix};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+/// Monotonic stage timer on native targets; zero-cost no-op on `wasm32`,
+/// where `std::time::Instant::now` traps (`time not implemented on this platform`)
+/// and browser bindings keep timing on JavaScript clocks.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+struct StageTimer(std::time::Instant);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl StageTimer {
+    #[inline]
+    fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+
+    #[inline]
+    fn elapsed(self) -> Duration {
+        self.0.elapsed()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+struct StageTimer;
+
+#[cfg(target_arch = "wasm32")]
+impl StageTimer {
+    #[inline]
+    fn start() -> Self {
+        Self
+    }
+
+    #[inline]
+    fn elapsed(self) -> Duration {
+        Duration::ZERO
+    }
+}
 
 /// The talker's pinned mRoPE base. The microdecoder and codec each use a different theta; crossing
 /// them is a silent correctness failure, so the constant lives next to its only call sites.
@@ -1150,7 +1187,7 @@ impl<'a> QwenGenerator<'a> {
         shared_prefix: Option<&TalkerPromptPrefix>,
     ) -> Result<Option<TalkerPromptPrefix>, GenerationError> {
         self.timings = GenerationTimings::default();
-        let prefill_started = Instant::now();
+        let prefill_started = StageTimer::start();
         if self.prompt_mode.clone_mode != CloneMode::XVector {
             return Err(GenerationError::new(
                 "shared cross-voice prefixes require x-vector prompt assembly",
@@ -1262,7 +1299,7 @@ impl FrameGenerator for QwenGenerator<'_> {
         mode: UtteranceStart,
     ) -> Result<(), GenerationError> {
         self.timings = GenerationTimings::default();
-        let prefill_started = Instant::now();
+        let prefill_started = StageTimer::start();
         if matches!(mode, UtteranceStart::Continuation)
             && (self.prompt_mode.clone_mode == CloneMode::Icl || !self.prompt_mode.streaming())
         {
@@ -1431,7 +1468,7 @@ impl FrameGenerator for QwenGenerator<'_> {
         // production SAMPLES every residual depth exactly as upstream's subtalker_dosample=true
         // does — greedy residuals under a sampled talker sit in a measured silence attractor
         // (frankentts-p7r; the reference reproduces it in that mismatched configuration).
-        let microdecoder_started = Instant::now();
+        let microdecoder_started = StageTimer::start();
         let sampler = &mut self.sampler;
         let sampling_mode = self.sampling_mode;
         // A non-finite residual logit (corrupt checkpoint, numeric blowup) must surface as a
@@ -1492,7 +1529,7 @@ impl FrameGenerator for QwenGenerator<'_> {
             return Err(generation_error(error));
         }
         self.timings.microdecoder += microdecoder_started.elapsed();
-        let feedback_started = Instant::now();
+        let feedback_started = StageTimer::start();
         let mut codes = Vec::with_capacity(CODE_GROUP_COUNT);
         codes.push(primary);
         codes.extend(self.microdecoder_codes.iter().map(|&code| code as u32));
@@ -1568,7 +1605,7 @@ impl FrameGenerator for QwenGenerator<'_> {
         }
 
         self.timings.feedback += feedback_started.elapsed();
-        let talker_started = Instant::now();
+        let talker_started = StageTimer::start();
 
         let (cos, sin) = talker::mrope_rows(
             &[utterance.next_position as i64],
