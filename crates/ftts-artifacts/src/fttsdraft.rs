@@ -301,9 +301,7 @@ impl DraftTensor {
             .map_err(|_| DraftError::CorruptHeader("cols exceeds platform usize".into()))?;
 
         let expected_elems = rows.checked_mul(cols).ok_or_else(|| {
-            DraftError::CorruptHeader(format!(
-                "tensor {name} dimension overflow: {rows} * {cols}"
-            ))
+            DraftError::CorruptHeader(format!("tensor {name} dimension overflow: {rows} * {cols}"))
         })?;
 
         let scales_arr = obj
@@ -343,14 +341,10 @@ impl DraftTensor {
         let mut data = Vec::with_capacity(data_arr.len());
         for item in data_arr {
             let raw = item.as_i64().ok_or_else(|| {
-                DraftError::CorruptHeader(format!(
-                    "tensor {name} contains non-integer data entry"
-                ))
+                DraftError::CorruptHeader(format!("tensor {name} contains non-integer data entry"))
             })?;
             let byte = i8::try_from(raw).map_err(|_| {
-                DraftError::CorruptHeader(format!(
-                    "tensor {name} data entry {raw} out of i8 range"
-                ))
+                DraftError::CorruptHeader(format!("tensor {name} data entry {raw} out of i8 range"))
             })?;
             data.push(byte);
         }
