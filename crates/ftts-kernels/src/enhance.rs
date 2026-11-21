@@ -1219,8 +1219,8 @@ impl Fft {
     /// twiddles (no 1/n scaling — callers scale).
     fn fft_complex(&self, buf: &mut [f32], inverse: bool) {
         let n = self.n;
-        for i in 0..n {
-            let j = self.rev[i] as usize;
+        for (i, &rev) in self.rev.iter().enumerate().take(n) {
+            let j = rev as usize;
             if i < j {
                 buf.swap(2 * i, 2 * j);
                 buf.swap(2 * i + 1, 2 * j + 1);
